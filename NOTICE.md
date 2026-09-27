@@ -23,3 +23,9 @@ authors under their own terms.
 
 - **Source:** the verbs headers in `crates/glm53f-rdma/native/include/` come from linux-rdma/rdma-core (via mimo26f-afd).
 - **Licence:** dual-licensed; used here under the OpenIB.org BSD licence. Each file's header carries its copyright notices and the licence text.
+
+## TensorFold: MIT
+
+- **Source:** <https://github.com/ashhart/TensorFold> @ `bb4b4a3`. Copyright (c) the TensorFold authors.
+- **What was taken:** the fused KDA chain, replay and conv-shift kernels for GLM-5.3-Flash (`crates/glm53f-kda/kernels/`), ported to a C ABI with batching; the source file is kept verbatim for a bitwise parity test.
+- **Licence text:** `crates/glm53f-kda/LICENSE.tensorfold`.

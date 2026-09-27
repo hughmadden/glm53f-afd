@@ -65,8 +65,10 @@ MiMo's 416.7. What pushes the estimate each way:
 - **Better than MiMo:** 11% fewer MoE layers. The coordinator's weights are read
   once per step and shared by all rows.
 - **Worse than MiMo:**
-  - each active request reads and writes 272 MiB of FP32 KDA state per step, so
-    C16 adds about 2.5 ms per step;
+  - each active request reads and writes 272 MiB of FP32 KDA state per step. The
+    recurrent part measured 3.0–3.5 ms per step for 8 requests of one row on an
+    RTX 4090, so C16 on the 5090 costs nearer **4 ms** per step. This corrects an
+    earlier estimate of 2.5 ms, which assumed full bandwidth;
   - the BF16 KDA projections.
 
 ## 5. Prefill
@@ -86,7 +88,12 @@ two lanes, so it runs at the slower side's rate.
   selection. Averaged over a 1M prompt this is about 11 GFLOP per token, and about
   50 µs per token of selection.
 - **KDA:** linear in n, so the attention cost stays nearly flat as context grows,
-  unlike the global-attention layers in MiMo.
+  unlike the global-attention layers in MiMo. It needs a **chunked prefill
+  kernel** (the gated delta rule in WY form, 64-row chunks). Run serially, the
+  recurrence alone measured 46 µs per token over 34 layers on an RTX 4090, and the
+  full fused chain 86–101 µs: half the coordinator's budget. The chunked form is
+  about 0.3 GFLOP per token, or 6–10 µs on the 5090, if its intermediates stay in
+  FP32 and its passes are fused.
 
 | Prompt | Expected | Derivation |
 |---|---:|---|
