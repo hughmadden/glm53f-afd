@@ -11,12 +11,15 @@ indexer), not the serving shell.
 - Build the reference oracle: the `transformers` `glm5_next` code on the official
   FP8 weights. Record per-layer goldens for a handful of short prompts, as fixtures
   with digests.
-- Expert-format bake-off (D6):
-  - compare EXL3 K4, NVFP4 and FP8 experts on one prompt corpus;
-  - measure top-1 agreement, KL and DFlash2 acceptance;
-  - any existing serving stack on the Sparks will do; this measures the
-    checkpoints, not the engine.
-- **Gate:** decisions recorded; goldens reproducible; format table filled.
+- Expert format (D6): **largely answered by published measurements** (DESIGN §5).
+  EXL3 K4 scores a KLD of 0.0246 against BF16, official FP8 scores 0.0206, both on
+  the same 25-window panel. The engine uses EXL3 K4 by default. No separate
+  bake-off is needed.
+- The engine's end-to-end KL gate scores on that **same public panel**. It uses the
+  BF16 teacher logits of `brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits`: the
+  `logits/` set, about 32 GB, fetched when the engine first produces logits. The
+  engine's number is then directly comparable with the published 0.0246.
+- **Gate:** decisions recorded; goldens reproducible.
 
 ## Phase 1: the Spark ranks (2–4 days)
 

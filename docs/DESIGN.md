@@ -113,16 +113,31 @@ no deployment-specific details in it.
 The Sparks can hold any of the three formats (SIZING §6). The choice trades
 quality against decode speed:
 
-| Format | Per rank | M1 read per token | Kernel options | Quality evidence |
+| Format | Per rank | M1 read per token | Kernel options | KLD vs BF16 (nats), top-1 agreement |
 |---|---:|---:|---|---|
-| EXL3 K4 (`mcg` trellis, routed experts only) | 38.2 GB | 1.06 GB | **T** (GLM-Flash native), **S** | Used by two GLM-Flash engines on Sparks; no published KL figure |
-| NVFP4 (modelopt, group of 16) | 42.8 GB | 1.19 GB | **S** (GLM-Flash geometry), **M** B1 with new scales | Serves on Sparks in vLLM and SGLang; no published KL figure |
-| FP8 (official) | 76.1 GB | 2.11 GB | **S** block-FP8 grouped | **The reference** |
+| EXL3 K4 (`mcg` trellis, routed experts only; `tr3-4bpw`) | 38.2 GB | 1.06 GB | **T** (GLM-Flash native), **S** | **0.0246**, 95.3% |
+| EXL3 K6 (no public checkpoint found) | ~57 GB | ~1.59 GB | as K4 | **0.0137**, 96.6% |
+| NVFP4 (modelopt, group of 16) | 42.8 GB | 1.19 GB | **S** (GLM-Flash geometry), **M** B1 with new scales | not measured on this panel |
+| FP8 (official) | 76.1 GB | 2.11 GB | **S** block-FP8 grouped | **0.0206**, 95.6% |
 
-Plan: measure all three against FP8 on the same prompt corpus: top-1
-agreement, KL and DFlash2 acceptance. Choose using the joint table (D6). The
-coordinator always loads the official checkpoint's non-expert tensors, since the
-quantized checkpoints ship them in BF16.
+**Source of the KLD column.** Published measurements on one 25-window panel
+(51,175 scored positions) against the BF16 model: the
+[quant-fidelity registry](https://huggingface.co/datasets/malaiwah/quant-fidelity-registry)
+and the `tr3-4bpw` model card.
+- **Noise floor:** the same BF16 model run on two different stacks scores
+  0.0115–0.0127.
+- **KV format:** the K4 row used an FP8 MLA cache. With an NVFP4 cache, the same
+  checkpoint scored 0.0548 and failed that card's quality gate, which supports D1.
+
+**Choice (D6).**
+- **EXL3 K4 by default.** It is already the format the Sparks can load, it is the
+  fastest, and it is within 0.004 nats of the official FP8.
+- **FP8 experts:** twice the bytes for that difference, so they are not worth it.
+- **EXL3 K6:** the quality upgrade, if one is published or we quantize one
+  ourselves.
+- **Loading:** whatever the expert format, the coordinator loads the official
+  checkpoint's non-expert tensors, because the quantized checkpoints ship them in
+  BF16.
 
 ## 6. KDA
 
