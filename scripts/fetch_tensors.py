@@ -176,10 +176,19 @@ def main() -> int:
         os.pwrite(fd, struct.pack("<Q", len(hbytes)) + hbytes, 0)
         os.ftruncate(fd, base + off)
         files.append((out_name, path, fd, header, base))
+        # Coalesce tensors that are contiguous in the same source shard into one run (their
+        # destinations are contiguous too, since a group keeps source order), then split each
+        # run into chunks: thousands of small tensors cost a handful of requests, not one each.
+        runs = []  # [shard, src_start, nbytes, dst]
         for name, shard, start, nbytes, dtype, shape in group:
             dst = base + header[name]["data_offsets"][0]
+            if runs and runs[-1][0] == shard and runs[-1][1] + runs[-1][2] == start:
+                runs[-1][2] += nbytes
+            else:
+                runs.append([shard, start, nbytes, dst])
+        for shard, start, nbytes, dst in runs:
             for c in range(0, nbytes, chunk):
-                key = f"{out_name}:{name}:{c}"
+                key = f"{out_name}:{shard}:{start + c}"
                 if key not in done:
                     jobs.append((key, fd, url_for(args.repo, args.revision, shard), start + c,
                                  min(chunk, nbytes - c), dst + c))
