@@ -1,0 +1,10 @@
+# glm53f-afd Rust workspace. Crates are glm53f-*; each crate that copies code from
+# another project records it in its PROVENANCE.md, consolidated into docs/REUSE.md.
+# No external Rust crates: the engine builds from this repository and the CUDA toolkit.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
