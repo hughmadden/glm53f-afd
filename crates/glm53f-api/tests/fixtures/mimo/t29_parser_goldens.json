@@ -1,0 +1,168 @@
+{
+ "cases": [
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "retries": 5,
+       "url": "https://x/y"
+      },
+      "name": "fetch"
+     }
+    ]
+   },
+   "id": "simple_two_params_schema_coercion",
+   "must_not": [
+    "wrong coercion: retries must be int 5, not str"
+   ],
+   "must_report": [],
+   "note": "T27 _coerce_value: text '5' + schema type integer -\u003e 5",
+   "output": "\u003ctool_call\u003e\u003cfunction=fetch\u003e\u003cparameter=url\u003ehttps://x/y\u003c/parameter\u003e\u003cparameter=retries\u003e5\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "v": "abc"
+      },
+      "name": "echo"
+     }
+    ]
+   },
+   "id": "value_contains_closing_parameter_tag",
+   "must_not": [
+    "wedge",
+    "nameless call",
+    "silent drop of the tail"
+   ],
+   "must_report": [
+    "unparsed tail after the embedded closing tag"
+   ],
+   "note": "T29 gate case. Format has no escaping; documented semantics = split on the FIRST closing parameter tag; the tail must be reported, never silently dropped.",
+   "output": "\u003ctool_call\u003e\u003cfunction=echo\u003e\u003cparameter=v\u003eabc\u003c/parameter\u003edef\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "v": "abc\u003c|im_end|\u003edef"
+      },
+      "name": "echo"
+     }
+    ]
+   },
+   "id": "value_contains_chat_eos_special_token",
+   "must_not": [
+    "truncate the value",
+    "treat it as end of message",
+    "wedge"
+   ],
+   "must_report": [],
+   "note": "T29 gate case. The EOS special token inside an argument is plain text to the parser; only the model's generation honors it.",
+   "output": "\u003ctool_call\u003e\u003cfunction=echo\u003e\u003cparameter=v\u003eabc\u003c|im_end|\u003edef\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": []
+   },
+   "id": "missing_closing_tool_call_tag",
+   "must_not": [
+    "invent a call",
+    "silent drop"
+   ],
+   "must_report": [
+    "lost call (closing tag missing)"
+   ],
+   "note": "T27: a call without its closing tag is LOST and must be reported, matching vLLM mimo behavior.",
+   "output": "\u003ctool_call\u003e\u003cfunction=fetch\u003e\u003cparameter=url\u003ehttps://x/y\u003c/parameter\u003e\u003c/function\u003e"
+  },
+  {
+   "expected": {
+    "calls": [],
+    "error": "nameless tool call"
+   },
+   "id": "nameless_call_is_an_error",
+   "must_not": [
+    "persist a nameless call",
+    "return 200 with an empty name"
+   ],
+   "must_report": [
+    "nameless tool call"
+   ],
+   "note": "T29: our API (A8) validates every parsed call (non-empty name, JSON-parsable arguments) and returns an error.",
+   "output": "\u003ctool_call\u003e\u003cparameter=url\u003ex\u003c/parameter\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "n": 5,
+       "s": "5"
+      },
+      "name": "set"
+     }
+    ]
+   },
+   "id": "non_string_renders_with_tojson",
+   "must_not": [
+    "coerce s to int",
+    "coerce n to str"
+   ],
+   "must_report": [],
+   "note": "T27: the template renders non-strings with tojson (5 vs \"5\" are distinct); the parser coerces to the schema.",
+   "output": "\u003ctool_call\u003e\u003cfunction=set\u003e\u003cparameter=n\u003e5\u003c/parameter\u003e\u003cparameter=s\u003e\"5\"\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "url": "https://x/y"
+      },
+      "name": "fetch"
+     }
+    ],
+    "reasoning": [
+     "reasoning"
+    ]
+   },
+   "id": "think_block_then_call",
+   "must_not": [
+    "drop the call after the think block"
+   ],
+   "must_report": [],
+   "note": "T29: think tags feed the reasoning parser; the call still parses.",
+   "output": "\u003cthink\u003ereasoning\u003c/think\u003e\u003ctool_call\u003e\u003cfunction=fetch\u003e\u003cparameter=url\u003ehttps://x/y\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  },
+  {
+   "expected": {
+    "calls": [
+     {
+      "arguments": {
+       "k": 1
+      },
+      "name": "a"
+     },
+     {
+      "arguments": {
+       "k": 2
+      },
+      "name": "b"
+     }
+    ]
+   },
+   "id": "two_calls_one_message",
+   "must_not": [
+    "merge the calls",
+    "drop the second call"
+   ],
+   "must_report": [],
+   "note": "both calls in order.",
+   "output": "\u003ctool_call\u003e\u003cfunction=a\u003e\u003cparameter=k\u003e1\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e\u003ctool_call\u003e\u003cfunction=b\u003e\u003cparameter=k\u003e2\u003c/parameter\u003e\u003c/function\u003e\u003c/tool_call\u003e"
+  }
+ ]
+}

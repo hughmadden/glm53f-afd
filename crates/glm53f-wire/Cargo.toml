@@ -1,0 +1,31 @@
+# glm53f-wire (I4 items 5+6) — DS41RTE3 v3 wire codec + L4 integrity ladder
+# (ADVISOR-I4 §3.2 items 5-6 / §3.3, ARCHITECTURE.md §9 item 2 + §11.5).
+#
+# Row contracts (tests pin these; they are not comments):
+#   request row  = 4,360 B (40-B descriptor + 4,224-B FP8 E4M3/UE8M0-K32 hidden
+#                  row + 8 x 12-B route entries) per token per layer per Spark
+#   compact return = 8,192 B BF16 per token per layer per Spark, the Spark
+#                  pre-summing its 8 weighted route partials (NEVER per-route
+#                  FP32 — the 24.6 MB/token wall, ADVISOR-I4 A6)
+#
+# Copied from mimo26f-afd v1.2.0 `crates/mimo26-wire` (PROVENANCE.md). The frame
+# magic `DS41RTE3` and version 3 are kept: they are the contract with the expert
+# ranks. Format derivation copy-in source (READ-ONLY): tpurtell/ds41rt
+# ds41rt-transport `protocol_v2.rs`. Two-run trap suite convention (as in
+# mimo26f-afd's mimo26-load/mimo26-attn):
+#   CORRECT: cargo test -p glm53f-wire                  (must be green)
+#   NAIVE:   GLM53F_SPIKE_NAIVE=1 <same>               (every *_n_* NEGATIVE
+#            test must FAIL; every BOTH-RUNS test passes). Classification is
+#            listed in tests/wire_layout.rs and tests/l4_integrity.rs headers.
+[package]
+name = "glm53f-wire"
+version = "0.1.0"
+edition = "2021"
+description = "DS41RTE3 v3 request/compact-return frames (4360-B rows, 8192-B BF16 partials), CRC32C + seq L4 ladder"
+publish = false
+
+[lib]
+name = "glm53f_wire"
+path = "src/lib.rs"
+
+[dependencies]

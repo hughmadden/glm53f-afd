@@ -1,0 +1,26 @@
+# glm53f-api (A8, I5-R8) — the OpenAI-compatible HTTP/1.1 API. Copied from
+# mimo26f-afd v1.2.0 `crates/mimo26-api` (PROVENANCE.md).
+#
+# std-only (no external crates). The coordinator wires the `Engine` trait into
+# its binary. Serves:
+#   GET  /v1/models
+#   POST /v1/chat/completions  (non-stream + SSE, tool-call parsing T27/T29/T24)
+#
+# The HTTP/1.1 server and the JSON codec are hand-rolled so the crate is
+# dependency-free. The `Engine` trait (tokenize / render_chat / decode_image /
+# generate with a token callback) is implemented by the coordinator; the model's
+# completion markup (reasoning, tool calls) is a `Dialect`. Tests use a stub
+# Engine and the MiMo reference dialect.
+
+[package]
+name = "glm53f-api"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible HTTP/1.1 API (A8): /v1/models + /v1/chat/completions, model Dialect seam (MiMo reference dialect), Engine trait"
+publish = false
+
+[lib]
+name = "glm53f_api"
+path = "src/lib.rs"
+
+[dependencies]

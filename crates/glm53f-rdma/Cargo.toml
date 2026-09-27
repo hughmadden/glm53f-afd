@@ -1,0 +1,19 @@
+# glm53f-rdma — RDMA RC transport shim for the expert exchange (perf reset R2 part 2,
+# mimo26f-afd docs/design/perf-reset-vs-ds41rt.md; the upstream DS41RT v15 design: SEND into
+# pre-posted RECV slots of registered buffers, busy-polled completions). Copied from
+# mimo26f-afd v1.2.0 `crates/mimo26-rdma` (PROVENANCE.md).
+#
+# The native shim links the system libibverbs (rdma-core 50, headers vendored in
+# native/include) and is only built under the `rdma` feature, so the CPU merge
+# gate needs no RDMA stack. Without the feature every entry point returns an error.
+[package]
+name = "glm53f-rdma"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+rdma = []
+
+[dependencies]
