@@ -1,0 +1,23 @@
+# build outputs
+/target/
+/build*/
+/dist/
+*.o
+*.so
+*.cubin
+*.fatbin
+
+# local runs, logs and scratch (keep receipts that are meant to be public in docs/)
+/runs/
+/scratch/
+*.log
+
+# weights and large fixtures never belong here
+*.safetensors
+*.gguf
+
+# environment
+.env
+*.env
+.venv/
+__pycache__/
