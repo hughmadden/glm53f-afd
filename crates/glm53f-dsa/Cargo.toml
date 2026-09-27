@@ -1,0 +1,35 @@
+# glm53f-dsa: the DeepSeek sparse attention (DSA) layers of GLM-5.3-Flash.
+#
+# The 11 DSA layers (3, 7, ..., 43) run MLA with a 512-dim latent and no RoPE,
+# plus a k-pool indexer that selects the top 512 pools (2,048 tokens) and the
+# incomplete tail pool. This crate holds:
+#   - an f32 CPU reference of the whole layer path (indexer, k-pool compression,
+#     selection, sparse MLA in the expanded and the absorbed form);
+#   - the cache formats (FP8 latent record, pooled index key, raw tail);
+#   - CUDA kernels behind the `cuda` feature (indexer score + top-512,
+#     sparse MLA decode/verify, a prefill variant).
+#
+# `cargo test` needs no CUDA toolkit. `--features cuda` compiles the kernels
+# with nvcc (GLM53F_NVCC, GLM53F_CUDA_ARCH) and links cudart.
+[package]
+name = "glm53f-dsa"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GLM-5.3-Flash DSA: k-pool indexer, top-512 selection, sparse MLA over an FP8 latent (CPU reference + CUDA)"
+publish = false
+
+[lib]
+name = "glm53f_dsa"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile and link the CUDA kernels (needs nvcc; a GPU only to run them).
+cuda = []
+
+[dependencies]
+
+[[example]]
+name = "dsa_bench"
+required-features = ["cuda"]
