@@ -1,0 +1,53 @@
+# Provenance: glm53f-layers
+
+Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). Commits are full hashes; each
+digest is the sha256 of the whole source file at that commit. All dates are 28 September 2026.
+
+Sources (letters as in [docs/DESIGN.md](../../docs/DESIGN.md) §4):
+
+- **D**: ds41rt @ `3067d0684a0b572d88a17d38ca3f7d10599619b4`, MIT. Its licence is kept in
+  [LICENSE.ds41rt](LICENSE.ds41rt) and applies to the adapted kernel code marked below.
+- **R**: `huggingface/transformers` @ `7cd73d9df0c14b151c684b708a9f27d8d0349dfe`,
+  `src/transformers/models/glm5_next/modeling_glm5_next.py`, Apache-2.0. Semantics only; no
+  code copied.
+- **M**: mimo26f-afd v1.2.0 @ `bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79`, MIT. Build pattern
+  and design reference only.
+- **G**: glmrt-5.3-1rtx-4spark v9 @ `dc6d9b8e1600e001cb1d4228bd911f4df8091f99`, MIT. Design
+  reference only; no code copied.
+- **S**: sparkinfer-glmrt @ `7fcc094edcc93af61fdfbe14300100e3204363ea`, Apache-2.0. Read for
+  the sm_120 notes below; no code copied.
+
+| Unit | Source (repo @ commit : path) | sha256 (source file) | Here | Delta | Pinned by | Date |
+|---|---|---|---|---|---|---|
+| mHC weights, collapse, expand-and-mix, final mean; decoder-layer stream flow | R : `Glm5NextTextHyperConnection`, `Glm5NextTextHyperHead`, `Glm5NextTextUnweightedRMSNorm`, `Glm5NextTextDecoderLayer.forward`, `Glm5NextTextModel.forward` | `4fe6ed7703e4f8f1dc7e3995af2b619058be8fec1f5157b7f512fc6f6150503f` | `src/mhc.rs`, `src/layer.rs`, `kernels/hc.cu` | **Reimplemented** from the reference's definition, keeping its rounding points (BF16 `post` and `comb` before the expansion, BF16 products and sums as the reference's BF16 tensors round them). Fixed summation orders, the RMS scale applied after the projection, and `exp` from `src/math.rs` (see `src/lib.rs`, numerics contract). | `tests/cpu_mhc.rs` (against a direct f64 transcription; invariants), `tests/cpu_layer.rs`, `tests/real_weights.rs`, `tests/goldens.rs` | 2026-09-28 |
+| 16-lane Sinkhorn butterfly (row sums over lanes xor 1, 2; column sums over xor 4, 8; `v / sum + eps`, then 19 rounds) | D : `native/cuda/kernels/v41_hc.cu` (`finish_mixes_kernel`, lines 174–194) | `876a21727496ba80f602e4dda7676af2de76b18200afa0b7c818fbdab6960ef5` | `kernels/hc.cu` (`sinkhorn16`), `src/mhc.rs` (`sinkhorn`, its CPU model) | **Adapted.** Same lane layout and operation sequence; every add and divide is an explicit IEEE intrinsic; `exp` is `exp_f32`; runs on its own warp of the finish kernel, off the collapse's critical path. The `pre`/`post` formulas keep the reference's separate multiply and add (the source fuses them). | `tests/gpu_kernels.rs`: `hc_boundary_matches` (bitwise), `tests/cpu_mhc.rs` | 2026-09-28 |
+| Collapse and expansion kernels (one sequential f32 sum per output, rounded once) | D : `native/cuda/kernels/v41_hc.cu` (`pre_kernel`, `post_kernel`, lines 6–29) | `876a21727496ba80f602e4dda7676af2de76b18200afa0b7c818fbdab6960ef5` | `kernels/hc.cu` (`hc_finish_kernel` collapse, `expand4`) | Design reference, rewritten: hidden 4,096 (not 5,120); the expansion follows GLM's reference rounding (BF16 `post` and `comb`, three BF16 roundings) instead of one f32 rounding; fused with the next projection and with the sublayer's RMSNorm and FP8 quantization. | `tests/gpu_kernels.rs`: `hc_fused_expand_and_head_match`, `dense_layer_chain_matches_cpu_flow` | 2026-09-28 |
+| Router top-k by warp-shuffle argmax rounds, ties to the lower expert index | D : `native/cuda/kernels/v41_router.cu` (`select_fast_kernel`, lines 72–112) | `7a8974cd9d6bf3b47f9ac829a35754d4eaf6ad2f73782d9689a4e05ce53a3025` | `kernels/router.cu` (`router_select_kernel`) | **Adapted.** Sigmoid scores (the source uses sqrt-softplus), no image-token bias, up to 1,024 experts and top-32, weights `score / (sum + 1e-20) * scale` with IEEE intrinsics, the scale a parameter (2.5 for GLM-5.3-Flash). | `tests/gpu_kernels.rs`: `router_matches_and_is_row_independent`; `tests/gpu_real_weights.rs`: `moe_layers_on_real_weights` | 2026-09-28 |
+| Router logits: one warp per expert, 16-byte loads, weight row reused across activation rows | D : `native/cuda/kernels/v41_router.cu` (`score_rows_kernel`, lines 30–68) | `7a8974cd9d6bf3b47f9ac829a35754d4eaf6ad2f73782d9689a4e05ce53a3025` | `kernels/router.cu` (`router_logits_kernel`) | Design reference, rewritten: a warp per expert instead of a block per expert; one row per warp up to 8 rows, 8 rows per warp beyond; butterfly instead of a shared-memory tree. | as above | 2026-09-28 |
+| Router semantics (FP32 logits, sigmoid, bias for selection only, normalization, scale) | R : `Glm5NextTextTopkRouter` | `4fe6ed7703e4f8f1dc7e3995af2b619058be8fec1f5157b7f512fc6f6150503f` | `src/router.rs` | **Reimplemented.** f32 throughout as the reference (M's router uses f64 selection; not taken). The lower-index tie rule is also M's (`crates/mimo26-coordinator/src/router.rs`, sha256 `48e445d154a6e8e6f45a47311bd5481d41c62b14ca2eb624fa232f929e163e45`). | `tests/cpu_router.rs` | 2026-09-28 |
+| SwiGLU with the clamp; dense MLP and shared expert | R : `Glm5NextTextMLP`, `Glm5NextTextExperts._apply_gate`, `Glm5NextTextMoE` | `4fe6ed7703e4f8f1dc7e3995af2b619058be8fec1f5157b7f512fc6f6150503f` | `src/mlp.rs`, `kernels/elementwise.cu` (`swiglu_kernel`) | **Reimplemented**: gate clamped above only, up clamped on both sides, BF16 after SiLU and after the product (D's `shared_swiglu` in `v41_fp8.cu`, sha256 `71647f3c0e17091e09d1d199b089824a534c846082be557bd63088c791c480df`, rounds once; not taken). The kernel also writes the down projection's W8A8 input. | `tests/cpu_fp8_mlp.rs`: `swiglu_clamps`; `tests/gpu_kernels.rs`: `swiglu_matches` | 2026-09-28 |
+| FP8 decode GEMM (lane streams 16 weight bytes per step, block scale folded into an f32 accumulator, warp reduction; a row's arithmetic independent of the batch) | G : `native/cuda/kernels/linear.cu` (`linear_w8a16_group256_m1_simt_kernel`, `..._parity_batched_kernel`) | `04027060ac804643b7521a28366a5a6f204cec94a14cc1d47dd681c86e55a91a` | `kernels/fp8_gemm.cu` (`fp8_gemm_decode_kernel`) | Design reference, rewritten: E4M3 with 128 x 128 f32 block scales (the source is INT8 with group-256 scales); W8A16 and W8A8 activations; 2 rows per warp; K splits reduced in split order. | `tests/gpu_kernels.rs`: `decode_gemm_is_bitwise_and_row_independent`; `tests/gpu_real_weights.rs` | 2026-09-28 |
+| Split-K partial reduction in split order | D : `native/cuda/kernels/v41_fp8.cu` (`reduce_splits`, lines 76–82) | `71647f3c0e17091e09d1d199b089824a534c846082be557bd63088c791c480df` | `kernels/fp8_gemm.cu` (`splitk_reduce_kernel`) | Design reference, rewritten: any split count; the first partial starts the sum (no leading zero). | `tests/gpu_kernels.rs`: `decode_gemm_is_bitwise_and_row_independent` | 2026-09-28 |
+| FP8 prefill GEMM (mma.sync m16n8k32 e4m3, per-128-block f32 promotion, cp.async pipeline, swizzled ldmatrix) | — | — | `kernels/fp8_gemm.cu` (`fp8_gemm_prefill_kernel`) | Written for this crate from the PTX ISA's fragment layouts. The per-block promotion is the scheme of the reference's block-FP8 kernels (transformers' `w8a8_block_fp8_matmul`). | `tests/gpu_kernels.rs`: `prefill_gemm_is_exact_on_integer_data` (bitwise), `prefill_gemm_is_within_bound_of_exact` | 2026-09-28 |
+| `exp` polynomial and Cody-Waite reduction constants | Cephes Math Library `expf` (S. L. Moshier), as widely reused | — | `src/math.rs`, `kernels/common.cuh` (`exp_f32`) | Numeric constants only (six coefficients, two `ln 2` parts); the evaluation is written for this crate with IEEE operations so the CPU and GPU agree bit for bit. | `src/math.rs`: `exp_accuracy` (within 2 ulp of f64 over the whole range) | 2026-09-28 |
+| Feature-gated nvcc build and `cudart` link | M : `crates/mimo26-attn/build.rs` | `7b97990d4cd36e85dc3c6ec20b26d79b073359515833e25f43602e515e29603e` | `build.rs` | Pattern only, rewritten as in `glm53f-kda`: `GLM53F_NVCC`, `GLM53F_CUDA_ARCH` (default `sm_89`), `GLM53F_CUDA_LIB`; exact-arithmetic flags (`--fmad=false --ftz=false --prec-div=true --prec-sqrt=true`); four translation units. | `cargo test -p glm53f-layers --features cuda` | 2026-09-28 |
+| Router `topk` pattern reference | M : `crates/mimo26-coordinator/kernels/glue.cu` (`router_topk_kernel`) | `79a306467d6937235e00299d8422fc2328b3b4a73824a47af798f8bc9dddc4e7` | — | Read; its f64 sigmoid and selection are not taken (the reference is f32). | — | 2026-09-28 |
+| Block-FP8 on sm_120 (for the notes below) | S : `b12x/gemm/block_fp8_linear/_preparation.py`, `b12x/gemm/_shared/block_fp8.py`, `b12x/gemm/_shared/wo_mxfp8.py` | `c0a00164cfbc6ba901a281e470d9ffa7cfdd2fa9c548b5cb9d5587bb9adb2957`, `34f7867c88f411071e0b4a1b3715248d03467a2c29fc011cad632781088b3eb9`, `685b49c6309012de6b8e92552f8d063579b721a103bb6a180faab9e2daa6d09d` | — | Read only. | — | 2026-09-28 |
+| SHA-256, JSON reader, safetensors header reader, BF16 and E4M3 coding | FIPS 180-4, RFC 8259, the safetensors format, IEEE 754 and the OCP FP8 formats | — | `src/testkit/`, `src/bf16.rs`, `src/fp8.rs` | Written from the specifications. | Known-answer tests in each module | 2026-09-28 |
+
+## Notes for the sm_120 (RTX 5090) build
+
+- **Everything here builds for sm_120 unchanged** (`GLM53F_CUDA_ARCH=sm_120`): the decode GEMM,
+  mHC, router and elementwise kernels use CUDA cores and warp shuffles, and the prefill GEMM uses
+  `mma.sync ... e4m3`, which sm_120 supports. Retune there: the decode GEMM's rows per CTA and
+  unroll, the prefill tile and stage count (sm_120 allows 99 KB of shared memory per block).
+- **S's `block_fp8_linear` and D's native FP8 path use the MXFP8 block-scaled MMA**, whose scales
+  are UE8M0 (powers of two) per 32 values. GLM-5.3-Flash's `weight_scale_inv` values are arbitrary
+  f32: between 0.6% and 21% of the blocks of layers 0, 3 and 4 are powers of two
+  (`tests/real_weights.rs` prints the count per tensor). Using that path means
+  re-quantising every FP8 weight onto power-of-two scales at load (S's
+  `_requantize_block_fp8_to_ue8m0`: a second E4M3 rounding of every weight, about 3.7% RMS by its
+  own measurement) and quantising activations per 32 with E8M0 scales instead of per 128 with f32
+  scales. That is a numerics change that needs a KL gate. The
+  checkpoint-exact option on sm_120 is this crate's kernel: plain `mma.sync` e4m3 with f32 block
+  scales applied at the per-128 promotion.

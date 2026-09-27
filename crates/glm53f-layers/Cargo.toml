@@ -1,0 +1,29 @@
+# glm53f-layers: the coordinator's non-attention layers for GLM-5.3-Flash. The mHC
+# boundaries (4 residual streams, Sinkhorn 20), the router (sigmoid top-8 of 288),
+# SwiGLU with the clamp, the dense and shared-expert MLPs, and the FP8 block-128
+# projection GEMMs. An f32 CPU reference that models the kernels' arithmetic, and
+# CUDA kernels behind a C ABI (kernels/glm53f_layers.h) under the `cuda` feature.
+# Standard library only. Provenance: PROVENANCE.md.
+[package]
+name = "glm53f-layers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GLM-5.3-Flash mHC, router, SwiGLU/MLPs and FP8 block-128 projection GEMMs: CPU reference and CUDA kernels"
+publish = false
+
+[lib]
+name = "glm53f_layers"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile and link the CUDA kernels (build.rs; needs nvcc, and a GPU to run them). Off by
+# default, so `cargo test` needs no CUDA toolkit.
+cuda = []
+
+[[example]]
+name = "layers_bench"
+required-features = ["cuda"]
+
+[dependencies]

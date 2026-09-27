@@ -17,7 +17,9 @@ authors under their own terms.
 ## DS41RT: MIT
 
 - **Source:** <https://github.com/tpurtell/ds41rt>. Copyright (c) 2026 T.J. Purtell.
-- **What was taken, through mimo26f-afd:** the designs of the `DS41RTE3` v3 wire format and the RDMA transport (reimplemented there, no code copied), and the sampling-parameter validation ranges in `crates/glm53f-api/src/types.rs` (transcribed from v15). No DS41RT source file is copied yet.
+- **What was taken, through mimo26f-afd:** the designs of the `DS41RTE3` v3 wire format and the RDMA transport (reimplemented there, no code copied), and the sampling-parameter validation ranges in `crates/glm53f-api/src/types.rs` (transcribed from v15).
+- **What was taken directly** (ds41rt @ `3067d06`): the mHC Sinkhorn, collapse and expansion kernels, the router logits and top-k selection, and the split-K reduction, adapted in `crates/glm53f-layers/kernels/`. `crates/glm53f-layers/PROVENANCE.md` lists the lines and changes.
+- **Licence text:** `crates/glm53f-layers/LICENSE.ds41rt`.
 
 ## rdma-core headers: GPL-2.0 or OpenIB.org BSD
 
