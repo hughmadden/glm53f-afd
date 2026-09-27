@@ -26,6 +26,6 @@ authors under their own terms.
 
 ## TensorFold: MIT
 
-- **Source:** <https://github.com/ashhart/TensorFold> @ `bb4b4a3`. Copyright (c) the TensorFold authors.
+- **Source:** <https://github.com/ashhart/TensorFold> @ `bb4b4a3`. Copyright (c) 2026 TensorFold contributors (as in its licence).
 - **What was taken:** the fused KDA chain, replay and conv-shift kernels for GLM-5.3-Flash (`crates/glm53f-kda/kernels/`), ported to a C ABI with batching; the source file is kept verbatim for a bitwise parity test.
 - **Licence text:** `crates/glm53f-kda/LICENSE.tensorfold`.
