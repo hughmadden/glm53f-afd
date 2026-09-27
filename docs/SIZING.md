@@ -72,7 +72,7 @@ Byte counts are from the official checkpoint headers.
 
 | Group | Official checkpoint | Resident on the 5090 |
 |---|---|---:|
-| KDA attention, 34 layers | **BF16**, 9.37 GB | 9.37 GB, or 4.68 GB if we quantize it to FP8 ourselves |
+| KDA attention, 34 layers | **BF16**, 9.37 GB | 9.37 GB, or 4.69 GB if we quantize its projections to FP8 ourselves (128 × 128 block scales; conv, norms, `A_log` and `dt_bias` as shipped) |
 | DSA attention and indexer, 11 layers | FP8 + BF16, 1.64 GB | 1.64 GB |
 | Shared experts, 42 layers | FP8, 1.06 GB | 1.06 GB |
 | Dense MLP, layers 0–2 | FP8, 0.45 GB | 0.45 GB |
@@ -107,7 +107,7 @@ remains.
 | C. B plus FP8 KDA projections | 13.2–15.2 GiB | 2.30–2.64 M | 8–10 | 2 | 1.18–1.36 M |
 | D. All-BF16 non-expert (quantized checkpoints as shipped) | 6.4–8.4 GiB | 1.11–1.46 M | 4–5 | 1 | 0.57–0.75 M |
 
-- With 8 slots instead of 16, each layout gains about 1.4 GiB (about 0.24 M FP8 tokens).
+- With 8 slots instead of 16, each layout gains about 1.4 GiB (about 0.25 M FP8 tokens).
 - **A single request can use the model's full 1,048,576 tokens in every layout
   with FP8 KV.** With BF16 KV, layouts A, B and D cap one request at about
   0.6–1.0 M tokens.
@@ -121,13 +121,15 @@ Each rank holds a quarter of every routed expert, split over the expert's
 
 | Expert format | Per rank | MTP experts | Left of ~113–116 GiB | Read per token at one row (M1) |
 |---|---:|---:|---:|---:|
-| EXL3 K4 (`tr3-4bpw`) | 38.2 GB (35.5 GiB) | 0.9 GB | ~75 GiB | 1.06 GB, 4.6 ms at 230 GB/s |
+| EXL3 K4 (`tr3-4bpw`) | 38.4 GB (35.8 GiB) | 0.9 GB | ~75 GiB | 1.07 GB, 4.6 ms at 230 GB/s |
 | NVFP4 (modelopt) | 42.8 GB (39.9 GiB) | 1.0 GB | ~70 GiB | 1.19 GB, 5.2 ms |
 | FP8 (official) | 76.1 GB (70.9 GiB) | 1.8 GB | ~40 GiB | 2.11 GB, 9.2 ms |
 
 - A DGX Spark exposes about 121 GiB to Linux. About 113–116 GiB is available when
   the system is otherwise idle (measured on the reference setup).
 - Context never touches the Sparks: all KV and KDA state lives on the coordinator.
+- An EXL3 rank holds slightly more than a quarter of the routed bytes: every rank keeps the
+  Hadamard sign vectors and codebook markers of its sliced projections whole (0.22 GB per rank).
 - The spare memory keeps the **FP8 experts** option open. They fit with room to
   spare, at roughly twice the Spark read time per token (decision D6).
 - 230 GB/s is the marginal read rate an EXL3 K4 kernel reached on GB10 for

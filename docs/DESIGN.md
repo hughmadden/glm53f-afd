@@ -115,7 +115,7 @@ quality against decode speed:
 
 | Format | Per rank | M1 read per token | Kernel options | KLD vs BF16 (nats), top-1 agreement |
 |---|---:|---:|---|---|
-| EXL3 K4 (`mcg` trellis, routed experts only; `tr3-4bpw`) | 38.2 GB | 1.06 GB | **T** (GLM-Flash native), **S** | **0.0246**, 95.3% |
+| EXL3 K4 (`mcg` trellis, routed experts only; `tr3-4bpw`) | 38.4 GB | 1.07 GB | **T** (GLM-Flash native), **S** | **0.0246**, 95.3% |
 | EXL3 K6 (no public checkpoint found) | ~57 GB | ~1.59 GB | as K4 | **0.0137**, 96.6% |
 | NVFP4 (modelopt, group of 16) | 42.8 GB | 1.19 GB | **S** (GLM-Flash geometry), **M** B1 with new scales | not measured on this panel |
 | FP8 (official) | 76.1 GB | 2.11 GB | **S** block-FP8 grouped | **0.0206**, 95.6% |

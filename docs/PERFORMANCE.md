@@ -25,8 +25,8 @@ coordinator: KDA projections in BF16, and 4 mHC streams.
 
 | Term | Derivation | Layout B, EXL3 K4 | Layout C (FP8 KDA) |
 |---|---|---:|---:|
-| Spark expert reads | 42 layers × 8 slices × 3.15 MB at 230 GB/s | 4.6 ms | 4.6 ms |
-| Coordinator weight reads | 13.96 GB (B) or 9.27 GB (C) at 85–90% of 1.79 TB/s | 8.7–9.2 ms | 5.8–6.1 ms |
+| Spark expert reads | 42 layers × 8 slices × 3.17 MB at 230 GB/s | 4.6 ms | 4.6 ms |
+| Coordinator weight reads | 13.96 GB (B) or 9.28 GB (C) at 85–90% of 1.79 TB/s | 8.7–9.2 ms | 5.8–6.1 ms |
 | Fixed cost per MoE layer | 0.20–0.27 ms × 42. Covers exchange, Spark fixed cost and per-layer launches. The range spans DS41RT to MiMo. | 8.4–11.3 ms | 8.4–11.3 ms |
 | KDA state, indexer, mHC | 0.3 GB of FP32 state per step; top-512 over n/4 pools; 90 mHC boundaries | 1.0–1.5 ms | 1.0–1.5 ms |
 | **M1 cycle** | | **22.7–26.6 ms** | **19.8–23.5 ms** |
