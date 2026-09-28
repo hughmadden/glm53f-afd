@@ -251,6 +251,10 @@ impl<B: ExpertBackend> ExpertBackend for GoldenRoutes<B> {
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
         self.inner.finish(call, stream)
     }
+
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
 }
 
 /// A forward over decoder layers `0 .. layers` with local FP8 experts behind golden routing.
@@ -285,11 +289,13 @@ pub fn forward(
         t0.elapsed().as_secs_f64()
     );
     let stream = Arc::new(Stream::new().unwrap());
+    let layout = KvLayout::new(&shape, None);
     let kv = KvPool::new(
         KvConfig {
-            layout: KvLayout::new(&shape, None),
+            layout,
             max_slots: 6,
-            pages: 64,
+            // 64 pages of rows, and room for four snapshot marks (they take pool pages).
+            pages: 64 + 4 * layout.mark_pages(),
             max_pages: 16,
             base_pages: 1,
         },
@@ -318,4 +324,42 @@ pub fn forward(
     };
     let fwd = GlmForward::new(model, embed, kv, experts, cfg).unwrap();
     Some(Setup { fwd, seen })
+}
+
+/// A forward over decoder layers `0 .. layers` with the experts `experts` makes (given the
+/// forward's stream), a pool of `pages` pages (page tables of `max_pages`) and `slots` slots:
+/// for tests that size the pool themselves.
+pub fn forward_with(
+    layers: usize,
+    cfg: ForwardConfig,
+    experts: impl FnOnce(&Arc<Stream>) -> Box<dyn ExpertBackend>,
+    slots: usize,
+    pages: usize,
+    max_pages: usize,
+) -> Option<GlmForward> {
+    let dir = checkpoint_dir()?;
+    let (mcfg, ckpt) = match open_checkpoint(&dir) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("skip: cannot open the checkpoint: {e}");
+            return None;
+        }
+    };
+    let shape = ModelShape::new(&mcfg.text, layers).unwrap();
+    let model = DeviceModel::load(&ckpt, &shape).unwrap();
+    let embed = HostEmbedding::load(&ckpt).unwrap();
+    let stream = Arc::new(Stream::new().unwrap());
+    let kv = KvPool::new(
+        KvConfig {
+            layout: KvLayout::new(&shape, None),
+            max_slots: slots,
+            pages,
+            max_pages,
+            base_pages: 0,
+        },
+        stream.clone(),
+    )
+    .unwrap();
+    let experts = experts(&stream);
+    Some(GlmForward::new(model, embed, kv, experts, cfg).unwrap())
 }

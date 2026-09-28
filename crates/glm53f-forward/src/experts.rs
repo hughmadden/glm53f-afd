@@ -13,6 +13,10 @@
 //!   serving shell's wire client: `submit` quantizes the rows into FP8 wire rows and sends them
 //!   with the routes, `finish` waits for the ranks' planes and sums them into `out` on the
 //!   stream.
+//!
+//! **Calls in flight.** A two-lane prefill (`crate::forward`) submits one lane's layer while the
+//! other lane's is still out: [`ExpertBackend::depth`] says how many calls may be submitted and
+//! not yet finished. They are finished oldest first.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,8 +57,13 @@ pub struct ExpertCall<'a> {
 pub trait ExpertBackend: Send {
     /// Start one layer's routed experts (work may be enqueued on `stream`).
     fn submit(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()>;
-    /// The routed sum is in `call.out` for work enqueued on `stream` after this returns.
+    /// The routed sum is in `call.out` for work enqueued on `stream` after this returns. Calls
+    /// in flight are finished in the order they were submitted.
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()>;
+    /// Calls that may be in flight at once (submitted, not yet finished): 1 or 2.
+    fn depth(&self) -> usize {
+        1
+    }
 }
 
 /// Routed output of zeros.
@@ -63,6 +72,9 @@ pub struct ZeroExperts;
 impl ExpertBackend for ZeroExperts {
     fn submit(&mut self, _call: &ExpertCall<'_>, _stream: &Stream) -> Result<()> {
         Ok(())
+    }
+    fn depth(&self) -> usize {
+        2
     }
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
         let n = call.rows * HIDDEN * 2;
@@ -376,5 +388,10 @@ impl ExpertBackend for LocalFp8Experts {
 
     fn finish(&mut self, _call: &ExpertCall<'_>, _stream: &Stream) -> Result<()> {
         Ok(())
+    }
+
+    /// `submit` enqueues all of a call's work (its scratch is reused in stream order).
+    fn depth(&self) -> usize {
+        2
     }
 }

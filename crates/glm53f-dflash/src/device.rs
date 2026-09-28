@@ -169,6 +169,11 @@ impl Scratch {
         }
         Ok(self.buf.as_ref().expect("allocated"))
     }
+
+    /// Device bytes held now.
+    pub fn bytes(&self) -> usize {
+        self.buf.as_ref().map_or(0, |b| b.bytes())
+    }
 }
 
 /// A CUDA stream, destroyed on drop (unless borrowed).

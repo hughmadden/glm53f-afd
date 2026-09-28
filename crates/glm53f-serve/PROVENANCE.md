@@ -16,6 +16,7 @@ wires this repository's crates together.
 |---|---|---|
 | src/lib.rs | The options (flags, environment fallbacks, checks, `--drafter`), the KV pool's page count, the development-mode banner, and their tests | 2026-09-28 |
 | src/main.rs (the drafter) | The DFlash2 drafter loaded next to the weights before the KV is sized (its ring in each slot's fixed state), attached to the forward, verify passes sized for every slot's window, its memory logged; off in a development mode of fewer than 44 layers | 2026-09-28 |
+| src/main.rs (start-up memory) | The allocation order (the experts' and the forward's buffers before the KV pool, the pool from what is left) and the memory plan logged at start-up; the prefill lanes and the lane trace (`GLM53F_PROFILE`) | 2026-09-28 |
 | tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
 | Cargo.toml | The manifest | 2026-09-28 |
 

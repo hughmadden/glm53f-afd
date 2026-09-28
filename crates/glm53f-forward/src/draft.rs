@@ -16,7 +16,13 @@
 //!   segment) or a decode pass, all its rows; after a verify pass, nothing until its commit,
 //!   which appends the first `keep` rows of each window (the anchor and the accepted drafts).
 //!   Appends run on the forward's stream right after the pass that wrote the taps, so a row's
-//!   taps never wait in the buffer past the next pass.
+//!   taps never wait in the buffer past the next pass. A two-lane prefill pass (`crate::forward`)
+//!   captures each lane's rows into their rows of the buffer and appends lane by lane, lane A's
+//!   rows first (a request the lanes split: lane A's part, then lane B's), the calls two one-lane
+//!   passes of the same rows make.
+//! - **Memory.** [`Dflash::reserve`] allocates the tap buffer for the forward's largest pass and
+//!   grows the drafter's working buffers to their largest use before a server sizes its KV pool;
+//!   appends and drafts then allocate nothing.
 //! - **Drafts.** A batch of requests, each at its committed length with its last verified token
 //!   as the anchor (the anchor's embedding row comes from the host table); the drafter reads the
 //!   forward's LM head in place.
@@ -161,9 +167,26 @@ impl Dflash {
         self.gpu.weight_bytes()
     }
 
-    /// Device bytes of the tap buffer (0 until attached).
+    /// Device bytes of the tap buffer (0 until attached or reserved).
     pub fn tap_bytes(&self) -> usize {
         self.taps.as_ref().map_or(0, |t| t.bytes())
+    }
+
+    /// Device bytes of the drafter's working buffers (grown by appends and drafts, or all at
+    /// once by [`Dflash::reserve`]).
+    pub fn scratch_bytes(&self) -> usize {
+        self.gpu.scratch_bytes()
+    }
+
+    /// Allocate everything the drafter uses while serving, before a server sizes its KV pool
+    /// from the memory left: the tap buffer for passes of up to `rows` rows (the forward's
+    /// largest pass: `ForwardBuffers::pass_rows`), and the drafter's working buffers for drafts
+    /// of up to `requests` requests and appends of any size (`GpuDrafter::reserve`). Later
+    /// appends and drafts of no more then allocate nothing. Returns the bytes of the two.
+    pub fn reserve(&mut self, rows: usize, requests: usize) -> Result<(usize, usize)> {
+        self.reserve_taps(rows)?;
+        let scratch = self.gpu.reserve(requests).map_err(Error::Other)?;
+        Ok((self.tap_bytes(), scratch))
     }
 
     pub(crate) fn head(&self) -> *const u16 {
@@ -174,9 +197,16 @@ impl Dflash {
         &self.stream
     }
 
-    /// The tap buffer for passes of up to `rows` rows.
-    pub(crate) fn alloc_taps(&mut self, rows: usize) -> Result<()> {
-        self.taps = Some(DeviceBuffer::alloc(rows * TAP_WIDTH * 2)?);
+    /// The tap buffer for passes of up to `rows` rows (kept when it is large enough already).
+    pub(crate) fn reserve_taps(&mut self, rows: usize) -> Result<()> {
+        if self
+            .taps
+            .as_ref()
+            .is_none_or(|t| t.bytes() < rows * TAP_WIDTH * 2)
+        {
+            self.taps = None;
+            self.taps = Some(DeviceBuffer::alloc(rows * TAP_WIDTH * 2)?);
+        }
         Ok(())
     }
 
@@ -193,10 +223,12 @@ impl Dflash {
 
     /// At the entry of decoder layer `layer`, before its attention: when a tap is read there,
     /// the mean of `streams` (the layer's input streams, BF16 `[rows][4][4096]`, the previous
-    /// layer's completed output) into its columns of the tap buffer.
+    /// layer's completed output) into its columns of the tap buffer's rows `row0 ..` (a lane
+    /// of a two-lane pass writes the pass's rows it holds).
     pub(crate) fn capture(
         &self,
         layer: usize,
+        row0: usize,
         rows: usize,
         streams: *const u16,
         stream: &Stream,
@@ -204,16 +236,16 @@ impl Dflash {
         let Some(t) = tap_at(layer) else {
             return Ok(());
         };
-        let taps = self.taps_buf(rows)?;
-        // SAFETY: `streams` holds `rows` rows of the pass; the tap buffer holds them too
-        // (checked), its column block `t` at a 16-byte multiple.
+        let taps = self.taps_buf(row0 + rows)?;
+        // SAFETY: `streams` holds `rows` rows of the pass; the tap buffer holds rows `row0 ..
+        // row0 + rows` (checked), its column block `t` at a 16-byte multiple.
         launched(
             unsafe {
                 ffi::glm53f_fwd_stream_mean(
                     streams,
                     rows as i32,
                     HIDDEN as i32,
-                    taps.ptr(t * HIDDEN),
+                    taps.ptr(row0 * TAP_WIDTH + t * HIDDEN),
                     TAP_WIDTH as i64,
                     stream.raw(),
                 )

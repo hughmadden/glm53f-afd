@@ -20,8 +20,11 @@
 //!   until [`ServedForward::warm_rows`] rows are back in context: its steps verify a window of
 //!   one row, a decode step.
 //! - Admission sees the page pool: slots grow into the pages the `KvPool` allocated up front,
-//!   so `free_bytes` is the pool's free pages, less any shortfall of device memory below the
-//!   margin (marks and workspaces come from device memory).
+//!   and snapshot marks take pages of the same pool (`crate::kv`), so `free_bytes` is the pool's
+//!   free pages. The forward's buffers were allocated before the pool was sized, and a pass
+//!   allocates nothing; `free_bytes` still subtracts any shortfall of device memory below the
+//!   margin, for allocations outside both (the sampler's small buffers, kernel modules loaded on
+//!   first use).
 //! - Images are refused (the vision tower is a later phase).
 
 use glm53f_coordinator::gpu::Sampler;
@@ -164,7 +167,9 @@ const LOG_ROUNDS: u64 = 64;
 pub struct ServedForward {
     pub fwd: GlmForward,
     sampler: Sampler,
-    /// Device bytes kept free for the forward's own growth (index and attention workspaces).
+    /// Device bytes that should stay free outside the pool and the forward's buffers (the
+    /// sampler's buffers, kernel modules loaded on first use); a shortfall below it comes off
+    /// the pool's free pages in `free_bytes`.
     pub margin: usize,
     /// With a drafter: the most drafts a step proposes per request (0 to 7; the block is one
     /// more, 1 turning speculation off).
@@ -226,7 +231,7 @@ impl ModelForward for ServedForward {
         Limits {
             vocab: VOCAB,
             sample_vocab: SAMPLE_VOCAB,
-            batch_rows: self.fwd.cfg.max_rows,
+            batch_rows: self.fwd.prefill_rows(),
             block: if self.fwd.has_drafter() {
                 self.max_drafts.min(DRAFTS) + 1
             } else {
@@ -236,10 +241,10 @@ impl ModelForward for ServedForward {
     }
 
     /// The page pool's free pages, in bytes: a slot grows into pages of the pool the `KvPool`
-    /// allocated up front ([`KvSlot::need_bytes`] counts pages), so the device's free memory does
-    /// not measure room for a request. Less any shortfall of the device's free memory below
-    /// `margin`: marks and the forward's workspaces come from device memory, and admission then
-    /// evicts retained slots, which frees both.
+    /// allocated up front ([`KvSlot::need_bytes`] counts pages), and snapshot marks take pages of
+    /// it too, so the device's free memory does not measure room for a request. Less any
+    /// shortfall of the device's free memory below `margin` (allocations outside the pool and
+    /// the forward's buffers); admission then evicts retained slots, which frees pages.
     fn free_bytes(&self) -> Result<usize, String> {
         let (free, _) = s(device::mem_info())?;
         let kv = &self.fwd.kv;
@@ -252,7 +257,7 @@ impl ModelForward for ServedForward {
             return Err("this forward has no vision tower yet".into());
         }
         let total: usize = segs.iter().map(|g| g.tokens.len()).sum();
-        let one_pass = segs.len() <= self.fwd.cfg.max_requests && total <= self.fwd.cfg.max_rows;
+        let one_pass = segs.len() <= self.fwd.cfg.max_requests && total <= self.fwd.prefill_rows();
         let groups: Vec<std::ops::Range<usize>> = if one_pass {
             vec![0..segs.len()]
         } else {

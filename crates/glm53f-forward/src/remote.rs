@@ -27,6 +27,14 @@
 //! `finish`, so it already runs on the GPU while `finish` blocks on the returns; the hook has
 //! nothing to add and is not used.
 //!
+//! **Two exchanges in flight** (the forward's two-lane prefill; mimo26f-afd perf reset R4). Over
+//! RDMA the wire client takes a second request while the first is out (each rank pre-posts two
+//! receive slots), so [`ExpertBackend::depth`] is 2 and `finish` collects the oldest. Over TCP it
+//! is 1: a second multi-megabyte write can block against the first return. `GLM53F_WIRE_INFLIGHT=1`
+//! holds an RDMA wire to one as well (the lanes then take turns on the wire, as over TCP). The
+//! device buffers are reused safely either way: `submit` has the rows on the host before it
+//! returns, and every `finish` uploads and sums on the one stream, in order.
+//!
 //! **Numerics.** The ranks hold EXL3 4-bit experts and receive FP8 rows, so the routed output is
 //! not the local FP8 experts' bits: the rank crate measures a cosine of at least 0.990 against the
 //! reference (`glm53f-rank`, `tests/real_experts.rs`). A row's result does not depend on the
@@ -43,7 +51,7 @@
 //! connection after a failed request), so the backend refuses every later call with the first
 //! error; the coordinator has to reconnect by restarting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -76,6 +84,11 @@ pub struct ExchangeTimes {
     /// Of the total, the time `finish` blocked on the returns (after the shared expert was
     /// enqueued).
     pub wait_ms: f64,
+    /// Host time outside the exchange: in `submit`, from the call to the request posted (the
+    /// wire rows' quantization and download, the frames' encode and post); in `finish`, after
+    /// the returns were read (the four planes' upload and the sum enqueued). Totals.
+    pub send_ms: f64,
+    pub upload_ms: f64,
 }
 
 impl ExchangeTimes {
@@ -83,7 +96,7 @@ impl ExchangeTimes {
         self.total_ms / self.count.max(1) as f64
     }
 
-    fn add(&mut self, ms: f64, wait_ms: f64) {
+    fn add(&mut self, ms: f64, wait_ms: f64, send_ms: f64, upload_ms: f64) {
         if self.count == 0 || ms < self.min_ms {
             self.min_ms = ms;
         }
@@ -91,17 +104,21 @@ impl ExchangeTimes {
         self.count += 1;
         self.total_ms += ms;
         self.wait_ms += wait_ms;
+        self.send_ms += send_ms;
+        self.upload_ms += upload_ms;
     }
 }
 
 /// Exchange times by (layer, rows), shared with whoever holds [`RemoteExperts::times`].
 pub type WireTimes = BTreeMap<(usize, usize), ExchangeTimes>;
 
-/// An exchange in flight: its layer, rows and when its request started.
+/// An exchange in flight: its layer, rows, when its request started, and the host time `submit`
+/// spent getting it out.
 struct Sent {
     layer: usize,
     rows: usize,
     start: Instant,
+    send_ms: f64,
 }
 
 /// The routed experts on the expert ranks, through the wire client.
@@ -120,7 +137,10 @@ pub struct RemoteExperts {
     sum: DeviceBuffer,
     host_q: Vec<u8>,
     routes: Vec<(u32, f32)>,
-    sent: Option<Sent>,
+    /// Exchanges in flight, oldest first (at most [`ExpertBackend::depth`]), and the most a
+    /// pipelined wire takes (`GLM53F_WIRE_INFLIGHT`, 2 by default).
+    sent: VecDeque<Sent>,
+    inflight: usize,
     failed: Option<String>,
     times: Arc<Mutex<WireTimes>>,
 }
@@ -156,10 +176,21 @@ impl RemoteExperts {
             sum: DeviceBuffer::alloc(r * HIDDEN * 4)?,
             host_q: vec![0u8; r * (HIDDEN + SCALES)],
             routes: Vec::with_capacity(r * TOP_K),
-            sent: None,
+            sent: VecDeque::new(),
+            inflight: std::env::var("GLM53F_WIRE_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+                .clamp(1, 2),
             failed: None,
             times: Arc::new(Mutex::new(WireTimes::default())),
         })
+    }
+
+    /// Device bytes the backend allocates for exchanges of up to `max_rows` rows (all at
+    /// construction; an exchange allocates nothing).
+    pub fn device_bytes(max_rows: usize) -> usize {
+        max_rows * (HIDDEN * 4 + HIDDEN + SCALES + SCALES * 4 + RANKS * HIDDEN * 2 + HIDDEN * 4)
     }
 
     /// Connect to the four ranks (`addrs[r]` is rank `r`, `host:port`) with GLM-5.3-Flash's wire
@@ -192,12 +223,13 @@ impl RemoteExperts {
     fn fail(&mut self, e: String) -> Error {
         let msg = format!("expert wire: {e}");
         self.failed = Some(msg.clone());
-        self.sent = None;
+        self.sent.clear();
         Error::Other(msg)
     }
 
     /// Quantize `call.x` into the wire rows and send them with the call's routes.
     fn send(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
+        let called = Instant::now();
         let rows = call.rows;
         let st = stream.raw();
         let (x32, sinv) = (self.x32.ptr::<f32>(0), self.scale_inv.ptr::<f32>(0));
@@ -250,22 +282,24 @@ impl RemoteExperts {
         {
             return Err(self.fail(e));
         }
-        self.sent = Some(Sent {
+        self.sent.push_back(Sent {
             layer: call.layer,
             rows,
             start,
+            send_ms: called.elapsed().as_secs_f64() * 1e3,
         });
         Ok(())
     }
 
-    /// Collect the exchange in flight and write its routed sum into `call.out` on `stream`.
+    /// Collect the oldest exchange in flight and write its routed sum into `call.out` on
+    /// `stream`.
     fn collect(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
-        let Some(sent) = self.sent.take() else {
+        let Some(sent) = self.sent.pop_front() else {
             return Err(invalid!("finish without a submitted exchange"));
         };
         if sent.layer != call.layer || sent.rows != call.rows {
             return Err(self.fail(format!(
-                "finish of layer {} ({} rows) while layer {} ({} rows) is in flight",
+                "finish of layer {} ({} rows) while layer {} ({} rows) is the oldest in flight",
                 call.layer, call.rows, sent.layer, sent.rows
             )));
         }
@@ -327,7 +361,12 @@ impl RemoteExperts {
             .unwrap_or_else(|p| p.into_inner())
             .entry((sent.layer, rows))
             .or_default()
-            .add(ms(sent.start, done), ms(wait, done));
+            .add(
+                ms(sent.start, done),
+                ms(wait, done),
+                sent.send_ms,
+                ms(done, Instant::now()),
+            );
         Ok(())
     }
 }
@@ -345,8 +384,12 @@ impl ExpertBackend for RemoteExperts {
         if call.host_ids.len() != rows * TOP_K || call.host_weights.len() != rows * TOP_K {
             return Err(invalid!("routes for {rows} rows"));
         }
-        if self.sent.is_some() {
-            return Err(invalid!("an exchange is already in flight"));
+        if self.sent.len() >= self.depth() {
+            return Err(invalid!(
+                "{} exchanges already in flight (the wire takes {})",
+                self.sent.len(),
+                self.depth()
+            ));
         }
         self.send(call, stream)
     }
@@ -354,5 +397,13 @@ impl ExpertBackend for RemoteExperts {
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
         self.live()?;
         self.collect(call, stream)
+    }
+
+    fn depth(&self) -> usize {
+        if self.wire.pipelined() {
+            self.inflight
+        } else {
+            1
+        }
     }
 }

@@ -228,6 +228,51 @@ struct Buffers {
     topk_ws: Scratch,
 }
 
+impl Buffers {
+    fn all(&self) -> [&Scratch; 38] {
+        [
+            &self.taps,
+            &self.feat,
+            &self.feat_b,
+            &self.kv,
+            &self.meta_pos,
+            &self.meta_req,
+            &self.bases,
+            &self.h,
+            &self.xn,
+            &self.xb,
+            &self.wide_b,
+            &self.dynk,
+            &self.qkv,
+            &self.att_b,
+            &self.a,
+            &self.gu,
+            &self.part,
+            &self.fin,
+            &self.fin_b,
+            &self.draft_b,
+            &self.logits,
+            &self.vals,
+            &self.ids,
+            &self.hp,
+            &self.anchor_rows,
+            &self.start,
+            &self.lo,
+            &self.anchors,
+            &self.temps,
+            &self.unif,
+            &self.tokens,
+            &self.index,
+            &self.scores,
+            &self.q,
+            &self.conf,
+            &self.trace,
+            &self.rope,
+            &self.topk_ws,
+        ]
+    }
+}
+
 /// What the last draft computed besides the proposals, for tests (downloaded on request).
 pub struct Outputs {
     /// `norm(h)` `[nreq * block][hidden]`.
@@ -485,6 +530,39 @@ impl GpuDrafter {
             Head::Owned(b) => b.ptr::<u16>(0),
             Head::Borrowed(p) => *p,
         }
+    }
+
+    /// Device bytes of the working buffers appends and drafts have grown so far (weights and
+    /// rings aside).
+    pub fn scratch_bytes(&self) -> usize {
+        self.buf.all().iter().map(|s| s.bytes()).sum()
+    }
+
+    /// Grow every working buffer to the size its largest use takes, so that later appends (any
+    /// number of rows, passes of at most [`GpuDrafter::append_chunk`]) and drafts of up to `nreq`
+    /// requests at any context allocate nothing: one append of a full window of zero taps into a
+    /// scratch slot, then one greedy draft of `nreq` requests over it (the most attention splits
+    /// a window gives). The scratch slot's ring is freed on return. Returns
+    /// [`GpuDrafter::scratch_bytes`].
+    pub fn reserve(&mut self, nreq: usize) -> Result<usize, String> {
+        let d = self.dims;
+        let mut slot = self.new_slot()?;
+        let zeros = vec![0u16; d.window * d.tap_width()];
+        // SAFETY: host taps only.
+        unsafe { self.append_taps(&mut [(&mut slot, Taps::Host(&zeros))]) }?;
+        let embed = vec![0u16; d.hidden];
+        let reqs: Vec<DraftRequest<'_, GpuSlot>> = (0..nreq.max(1))
+            .map(|_| DraftRequest {
+                slot: &slot,
+                anchor: 0,
+                anchor_embed: &embed,
+                temperature: 0.0,
+                uniforms: &[],
+            })
+            .collect();
+        self.launch(&reqs)?;
+        self.proposals(reqs.len())?;
+        Ok(self.scratch_bytes())
     }
 
     /// A slot with an empty context (its ring allocated, not cleared).

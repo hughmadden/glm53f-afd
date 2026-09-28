@@ -86,9 +86,12 @@ Each binary runs only on the architecture it was built for; the rank checks this
    ```
 
    Without `GLM53F_RDMA=1` the exchange runs over TCP on the same fabric addresses (with or
-   without CRCs, as long as the ranks agree). It loads
-   the weights, sizes the KV pool from the free GPU memory (less `--reserve-gib`, 4 by default),
-   connects the ranks in rank order and prints `serving the API on ...`.
+   without CRCs, as long as the ranks agree). It loads the weights (and with `--drafter` the
+   drafter's), connects the ranks in rank order, allocates every buffer a pass uses (both
+   prefill lanes' scratch for `--prefill-rows`, the verify scratch, the attention workspaces,
+   the expert exchange's buffers, the drafter's tap buffer and working memory), then sizes the
+   KV page pool from what is left less `--reserve-gib` (1 by default), logs what it allocated
+   for what, and prints `serving the API on ...`.
 
 3. A request:
 
@@ -99,6 +102,31 @@ Each binary runs only on the architecture it was built for; the rank checks this
 
 `glm53f-serve --help` lists the options; the crate documentation (`crates/glm53f-serve/src/lib.rs`)
 describes each.
+
+### Prefill lanes and device memory
+
+- **Two lanes.** A prefill pass of `--prefill-rows` rows (4,096 by default) runs in
+  `--prefill-lanes` lanes (2 by default): lane B's attention runs while the ranks compute lane
+  A's routed experts, and the other way round. Over RDMA two exchanges are in flight (the ranks
+  hold lane B's request while they compute lane A's); over TCP one. A lane is one exchange, at
+  most 4,096 rows, so `--prefill-rows 8192 --prefill-lanes 2` gives two lanes of 4,096 and
+  `--prefill-lanes 1` the serial pass. `crates/glm53f-serve/src/lib.rs` explains the default.
+  With `--drafter` each lane captures the drafter's taps for its own rows, and the rows reach
+  the drafter's context lane by lane, as two one-lane passes would give them.
+- **Memory.** Nothing a pass, a draft or an append to the drafter's context uses is allocated
+  after start-up. Snapshot marks (the KDA states
+  of a prompt or turn end, 141 MiB) take pages of the KV pool, which admission counts, so a
+  short pool evicts retained snapshots, skips a snapshot or refuses a request; it never runs the
+  device out of memory in a pass. The start-up log's `device memory` lines list the weights, the
+  forward's buffers (each lane, verify, workspaces, GEMM), the drafter's weights, tap buffer,
+  working memory and per-slot ring, the expert exchange, the slots' state, the pool (with what
+  the snapshot banks would take of it if full) and what was left free.
+- **Tracing a pass.** With `GLM53F_PROFILE=1` each prefill pass prints a `PIPE` line: per MoE
+  layer (median), the wall time, each lane's GPU time for its attention and its shared expert,
+  the host's time waiting for the routes, in `submit` and in `finish` (blocked on the ranks,
+  then the planes uploaded), and each lane's exchange as the coordinator sees it (`submit`
+  returned to `finish` returned: about the other lane's work when the exchange is hidden). The
+  ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
 
 ## Development on one GPU
 
@@ -119,6 +147,11 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_RANK_BIN=.../glm53f-rank
 GLM53F_RANK_DIRS=<rank-0>,<rank-1>,<rank-2>,<rank-3> \
   cargo test --release -p glm53f-forward --features coordinator --test remote_experts -- --nocapture --test-threads=1
 
+# Two-lane prefill against one lane (bit for bit against the same rows as two passes) and the
+# goldens; admission and snapshots under a tight pool.
+GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
+  cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission -- --nocapture --test-threads=1
+
 # One streamed chat completion through glm53f-serve in development mode.
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
@@ -137,6 +170,8 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
 | `GLM53F_API_ADDR` | `--listen` | The API's address (default `127.0.0.1:8100`) |
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
+| `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
+| `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 or 2 (default 2) |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the
@@ -148,8 +183,10 @@ smaller of 32 GiB and 40% of the available RAM), `GLM53F_PREFILL_SEGMENT_MS`,
 **Expert wire:** `GLM53F_RDMA=1` (coordinator: RDMA RC, in an `rdma` build; the ranks follow the
 coordinator's handshake), `GLM53F_WIRE_NOCRC=1` (frames without CRC32C; both sides must agree;
 RDMA requires it), `GLM53F_WIRE_MIN_GBPS` (the fabric's floor rate, default 100),
-`GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_TIMELINE=1`
-(cross-host timeline events), `GLM53F_PROFILE=1` (per-exchange timings on the coordinator).
+`GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_WIRE_INFLIGHT=1` (one
+exchange in flight over RDMA too, instead of two: the prefill lanes then take turns on the wire),
+`GLM53F_TIMELINE=1` (cross-host timeline events), `GLM53F_PROFILE=1` (per-exchange timings on the
+coordinator, and a `PIPE` line per prefill pass).
 
 **Rank:** `GLM53F_RANK_TRACE=1` (a timing line per request), `GLM53F_RANK_DUMP_FRAME=<path>`
 with `GLM53F_RANK_DUMP_LAYER` (write one request frame for offline replay).

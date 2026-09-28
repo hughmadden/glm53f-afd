@@ -45,7 +45,7 @@ mod daemon {
     use glm53f_forward::draft::{Dflash, LAYERS_NEEDED};
     use glm53f_forward::embed::HostEmbedding;
     use glm53f_forward::experts::{ExpertBackend, LocalFp8Experts};
-    use glm53f_forward::forward::{ForwardConfig, GlmForward};
+    use glm53f_forward::forward::{ForwardBuffers, ForwardConfig, GlmForward};
     use glm53f_forward::gemm::Fp8Act;
     use glm53f_forward::kv::{KvConfig, KvPool};
     use glm53f_forward::kvplan::{KvLayout, PAGE};
@@ -62,12 +62,32 @@ mod daemon {
         r.map_err(|e| e.to_string())
     }
 
+    fn gib(b: usize) -> String {
+        format!("{:.2} GiB", b as f64 / GIB)
+    }
+
+    fn mib(b: usize) -> String {
+        format!("{:.1} MiB", b as f64 / MIB)
+    }
+
     pub fn run(o: &Options) -> Result<(), String> {
+        // The text side first (the scheduler's configuration sizes the snapshot banks below).
+        let codec = GlmPrompts::load(&o.tokenizer, &o.chat_template)?;
+        if codec.id_bound() != SAMPLE_VOCAB {
+            return Err(format!(
+                "the tokenizer's ids end at {}, the forward samples below {SAMPLE_VOCAB}",
+                codec.id_bound()
+            ));
+        }
+        let eos = codec.stop_ids()?;
+        let sched = SchedulerConfig::from_env(eos.clone());
+
         // 1. The coordinator's weights: the embedding in host RAM, the rest on the GPU.
+        let (free0, total) = s(device::mem_info())?;
         let (cfg, ckpt) = s(open_checkpoint(&o.checkpoint))?;
-        let total = cfg.text.num_hidden_layers as usize;
-        let layers = o.dev_layers.unwrap_or(total);
-        let banner = o.dev_layers.map(|n| dev_banner(n, total));
+        let n_layers = cfg.text.num_hidden_layers as usize;
+        let layers = o.dev_layers.unwrap_or(n_layers);
+        let banner = o.dev_layers.map(|n| dev_banner(n, n_layers));
         if let Some(b) = &banner {
             eprintln!("{b}");
         }
@@ -84,9 +104,9 @@ mod daemon {
             t0.elapsed().as_secs_f64()
         );
 
-        // 2. The drafter's weights next to the model's, before the KV takes what is left.
+        // 2. The drafter's weights next to the model's.
         let stream = Arc::new(s(Stream::new())?);
-        let drafter = match &o.drafter {
+        let mut drafter = match &o.drafter {
             Some(_) if layers < LAYERS_NEEDED => {
                 eprintln!(
                     "[coordinator] drafter off: its taps are the outputs of layers 5 to 42 and this \
@@ -110,17 +130,84 @@ mod daemon {
             None => None,
         };
 
-        // 3. The KV: each slot's positional state (and drafter ring) and page table, and the
-        // shared page pool.
+        // 3. The routed experts, with their buffers for one lane's exchange. With a drafter, one
+        //    verify pass holds every slot's window.
+        let mut fcfg = ForwardConfig {
+            max_rows: o.prefill_rows,
+            lanes: o.prefill_lanes,
+            max_requests: o.slots,
+            ..ForwardConfig::default()
+        };
+        if drafter.is_some() {
+            fcfg.max_verify_rows = fcfg.max_verify_rows.max(o.slots * (DRAFTS + 1));
+        }
+        let rows = fcfg.lane_rows().max(fcfg.max_verify_rows);
+        let (experts, experts_bytes, experts_what): (Box<dyn ExpertBackend>, usize, String) =
+            match &o.experts {
+                Experts::Remote(addrs) => {
+                    eprintln!("[coordinator] connecting the expert ranks {addrs:?}");
+                    let r = s(RemoteExperts::connect(addrs, rows))?;
+                    let what = format!(
+                        "the expert exchange, {rows} rows ({} in flight at most)",
+                        glm53f_forward::experts::ExpertBackend::depth(&r)
+                    );
+                    (Box::new(r), RemoteExperts::device_bytes(rows), what)
+                }
+                Experts::Local { dir, gib: g } => {
+                    eprintln!(
+                        "[coordinator] routed experts on this GPU from {} ({g} GiB, loaded on \
+                         demand)",
+                        dir.display()
+                    );
+                    let budget = (g * GIB) as usize;
+                    let e = s(LocalFp8Experts::new(
+                        dir,
+                        budget,
+                        rows,
+                        &stream,
+                        Fp8Act::Bf16,
+                    ))?;
+                    // Loaded on demand: the budget is kept free for them.
+                    (
+                        Box::new(e),
+                        budget,
+                        "the local FP8 experts' cache".to_string(),
+                    )
+                }
+            };
+
+        // 4. Every buffer the forward's passes use, and the drafter's tap buffer and working
+        //    memory, before the pool: no pass, append or draft allocates.
         let max_context = o
             .max_context
             .unwrap_or(usize::MAX)
             .min(cfg.text.max_position_embeddings as usize);
         let layout = KvLayout::new(&shape, drafter.as_ref().map(|d| d.config()));
         let max_pages = KvLayout::pages_for(max_context).div_ceil(4) * 4;
+        let bufs = s(ForwardBuffers::new(&fcfg, &shape, max_pages, &stream))?;
+        let fb = bufs.bytes();
+        let drafter_bytes = match drafter.as_mut() {
+            Some(d) => s(d.reserve(bufs.pass_rows(), o.slots))?,
+            None => (0, 0),
+        };
+
+        // 5. The KV: each slot's positional state (and drafter ring) and page table, then the page
+        //    pool from what is left, less the reserve (and the local experts' budget, loaded
+        //    later).
         let fixed = o.slots * (max_pages * 4 + layout.slot_fixed_bytes());
         let (free, _) = s(device::mem_info())?;
-        let pages = kv_pages(o.kv_gib, free, o.reserve_gib, fixed, layout.page_bytes)?;
+        let local = if matches!(o.experts, Experts::Local { .. }) {
+            experts_bytes
+        } else {
+            0
+        };
+        let pages = kv_pages(
+            o.kv_gib,
+            free.saturating_sub(local),
+            o.reserve_gib,
+            fixed,
+            layout.page_bytes,
+        )?;
         let kv = s(KvPool::new(
             KvConfig {
                 layout,
@@ -131,80 +218,97 @@ mod daemon {
             },
             stream.clone(),
         ))?;
-        eprintln!(
-            "[coordinator] KV: {} slots, {:.0} MiB of positional state each{}; a page pool of \
-             {:.2} GiB ({} tokens); up to {max_context} tokens per request",
-            o.slots,
-            layout.slot_fixed_bytes() as f64 / MIB,
-            if layout.draft_kv_bytes > 0 {
-                format!(
-                    " (the drafter's ring {:.2} MiB of it)",
-                    layout.draft_kv_bytes as f64 / MIB
-                )
-            } else {
-                String::new()
-            },
-            (pages * layout.page_bytes) as f64 / GIB,
-            pages * PAGE
-        );
-
-        // 4. The routed experts, and the forward. With a drafter, one verify pass holds every
-        // slot's window.
-        let mut fcfg = ForwardConfig {
-            max_rows: o.prefill_rows,
-            max_requests: o.slots,
-            ..ForwardConfig::default()
-        };
-        if drafter.is_some() {
-            fcfg.max_verify_rows = fcfg.max_verify_rows.max(o.slots * (DRAFTS + 1));
-        }
-        let rows = fcfg.max_rows.max(fcfg.max_verify_rows);
-        let experts: Box<dyn ExpertBackend> = match &o.experts {
-            Experts::Remote(addrs) => {
-                eprintln!("[coordinator] connecting the expert ranks {addrs:?}");
-                Box::new(s(RemoteExperts::connect(addrs, rows))?)
-            }
-            Experts::Local { dir, gib } => {
-                eprintln!(
-                    "[coordinator] routed experts on this GPU from {} ({gib} GiB, loaded on demand)",
-                    dir.display()
-                );
-                Box::new(s(LocalFp8Experts::new(
-                    dir,
-                    (gib * GIB) as usize,
-                    rows,
-                    &stream,
-                    Fp8Act::Bf16,
-                ))?)
-            }
-        };
-        let mut fwd = s(GlmForward::new(model, embed, kv, experts, fcfg))?;
+        let mut fwd = s(GlmForward::with_buffers(model, embed, kv, experts, bufs))?;
+        let drafter_weights = drafter.as_ref().map_or(0, |d| d.weight_bytes());
         if let Some(d) = drafter {
+            // Its tap buffer is already large enough: nothing is allocated here.
             s(fwd.attach_drafter(d))?;
+        }
+        let (left, _) = s(device::mem_info())?;
+        let mark = layout.mark_pages() * layout.page_bytes;
+        eprintln!(
+            "[coordinator] device memory, {} in all, {} free before the weights:",
+            gib(total),
+            gib(free0)
+        );
+        eprintln!(
+            "[coordinator]   weights {}; forward buffers {}: prefill {} lane(s) of {} rows ({}), \
+             verify {} rows {}, workspaces {} (indexer {}, sparse MLA {}, KDA {}), GEMM {}",
+            gib(fwd.model.bytes),
+            gib(fb.total()),
+            fcfg.lanes,
+            fcfg.lane_rows(),
+            fb.lanes
+                .iter()
+                .filter(|&&b| b > 0)
+                .map(|&b| gib(b))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            fcfg.max_verify_rows,
+            mib(fb.verify),
+            mib(fb.workspaces.iter().sum()),
+            mib(fb.workspaces[0]),
+            mib(fb.workspaces[1]),
+            mib(fb.workspaces[2]),
+            mib(fb.gemm)
+        );
+        if fwd.has_drafter() {
             eprintln!(
-                "[coordinator] drafter attached: up to {DRAFTS} drafts a step, verify passes of up to \
-                 {} rows; its tap buffer {:.1} MiB, the forward's scratch {:.0} MiB",
-                fcfg.max_verify_rows,
-                fwd.drafter().map_or(0, |d| d.tap_bytes()) as f64 / MIB,
-                fwd.scratch_bytes() as f64 / MIB
+                "[coordinator]   drafter: weights {}, tap buffer {} ({} rows), working memory {} \
+                 (drafts of up to {} requests), a context ring of {} in each slot's state; up to \
+                 {DRAFTS} drafts a step, verify passes of up to {} rows",
+                gib(drafter_weights),
+                mib(drafter_bytes.0),
+                fwd.pass_rows(),
+                mib(drafter_bytes.1),
+                o.slots,
+                mib(layout.draft_kv_bytes),
+                fcfg.max_verify_rows
             );
         }
+        eprintln!(
+            "[coordinator]   {} {}; {} slots x {} of positional state and page tables = {}",
+            experts_what,
+            mib(experts_bytes),
+            o.slots,
+            mib(fixed / o.slots),
+            gib(fixed)
+        );
+        eprintln!(
+            "[coordinator]   KV page pool {} ({pages} pages, {} tokens); up to {max_context} \
+             tokens per request; snapshot marks take {} pages ({}) each from the pool (the \
+             banks, {} prompt + {} turn, would take {} if full)",
+            gib(pages * layout.page_bytes),
+            pages * PAGE,
+            layout.mark_pages(),
+            mib(mark),
+            sched.bank,
+            sched.bank,
+            gib(2 * sched.bank * mark)
+        );
+        eprintln!(
+            "[coordinator]   left free: {} measured ({} reserved by --reserve-gib for kernel \
+             modules, the sampler and allocator slack{})",
+            gib(left),
+            gib((o.reserve_gib * GIB) as usize),
+            if local > 0 {
+                ", plus the local experts' budget"
+            } else {
+                ""
+            }
+        );
         let mut model = ServedForward::new(fwd)?;
         model.sampled_walk = std::env::var("GLM53F_DFLASH_SAMPLED_WALK").map_or(true, |v| v != "0");
+        if std::env::var_os("GLM53F_PROFILE").is_some() {
+            // Per prefill pass: each lane's GPU and host time per MoE layer (`PIPE` lines).
+            model.fwd.set_lane_trace(true, true);
+        }
         let slots = (0..o.slots)
             .map(|_| model.fwd.kv.slot())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // 5. The text side, the engine and its scheduler, the API.
-        let codec = GlmPrompts::load(&o.tokenizer, &o.chat_template)?;
-        if codec.id_bound() != SAMPLE_VOCAB {
-            return Err(format!(
-                "the tokenizer's ids end at {}, the forward samples below {SAMPLE_VOCAB}",
-                codec.id_bound()
-            ));
-        }
-        let eos = codec.stop_ids()?;
+        // 6. The engine and its scheduler, the API.
         let cache = HostCache::from_env(&slots[0])?;
         let queue = Queue::from_env(o.slots);
         let engine = CoordinatorEngine::start(
@@ -212,7 +316,7 @@ mod daemon {
             model,
             slots,
             cache,
-            SchedulerConfig::from_env(eos.clone()),
+            sched,
             queue,
             EngineConfig::new(eos, max_context),
         )?;

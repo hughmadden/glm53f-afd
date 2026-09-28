@@ -35,14 +35,22 @@
 //! | `rewind(to)` | rewound: positions the ring still holds (at or above `len - 2,048`) are kept, lower ones masked out |
 //! | `fork(src, to)` | `src`'s ring copied, then rewound to `to` the same way |
 //! | `import_page`, `import_state(tokens)` | restarted cold at `tokens` (the host image has no taps): drafts read only rows appended afterwards |
+//!
+//! **Marks live in the page pool.** A mark ([`KvMark`], 141 MiB for the whole model) takes
+//! [`KvLayout::mark_pages`] pages of the pool (376), each of its three parts from a page of its
+//! own, copied in and out by the row gather and scatter kernels. So a mark never allocates device
+//! memory: it counts against the same free pages admission counts, and when the pool has no room
+//! [`GlmKv::mark`] refuses (the shell then goes without that snapshot) instead of running the
+//! device out of memory. Dropping a mark gives its pages back.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use glm53f_dflash::gpu::GpuSlot;
 use glm53f_dflash::Dims;
 
-use crate::device::{DeviceBuffer, Stream};
+use crate::device::{launched, DeviceBuffer, Stream};
 use crate::error::{invalid, Error, Result};
+use crate::ffi;
 use crate::kvplan::{KvLayout, PageAlloc, PageChange, SlotPages, LAYER_PAGE_BYTES, PAGE, TAIL};
 
 /// How big the pool is.
@@ -80,6 +88,9 @@ pub(crate) struct KvShared {
     pub conv: DeviceBuffer,
     pub tails: DeviceBuffer,
     pub draft: Option<DeviceBuffer>,
+    /// One mark's page list, i32, for the gather and scatter kernels (one list serves every
+    /// mark operation: they run one after another on the stream).
+    mark_index: DeviceBuffer,
     pub stream: Arc<Stream>,
     alloc: Mutex<Alloc>,
 }
@@ -129,6 +140,7 @@ impl KvPool {
             } else {
                 None
             },
+            mark_index: DeviceBuffer::alloc(l.mark_pages().max(1) * 4)?,
             stream,
             alloc: Mutex::new(Alloc {
                 pages: PageAlloc::new(cfg.pages),
@@ -191,15 +203,33 @@ impl KvPool {
     }
 }
 
-/// The positional state saved at one position: KDA states, conv windows and DSA tails.
+/// The positional state saved at one position: KDA states, conv windows and DSA tails, held in
+/// [`KvLayout::mark_pages`] pages of the pool (given back when the mark is dropped).
 pub struct KvMark {
     pub tokens: usize,
-    pub(crate) buf: DeviceBuffer,
+    /// The pool pages holding the state, the three parts in order ([`KvLayout::mark_regions`]).
+    pages: Vec<u32>,
+    pool: Arc<KvShared>,
 }
 
 impl KvMark {
+    /// Bytes of the state it holds (its host image's size).
     pub fn bytes(&self) -> usize {
-        self.buf.bytes()
+        self.pool.cfg.layout.mark_bytes()
+    }
+
+    /// Pool pages it takes.
+    pub fn pages(&self) -> usize {
+        self.pages.len()
+    }
+}
+
+impl Drop for KvMark {
+    fn drop(&mut self) {
+        let mut a = self.pool.lock();
+        for &p in &self.pages {
+            a.pages.release(p);
+        }
     }
 }
 
@@ -371,42 +401,102 @@ impl GlmKv {
             .zero_async(s, self.tails_at(), l.tails_bytes())
     }
 
-    /// Copy the positional state into `buf` (`dir` true) or out of it into the slot.
-    fn copy_state(&self, buf: &DeviceBuffer, save: bool) -> Result<()> {
+    /// Copy the positional state into `mark`'s pages (`save`) or out of them into the slot.
+    /// Each part's whole pages go by one gather or scatter launch, its last partial page by a
+    /// copy.
+    fn copy_mark(&self, mark: &KvMark, save: bool) -> Result<()> {
+        if !Arc::ptr_eq(&mark.pool, &self.pool) {
+            return Err(invalid!("a mark of another pool"));
+        }
         let (l, s, p) = (*self.layout(), self.stream(), &self.pool);
-        let regions = [
-            (&p.state, self.state_at(), 0, l.kda_state_bytes()),
-            (&p.conv, self.conv_at(), l.kda_state_bytes(), l.conv_bytes()),
-            (
-                &p.tails,
-                self.tails_at(),
-                l.kda_state_bytes() + l.conv_bytes(),
-                l.tails_bytes(),
-            ),
+        let pb = l.page_bytes;
+        let list: Vec<i32> = mark.pages.iter().map(|&x| x as i32).collect();
+        // Pageable memory is staged before the call returns; the list buffer is reused in
+        // stream order.
+        p.mark_index.upload_async(s, 0, &list)?;
+        let arenas = [
+            (&p.state, self.state_at()),
+            (&p.conv, self.conv_at()),
+            (&p.tails, self.tails_at()),
         ];
-        for (arena, at, off, n) in regions {
-            if save {
-                buf.copy_from(s, off, arena, at, n)?;
-            } else {
-                arena.copy_from(s, at, buf, off, n)?;
+        let mut first = 0;
+        for ((arena, at), (_, n, pages)) in arenas.into_iter().zip(l.mark_regions()) {
+            let (full, rem) = (n / pb, n % pb);
+            if full > 0 {
+                let idx: *const i32 = p.mark_index.ptr(first);
+                // SAFETY: `full` rows of `pb` bytes, contiguous in the arena from `at` and at the
+                // mark's pages in the pool; every pointer, stride and size is a multiple of 16
+                // (page bytes are 35,904 per DSA layer; the arenas' per-slot regions are too).
+                let rc = unsafe {
+                    if save {
+                        ffi::glm53f_fwd_scatter_rows(
+                            arena.byte_ptr(at),
+                            pb as i64,
+                            idx,
+                            p.pages.byte_ptr(0),
+                            pb as i64,
+                            full as i32,
+                            pb as i64,
+                            s.raw(),
+                        )
+                    } else {
+                        ffi::glm53f_fwd_gather_rows(
+                            p.pages.byte_ptr(0),
+                            pb as i64,
+                            idx,
+                            arena.byte_ptr(at),
+                            pb as i64,
+                            full as i32,
+                            pb as i64,
+                            s.raw(),
+                        )
+                    }
+                };
+                launched(rc, "mark pages")?;
             }
+            if rem > 0 {
+                let page = mark.pages[first + full] as usize * pb;
+                if save {
+                    p.pages.copy_from(s, page, arena, at + full * pb, rem)?;
+                } else {
+                    arena.copy_from(s, at + full * pb, &p.pages, page, rem)?;
+                }
+            }
+            first += pages;
         }
         Ok(())
     }
 
     // ---- Marks, rewind, fork -------------------------------------------------------------
 
-    /// Save the positional state at the current position.
+    /// Save the positional state at the current position, in pages of the pool. `Err`
+    /// (out of memory) when the pool has too few free pages: nothing is allocated.
     pub fn mark(&self) -> Result<KvMark> {
         if self.pending != 0 {
             return Err(invalid!("mark inside an uncommitted verify window"));
         }
-        let buf = DeviceBuffer::alloc(self.layout().mark_bytes())?;
-        self.copy_state(&buf, true)?;
-        Ok(KvMark {
+        let need = self.layout().mark_pages();
+        let pages = {
+            let mut a = self.pool.lock();
+            let free = a.pages.free();
+            if free < need {
+                return Err(Error::OutOfMemory(format!(
+                    "a snapshot mark takes {need} pages of the KV pool, {free} are free"
+                )));
+            }
+            let mut v: Vec<u32> = (0..need)
+                .map(|_| a.pages.alloc().expect("a free page"))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let mark = KvMark {
             tokens: self.tokens,
-            buf,
-        })
+            pages,
+            pool: self.pool.clone(),
+        };
+        self.copy_mark(&mark, true)?;
+        Ok(mark)
     }
 
     /// Go back to `to` tokens, where `mark` was taken in this slot's history.
@@ -423,7 +513,7 @@ impl GlmKv {
             self.pages.rewind(&mut a.pages, to)?
         };
         self.apply(&ch)?;
-        self.copy_state(&mark.buf, false)?;
+        self.copy_mark(mark, false)?;
         self.tokens = to;
         self.pending = 0;
         if let Some(d) = self.draft.as_mut() {
@@ -457,7 +547,7 @@ impl GlmKv {
             self.pages.fork(&mut a.pages, &src.pages, to)?
         };
         self.apply(&ch)?;
-        self.copy_state(&mark.buf, false)?;
+        self.copy_mark(mark, false)?;
         self.tokens = to;
         if let (Some(d), Some(s)) = (self.draft.as_mut(), src.draft.as_ref()) {
             // The ring is positional, not paged: copy it whole, then keep what it holds of
@@ -523,14 +613,36 @@ impl GlmKv {
     /// slots past each tail's count (keys of a pool that has since completed) are zeroed, so
     /// the image depends only on the committed tokens.
     pub fn export_state(&self, mark: &KvMark, dst: &mut [u8]) -> Result<()> {
-        if dst.len() != mark.buf.bytes() {
+        if dst.len() != mark.bytes() || !Arc::ptr_eq(&mark.pool, &self.pool) {
             return Err(invalid!(
-                "state image of {} bytes, the mark holds {}",
+                "state image of {} bytes, the mark holds {} (or is another pool's)",
                 dst.len(),
-                mark.buf.bytes()
+                mark.bytes()
             ));
         }
-        mark.buf.download_bytes(self.stream(), 0, dst)?;
+        // Page by page (runs of consecutive pages in one copy), each part into its place in
+        // the image.
+        let pb = self.page_bytes();
+        let mut first = 0;
+        for (off, n, pages) in self.layout().mark_regions() {
+            let mut k = 0;
+            while k < pages {
+                let mut run = 1;
+                while k + run < pages
+                    && mark.pages[first + k + run] == mark.pages[first + k] + run as u32
+                {
+                    run += 1;
+                }
+                let bytes = (n - k * pb).min(run * pb);
+                self.pool.pages.download_bytes(
+                    self.stream(),
+                    mark.pages[first + k] as usize * pb,
+                    &mut dst[off + k * pb..off + k * pb + bytes],
+                )?;
+                k += run;
+            }
+            first += pages;
+        }
         let l = self.layout();
         let base = l.kda_state_bytes() + l.conv_bytes();
         for j in 0..l.dsa_layers {

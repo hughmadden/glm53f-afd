@@ -1,9 +1,24 @@
 //! Device and page-locked host memory, streams and events (feature `cuda`).
 
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cuda::{self, CudaError, RawEvent, RawStream};
 use crate::error::{Error, Result};
+
+/// Device allocations made through [`DeviceBuffer`] in this process, and their bytes.
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// `(count, bytes)` of the device allocations [`DeviceBuffer`] has made in this process (freed
+/// ones included). The forward allocates everything at construction, so a pass leaves these
+/// unchanged; tests check that.
+pub fn allocations() -> (usize, usize) {
+    (
+        ALLOCS.load(Ordering::Relaxed),
+        ALLOC_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 /// `Ok` for `cudaSuccess`, else the error with `what` and the runtime's name for it.
 pub fn check(code: CudaError, what: &str) -> Result<()> {
@@ -62,6 +77,8 @@ impl DeviceBuffer {
                     cuda::error_string(code)
                 )));
             }
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
         }
         Ok(DeviceBuffer { ptr, bytes })
     }

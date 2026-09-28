@@ -10,12 +10,16 @@
 //! 1. loads the coordinator's weights: every non-expert tensor of the official FP8 checkpoint
 //!    (the whole checkpoint, or its coordinator subset with the same tensor names). The
 //!    embedding stays in page-locked host RAM; everything else goes to the GPU;
-//! 2. sizes the KV: a page pool shared by the slots, and each slot's fixed state;
-//! 3. connects the routed experts: the four expert ranks (`--experts remote`, the default), or
+//! 2. connects the routed experts: the four expert ranks (`--experts remote`, the default), or
 //!    the official FP8 experts on this GPU (`--experts local`, development on one GPU);
-//! 4. with `--drafter`, loads the DFlash2 drafter onto the GPU next to the weights (before the KV
-//!    is sized; each slot's fixed state then holds its 40.16 MiB context ring) and attaches it to
-//!    the forward: speculative decoding, up to 7 drafts a step;
+//! 3. with `--drafter`, loads the DFlash2 drafter onto the GPU next to the weights (each slot's
+//!    fixed state then holds its 40.16 MiB context ring);
+//! 4. allocates every buffer the forward's passes use (both prefill lanes' scratch for
+//!    `--prefill-rows`, the verify scratch, the attention workspaces for any context), the
+//!    expert exchange's buffers and, with the drafter, its tap buffer and working memory, then
+//!    sizes the KV from the memory left: each slot's fixed state and a page pool shared by the
+//!    slots and by the snapshot marks (below); the drafter is attached to the forward:
+//!    speculative decoding, up to 7 drafts a step;
 //! 5. starts the engine and the scheduler (`glm53f-coordinator`) over the forward
 //!    (`glm53f-forward`'s `ServedForward`) and serves the OpenAI-compatible API
 //!    (`glm53f-api`, GLM's completion dialect).
@@ -38,8 +42,9 @@
 //! | `--slots N` | `GLM53F_MAX_SLOTS` | 16 | Requests with device state at once (1-64) |
 //! | `--max-context T` | | the model's (1,048,576) | Tokens one request can hold |
 //! | `--kv-gib G` | | the free memory less the reserve | The KV page pool |
-//! | `--reserve-gib G` | | 4 | Device memory left free for workspaces and snapshot marks |
-//! | `--prefill-rows R` | | 256 | Rows of one prefill pass (1-4096) |
+//! | `--reserve-gib G` | | 1 | Device memory left free after everything is allocated (kernel modules loaded on first use, the sampler, allocator slack) |
+//! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 4096 | Rows of one prefill pass, both lanes together (at most 4,096 per lane: the wire's request cap) |
+//! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass: 2 overlaps one lane's attention with the other's experts on the ranks, 1 runs the pass serially |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
@@ -50,11 +55,45 @@
 //! `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft greedily too); the wire client
 //! `GLM53F_RDMA=1` (an `rdma` build) with
 //! `GLM53F_WIRE_NOCRC=1` (which the ranks must set too), `GLM53F_WIRE_MIN_GBPS`,
-//! `GLM53F_TIMELINE`, `GLM53F_PROFILE`.
+//! `GLM53F_WIRE_INFLIGHT` (1 holds RDMA to one exchange in flight), `GLM53F_TIMELINE`,
+//! `GLM53F_PROFILE` (with the forward's lane trace).
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
 //! reached through an address without a RoCE v2 device at the floor rate. `GLM53F_WIRE_ALLOW_LAN=1`
 //! lifts the check for tests (loopback needs no lifting).
+//!
+//! # Prefill rows and lanes
+//!
+//! The default, 4,096 rows in two lanes of 2,048, comes from the first run on the fabric (4,096-row
+//! passes, one lane, traced per MoE layer): the coordinator's work between exchanges took 34.6 ms,
+//! the rank's compute 16.8 ms and the transfer about 8.6 ms, all serial. Two lanes overlap each
+//! lane's coordinator work with the other lane's exchange, so a layer costs about twice the larger
+//! of the two per lane. Taking the coordinator's work as linear in rows (0.25 ms at one row) and
+//! the rank's rate as measured (155K, 208K and 243K rows/s at 1,024, 2,048 and 4,096 rows):
+//!
+//! | Pass (lanes of) | Coordinator per lane | Exchange per lane | Per layer | Per row |
+//! |---|---:|---:|---:|---:|
+//! | 2,048 (1,024) | 8.8 ms | 8.8 ms | 17.7 ms | 8.6 us |
+//! | 4,096 (2,048) | 17.4 ms | 14.2 ms | 34.9 ms | 8.5 us |
+//! | 8,192 (4,096) | 34.6 ms | 25.5 ms | 69.2 ms | 8.4 us |
+//!
+//! Today every size is coordinator-bound at about the same rate (about 2.7K tok/s over 42 MoE
+//! layers and the rest), so the pass is sized for its other costs: 4,096 rows keeps the lanes'
+//! scratch at about 3.0 GiB (8,192 would double it, out of the KV pool) and a pass at about
+//! 1.5 s (the longest a running request waits for its next token). Lanes of 1,024 rows are
+//! balanced today but fall behind once the coordinator gets faster: the ranks then set the pace,
+//! at 6.9 us per row with lanes of 2,048 against 8.6 with lanes of 1,024 (6.2 with 4,096). The
+//! flags let a run on the real hardware compare them; `glm53f-forward`'s lane trace
+//! (`GLM53F_PROFILE=1`) shows where each layer's time goes.
+//!
+//! # Device memory
+//!
+//! Everything but the KV pool is allocated first, and the pool takes what is left less
+//! `--reserve-gib`; a pass allocates nothing. Snapshot marks (the KDA states and conv windows of
+//! a prompt or turn end, 141 MiB each) take pages of the pool (376 each), so admission, which
+//! counts free pages, counts them too: under pressure it evicts retained snapshots to the host
+//! tier, and a mark the pool has no room for is refused (that snapshot is skipped) instead of
+//! running the device out of memory. The start-up log lists what was allocated for what.
 //!
 //! # Development mode
 //!
@@ -75,14 +114,15 @@ pub const USAGE: &str = "usage:
   glm53f-serve --checkpoint <dir> --experts local [--experts-dir <dir>] [--dev-layers 0-N] [options]
 options:
   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
-  --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>  --prefill-rows <r>
+  --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
+  --prefill-rows <r>  --prefill-lanes 1|2
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
 /// Expert ranks.
 pub const RANKS: usize = 4;
-/// Rows of one prefill pass at most (the wire's request cap).
-pub const MAX_PREFILL_ROWS: usize = 4096;
+/// Rows of one prefill lane at most (one exchange: the wire's request cap).
+pub const MAX_LANE_ROWS: usize = 4096;
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// Where the routed experts run.
@@ -108,7 +148,9 @@ pub struct Options {
     /// None: the free device memory less `reserve_gib` and the slots' fixed state.
     pub kv_gib: Option<f64>,
     pub reserve_gib: f64,
+    /// Rows of one prefill pass (every lane's together), and its lanes.
     pub prefill_rows: usize,
+    pub prefill_lanes: usize,
     /// The DFlash2 drafter's directory (none: no speculative decoding).
     pub drafter: Option<PathBuf>,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
@@ -174,8 +216,16 @@ impl Options {
             Some(v) => number("GLM53F_MAX_SLOTS", &v)?,
             None => 16,
         };
-        let (mut max_context, mut kv_gib, mut reserve_gib) = (None, None, 4.0f64);
-        let (mut prefill_rows, mut dev_layers) = (256, None);
+        let (mut max_context, mut kv_gib, mut reserve_gib) = (None, None, 1.0f64);
+        let mut prefill_rows = match env("GLM53F_PREFILL_ROWS") {
+            Some(v) => number("GLM53F_PREFILL_ROWS", &v)?,
+            None => 4096,
+        };
+        let mut prefill_lanes = match env("GLM53F_PREFILL_LANES") {
+            Some(v) => number("GLM53F_PREFILL_LANES", &v)?,
+            None => 2,
+        };
+        let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
         let mut it = args.iter();
         while let Some(k) = it.next() {
@@ -194,6 +244,7 @@ impl Options {
                 "--kv-gib" => kv_gib = Some(number(k, &val()?)?),
                 "--reserve-gib" => reserve_gib = number(k, &val()?)?,
                 "--prefill-rows" => prefill_rows = number(k, &val()?)?,
+                "--prefill-lanes" => prefill_lanes = number(k, &val()?)?,
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
@@ -215,9 +266,14 @@ impl Options {
         if !(1..=64).contains(&slots) {
             return Err(format!("--slots {slots}: 1 to 64"));
         }
-        if !(1..=MAX_PREFILL_ROWS).contains(&prefill_rows) {
+        if !matches!(prefill_lanes, 1 | 2) {
+            return Err(format!("--prefill-lanes {prefill_lanes}: 1 or 2"));
+        }
+        if !(1..=prefill_lanes * MAX_LANE_ROWS).contains(&prefill_rows) {
             return Err(format!(
-                "--prefill-rows {prefill_rows}: 1 to {MAX_PREFILL_ROWS}"
+                "--prefill-rows {prefill_rows}: 1 to {} with {prefill_lanes} lane(s) (at most \
+                 {MAX_LANE_ROWS} per lane)",
+                prefill_lanes * MAX_LANE_ROWS
             ));
         }
         if max_context == Some(0) || dev_layers == Some(0) {
@@ -242,6 +298,7 @@ impl Options {
             kv_gib,
             reserve_gib,
             prefill_rows,
+            prefill_lanes,
             drafter,
             dev_layers,
         })
@@ -317,8 +374,11 @@ mod tests {
         assert_eq!(o.chat_template, PathBuf::from("/w/chat_template.jinja"));
         assert_eq!(o.experts, Experts::Remote(parse_ranks(RANK_LIST).unwrap()));
         assert_eq!((o.listen.as_str(), o.slots), ("127.0.0.1:8100", 8));
-        assert_eq!((o.max_context, o.kv_gib, o.reserve_gib), (None, None, 4.0));
-        assert_eq!((o.prefill_rows, o.dev_layers, o.drafter), (256, None, None));
+        assert_eq!((o.max_context, o.kv_gib, o.reserve_gib), (None, None, 1.0));
+        assert_eq!(
+            (o.prefill_rows, o.prefill_lanes, o.dev_layers, o.drafter),
+            (4096, 2, None, None)
+        );
         // Flags win over the environment.
         let o = Options::parse(
             &args("--checkpoint /c --slots 2 --listen 0.0.0.0:9000 --tokenizer /t.json"),
@@ -339,6 +399,16 @@ mod tests {
         );
         let o = Options::parse(&args("--drafter /e"), &with).unwrap();
         assert_eq!(o.drafter, Some(PathBuf::from("/e")));
+        // The prefill knobs: the environment, and flags over it.
+        let env2 = |k: &str| match k {
+            "GLM53F_PREFILL_ROWS" => Some("2048".to_string()),
+            "GLM53F_PREFILL_LANES" => Some("1".to_string()),
+            _ => env(k),
+        };
+        let o = Options::parse(&[], &env2).unwrap();
+        assert_eq!((o.prefill_rows, o.prefill_lanes), (2048, 1));
+        let o = Options::parse(&args("--prefill-rows 8192 --prefill-lanes 2"), &env2).unwrap();
+        assert_eq!((o.prefill_rows, o.prefill_lanes), (8192, 2));
     }
 
     #[test]
@@ -370,14 +440,17 @@ mod tests {
     #[test]
     fn bad_options_are_refused() {
         let bad = [
-            "",                                           // no checkpoint
-            "--checkpoint /c",                            // remote without ranks
-            "--checkpoint /c --ranks a:1,b:2,c:3",        // three ranks
-            "--checkpoint /c --ranks a:1,b:2,c:3,d",      // no port
-            "--checkpoint /c --experts gpu",              // unknown backend
-            "--checkpoint /c --experts local --slots 0",  // no slots
-            "--checkpoint /c --experts local --slots 65", // too many
-            "--checkpoint /c --experts local --prefill-rows 5000",
+            "",                                                    // no checkpoint
+            "--checkpoint /c",                                     // remote without ranks
+            "--checkpoint /c --ranks a:1,b:2,c:3",                 // three ranks
+            "--checkpoint /c --ranks a:1,b:2,c:3,d",               // no port
+            "--checkpoint /c --experts gpu",                       // unknown backend
+            "--checkpoint /c --experts local --slots 0",           // no slots
+            "--checkpoint /c --experts local --slots 65",          // too many
+            "--checkpoint /c --experts local --prefill-rows 8193", // over two lanes of 4,096
+            "--checkpoint /c --experts local --prefill-rows 5000 --prefill-lanes 1",
+            "--checkpoint /c --experts local --prefill-lanes 3",
+            "--checkpoint /c --experts local --prefill-rows 0",
             "--checkpoint /c --experts local --kv-gib 0",
             "--checkpoint /c --experts local --reserve-gib -1",
             "--checkpoint /c --experts local --max-context 0",

@@ -104,6 +104,8 @@ impl GemmPolicy {
 /// Split-K scratch sizes: f32 partials and zeroed counters.
 const PARTIAL_FLOATS: usize = 1 << 20;
 const SYNC_COUNTERS: usize = 1 << 16;
+/// The cuBLAS workspace.
+const BLAS_WORKSPACE: usize = 32 << 20;
 
 /// The GEMM engine: a cuBLAS handle and the split-K scratch the fused kernels share (one
 /// stream: launches run one after another, and the kernels leave the counters zeroed).
@@ -120,11 +122,16 @@ impl Gemm {
             return Err(invalid!("the GEMV takes at most 8 rows"));
         }
         Ok(Gemm {
-            blas: Blas::new(stream, 32 << 20)?,
+            blas: Blas::new(stream, BLAS_WORKSPACE)?,
             partials: DeviceBuffer::alloc(PARTIAL_FLOATS * 4)?,
             sync: DeviceBuffer::zeroed(SYNC_COUNTERS * 4)?,
             policy,
         })
+    }
+
+    /// Device bytes of its scratch (the cuBLAS workspace and the split-K buffers).
+    pub fn bytes(&self) -> usize {
+        BLAS_WORKSPACE + self.partials.bytes() + self.sync.bytes()
     }
 
     /// The GEMV's K splits for `w` (shape only).

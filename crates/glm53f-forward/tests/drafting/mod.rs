@@ -55,6 +55,11 @@ impl ExpertBackend for SomeExperts {
             ZeroExperts.finish(call, stream)
         }
     }
+
+    /// Both run a call's work in `submit`: two lanes may have calls in flight.
+    fn depth(&self) -> usize {
+        2
+    }
 }
 
 /// Deterministic token ids in the vocabulary.
@@ -70,9 +75,13 @@ pub fn ids(seed: u64, n: usize) -> Vec<u32> {
         .collect()
 }
 
+/// Snapshot marks the pool has room for beyond the tests' pages (a mark takes pages of the pool:
+/// 376 for the whole model).
+pub const MARKS: usize = 4;
+
 /// A 45-layer forward with the drafter attached and a KV pool of `slots` slots of up to
-/// `max_pages` pages (64 tokens each), `pages` in all; local experts get `expert_gib` GiB.
-/// None (printed) when data or GPU memory is missing.
+/// `max_pages` pages (64 tokens each), `pages` in all plus room for [`MARKS`] snapshot marks;
+/// local experts get `expert_gib` GiB. None (printed) when data or GPU memory is missing.
 pub fn drafted_forward(
     cfg: ForwardConfig,
     slots: usize,
@@ -90,7 +99,8 @@ pub fn drafted_forward(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    let need = if loaded >= 45 { 20.0 } else { 7.0 } + expert_gib;
+    // Plus the marks' pages (0.6 GiB).
+    let need = if loaded >= 45 { 20.6 } else { 7.6 } + expert_gib;
     if !gpu_with(need) {
         return None;
     }
@@ -115,11 +125,12 @@ pub fn drafted_forward(
         d.weight_bytes() as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
+    let layout = KvLayout::new(&shape, Some(d.config()));
     let kv = KvPool::new(
         KvConfig {
-            layout: KvLayout::new(&shape, Some(d.config())),
+            layout,
             max_slots: slots,
-            pages,
+            pages: pages + MARKS * layout.mark_pages(),
             max_pages,
             base_pages: 1,
         },

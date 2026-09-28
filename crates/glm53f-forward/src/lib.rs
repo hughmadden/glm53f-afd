@@ -19,7 +19,7 @@
 //! | `kv` | The pool (pages, page tables, KDA states, conv windows, DSA tails) and [`kv::GlmKv`], one request's view |
 //! | `experts` | [`experts::ExpertBackend`], `LocalFp8Experts`, `ZeroExperts` |
 //! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
-//! | `forward` | [`forward::GlmForward`]: the layer loop, the head, prefill / decode / verify / commit, taps and stage timing |
+//! | `forward` | [`forward::GlmForward`]: the layer loop in one lane or two (a prefill's lanes overlap one lane's attention with the other's routed experts), the head, prefill / decode / verify / commit, taps, stage timing and the lane trace; `ForwardBuffers`, every buffer a pass uses, allocated up front |
 //! | `draft` | The DFlash2 drafter in the forward (`glm53f-dflash`): its taps (the mean of the four streams after layers 5, 14, 24, 33 and 42), the committed rows appended to each slot's ring, the drafts |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
 //! | `device`, `cuda`, `cublas`, `ffi` | Device memory, streams and events; the runtime, cuBLAS and kernel bindings |
@@ -72,7 +72,8 @@
 //! BF16 conv windows (4.8 MiB) and the DSA tails (17 KB). [`kv::GlmKv`] is one request: its
 //! committed length and pending verify rows, its pages, `reserve`, marks of the positional state,
 //! `rewind` to a mark, `fork` from a mark of another slot (full pages shared copy-on-write, the
-//! partial page copied), and host images of pages and marks. Byte counts equal the memory
+//! partial page copied), and host images of pages and marks. A mark is held in pages of the pool
+//! (376 of them), so admission, which counts free pages, counts marks too. Byte counts equal the memory
 //! planner's (`glm53f-model`'s `KvGeometry` and `SlotState`) plus the tails, which the planner
 //! does not count (`tests/kv_plan.rs`). With a drafter, each slot also holds the drafter's context
 //! ring (40.16 MiB), kept at the committed length (`crate::draft`).
@@ -85,6 +86,7 @@
 //! cargo test --release -p glm53f-forward --features coordinator --test serve
 //! cargo test --release -p glm53f-forward --features coordinator --test draft           # the drafter's taps and context
 //! cargo test --release -p glm53f-forward --features coordinator --test draft_lossless  # speculation changes no token
+//! cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission   # two-lane prefill; memory
 //! cargo run  --release -p glm53f-forward --features cuda --example gemm_bench
 //! cargo run  --release -p glm53f-forward --features cuda --example decode_bench
 //! ```

@@ -7,6 +7,8 @@
 //! - A rewind to a mark and a fork from a mark continue bit for bit like the original run.
 //! - A fork shares full pages; a slot that rewinds into a shared page gets its own copy, and
 //!   the other slot's page is unchanged.
+//! - A mark takes pages of the pool (and gives them back when dropped); a pool without room
+//!   refuses a mark instead of allocating device memory.
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -83,9 +85,17 @@ fn marks_rewinds_forks_and_host_images() {
     let m60 = a.mark().unwrap();
     fwd.prefill(&mut [(&mut a, &p[60..])]).unwrap();
     run(fwd, &mut a, &ids(4, 2));
+    let before = fwd.kv.free_pages();
     let m72 = a.mark().unwrap();
     assert_eq!((m60.tokens, m72.tokens, a.tokens()), (60, 72, 72));
     assert_eq!(m72.bytes(), a.state_bytes());
+    let mark_pages = fwd.kv.config().layout.mark_pages();
+    assert_eq!(m72.pages(), mark_pages);
+    assert_eq!(
+        fwd.kv.free_pages(),
+        before - mark_pages,
+        "a mark takes pool pages"
+    );
     let (pages, state) = export(&a, &m72);
     assert_eq!(pages.len(), 2);
 
@@ -171,6 +181,21 @@ fn marks_rewinds_forks_and_host_images() {
     fwd.verify(&mut [(&mut d, &ids(7, 3)[..])]).unwrap();
     assert!(d.mark().is_err());
     fwd.commit(&mut [&mut d], &[3]).unwrap();
+    // A pool without room for a mark refuses it and allocates nothing.
+    let mut hold = Vec::new();
+    while fwd.kv.free_pages() >= mark_pages {
+        hold.push(d.mark().unwrap());
+    }
+    let allocs = glm53f_forward::device::allocations();
+    let e = d.mark().err().expect("a mark without room in the pool");
+    assert!(e.to_string().contains("pages of the KV pool"), "{e}");
+    assert_eq!(glm53f_forward::device::allocations(), allocs);
+    eprintln!(
+        "marks take {mark_pages} pool pages each; with {} free a mark is refused: {e}",
+        fwd.kv.free_pages()
+    );
+    drop(hold);
+    drop((m60, m72, mb));
     drop((a, b, c, d));
     assert_eq!(fwd.kv.free_pages(), free0, "pages leaked");
 }

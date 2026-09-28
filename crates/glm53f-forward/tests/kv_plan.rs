@@ -55,11 +55,23 @@ fn accounting_matches_the_planner() {
         l.draft_kv_bytes as f64 / 1048576.0,
         l.mark_bytes() as f64 / 1048576.0
     );
+    // A mark on the device: pool pages, each part (KDA states, conv windows, tails) from a page
+    // of its own: 362 + 13 + 1 = 376 pages, 0.6% over the state it holds.
+    let regions = l.mark_regions();
+    assert_eq!(regions.map(|r| r.2), [362, 13, 1]);
+    assert_eq!(
+        regions.map(|r| r.0),
+        [0, l.kda_state_bytes(), l.kda_state_bytes() + l.conv_bytes()]
+    );
+    assert_eq!(regions.iter().map(|r| r.1).sum::<usize>(), l.mark_bytes());
+    assert_eq!(l.mark_pages(), 376);
+    assert!(l.mark_pages() * l.page_bytes >= l.mark_bytes());
     // The layer prefix the golden tests run: layers 0-4 (KDA 0, 1, 2, 4; DSA 3).
     let s5 = ModelShape::new(&cfg.text, 5).unwrap();
     assert_eq!((s5.kda_layers, s5.dsa_layers), (4, 1));
     assert_eq!(s5.kda_index, vec![Some(0), Some(1), Some(2), None, Some(3)]);
     assert_eq!(KvLayout::new(&s5, None).page_bytes, 35_904);
+    assert_eq!(KvLayout::new(&s5, None).mark_pages(), 468 + 17 + 1);
 }
 
 fn check_refs(alloc: &PageAlloc, slots: &[&SlotPages]) {

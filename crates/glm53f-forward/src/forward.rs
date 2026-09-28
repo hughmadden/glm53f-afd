@@ -34,11 +34,59 @@
 //! the head also captures the drafter's taps at the entry of layers 6, 15, 25, 34 and 43, and
 //! the committed rows (a prefill or decode pass's, a commit's kept rows) go to each slot's
 //! drafter context.
+//!
+//! # Two lanes (prefill)
+//!
+//! A layer's routed experts run on the expert ranks while the coordinator waits, so a serial
+//! prefill leaves one side idle at every MoE layer. With [`ForwardConfig::lanes`] 2, a prefill
+//! pass cuts its rows in two halves, lanes A and B (a request that straddles the middle is split:
+//! lane B continues it at the positions after lane A's part), and runs them through each layer
+//! in turn:
+//!
+//! ```text
+//! layer L:  A: attention, router, submit A's experts, shared expert
+//!           B: attention, router, submit B's experts, shared expert  <- the ranks: A's experts
+//!           A: finish A's experts (L); A: attention (L + 1) ...        <- the ranks: B's experts
+//! ```
+//!
+//! Lane B's attention at layer L needs only what lane A's attention at L left behind: the KDA
+//! states and conv windows (in the pool, updated in place), the MLA latents and pooled keys of
+//! lane A's rows (in the pages), and a split request's DSA tail (copied from lane A's batch tails
+//! before each DSA layer). Within a request, lane A's rows go through each layer before lane
+//! B's, the causal order.
+//!
+//! At most [`ExpertBackend::depth`] calls are in flight, the oldest finished first: 2 over RDMA,
+//! where the ranks take lane B's request while they compute lane A's; 1 over TCP, where lane A
+//! is collected before lane B is sent (lane B's attention still overlaps lane A's exchange).
+//! Each lane has its own buffers (its `Scratch`, swapped in as the active one); the attention
+//! workspaces are shared, since the lanes' kernels run one after another on the one stream.
+//! Decode and verify passes, `run_layers`, passes with a test tap ([`GlmForward::set_tap`]) and
+//! prefill passes under two lanes of [`ForwardConfig::min_lane_rows`] run in one lane. Two lanes
+//! change the row counts of the tensor-core GEMMs, so a prefill's results move within rounding
+//! (deterministically: two lanes give the bits of the same rows run as two passes, lane A's then
+//! lane B's); decode's row independence is untouched. [`GlmForward::set_lane_trace`] times each
+//! lane per layer.
+//!
+//! **The drafter in two lanes.** Each lane captures the drafter's taps for its own rows, into
+//! those rows of the tap buffer (a lane's rows are a contiguous slice of the pass). After the
+//! pass the rows are committed and appended to the drafter's context lane by lane, lane A's then
+//! lane B's (a request split by the cut gets lane A's part, then lane B's), with the calls two
+//! one-lane passes of the same rows would make, so the rings hold the same bits.
+//!
+//! # Memory
+//!
+//! Every buffer a pass uses is allocated before the forward exists ([`ForwardBuffers`]): the
+//! lanes' scratch for [`ForwardConfig::max_rows`], the verify scratch, and the attention
+//! workspaces for the largest pass at any context. A drafter's tap buffer and working memory are
+//! sized up front too (`crate::draft::Dflash::reserve`). A pass allocates no device memory, so a
+//! server can size its KV page pool from what is left and never run out mid-pass.
 
 use core::ffi::c_void;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use glm53f_dsa::ffi::{self as dffi, DsaCache, DsaWindow};
 use glm53f_kda::ffi as kffi;
@@ -54,13 +102,20 @@ use crate::gemm::{act_quant, Fp8Input, Gemm, GemmPolicy};
 use crate::kv::{GlmKv, KvPool};
 use crate::kvplan::{KvLayout, LAYER_PAGE_BYTES, TAIL};
 use crate::shape::*;
-use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, MlpW};
+use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW};
 
 /// Sizes and kernel choices of a forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForwardConfig {
-    /// Rows of one prefill pass (a longer segment runs in chunks of this many).
+    /// Rows of one prefill pass, every lane's together (a longer segment runs in chunks of this
+    /// many).
     pub max_rows: usize,
+    /// Lanes of a prefill pass: 1, or 2 to pipeline it (module documentation). A lane holds
+    /// `max_rows / lanes` rows (rounded up).
+    pub lanes: usize,
+    /// The fewest rows worth a second lane: a prefill pass under twice this runs in one lane
+    /// (if it fits in one).
+    pub min_lane_rows: usize,
     /// Rows of one verify pass, all windows together.
     pub max_verify_rows: usize,
     /// Requests in one pass.
@@ -82,10 +137,19 @@ pub struct ForwardConfig {
     pub kda_prefill_value_blocks: i32,
 }
 
+impl ForwardConfig {
+    /// Rows one lane holds.
+    pub fn lane_rows(&self) -> usize {
+        self.max_rows.div_ceil(self.lanes.max(1))
+    }
+}
+
 impl Default for ForwardConfig {
     fn default() -> Self {
         ForwardConfig {
             max_rows: 256,
+            lanes: 1,
+            min_lane_rows: 64,
             max_verify_rows: 64,
             max_requests: 16,
             policy: GemmPolicy::default(),
@@ -324,7 +388,8 @@ fn buf(bytes: usize) -> Result<DeviceBuffer> {
     DeviceBuffer::alloc(bytes.max(16))
 }
 
-/// Every per-pass buffer, sized for `rows` rows and `logits` logit rows.
+/// Every per-pass buffer of one lane, sized for `rows` rows and `logits` logit rows. The
+/// attention workspaces are shared by the lanes ([`Workspaces`]).
 pub(crate) struct Scratch {
     rows: usize,
     logit_rows: usize,
@@ -374,9 +439,6 @@ pub(crate) struct Scratch {
     o16: DeviceBuffer,
     o_q: DeviceBuffer,
     o_s: DeviceBuffer,
-    idx_ws: DeviceBuffer,
-    kda_ws: DeviceBuffer,
-    mla_ws: DeviceBuffer,
     // FFN
     gu: DeviceBuffer,
     act: DeviceBuffer,
@@ -397,19 +459,22 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
+    /// `taps`: the lane that taps read and `run_layers` returns from (lane A); lane B's
+    /// scratch has no tap buffer (passes with a tap run in one lane).
     fn new(
         rows: usize,
         logit_rows: usize,
         requests: usize,
         max_pages: usize,
         dsa_layers: usize,
+        taps: bool,
     ) -> Result<Scratch> {
         let r = rows;
         Ok(Scratch {
             rows,
             logit_rows,
             streams: [buf(r * HC * HIDDEN * 2)?, buf(r * HC * HIDDEN * 2)?],
-            tap_streams: buf(r * HC * HIDDEN * 2)?,
+            tap_streams: buf(if taps { r * HC * HIDDEN * 2 } else { 0 })?,
             partials: buf(r * (HIDDEN / 128) * 25 * 4)?,
             pre: buf(r * 16)?,
             collapsed: buf(r * HIDDEN * 2)?,
@@ -452,9 +517,6 @@ impl Scratch {
             o16: buf(r * MLA_HEADS * V_HEAD * 2)?,
             o_q: buf(r * MLA_HEADS * V_HEAD)?,
             o_s: buf(r * (MLA_HEADS * V_HEAD / 128) * 4)?,
-            idx_ws: buf(0)?,
-            kda_ws: buf(0)?,
-            mla_ws: buf(0)?,
             gu: buf(r * 2 * DENSE_INTER * 2)?,
             act: buf(r * DENSE_INTER * 2)?,
             act_q: buf(r * DENSE_INTER)?,
@@ -519,9 +581,6 @@ impl Scratch {
             &self.o16,
             &self.o_q,
             &self.o_s,
-            &self.idx_ws,
-            &self.mla_ws,
-            &self.kda_ws,
             &self.gu,
             &self.act,
             &self.act_q,
@@ -586,6 +645,399 @@ impl VerifyScratch {
     }
 }
 
+/// The attention kernels' workspaces. The lanes share them (their kernels run one after another
+/// on the stream), and they are sized at construction for the largest pass at any context, so no
+/// pass grows them.
+struct Workspaces {
+    /// The indexer's selection (`glm53f_dsa_index_workspace_bytes`).
+    idx: DeviceBuffer,
+    /// Sparse MLA's split partials (passes of at most 8 rows).
+    mla: DeviceBuffer,
+    /// The chunked KDA prefill kernel's (when [`ForwardConfig::kda_chunked_prefill`] is on at
+    /// construction; switched on later, it grows on the first chunked pass).
+    kda: DeviceBuffer,
+}
+
+impl Workspaces {
+    /// Bytes of each for attention calls of up to `rows` rows on a GPU of `sms` multiprocessors:
+    /// the largest over every row count, whatever the context.
+    fn plan(cfg: &ForwardConfig, rows: usize, sms: i32, dsa_layers: usize) -> [usize; 3] {
+        let idx = if dsa_layers == 0 {
+            0
+        } else {
+            // `glm53f_dsa_index_plan` splits the pools of a pass of r rows into at most
+            // max(2 sms / r, 1) chunks per row whatever the context (a chunk holds at least
+            // ceil(pools / per_row) pools), and the workspace grows with the chunks.
+            (1..=rows)
+                .map(|r| {
+                    let chunks = ((2 * sms.max(1) as usize) / r).max(1) as i32;
+                    // SAFETY: a host function.
+                    unsafe { dffi::glm53f_dsa_index_workspace_bytes(r as i32, chunks) as usize }
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        // Split partials only for passes of at most 8 rows (larger passes run one split).
+        let mla = if dsa_layers == 0 {
+            0
+        } else {
+            // SAFETY: a host function.
+            unsafe {
+                dffi::glm53f_dsa_mla_workspace_bytes(rows.min(8) as i32, cfg.decode_splits as i32)
+                    as usize
+            }
+        };
+        let kda = if cfg.kda_chunked_prefill {
+            // SAFETY: a host function.
+            unsafe {
+                kffi::glm53f_kda_prefill_workspace_bytes(
+                    KDA_HEADS as i32,
+                    cfg.max_requests as i32,
+                    cfg.kda_prefill_rows.max(16) as i32,
+                ) as usize
+            }
+        } else {
+            0
+        };
+        [idx, mla, kda]
+    }
+
+    fn new(sizes: [usize; 3]) -> Result<Workspaces> {
+        Ok(Workspaces {
+            idx: buf(sizes[0])?,
+            mla: buf(sizes[1])?,
+            kda: buf(sizes[2])?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.idx.bytes() + self.mla.bytes() + self.kda.bytes()
+    }
+}
+
+/// Device bytes of a forward's per-pass buffers, by use (for start-up logs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BufferBytes {
+    /// Each lane's scratch (lane B: 0 in a one-lane forward).
+    pub lanes: [usize; 2],
+    /// The verify round's saved inputs.
+    pub verify: usize,
+    /// The indexer, sparse MLA and chunked KDA workspaces.
+    pub workspaces: [usize; 3],
+    /// The GEMM engine's cuBLAS workspace and split-K scratch.
+    pub gemm: usize,
+}
+
+impl BufferBytes {
+    pub fn total(&self) -> usize {
+        self.lanes.iter().sum::<usize>()
+            + self.verify
+            + self.workspaces.iter().sum::<usize>()
+            + self.gemm
+    }
+}
+
+/// Every device buffer a forward's passes use, allocated before the forward is built: a server
+/// allocates them, then sizes its KV page pool from the memory left ([`GlmForward::with_buffers`]).
+/// No pass allocates.
+pub struct ForwardBuffers {
+    cfg: ForwardConfig,
+    max_pages: usize,
+    kda_layers: usize,
+    dsa_layers: usize,
+    sms: i32,
+    stream: Arc<Stream>,
+    gemm: Gemm,
+    s: Scratch,
+    s2: Option<Scratch>,
+    v: VerifyScratch,
+    ws: Workspaces,
+}
+
+impl ForwardBuffers {
+    /// The buffers of a forward over `shape` with `cfg`, for page tables of `max_pages` pages,
+    /// running on `stream` (the KV pool's): the lanes' scratch, the verify scratch, the
+    /// attention workspaces, and the GEMM engine's (cuBLAS and split-K) scratch.
+    pub fn new(
+        cfg: &ForwardConfig,
+        shape: &ModelShape,
+        max_pages: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<ForwardBuffers> {
+        let groups_ok = |g: usize| matches!(g, 1 | 2 | 4);
+        if cfg.max_rows == 0
+            || !matches!(cfg.lanes, 1 | 2)
+            || cfg.min_lane_rows == 0
+            || cfg.max_verify_rows == 0
+            || cfg.max_requests == 0
+            || !(1..=64).contains(&cfg.decode_splits)
+            || !groups_ok(cfg.decode_head_groups)
+            || !groups_ok(cfg.prefill_head_groups)
+            || !matches!(cfg.kda_prefill_value_blocks, 1 | 2 | 4)
+        {
+            return Err(invalid!("bad forward config {cfg:?}"));
+        }
+        let sms = device::sm_count()?;
+        let lane = cfg.lane_rows();
+        // Lane A also runs decode and verify passes, and every one-lane pass.
+        let rows = lane.max(cfg.max_verify_rows);
+        let logit_rows = cfg.max_requests.max(cfg.max_verify_rows);
+        let dl = shape.dsa_layers;
+        let s = Scratch::new(rows, logit_rows, cfg.max_requests, max_pages, dl, true)?;
+        let s2 = if cfg.lanes == 2 {
+            // Lane B: prefill rows only; its logit rows go to lane A's head buffers.
+            Some(Scratch::new(
+                lane,
+                0,
+                cfg.max_requests,
+                max_pages,
+                dl,
+                false,
+            )?)
+        } else {
+            None
+        };
+        let v = VerifyScratch::new(cfg.max_verify_rows, shape.kda_layers, dl)?;
+        let ws = Workspaces::new(Workspaces::plan(cfg, rows, sms, dl))?;
+        Ok(ForwardBuffers {
+            cfg: *cfg,
+            max_pages,
+            kda_layers: shape.kda_layers,
+            dsa_layers: dl,
+            sms,
+            stream: stream.clone(),
+            gemm: Gemm::new(stream, cfg.policy)?,
+            s,
+            s2,
+            v,
+            ws,
+        })
+    }
+
+    /// Rows the largest pass holds: a two-lane prefill's, one lane's, or a verify pass's (a
+    /// drafter's tap buffer holds that many: `crate::draft::Dflash::reserve`).
+    pub fn pass_rows(&self) -> usize {
+        let two = self.s2.as_ref().map_or(0, |b| 2 * b.rows.min(self.s.rows));
+        two.max(self.s.rows).max(self.v.rows)
+    }
+
+    pub fn bytes(&self) -> BufferBytes {
+        BufferBytes {
+            lanes: [self.s.bytes(), self.s2.as_ref().map_or(0, |s| s.bytes())],
+            verify: self.v.bytes(),
+            workspaces: [
+                self.ws.idx.bytes(),
+                self.ws.mla.bytes(),
+                self.ws.kda.bytes(),
+            ],
+            gemm: self.gemm.bytes(),
+        }
+    }
+}
+
+/// The previous sublayer's output a boundary expands: block_out, block_out2 (the shared
+/// expert's output, or null), post, comb.
+type Prev = (*const u16, *const u16, *const f32, *const f32);
+
+/// One lane of a pass: its requests, metadata, and where it is in the layer loop.
+struct Lane {
+    /// The lane's requests; `row0` counts from the lane's first row.
+    reqs: Vec<Req>,
+    /// Where they are in the pass: the index of the first among the pass's requests (lane B's
+    /// first is lane A's last when the cut splits it), and the lane's first row.
+    first: usize,
+    base: usize,
+    rows: usize,
+    meta: Meta,
+    /// The stream buffer holding the lane's current streams, and the output to expand next.
+    cur: usize,
+    prev: Option<Prev>,
+    /// Lane B: `(k, n)` when its first request continues lane A's request `k` of `n` (its DSA
+    /// tails come from lane A before each DSA layer).
+    continues: Option<(usize, usize)>,
+    /// Logit rows, from the lane's first row, and how many of the pass's logit rows come
+    /// before them.
+    logit_rows: Vec<i32>,
+    logit_base: usize,
+    /// The MoE call in flight: submitted to the backend, not finished.
+    exchange: Option<Exchange>,
+    host_ids: Vec<i32>,
+    host_weights: Vec<f32>,
+}
+
+/// An MoE call in flight (its device pointers are in its lane's scratch, which may be swapped
+/// out when it finishes), and what its lane's next boundary expands.
+struct Exchange {
+    layer: usize,
+    x: *const u16,
+    x_q: *const u8,
+    x_scales: *const f32,
+    ids: *const i32,
+    weights: *const f32,
+    out: *mut u16,
+    next: Prev,
+}
+
+impl Exchange {
+    fn call<'a>(&self, lane: &'a Lane) -> ExpertCall<'a> {
+        ExpertCall {
+            layer: self.layer,
+            rows: lane.rows,
+            x: self.x,
+            x_q: self.x_q,
+            x_scales: self.x_scales,
+            ids: self.ids,
+            weights: self.weights,
+            host_ids: &lane.host_ids,
+            host_weights: &lane.host_weights,
+            out: self.out,
+        }
+    }
+}
+
+/// The pass's requests cut at row `at`: lane A's (the rows before it), lane B's, and, when a
+/// request straddles the cut, its index in lane A (lane B's first request continues it at the
+/// positions after lane A's part).
+fn cut(reqs: &[Req], at: usize) -> (Vec<Req>, Vec<Req>, Option<usize>) {
+    let (mut a, mut b, mut split) = (Vec::new(), Vec::new(), None);
+    for r in reqs {
+        if r.row0 + r.rows <= at {
+            a.push(*r);
+        } else if r.row0 >= at {
+            b.push(Req {
+                row0: r.row0 - at,
+                ..*r
+            });
+        } else {
+            let n = at - r.row0;
+            split = Some(a.len());
+            a.push(Req { rows: n, ..*r });
+            b.push(Req {
+                start: r.start + n,
+                rows: r.rows - n,
+                row0: 0,
+                ..*r
+            });
+        }
+    }
+    (a, b, split)
+}
+
+/// Pipeline timings of the last prefill pass (with [`GlmForward::set_lane_trace`] on): per MoE
+/// layer and lane, GPU time from events on the stream and host time from the wall clock.
+#[derive(Clone, Debug, Default)]
+pub struct LaneTrace {
+    /// Rows per lane, and the backend's calls in flight at most.
+    pub rows: Vec<usize>,
+    pub depth: usize,
+    /// Host time of the layer loop.
+    pub loop_ms: f64,
+    pub layers: Vec<LayerTrace>,
+}
+
+/// One MoE layer of a traced pass; the vectors are per lane.
+#[derive(Clone, Debug, Default)]
+pub struct LayerTrace {
+    pub layer: usize,
+    /// Host time from lane A starting this layer to lane A starting the next (or the loop's end).
+    pub wall_ms: f64,
+    /// GPU time of the lane's attention sublayer with both boundaries and the router (its work
+    /// before the routes go to the host), and of its shared expert.
+    pub gpu_attn_ms: Vec<f64>,
+    pub gpu_shared_ms: Vec<f64>,
+    /// Host time blocked on the GPU for the routes, inside the backend's `submit`, and inside its
+    /// `finish` (blocked on the exchange, then the output enqueued).
+    pub routes_ms: Vec<f64>,
+    pub submit_ms: Vec<f64>,
+    pub finish_ms: Vec<f64>,
+    /// Host time from `submit` returning to `finish` returning: the exchange's round trip as the
+    /// coordinator sees it. About the other lane's work when the exchange hides behind it; the
+    /// rank's compute plus the transfer when the coordinator waits (`finish`).
+    pub out_ms: Vec<f64>,
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+impl LaneTrace {
+    /// Medians over the MoE layers, one line: per-layer wall time, each lane's GPU and host
+    /// times, and how busy the GPU was.
+    pub fn summary(&self) -> String {
+        let n = self.rows.len();
+        let med = |f: &dyn Fn(&LayerTrace) -> f64| median(self.layers.iter().map(f).collect());
+        let per = |name: &str, f: &dyn Fn(&LayerTrace, usize) -> f64| {
+            let v: Vec<String> = (0..n)
+                .map(|x| format!("{:.2}", med(&|t| f(t, x))))
+                .collect();
+            format!("{name} {}", v.join(" + "))
+        };
+        let wall = med(&|t| t.wall_ms);
+        let busy = med(&|t| (0..n).map(|x| t.gpu_attn_ms[x] + t.gpu_shared_ms[x]).sum());
+        let rows: Vec<String> = self.rows.iter().map(|r| r.to_string()).collect();
+        format!(
+            concat!(
+                "lanes {} rows (depth {}): layer loop {:.1} ms; per MoE layer, median of {}: ",
+                "wall {wall:.2} ms; GPU {}, {} (busy {busy:.2} ms, {:.0}%); host {}, {}, {}; {}"
+            ),
+            rows.join(" + "),
+            self.depth,
+            self.loop_ms,
+            self.layers.len(),
+            per("attention", &|t, x| t.gpu_attn_ms[x]),
+            per("shared", &|t, x| t.gpu_shared_ms[x]),
+            100.0 * busy / wall.max(1e-9),
+            per("routes wait", &|t, x| t.routes_ms[x]),
+            per("submit", &|t, x| t.submit_ms[x]),
+            per("finish", &|t, x| t.finish_ms[x]),
+            per("exchange out", &|t, x| t.out_ms[x]),
+            wall = wall,
+            busy = busy,
+        )
+    }
+}
+
+/// Where a lane's trace event is recorded in a layer.
+#[derive(Clone, Copy)]
+enum At {
+    AttnStart = 0,
+    RouterEnd = 1,
+    SharedStart = 2,
+    SharedEnd = 3,
+}
+
+/// One lane's layer while tracing: event indices and host times.
+#[derive(Clone, Default)]
+struct TraceRec {
+    events: [Option<usize>; 4],
+    routes_ms: f64,
+    submit_ms: f64,
+    finish_ms: f64,
+    sent: Option<Instant>,
+    out_ms: f64,
+}
+
+/// The trace being recorded, and the last pass's.
+struct Tracer {
+    /// Print each traced pass's summary to stderr.
+    print: bool,
+    /// Recording the current pass (a prefill pass).
+    active: bool,
+    events: Vec<Event>,
+    used: usize,
+    /// `[layer][lane]` records of the current pass.
+    recs: Vec<[TraceRec; 2]>,
+    /// When lane A started each layer, and the layer loop's bounds.
+    starts: Vec<(usize, Instant)>,
+    loop_start: Instant,
+    loop_end: Instant,
+    last: Option<LaneTrace>,
+}
+
 /// One request's rows in a pass.
 #[derive(Clone, Copy, Debug)]
 struct Req {
@@ -629,14 +1081,18 @@ pub struct GlmForward {
     gemm: Gemm,
     stream: Arc<Stream>,
     pub cfg: ForwardConfig,
+    /// The active lane's buffers: lane A's outside a pass.
     s: Scratch,
+    /// The other lane's (a two-lane forward), and which lane `s` is.
+    s2: Option<Scratch>,
+    lane: usize,
     v: VerifyScratch,
+    ws: Workspaces,
     pending: Option<Pending>,
     timer: RefCell<Option<Timer>>,
     tap: Option<Box<TapFn>>,
+    trace: Option<Tracer>,
     sms: i32,
-    host_ids: Vec<i32>,
-    host_weights: Vec<f32>,
     /// The DFlash2 drafter, when attached.
     draft: Option<Dflash>,
 }
@@ -663,39 +1119,51 @@ impl GlmForward {
         experts: Box<dyn ExpertBackend>,
         cfg: ForwardConfig,
     ) -> Result<GlmForward> {
+        let bufs = ForwardBuffers::new(&cfg, &model.shape, kv.config().max_pages, kv.stream())?;
+        GlmForward::with_buffers(model, embed, kv, experts, bufs)
+    }
+
+    /// [`GlmForward::new`] with buffers allocated beforehand ([`ForwardBuffers::new`], for the
+    /// same shape and page-table width): the order a server takes to size its page pool from
+    /// the memory the forward leaves.
+    pub fn with_buffers(
+        model: DeviceModel,
+        embed: HostEmbedding,
+        kv: KvPool,
+        experts: Box<dyn ExpertBackend>,
+        bufs: ForwardBuffers,
+    ) -> Result<GlmForward> {
         let shape = &model.shape;
         let layout = KvLayout::new(shape, None);
         let kl = kv.config().layout;
         if kl.kda_layers != layout.kda_layers || kl.dsa_layers != layout.dsa_layers {
             return Err(invalid!("the KV pool is laid out for another model shape"));
         }
-        let groups_ok = |g: usize| matches!(g, 1 | 2 | 4);
-        if cfg.max_rows == 0
-            || cfg.max_verify_rows == 0
-            || cfg.max_requests == 0
-            || !(1..=64).contains(&cfg.decode_splits)
-            || !groups_ok(cfg.decode_head_groups)
-            || !groups_ok(cfg.prefill_head_groups)
-            || !matches!(cfg.kda_prefill_value_blocks, 1 | 2 | 4)
+        if bufs.kda_layers != shape.kda_layers
+            || bufs.dsa_layers != shape.dsa_layers
+            || bufs.max_pages != kv.config().max_pages
+            || !Arc::ptr_eq(&bufs.stream, kv.stream())
         {
-            return Err(invalid!("bad forward config {cfg:?}"));
+            return Err(invalid!(
+                "the forward's buffers were made for another shape, page-table width or stream"
+            ));
         }
-        let stream = kv.stream().clone();
         // SAFETY: one-time kernel setup (shared-memory limits).
         device::launched(unsafe { dffi::glm53f_dsa_init() }, "glm53f_dsa_init")?;
-        let rows = cfg.max_rows.max(cfg.max_verify_rows);
-        let logit_rows = cfg.max_requests.max(cfg.max_verify_rows);
-        let s = Scratch::new(
-            rows,
-            logit_rows,
-            cfg.max_requests,
-            kv.config().max_pages,
-            shape.dsa_layers,
-        )?;
-        let v = VerifyScratch::new(cfg.max_verify_rows, shape.kda_layers, shape.dsa_layers)?;
+        let ForwardBuffers {
+            cfg,
+            sms,
+            stream,
+            gemm,
+            s,
+            s2,
+            v,
+            ws,
+            ..
+        } = bufs;
         Ok(GlmForward {
-            gemm: Gemm::new(&stream, cfg.policy)?,
-            sms: device::sm_count()?,
+            gemm,
+            sms,
             model: Arc::new(model),
             embed,
             kv,
@@ -703,12 +1171,14 @@ impl GlmForward {
             stream,
             cfg,
             s,
+            s2,
+            lane: 0,
             v,
+            ws,
             pending: None,
             timer: RefCell::new(None),
             tap: None,
-            host_ids: Vec::new(),
-            host_weights: Vec::new(),
+            trace: None,
             draft: None,
         })
     }
@@ -721,9 +1191,35 @@ impl GlmForward {
         &self.stream
     }
 
-    /// Device bytes of the forward's own scratch (not weights, not the KV pool).
+    /// Device bytes of the forward's own buffers (not weights, not the KV pool): every lane's
+    /// scratch, the verify scratch, the attention workspaces and the GEMM engine's scratch.
     pub fn scratch_bytes(&self) -> usize {
-        self.s.bytes() + self.v.bytes()
+        self.s.bytes()
+            + self.s2.as_ref().map_or(0, |s| s.bytes())
+            + self.v.bytes()
+            + self.ws.bytes()
+            + self.gemm.bytes()
+    }
+
+    /// Record [`LaneTrace`]s of later prefill passes ([`GlmForward::take_lane_trace`]), and with
+    /// `print`, write each one's summary to stderr (`PIPE ...`).
+    pub fn set_lane_trace(&mut self, on: bool, print: bool) {
+        self.trace = on.then(|| Tracer {
+            print,
+            active: false,
+            events: Vec::new(),
+            used: 0,
+            recs: Vec::new(),
+            starts: Vec::new(),
+            loop_start: Instant::now(),
+            loop_end: Instant::now(),
+            last: None,
+        });
+    }
+
+    /// The last traced prefill pass's timings.
+    pub fn take_lane_trace(&mut self) -> Option<LaneTrace> {
+        self.trace.as_mut().and_then(|t| t.last.take())
     }
 
     /// Replace the expert backend (returns the old one).
@@ -812,9 +1308,16 @@ impl GlmForward {
                 "the KV pool has no drafter rings (lay it out with the drafter's config)"
             ));
         }
-        d.alloc_taps(self.s.rows.max(self.v.rows))?;
+        d.reserve_taps(self.pass_rows())?;
         self.draft = Some(d);
         Ok(())
+    }
+
+    /// Rows the largest pass holds: a two-lane prefill's, one lane's, or a verify pass's (the
+    /// drafter's tap buffer holds that many).
+    pub fn pass_rows(&self) -> usize {
+        let two = self.s2.as_ref().map_or(0, |b| 2 * b.rows.min(self.s.rows));
+        two.max(self.s.rows).max(self.v.rows)
     }
 
     pub fn has_drafter(&self) -> bool {
@@ -837,16 +1340,28 @@ impl GlmForward {
 
     // ---- Public passes ---------------------------------------------------------------------
 
+    /// Rows one prefill pass takes now: both lanes' when passes run in two, else one lane's.
+    pub fn prefill_rows(&self) -> usize {
+        let one = self.s.rows.min(self.cfg.max_rows);
+        match &self.s2 {
+            Some(b) if self.cfg.lanes == 2 && self.tap.is_none() => {
+                self.cfg.max_rows.min(2 * one.min(b.rows))
+            }
+            _ => one,
+        }
+    }
+
     /// Append and commit each segment's tokens; returns the greedy pick after each segment's
     /// last token. Segments that fit in one pass together run as one batch; others run one
-    /// after another in chunks of `max_rows`.
+    /// after another in chunks of [`GlmForward::prefill_rows`] (`max_rows`).
     pub fn prefill(&mut self, segs: &mut [(&mut GlmKv, &[u32])]) -> Result<Vec<u32>> {
         self.check_idle(segs.iter().map(|(k, _)| &**k))?;
         let total: usize = segs.iter().map(|(_, t)| t.len()).sum();
         if segs.iter().any(|(_, t)| t.is_empty()) {
             return Err(invalid!("an empty prefill segment"));
         }
-        if segs.len() <= self.cfg.max_requests && total <= self.cfg.max_rows {
+        let cap = self.prefill_rows();
+        if segs.len() <= self.cfg.max_requests && total <= cap {
             let tokens: Vec<u32> = segs.iter().flat_map(|(_, t)| t.iter().copied()).collect();
             let rows: Vec<usize> = segs.iter().map(|(_, t)| t.len()).collect();
             let mut kvs: Vec<&mut GlmKv> = segs.iter_mut().map(|(k, _)| &mut **k).collect();
@@ -863,7 +1378,7 @@ impl GlmForward {
         let mut out = Vec::with_capacity(segs.len());
         for (kv, tokens) in segs.iter_mut() {
             let mut last = 0;
-            for chunk in tokens.chunks(self.cfg.max_rows) {
+            for chunk in tokens.chunks(cap) {
                 let is_last = chunk.as_ptr_range().end == tokens.as_ptr_range().end;
                 let r = self.pass(
                     Mode::Prefill,
@@ -1284,9 +1799,52 @@ impl GlmForward {
         head: bool,
         logits: bool,
     ) -> Result<Vec<u32>> {
+        let r = self.pass_lanes(mode, kvs, rows, input, layers, head, logits);
+        // Between passes (a failed one too) lane A's buffers are the active ones.
+        self.use_lane(0);
+        if let Some(t) = self.trace.as_mut() {
+            t.active = false;
+        }
+        r
+    }
+
+    /// Whether a pass of `total` rows runs in two lanes: a prefill of token ids without a tap,
+    /// in a two-lane forward, of at least two lanes' worth of rows or more than one lane holds.
+    fn two_lanes(&self, mode: Mode, input: &Input<'_>, total: usize) -> bool {
+        mode == Mode::Prefill
+            && self.cfg.lanes == 2
+            && self.s2.is_some()
+            && self.tap.is_none()
+            && matches!(input, Input::Tokens(_))
+            && (total > self.s.rows || total >= 2 * self.cfg.min_lane_rows)
+    }
+
+    /// Make lane `i`'s buffers the active ones (`s`); the other lane's wait in `s2`.
+    fn use_lane(&mut self, i: usize) {
+        if i != self.lane {
+            let other = self.s2.as_mut().expect("a two-lane forward");
+            std::mem::swap(&mut self.s, other);
+            self.lane = i;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pass_lanes(
+        &mut self,
+        mode: Mode,
+        kvs: &mut [&mut GlmKv],
+        rows: &[usize],
+        input: Input<'_>,
+        layers: Range<usize>,
+        head: bool,
+        logits: bool,
+    ) -> Result<Vec<u32>> {
         let total: usize = rows.iter().sum();
+        let two = self.two_lanes(mode, &input, total);
         let cap = if mode == Mode::Verify {
             self.v.rows
+        } else if two {
+            2 * self.s.rows.min(self.s2.as_ref().map_or(0, |s| s.rows))
         } else {
             self.s.rows
         };
@@ -1319,14 +1877,14 @@ impl GlmForward {
             });
             row0 += r;
         }
-        let logit_rows: Vec<i32> = match mode {
-            Mode::Prefill => reqs.iter().map(|r| (r.row0 + r.rows - 1) as i32).collect(),
-            _ => (0..total as i32).collect(),
+        let n_logits = if mode == Mode::Prefill {
+            reqs.len()
+        } else {
+            total
         };
-        if head && logits && logit_rows.len() > self.s.logit_rows {
+        if head && logits && n_logits > self.s.logit_rows {
             return Err(invalid!(
-                "{} logit rows, the scratch holds {}",
-                logit_rows.len(),
+                "{n_logits} logit rows, the scratch holds {}",
                 self.s.logit_rows
             ));
         }
@@ -1339,210 +1897,514 @@ impl GlmForward {
             }
             _ => None,
         };
-        let meta = self.upload_meta(&reqs, total, tokens, None, &logit_rows)?;
-        self.gather_batch(&reqs, &meta)?;
+        // The lanes: the two halves of the rows (a request across the middle is split, lane B
+        // continuing it), or one lane of every row.
+        let parts = if two {
+            let at = total.div_ceil(2);
+            let (a, b, split) = cut(&reqs, at);
+            let na = a.len();
+            let first_b = split.unwrap_or(na);
+            vec![
+                (a, 0, 0..at, None, split),
+                (b, first_b, at..total, split.map(|k| (k, na)), None),
+            ]
+        } else {
+            vec![(reqs.clone(), 0, 0..total, None, None)]
+        };
         let st = self.stream.clone();
-        // Input streams.
-        let mut cur = 0;
-        match input {
-            Input::Tokens(_) => unsafe {
-                self.embed.gather(
-                    meta.ids,
-                    total,
-                    self.s.streams[0].ptr(0),
-                    core::ptr::null_mut(),
-                    &st,
-                )
-            }?,
-            Input::DeviceIds(ids) => unsafe {
-                self.embed.gather(
-                    ids,
-                    total,
-                    self.s.streams[0].ptr(0),
-                    core::ptr::null_mut(),
-                    &st,
-                )
-            }?,
-            Input::Streams(x) => self.s.streams[0].upload_async(&st, 0, x)?,
+        let mut lanes = Vec::with_capacity(parts.len());
+        let mut logit_base = 0;
+        for (i, (lreqs, first, span, continues, goes_on)) in parts.into_iter().enumerate() {
+            self.use_lane(i);
+            let n = span.len();
+            // Prefill: each request's last row (not lane A's part of a request lane B goes on
+            // with). Decode and verify: every row.
+            let logit_rows: Vec<i32> = match mode {
+                Mode::Prefill => lreqs
+                    .iter()
+                    .enumerate()
+                    .filter(|&(k, _)| goes_on != Some(k))
+                    .map(|(_, r)| (r.row0 + r.rows - 1) as i32)
+                    .collect(),
+                _ => (0..n as i32).collect(),
+            };
+            let meta = self.upload_meta(
+                &lreqs,
+                n,
+                tokens.map(|t| &t[span.clone()]),
+                None,
+                &logit_rows,
+            )?;
+            self.gather_batch(&lreqs, &meta)?;
+            // Input streams.
+            match &input {
+                Input::Tokens(_) => unsafe {
+                    self.embed.gather(
+                        meta.ids,
+                        n,
+                        self.s.streams[0].ptr(0),
+                        core::ptr::null_mut(),
+                        &st,
+                    )
+                }?,
+                Input::DeviceIds(ids) => unsafe {
+                    self.embed.gather(
+                        *ids,
+                        n,
+                        self.s.streams[0].ptr(0),
+                        core::ptr::null_mut(),
+                        &st,
+                    )
+                }?,
+                Input::Streams(x) => self.s.streams[0].upload_async(&st, 0, x)?,
+            }
+            let nl = logit_rows.len();
+            lanes.push(Lane {
+                reqs: lreqs,
+                first,
+                base: span.start,
+                rows: n,
+                meta,
+                cur: 0,
+                prev: None,
+                continues,
+                logit_rows,
+                logit_base,
+                exchange: None,
+                host_ids: Vec::new(),
+                host_weights: Vec::new(),
+            });
+            logit_base += nl;
         }
         self.mark(usize::MAX, "embed")?;
         // Every pass through the head captures the drafter's taps (`crate::draft`).
         let taps = head && self.draft.is_some();
-        // prev: the previous sublayer's output to expand (block_out, block_out2, post, comb).
-        let mut prev: Option<(*const u16, *const u16, *const f32, *const f32)> = None;
-        for l in layers.clone() {
-            // Attention boundary.
-            let model = self.model.clone();
-            let lw = &model.layers[l];
-            let expanded = self.boundary(total, &lw.attn_hc, &lw.input_norm, cur, prev, true)?;
-            if expanded {
-                cur ^= 1;
-            }
-            if let Some(d) = self.draft.as_ref().filter(|_| taps) {
-                // streams[cur]: this layer's input, the previous layer's completed output. At the
-                // entry of layers 6, 15, 25, 34 and 43 their mean is a tap (glm53f-dflash
-                // README step 1: SGLang captures before layer k + 1, contracted by the mean).
-                d.capture(l, total, self.s.streams[cur].ptr(0), &self.stream)?;
-            }
-            self.mark(l, "attn_hc")?;
-            match &lw.attn {
-                AttnW::Kda(w) => self.kda(l, mode, total, &reqs, &meta, w)?,
-                AttnW::Dsa(w) => self.dsa(l, mode, total, &reqs, &meta, w)?,
-            }
-            self.tap(l, TapPoint::AttnDone, mode, total, cur)?;
-            // FFN boundary, expanding the attention output.
-            let a: (*const u16, *const u16, *const f32, *const f32) = (
-                self.s.attn_out.ptr(0),
-                core::ptr::null(),
-                self.s.attn_post.ptr(0),
-                self.s.attn_comb.ptr(0),
-            );
-            self.boundary(total, &lw.ffn_hc, &lw.post_attn_norm, cur, Some(a), false)?;
-            cur ^= 1;
-            self.mark(l, "ffn_hc")?;
-            let two = match &lw.ffn {
-                FfnW::Dense(m) => {
-                    self.mlp(total, m, self.s.ffn_out.ptr(0))?;
-                    self.mark(l, "dense_mlp")?;
-                    false
-                }
-                FfnW::Moe {
-                    router,
-                    bias,
-                    shared,
-                } => {
-                    self.moe(l, total, router, bias, shared)?;
-                    true
-                }
-            };
-            prev = Some((
-                self.s.ffn_out.ptr(0),
-                if two {
-                    self.s.ffn_out2.ptr(0)
-                } else {
-                    core::ptr::null()
-                },
-                self.s.ffn_post.ptr(0),
-                self.s.ffn_comb.ptr(0),
-            ));
-            self.tap(l, TapPoint::FfnDone, mode, total, cur)?;
-            if self.tap.is_some() {
-                self.expand_to_tap(total, cur, prev.unwrap())?;
-                self.tap(l, TapPoint::LayerOut, mode, total, cur)?;
-            }
-        }
-        // Tails of prefill and decode passes were committed in the layers: back to the slots.
+        self.run_lanes(mode, &mut lanes, layers, taps)?;
+        // Tails of prefill and decode passes were committed in the layers: back to the slots,
+        // lane A's first (a split request's final tail is lane B's).
         if mode != Mode::Verify {
-            self.scatter_tails(&reqs, &meta)?;
+            for (i, lane) in lanes.iter().enumerate() {
+                self.use_lane(i);
+                self.scatter_tails(&lane.reqs, &lane.meta)?;
+            }
         }
-        let mut picks = Vec::new();
-        if head {
-            let (bo, bo2, post, comb) = prev.unwrap();
-            // SAFETY: scratch buffers sized for `total` rows.
+        let picks = if head {
+            self.head(&lanes, total, logits)?
+        } else {
+            if self.tap.is_none() {
+                // The last layer's output streams, for run_layers (one lane).
+                let l = &lanes[0];
+                self.expand_to_tap(total, l.cur, l.prev.expect("the last layer's output"))?;
+            }
+            Vec::new()
+        };
+        self.finish_trace(&lanes)?;
+        if mode == Mode::Verify {
+            // Pending rows; they reach the drafter at their commit.
+            for (kv, &r) in kvs.iter_mut().zip(rows) {
+                kv.pending = r;
+            }
+            self.pending = Some(Pending { reqs, rows: total });
+            return Ok(picks);
+        }
+        // Commit the positions, lane by lane, and with a drafter append each lane's rows to its
+        // slots' contexts right after (lane A's first: a request the cut split gets lane A's
+        // part, then lane B's), the calls one-lane passes of the same rows make.
+        for lane in &lanes {
+            let ks = &mut kvs[lane.first..lane.first + lane.reqs.len()];
+            for (kv, r) in ks.iter_mut().zip(&lane.reqs) {
+                kv.tokens += r.rows;
+            }
+            if let Some(d) = self.draft.as_mut().filter(|_| taps) {
+                let rows: Vec<(usize, usize)> = lane
+                    .reqs
+                    .iter()
+                    .map(|r| (lane.base + r.row0, r.rows))
+                    .collect();
+                d.append(ks, &rows)?;
+            }
+        }
+        if taps {
+            self.mark(usize::MAX, "draft_append")?;
+        }
+        Ok(picks)
+    }
+
+    /// Layers `layers` over the lanes: per layer, each lane's attention sublayer, then its FFN.
+    /// An MoE FFN's routed experts go to the backend (`submit`) and are collected later
+    /// (`finish`): a lane's next attention waits for its own, at most the backend's depth are
+    /// out at once, and the oldest is collected first. With two lanes, one lane's attention
+    /// runs while the other's experts are out.
+    fn run_lanes(
+        &mut self,
+        mode: Mode,
+        lanes: &mut [Lane],
+        layers: Range<usize>,
+        taps: bool,
+    ) -> Result<()> {
+        let depth = self.experts.depth().clamp(1, 2);
+        let mut flight: VecDeque<usize> = VecDeque::new();
+        let model = self.model.clone();
+        if let Some(t) = self.trace.as_mut() {
+            t.active = mode == Mode::Prefill;
+            t.used = 0;
+            t.recs = vec![Default::default(); model.shape.layers];
+            t.starts.clear();
+            t.loop_start = Instant::now();
+        }
+        for l in layers {
+            let lw = &model.layers[l];
+            if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
+                t.starts.push((l, Instant::now()));
+            }
+            for x in 0..lanes.len() {
+                while lanes[x].exchange.is_some() {
+                    let y = flight.pop_front().expect("a call in flight");
+                    self.finish_lane(&mut lanes[y], y, mode)?;
+                }
+                self.use_lane(x);
+                self.trace_event(l, x, At::AttnStart)?;
+                self.attention(l, mode, &mut lanes[x], lw, taps)?;
+                match &lw.ffn {
+                    FfnW::Dense(m) => {
+                        let s = &self.s;
+                        let (out, post, comb): (*mut u16, *const f32, *const f32) =
+                            (s.ffn_out.ptr(0), s.ffn_post.ptr(0), s.ffn_comb.ptr(0));
+                        self.mlp(lanes[x].rows, m, out)?;
+                        self.mark(l, "dense_mlp")?;
+                        lanes[x].prev = Some((out, core::ptr::null(), post, comb));
+                        self.ffn_taps(l, mode, &lanes[x])?;
+                    }
+                    FfnW::Moe {
+                        router,
+                        bias,
+                        shared,
+                    } => {
+                        self.moe_router(&lanes[x], router, bias)?;
+                        self.trace_event(l, x, At::RouterEnd)?;
+                        let t = Instant::now();
+                        self.moe_routes(l, &mut lanes[x])?;
+                        self.trace_host(l, x, |r| &mut r.routes_ms, t);
+                        while flight.len() >= depth {
+                            let y = flight.pop_front().expect("a call in flight");
+                            self.finish_lane(&mut lanes[y], y, mode)?;
+                        }
+                        let t = Instant::now();
+                        self.moe_submit(l, &mut lanes[x])?;
+                        self.trace_host(l, x, |r| &mut r.submit_ms, t);
+                        if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
+                            t.recs[l][x].sent = Some(Instant::now());
+                        }
+                        flight.push_back(x);
+                        // The shared expert: the GPU runs it while the call is out.
+                        let shared_out: *mut u16 = self.s.ffn_out2.ptr(0);
+                        self.trace_event(l, x, At::SharedStart)?;
+                        self.mlp(lanes[x].rows, shared, shared_out)?;
+                        self.mark(l, "shared")?;
+                        self.trace_event(l, x, At::SharedEnd)?;
+                    }
+                }
+            }
+        }
+        while let Some(y) = flight.pop_front() {
+            self.finish_lane(&mut lanes[y], y, mode)?;
+        }
+        if let Some(t) = self.trace.as_mut() {
+            t.loop_end = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// A lane's attention sublayer: the attention boundary (expanding its last FFN output), the
+    /// drafter's taps of the lane's rows (`taps`), KDA or DSA, then the FFN boundary.
+    fn attention(
+        &mut self,
+        l: usize,
+        mode: Mode,
+        lane: &mut Lane,
+        lw: &LayerW,
+        taps: bool,
+    ) -> Result<()> {
+        if self.boundary(
+            lane.rows,
+            &lw.attn_hc,
+            &lw.input_norm,
+            lane.cur,
+            lane.prev,
+            true,
+        )? {
+            lane.cur ^= 1;
+        }
+        if let Some(d) = self.draft.as_ref().filter(|_| taps) {
+            // streams[cur]: this layer's input, the previous layer's completed output. At the
+            // entry of layers 6, 15, 25, 34 and 43 their mean is a tap (glm53f-dflash README
+            // step 1: SGLang captures before layer k + 1, contracted by the mean), into the
+            // lane's rows of the pass.
+            d.capture(
+                l,
+                lane.base,
+                lane.rows,
+                self.s.streams[lane.cur].ptr(0),
+                &self.stream,
+            )?;
+        }
+        self.mark(l, "attn_hc")?;
+        match &lw.attn {
+            AttnW::Kda(w) => self.kda(l, mode, lane.rows, &lane.reqs, &lane.meta, w)?,
+            AttnW::Dsa(w) => {
+                if let Some((k, n)) = lane.continues {
+                    self.continue_tail(l, k, n, lane.reqs.len())?;
+                }
+                self.dsa(l, mode, lane.rows, &lane.reqs, &lane.meta, w)?
+            }
+        }
+        self.tap(l, TapPoint::AttnDone, mode, lane.rows, lane.cur)?;
+        // FFN boundary, expanding the attention output.
+        let s = &self.s;
+        let a: Prev = (
+            s.attn_out.ptr(0),
+            core::ptr::null(),
+            s.attn_post.ptr(0),
+            s.attn_comb.ptr(0),
+        );
+        self.boundary(
+            lane.rows,
+            &lw.ffn_hc,
+            &lw.post_attn_norm,
+            lane.cur,
+            Some(a),
+            false,
+        )?;
+        lane.cur ^= 1;
+        self.mark(l, "ffn_hc")
+    }
+
+    /// Lane B's first request continues lane A's request `k` (of `n`): before DSA layer `l`,
+    /// its tail is the one lane A's part left at that layer (lane A ran the layer first, on the
+    /// same stream). `nb`: lane B's requests.
+    fn continue_tail(&mut self, l: usize, k: usize, n: usize, nb: usize) -> Result<()> {
+        debug_assert_eq!(self.lane, 1, "lane B's buffers are active");
+        let j = self.model.shape.dsa_index[l].expect("a DSA layer");
+        let a = self.s2.as_ref().expect("lane A's buffers");
+        self.s.batch_tails.copy_from(
+            &self.stream,
+            j * nb * TAIL,
+            &a.batch_tails,
+            (j * n + k) * TAIL,
+            TAIL,
+        )
+    }
+
+    /// Collect lane `y`'s call in flight (its pointers are its own, so lane `y`'s buffers need
+    /// not be the active ones): its FFN output is complete for later work on the stream.
+    fn finish_lane(&mut self, lane: &mut Lane, y: usize, mode: Mode) -> Result<()> {
+        let ex = lane.exchange.take().expect("a call in flight");
+        let st = self.stream.clone();
+        let t = Instant::now();
+        self.experts.finish(&ex.call(lane), &st)?;
+        self.trace_host(ex.layer, y, |r| &mut r.finish_ms, t);
+        if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
+            let r = &mut t.recs[ex.layer][y];
+            if let Some(s) = r.sent {
+                r.out_ms = s.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        self.mark(ex.layer, "routed_wait")?;
+        lane.prev = Some(ex.next);
+        self.ffn_taps(ex.layer, mode, lane)
+    }
+
+    /// Taps after a lane's FFN (only one-lane passes have a tap).
+    fn ffn_taps(&mut self, l: usize, mode: Mode, lane: &Lane) -> Result<()> {
+        if self.tap.is_none() {
+            return Ok(());
+        }
+        self.tap(l, TapPoint::FfnDone, mode, lane.rows, lane.cur)?;
+        self.expand_to_tap(lane.rows, lane.cur, lane.prev.expect("the FFN output"))?;
+        self.tap(l, TapPoint::LayerOut, mode, lane.rows, lane.cur)
+    }
+
+    /// The head over each lane's last streams, then the LM head and the argmax over the pass's
+    /// logit rows (gathered into lane A's buffers, in request order). Returns the picks when
+    /// `logits`.
+    fn head(&mut self, lanes: &[Lane], total: usize, logits: bool) -> Result<Vec<u32>> {
+        let st = self.stream.clone();
+        let lr: usize = lanes.iter().map(|l| l.logit_rows.len()).sum();
+        // Decode and verify: every row is a logit row, read in place.
+        let whole = lanes.len() == 1 && lr == total;
+        for (i, lane) in lanes.iter().enumerate() {
+            self.use_lane(i);
+            let (bo, bo2, post, comb) = lane.prev.expect("the last layer's output");
+            // SAFETY: scratch buffers sized for the lane's rows.
             launched(
                 unsafe {
                     lffi::glm53f_hc_head(
-                        self.s.streams[cur].ptr(0),
+                        self.s.streams[lane.cur].ptr(0),
                         bo,
                         bo2,
                         post,
                         comb,
                         self.model.head.norm.ptr(0),
                         self.s.head_out.ptr(0),
-                        total as i32,
+                        lane.rows as i32,
                         HIDDEN as i32,
                         st.raw().cast(),
                     )
                 },
                 "glm53f_hc_head",
             )?;
-            self.mark(usize::MAX, "head_hc")?;
-            if logits {
-                let lr = logit_rows.len();
-                let x: *const u16 = if lr == total {
-                    self.s.head_out.ptr(0)
+            if logits && !whole && !lane.logit_rows.is_empty() {
+                let a = if i == 0 {
+                    &self.s
                 } else {
-                    // SAFETY: rows of the head output; indices < total.
-                    launched(
-                        unsafe {
-                            ffi::glm53f_fwd_gather_rows(
-                                self.s.head_out.ptr(0),
-                                (HIDDEN * 2) as i64,
-                                meta.logit_rows,
-                                self.s.head_sel.ptr(0),
-                                (HIDDEN * 2) as i64,
-                                lr as i32,
-                                (HIDDEN * 2) as i64,
-                                st.raw(),
-                            )
-                        },
-                        "gather logit rows",
-                    )?;
-                    self.s.head_sel.ptr(0)
+                    self.s2.as_ref().expect("lane A's buffers")
                 };
-                let lm = self.model.head.lm_head.mat();
-                unsafe {
-                    self.gemm.bf16(
-                        x,
-                        HIDDEN,
-                        0,
-                        &lm,
-                        lr,
-                        self.s.logits.ptr::<c_void>(0),
-                        VOCAB,
-                        0,
-                        true,
-                        &st,
-                    )
-                }?;
-                self.mark(usize::MAX, "lm_head")?;
-                // SAFETY: logits [lr][VOCAB]; next holds lr ids.
+                let dst: *mut u8 = a.head_sel.byte_ptr(lane.logit_base * HIDDEN * 2);
+                // SAFETY: rows of the head output; indices < the lane's rows; lane A's head
+                // buffer holds every logit row of the pass.
                 launched(
                     unsafe {
-                        ffi::glm53f_fwd_argmax(
-                            self.s.logits.ptr(0),
-                            VOCAB as i64,
-                            lr as i32,
-                            SAMPLE_VOCAB as i32,
-                            self.s.next.ptr(0),
-                            core::ptr::null_mut(),
+                        ffi::glm53f_fwd_gather_rows(
+                            self.s.head_out.ptr(0),
+                            (HIDDEN * 2) as i64,
+                            lane.meta.logit_rows,
+                            dst,
+                            (HIDDEN * 2) as i64,
+                            lane.logit_rows.len() as i32,
+                            (HIDDEN * 2) as i64,
                             st.raw(),
                         )
                     },
-                    "glm53f_fwd_argmax",
+                    "gather logit rows",
                 )?;
-                let mut ids = vec![0i32; lr];
-                // SAFETY: a host vector of lr ids.
-                let b = unsafe {
-                    std::slice::from_raw_parts_mut(ids.as_mut_ptr().cast::<u8>(), lr * 4)
-                };
-                self.s.next.download_bytes(&st, 0, b)?;
-                picks = ids.into_iter().map(|x| x as u32).collect();
-                self.mark(usize::MAX, "argmax")?;
-            }
-        } else if !head && self.tap.is_none() {
-            // The last layer's output streams, for run_layers.
-            self.expand_to_tap(total, cur, prev.unwrap())?;
-        }
-        // Commit the positions.
-        for (kv, &r) in kvs.iter_mut().zip(rows) {
-            match mode {
-                Mode::Verify => kv.pending = r,
-                _ => kv.tokens += r,
             }
         }
-        // Committed rows become drafter context (a verify window's rows wait for its commit).
-        if taps && mode != Mode::Verify {
-            let rows: Vec<(usize, usize)> = reqs.iter().map(|r| (r.row0, r.rows)).collect();
-            if let Some(d) = self.draft.as_mut() {
-                d.append(kvs, &rows)?;
+        self.use_lane(0);
+        self.mark(usize::MAX, "head_hc")?;
+        if !logits {
+            return Ok(Vec::new());
+        }
+        let x: *const u16 = if whole {
+            self.s.head_out.ptr(0)
+        } else {
+            self.s.head_sel.ptr(0)
+        };
+        let lm = self.model.head.lm_head.mat();
+        unsafe {
+            self.gemm.bf16(
+                x,
+                HIDDEN,
+                0,
+                &lm,
+                lr,
+                self.s.logits.ptr::<c_void>(0),
+                VOCAB,
+                0,
+                true,
+                &st,
+            )
+        }?;
+        self.mark(usize::MAX, "lm_head")?;
+        // SAFETY: logits [lr][VOCAB]; next holds lr ids.
+        launched(
+            unsafe {
+                ffi::glm53f_fwd_argmax(
+                    self.s.logits.ptr(0),
+                    VOCAB as i64,
+                    lr as i32,
+                    SAMPLE_VOCAB as i32,
+                    self.s.next.ptr(0),
+                    core::ptr::null_mut(),
+                    st.raw(),
+                )
+            },
+            "glm53f_fwd_argmax",
+        )?;
+        let mut ids = vec![0i32; lr];
+        // SAFETY: a host vector of lr ids.
+        let b = unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr().cast::<u8>(), lr * 4) };
+        self.s.next.download_bytes(&st, 0, b)?;
+        self.mark(usize::MAX, "argmax")?;
+        Ok(ids.into_iter().map(|x| x as u32).collect())
+    }
+
+    // ---- Lane trace ----------------------------------------------------------------------------
+
+    /// Record a trace event on the stream (tracing a prefill pass).
+    fn trace_event(&mut self, layer: usize, lane: usize, at: At) -> Result<()> {
+        if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
+            if t.used == t.events.len() {
+                t.events.push(Event::new()?);
             }
-            self.mark(usize::MAX, "draft_append")?;
+            t.events[t.used].record(&self.stream)?;
+            t.recs[layer][lane].events[at as usize] = Some(t.used);
+            t.used += 1;
         }
-        if mode == Mode::Verify {
-            self.pending = Some(Pending { reqs, rows: total });
+        Ok(())
+    }
+
+    /// Add the host time since `since` to a lane's layer record (tracing a prefill pass).
+    fn trace_host(
+        &mut self,
+        layer: usize,
+        lane: usize,
+        field: fn(&mut TraceRec) -> &mut f64,
+        since: Instant,
+    ) {
+        if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
+            *field(&mut t.recs[layer][lane]) += since.elapsed().as_secs_f64() * 1e3;
         }
-        Ok(picks)
+    }
+
+    /// Close a traced prefill pass: its per-layer record, from the events (waits for the stream).
+    fn finish_trace(&mut self, lanes: &[Lane]) -> Result<()> {
+        let Some(t) = self.trace.as_mut().filter(|t| t.active) else {
+            return Ok(());
+        };
+        t.active = false;
+        self.stream.synchronize()?;
+        let n = lanes.len();
+        let mut layers = Vec::new();
+        for (i, &(l, at)) in t.starts.iter().enumerate() {
+            if !self.model.shape.is_moe(l) {
+                continue;
+            }
+            let next = t.starts.get(i + 1).map_or(t.loop_end, |s| s.1);
+            let rec = &t.recs[l];
+            let gpu = |a: At, b: At| -> Result<Vec<f64>> {
+                (0..n)
+                    .map(
+                        |x| match (rec[x].events[a as usize], rec[x].events[b as usize]) {
+                            (Some(i), Some(j)) => {
+                                Ok(t.events[j].elapsed_ms_since(&t.events[i])? as f64)
+                            }
+                            _ => Ok(0.0),
+                        },
+                    )
+                    .collect()
+            };
+            layers.push(LayerTrace {
+                layer: l,
+                wall_ms: (next - at).as_secs_f64() * 1e3,
+                gpu_attn_ms: gpu(At::AttnStart, At::RouterEnd)?,
+                gpu_shared_ms: gpu(At::SharedStart, At::SharedEnd)?,
+                routes_ms: (0..n).map(|x| rec[x].routes_ms).collect(),
+                submit_ms: (0..n).map(|x| rec[x].submit_ms).collect(),
+                finish_ms: (0..n).map(|x| rec[x].finish_ms).collect(),
+                out_ms: (0..n).map(|x| rec[x].out_ms).collect(),
+            });
+        }
+        let trace = LaneTrace {
+            rows: lanes.iter().map(|l| l.rows).collect(),
+            depth: self.experts.depth().clamp(1, 2),
+            loop_ms: (t.loop_end - t.loop_start).as_secs_f64() * 1e3,
+            layers,
+        };
+        if t.print {
+            eprintln!("PIPE {}", trace.summary());
+        }
+        t.last = Some(trace);
+        Ok(())
     }
 
     /// Materialize `prev`'s expansion of streams `cur` into the tap buffer.
@@ -1834,9 +2696,10 @@ impl GlmForward {
             // SAFETY: a host function.
             let need = unsafe { kffi::glm53f_kda_prefill_workspace_bytes(KDA_HEADS as i32, n, per) }
                 as usize;
-            if need > self.s.kda_ws.bytes() {
+            if need > self.ws.kda.bytes() {
+                // Only when the chunked kernel was switched on after construction.
                 self.stream.synchronize()?;
-                self.s.kda_ws = DeviceBuffer::alloc(need)?;
+                self.ws.kda = DeviceBuffer::alloc(need)?;
             }
             let max_rows = reqs.iter().map(|r| r.rows).max().unwrap_or(0) as i32;
             // SAFETY: as for the chain below; the workspace was sized above.
@@ -1868,8 +2731,8 @@ impl GlmForward {
                         self.s.kda_out.ptr(0),
                         KDA_WIDTH as i64,
                         self.cfg.kda_prefill_value_blocks,
-                        self.s.kda_ws.ptr(0),
-                        self.s.kda_ws.bytes() as i64,
+                        self.ws.kda.ptr(0),
+                        self.ws.kda.bytes() as i64,
                         st.raw(),
                     )
                 },
@@ -2194,9 +3057,11 @@ impl GlmForward {
         };
         // SAFETY: a host function.
         let need = unsafe { dffi::glm53f_dsa_index_workspace_bytes(rows as i32, chunks) } as usize;
-        if need > self.s.idx_ws.bytes() {
+        // The workspaces were sized at construction for any pass; growing here would be a
+        // planning error (kept as a fallback rather than a failed pass).
+        if need > self.ws.idx.bytes() {
             self.stream.synchronize()?;
-            self.s.idx_ws = DeviceBuffer::alloc(need)?;
+            self.ws.idx = DeviceBuffer::alloc(need)?;
         }
         let small = rows <= 8;
         let (splits, groups) = if small {
@@ -2207,9 +3072,9 @@ impl GlmForward {
         // SAFETY: a host function.
         let mla_need =
             unsafe { dffi::glm53f_dsa_mla_workspace_bytes(rows as i32, splits as i32) } as usize;
-        if mla_need > self.s.mla_ws.bytes() {
+        if mla_need > self.ws.mla.bytes() {
             self.stream.synchronize()?;
-            self.s.mla_ws = DeviceBuffer::alloc(mla_need)?;
+            self.ws.mla = DeviceBuffer::alloc(mla_need)?;
         }
         let s = &self.s;
         launched(
@@ -2225,8 +3090,8 @@ impl GlmForward {
                     cache,
                     chunk_pools,
                     chunks,
-                    s.idx_ws.ptr(0),
-                    s.idx_ws.bytes() as u64,
+                    self.ws.idx.ptr(0),
+                    self.ws.idx.bytes() as u64,
                     s.pools.ptr(0),
                     s.tokens.ptr(0),
                     s.counts.ptr(0),
@@ -2264,8 +3129,8 @@ impl GlmForward {
                     cache,
                     splits as i32,
                     groups as i32,
-                    s.mla_ws.ptr(0),
-                    s.mla_ws.bytes() as u64,
+                    self.ws.mla.ptr(0),
+                    self.ws.mla.bytes() as u64,
                     s.o_lat.ptr(0),
                     s.lse.ptr(0),
                     raw,
@@ -2369,15 +3234,13 @@ impl GlmForward {
         unsafe { self.gemm.fp8(&a, &m.down.mat(), rows, out, &st) }
     }
 
-    fn moe(
+    /// The router over the lane's rows (top-8 of 288 with the bias for the choice; weights x 2.5).
+    fn moe_router(
         &mut self,
-        l: usize,
-        rows: usize,
+        lane: &Lane,
         router: &DeviceBuffer,
         bias: &DeviceBuffer,
-        shared: &MlpW,
     ) -> Result<()> {
-        let st = self.stream.clone();
         let s = &self.s;
         // SAFETY: normed [rows][4096]; router weight [288][4096]; outputs sized for `rows`.
         launched(
@@ -2390,62 +3253,60 @@ impl GlmForward {
                     s.sync.ptr(0),
                     s.ids.ptr(0),
                     s.weights.ptr(0),
-                    rows as i32,
+                    lane.rows as i32,
                     EXPERTS as i32,
                     HIDDEN as i32,
                     TOP_K as i32,
                     ROUTED_SCALE,
-                    st.raw().cast(),
+                    self.stream.raw().cast(),
                 )
             },
             "glm53f_router_fused",
-        )?;
-        // The routes to the host: the step's one host round trip.
-        let (mut h_ids, mut h_w) = (
-            std::mem::take(&mut self.host_ids),
-            std::mem::take(&mut self.host_weights),
-        );
-        h_ids.resize(rows * TOP_K, 0);
-        h_w.resize(rows * TOP_K, 0.0);
-        {
-            // SAFETY: host vectors of rows x 8 values.
-            let bi = unsafe {
-                std::slice::from_raw_parts_mut(h_ids.as_mut_ptr().cast::<u8>(), rows * TOP_K * 4)
-            };
-            s.ids.download_bytes(&st, 0, bi)?;
-            let bw = unsafe {
-                std::slice::from_raw_parts_mut(h_w.as_mut_ptr().cast::<u8>(), rows * TOP_K * 4)
-            };
-            s.weights.download_bytes(&st, 0, bw)?;
-        }
-        let (x, x_q, x_scales): (*const u16, *const u8, *const f32) =
-            (s.normed.ptr(0), s.normed_q.ptr(0), s.normed_s.ptr(0));
-        let (ids, weights): (*const i32, *const f32) = (s.ids.ptr(0), s.weights.ptr(0));
-        let out: *mut u16 = s.ffn_out.ptr(0);
-        let shared_out: *mut u16 = s.ffn_out2.ptr(0);
-        let call = |host_ids, host_weights| ExpertCall {
-            layer: l,
-            rows,
-            x,
-            x_q,
-            x_scales,
-            ids,
-            weights,
-            host_ids,
-            host_weights,
-            out,
+        )
+    }
+
+    /// The routes to the host: the step's one host round trip (the backend builds its frames
+    /// from them).
+    fn moe_routes(&mut self, l: usize, lane: &mut Lane) -> Result<()> {
+        let n = lane.rows * TOP_K;
+        lane.host_ids.resize(n, 0);
+        lane.host_weights.resize(n, 0.0);
+        let st = self.stream.clone();
+        // SAFETY: host vectors of rows x 8 values.
+        let bi = unsafe {
+            std::slice::from_raw_parts_mut(lane.host_ids.as_mut_ptr().cast::<u8>(), n * 4)
         };
-        let r = self
-            .mark(l, "router")
-            .and_then(|_| self.experts.submit(&call(&h_ids, &h_w), &st))
-            .and_then(|_| self.mark(l, "routed"))
-            // The shared expert overlaps a remote backend's exchange.
-            .and_then(|_| self.mlp(rows, shared, shared_out))
-            .and_then(|_| self.mark(l, "shared"))
-            .and_then(|_| self.experts.finish(&call(&h_ids, &h_w), &st))
-            .and_then(|_| self.mark(l, "routed_wait"));
-        self.host_ids = h_ids;
-        self.host_weights = h_w;
-        r
+        self.s.ids.download_bytes(&st, 0, bi)?;
+        let bw = unsafe {
+            std::slice::from_raw_parts_mut(lane.host_weights.as_mut_ptr().cast::<u8>(), n * 4)
+        };
+        self.s.weights.download_bytes(&st, 0, bw)?;
+        self.mark(l, "router")
+    }
+
+    /// Submit the lane's routed experts to the backend. The call stays in flight until
+    /// [`Self::finish_lane`] collects it, and names the FFN outputs the lane's next boundary
+    /// expands (the routed sum and the shared expert's output).
+    fn moe_submit(&mut self, l: usize, lane: &mut Lane) -> Result<()> {
+        let s = &self.s;
+        let ex = Exchange {
+            layer: l,
+            x: s.normed.ptr(0),
+            x_q: s.normed_q.ptr(0),
+            x_scales: s.normed_s.ptr(0),
+            ids: s.ids.ptr(0),
+            weights: s.weights.ptr(0),
+            out: s.ffn_out.ptr(0),
+            next: (
+                s.ffn_out.ptr(0),
+                s.ffn_out2.ptr(0),
+                s.ffn_post.ptr(0),
+                s.ffn_comb.ptr(0),
+            ),
+        };
+        let st = self.stream.clone();
+        self.experts.submit(&ex.call(lane), &st)?;
+        lane.exchange = Some(ex);
+        self.mark(l, "routed")
     }
 }

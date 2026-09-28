@@ -87,6 +87,28 @@ impl KvLayout {
         self.kda_state_bytes() + self.conv_bytes() + self.tails_bytes()
     }
 
+    /// A mark's three parts (KDA states, conv windows, DSA tails): `(offset in its host image,
+    /// bytes, pool pages)`. On the device a mark is held in pages of the pool, each part from a
+    /// page of its own.
+    pub fn mark_regions(&self) -> [(usize, usize, usize); 3] {
+        let pb = self.page_bytes;
+        let (s, c, t) = (
+            self.kda_state_bytes(),
+            self.conv_bytes(),
+            self.tails_bytes(),
+        );
+        [
+            (0, s, s.div_ceil(pb)),
+            (s, c, c.div_ceil(pb)),
+            (s + c, t, t.div_ceil(pb)),
+        ]
+    }
+
+    /// Pool pages one mark takes (GLM-5.3-Flash: 376 pages, 141 MiB).
+    pub fn mark_pages(&self) -> usize {
+        self.mark_regions().iter().map(|r| r.2).sum()
+    }
+
     /// Device bytes a slot holds whatever its length: its positional state and draft KV.
     pub fn slot_fixed_bytes(&self) -> usize {
         self.mark_bytes() + self.draft_kv_bytes
