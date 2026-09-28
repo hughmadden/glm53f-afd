@@ -29,11 +29,24 @@ use glm53f_layers::testkit::repo_root;
 
 const D: usize = 4096;
 
+/// The oracle's golden sets: `GLM53F_GOLDENS` if set (as in the other crates' tests), else
+/// `oracle/goldens` in this repository. A set whose payload files are absent (they are
+/// regenerated, not committed) is skipped with a note rather than failing a test.
 fn sets() -> Vec<GoldenSet> {
-    goldens::discover(&repo_root().join("oracle/goldens"))
+    let root = std::env::var_os("GLM53F_GOLDENS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("oracle/goldens"));
+    goldens::discover(&root)
         .iter()
         .filter_map(|d| GoldenSet::load(d).ok())
         .filter(|s| !s.entries.is_empty())
+        .filter(|s| {
+            let complete = s.entries.iter().all(|e| s.dir.join(&e.file).is_file());
+            if !complete {
+                eprintln!("skip: {} has no payloads (regenerate with the oracle)", s.dir.display());
+            }
+            complete
+        })
         .collect()
 }
 
