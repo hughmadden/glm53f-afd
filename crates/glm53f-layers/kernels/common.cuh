@@ -57,11 +57,69 @@ __device__ __forceinline__ uint32_t f32_to_e4m3(float x) {
   return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
 }
 
+// The E4M3 quantization's quotients without a division per value. Every caller quantizes
+// BF16 values v with the scale s = group_scale(amax) of a BF16 amax, and inv = RN(1 / s).
+// q0 = RN(v * inv) is within 2 ulps of v / s, the FMA gives the residual r = v - q0 * s
+// exactly, and one correction step q1 = RN(q0 + r * inv) (Markstein's) gives RN(v / s); when
+// r is 0, q0 is the exact quotient (and keeps a zero's sign). Rather than rely on the
+// correction step's error bound, glm53f_selfcheck_e4m3_quotients compares the resulting
+// codes with f32_to_e4m3(__fdiv_rn(v, s)) for every BF16 v and every BF16 amax: they agree
+// whenever s is in [2^-100, 2^100] and q0 is finite (|q0| <= 3e38), and otherwise this
+// divides.
+__device__ __forceinline__ bool quotient_scale_ok(float s) { return s >= 0x1p-100f && s <= 0x1p100f; }
+__device__ __forceinline__ float quotient_of(float v, float s, float inv, bool& exact_path) {
+  const float q0 = __fmul_rn(v, inv);
+  const float r = __fmaf_rn(-q0, s, v);
+  exact_path = fabsf(q0) <= 3.0e38f;
+  return r == 0.0f ? q0 : __fmaf_rn(r, inv, q0);
+}
+
+// G groups of N codes f32_to_e4m3(__fdiv_rn(v[g][i], s[g])), bit for bit (see above). The
+// divisions sit behind one branch that a lane takes only for a code off the fast path (so
+// the compiler keeps it a branch instead of computing both paths).
+template <int G, int N>
+__device__ __forceinline__ void e4m3_of_quotients(const float (&v)[G][N], const float (&s)[G], const float (&inv)[G],
+                                                  uint32_t (&code)[G][N]) {
+  static_assert(G * N <= 32 && N % 2 == 0, "one bit per code, codes in pairs");
+  uint32_t slow = 0;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    const bool scale_ok = quotient_scale_ok(s[g]);
+#pragma unroll
+    for (int i = 0; i < N; i += 2) {
+      bool ok0, ok1;
+      const float q0 = quotient_of(v[g][i], s[g], inv[g], ok0);
+      const float q1 = quotient_of(v[g][i + 1], s[g], inv[g], ok1);
+      // f32_to_e4m3 of both in one conversion (the instruction it uses with a zero partner).
+      const uint32_t two = __nv_cvt_float2_to_fp8x2(make_float2(q0, q1), __NV_SATFINITE, __NV_E4M3);
+      code[g][i] = two & 0xffu;
+      code[g][i + 1] = two >> 8;
+      slow |= (scale_ok && ok0 ? 0u : 1u << (g * N + i)) | (scale_ok && ok1 ? 0u : 1u << (g * N + i + 1));
+    }
+  }
+  if (slow) {
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+#pragma unroll
+      for (int i = 0; i < N; ++i)
+        if (slow & (1u << (g * N + i))) code[g][i] = f32_to_e4m3(__fdiv_rn(v[g][i], s[g]));
+  }
+}
+// One group.
+template <int N>
+__device__ __forceinline__ void e4m3_of_quotients(const float (&v)[N], float s, float inv, uint32_t (&code)[N]) {
+  const float s1[1] = {s}, inv1[1] = {inv};
+  e4m3_of_quotients<1, N>(reinterpret_cast<const float(&)[1][N]>(v), s1, inv1,
+                          reinterpret_cast<uint32_t(&)[1][N]>(code));
+}
+
 // ---- exp, sigmoid, silu: the same operations as src/math.rs --------------------------------
-__device__ __forceinline__ float exp_f32(float x) {
-  if (isnan(x)) return x;
-  if (x > __int_as_float(0x42b17218)) return __int_as_float(0x7f800000);
-  if (x < __int_as_float(0xc2aeac4f)) return 0.0f;
+// exp as src/math.rs exp, without branches: the polynomial runs on x clamped into range and the
+// special cases (NaN, overflow, underflow) are selected at the end, so that several calls can
+// run interleaved. In range the clamp returns x itself, so the bits are unchanged.
+__device__ __forceinline__ float exp_f32(float x_in) {
+  const float kHi = __int_as_float(0x42b17218), kLo = __int_as_float(0xc2aeac4f);
+  const float x = fminf(fmaxf(x_in, kLo), kHi);
   const float kLog2e = __int_as_float(0x3fb8aa3b), kMagic = __int_as_float(0x4b400000);
   const float kLn2Hi = __int_as_float(0x3f318000), kLn2Lo = __int_as_float(0xb95e8083);
   const float t = __fmaf_rn(x, kLog2e, kMagic);
@@ -76,12 +134,33 @@ __device__ __forceinline__ float exp_f32(float x) {
   p = __fmaf_rn(p, r, __int_as_float(0x3e2aaaaa));
   p = __fmaf_rn(p, r, __int_as_float(0x3f000000));
   const float y = __fadd_rn(__fmaf_rn(p, z, r), 1.0f);
-  const int ni = __float2int_rn(n);
-  if (ni > 127) return __fmul_rn(__fmul_rn(y, __int_as_float(254 << 23)), 2.0f);
-  return __fmul_rn(y, __int_as_float((ni + 127) << 23));
+  const int ni = __float2int_rn(n);  // -126 ..= 128 in range
+  const float big = __fmul_rn(__fmul_rn(y, __int_as_float(254 << 23)), 2.0f);
+  float v = __fmul_rn(y, __int_as_float((ni + 127) << 23));
+  v = ni > 127 ? big : v;
+  v = x_in < kLo ? 0.0f : v;
+  v = x_in > kHi ? __int_as_float(0x7f800000) : v;
+  v = x_in != x_in ? x_in : v;
+  return v;
 }
 __device__ __forceinline__ float sigmoid_f32(float x) {
   return __fdiv_rn(1.0f, __fadd_rn(1.0f, exp_f32(-x)));
+}
+
+// 1 / d for d in [1, 2^126) without a branch: the fast path of IEEE division as the compiler
+// emits it for __fdiv_rn(1.0f, d) (a hardware reciprocal, one Newton step, one correction),
+// which is exact there; glm53f_selfcheck_division_free compares it with __fdiv_rn for every
+// such d. `slow` is set for any other d (then the caller divides).
+__device__ __forceinline__ float recip_ge1(float d, bool& slow) {
+  float y0;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y0) : "f"(d));
+  const float y1 = __fmaf_rn(y0, __fmaf_rn(-d, y0, 1.0f), y0);
+  slow = !(d >= 1.0f && d < 0x1p126f);
+  return __fmaf_rn(y1, __fmaf_rn(-d, y1, 1.0f), y1);
+}
+// sigmoid_f32 through recip_ge1 (1 + e^-x is at least 1, or NaN).
+__device__ __forceinline__ float sigmoid_fast(float x, bool& slow) {
+  return recip_ge1(__fadd_rn(1.0f, exp_f32(-x)), slow);
 }
 __device__ __forceinline__ float silu_f32(float x) {
   return __fdiv_rn(x, __fadd_rn(1.0f, exp_f32(-x)));
@@ -100,7 +179,18 @@ __device__ __forceinline__ float rms_scale(float sum_sq, float n, float eps) {
 }
 
 // ---- Warp reductions -------------------------------------------------------------------------
-// Butterfly sum: every lane ends with the same bits (src/math.rs warp_sum).
+// Two butterfly levels (lanes xor a, then xor b) at once: (v + v^a) + (v^b + v^(a^b)), the
+// butterfly's own grouping, with the three partners fetched by independent shuffles. For a
+// warp alone on its latency (the Sinkhorn's); warp_sum keeps one shuffle per level, which
+// measured faster with many warps per SM.
+__device__ __forceinline__ float sum2_xor(float v, int a, int b) {
+  const float x1 = __shfl_xor_sync(0xffffffffu, v, a);
+  const float x2 = __shfl_xor_sync(0xffffffffu, v, b);
+  const float x3 = __shfl_xor_sync(0xffffffffu, v, a ^ b);
+  return __fadd_rn(__fadd_rn(v, x1), __fadd_rn(x2, x3));
+}
+// Butterfly sum over lanes xor 16, 8, 4, 2, 1: every lane ends with the same bits
+// (src/math.rs warp_sum).
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
   for (int off = 16; off; off >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, off));
@@ -123,6 +213,16 @@ __device__ __forceinline__ float group_scale(float amax) {
 }
 
 // ---- Memory ----------------------------------------------------------------------------------
+// The single-launch kernels' hand-off: after a CTA barrier, thread 0 adds to a counter in one
+// atomic with acquire-release semantics at GPU scope. Its release covers the writes every
+// thread of the CTA made before the barrier (the barrier orders them before it), and in the
+// CTA that reads the final count its acquire, passed on by the next barrier, orders the
+// CTA's later reads after every other CTA's release. Returns the count before the add.
+__device__ __forceinline__ unsigned atomic_add_acq_rel(unsigned* p, unsigned v) {
+  unsigned old;
+  asm volatile("atom.add.acq_rel.gpu.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+  return old;
+}
 // A streamed read: through the non-coherent path, not kept in L1.
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
   uint4 v;

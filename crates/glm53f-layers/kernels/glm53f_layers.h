@@ -64,6 +64,37 @@ int32_t glm53f_hc_head(const uint16_t* streams, const uint16_t* block_out,
                        const uint16_t* norm_weight, uint16_t* out, int32_t rows,
                        int32_t hidden, cudaStream_t stream);
 
+// ---- Single-launch decode boundary (added in the second revision) ---------------------------
+//
+// Kernels below that take `sync` coordinate their CTAs through it: an array of uint32_t
+// counters, zeroed once before first use (cudaMemset) and left zeroed by every completed
+// launch, so it can be reused and captured in graphs. Each concurrently running launch
+// needs its own `sync` array. After a failed launch, zero it again.
+
+// One whole boundary for 1..8 rows in one launch, bit-identical to glm53f_hc_project (with
+// the same `block_out`, ... arguments) followed by glm53f_hc_finish: the optional expansion
+// of the previous sublayer's output into `streams_out`, the projection partials into
+// `partials` [rows][hidden/128][25], then, in the last CTA of each row to finish (a counter in
+// `sync` [rows]), pre, post, comb, the collapse, the sublayer's RMSNorm and its W8A8
+// quantization, with the outputs of glm53f_hc_finish. hidden % 256 == 0 and hidden <= 4096.
+// `post`/`comb` may be the same buffers as `post_in`/`comb_in`, and `streams_out` may be
+// `streams_in` (each row reads them before any of its outputs is written). With
+// `comb` == null the Sinkhorn is skipped; glm53f_hc_comb can compute comb later from
+// `partials` (for example on another stream while the sublayer runs; `partials` must stay
+// unchanged until it has).
+int32_t glm53f_hc_boundary_decode(const uint16_t* streams_in, const uint16_t* block_out,
+                                  const uint16_t* block_out2, const float* post_in,
+                                  const float* comb_in, uint16_t* streams_out, const uint16_t* fn,
+                                  const float* base, const float* scale,
+                                  const uint16_t* norm_weight, float* partials, uint32_t* sync,
+                                  float* pre, float* post, float* comb, uint16_t* collapsed,
+                                  uint16_t* normed, uint8_t* normed_q, float* normed_scales,
+                                  int32_t rows, int32_t hidden, cudaStream_t stream);
+
+// comb [rows][16] from a boundary's `partials`, bit-identical to glm53f_hc_finish's comb.
+int32_t glm53f_hc_comb(const float* partials, const float* base, const float* scale, float* comb,
+                       int32_t rows, int32_t hidden, cudaStream_t stream);
+
 // ---- Router (sigmoid scores, bias-corrected top-k) ---------------------------------------
 
 // logits [rows][experts] (f32) = x [rows][hidden] (BF16) . weight [experts][hidden] (BF16).
@@ -78,6 +109,15 @@ int32_t glm53f_router_logits(const uint16_t* x, const uint16_t* weight, float* l
 int32_t glm53f_router_select(const float* logits, const float* bias, int32_t* ids,
                              float* weights, int32_t rows, int32_t experts, int32_t top_k,
                              float scale, cudaStream_t stream);
+
+// glm53f_router_logits and glm53f_router_select in one launch (added in the second
+// revision), bit-identical to the pair: the last CTA of each block of rows to finish its
+// logits (a counter in `sync`, at least `rows` entries) selects those rows' experts.
+// `logits` [rows][experts] is scratch that also holds the logits afterwards. experts <= 1024.
+int32_t glm53f_router_fused(const uint16_t* x, const uint16_t* weight, const float* bias,
+                            float* logits, uint32_t* sync, int32_t* ids, float* weights,
+                            int32_t rows, int32_t experts, int32_t hidden, int32_t top_k,
+                            float scale, cudaStream_t stream);
 
 // ---- Elementwise ------------------------------------------------------------------------
 
@@ -97,6 +137,17 @@ int32_t glm53f_act_quant(const uint16_t* x, uint8_t* q, float* scales, int32_t r
 int32_t glm53f_swiglu(const uint16_t* gate_up, uint16_t* act, uint8_t* q, float* scales,
                       int32_t rows, int32_t inter, cudaStream_t stream);
 
+// Self-check of the division-free arithmetic (added in the second revision). The E4M3
+// quantization's quotients x / scale come from a reciprocal and one FMA correction step, and
+// the router's sigmoids from the fast path of IEEE division without its range check, instead
+// of a division per value; both are exact on the inputs they get, which this counts
+// exhaustively on the running GPU. mismatches[0]: (x, amax) pairs, over every BF16 x and
+// every BF16 amax >= 0 (scale = amax / 448, or 1), whose code differs from the one IEEE
+// division gives; mismatches[1]: f32 d in [1, 2^126) whose reciprocal differs from IEEE
+// 1 / d. `mismatches` is device memory for two uint64; the contract is 0 and 0. About 2^31
+// + 2^30 cases, milliseconds.
+int32_t glm53f_selfcheck_division_free(uint64_t* mismatches, cudaStream_t stream);
+
 // ---- FP8 block-128 projections: out [rows][n] = x [rows][k] . W^T, W [n][k] E4M3 with
 // f32 scales [n/128][k/128]; n % 128 == 0, k % 128 == 0. ------------------------------------
 
@@ -113,6 +164,16 @@ int32_t glm53f_fp8_gemm_decode(const void* x, const float* x_scales, int32_t a8,
 // out [rows][n] (BF16) = sum over splits, in split order, of partials [ksplit][rows][n].
 int32_t glm53f_splitk_reduce(const float* partials, uint16_t* out, int32_t ksplit,
                              int32_t rows, int32_t n, cudaStream_t stream);
+
+// glm53f_fp8_gemm_decode with the K-split reduction in the same launch (added in the second
+// revision), bit-identical to glm53f_fp8_gemm_decode + glm53f_splitk_reduce: the last split
+// CTA of each block of 8 outputs (a counter in `sync`, at least n / 8 entries) adds the
+// partials in split order and writes BF16 `out`. ksplit == 1 needs neither `partials` nor
+// `sync` and is glm53f_fp8_gemm_decode.
+int32_t glm53f_fp8_gemm_decode_fused(const void* x, const float* x_scales, int32_t a8,
+                                     const uint8_t* w, const float* w_scales, int32_t rows,
+                                     int32_t n, int32_t k, int32_t ksplit, float* partials,
+                                     uint32_t* sync, uint16_t* out, cudaStream_t stream);
 
 // Prefill GEMM (W8A8, FP8 tensor cores: mma.m16n8k32 e4m3). Each 128-wide K block is
 // accumulated separately and added to the f32 output with fma(block, sx * sw, acc). x is

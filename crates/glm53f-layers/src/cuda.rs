@@ -27,6 +27,7 @@ unsafe extern "C" {
     fn cudaMemset(ptr: *mut c_void, value: c_int, count: usize) -> CudaError;
     fn cudaDeviceSynchronize() -> CudaError;
     fn cudaStreamCreate(stream: *mut CudaStream) -> CudaError;
+    fn cudaStreamCreateWithFlags(stream: *mut CudaStream, flags: u32) -> CudaError;
     fn cudaStreamSynchronize(stream: CudaStream) -> CudaError;
     fn cudaStreamDestroy(stream: CudaStream) -> CudaError;
     fn cudaEventCreate(event: *mut CudaEvent) -> CudaError;
@@ -159,16 +160,26 @@ impl Stream {
         )
     }
 
-    /// Capture the launches `f` issues on this stream into a graph.
+    /// Capture the launches `f` issues on the stream it is given into a graph (launched later on
+    /// any stream). The capture runs on a separate non-blocking stream: work another thread puts
+    /// on the legacy default stream, which waits for every blocking stream, would otherwise
+    /// invalidate a capture in progress.
     pub fn capture(&self, f: impl FnOnce(&Stream) -> Result<(), String>) -> Result<Graph, String> {
+        let mut cs = core::ptr::null_mut();
+        // SAFETY: writes a new stream handle; 1 = cudaStreamNonBlocking.
+        check(
+            unsafe { cudaStreamCreateWithFlags(&mut cs, 1) },
+            "cudaStreamCreateWithFlags",
+        )?;
+        let cs = Stream(cs);
         // SAFETY: begin/end capture on a live stream; mode 2 = relaxed.
         check(
-            unsafe { cudaStreamBeginCapture(self.0, 2) },
+            unsafe { cudaStreamBeginCapture(cs.0, 2) },
             "cudaStreamBeginCapture",
         )?;
-        let r = f(self);
+        let r = f(&cs);
         let mut g = core::ptr::null_mut();
-        let e = unsafe { cudaStreamEndCapture(self.0, &mut g) };
+        let e = unsafe { cudaStreamEndCapture(cs.0, &mut g) };
         r?;
         check(e, "cudaStreamEndCapture")?;
         let mut x = core::ptr::null_mut();

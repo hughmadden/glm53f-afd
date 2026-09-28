@@ -379,6 +379,21 @@ pub fn swiglu(
     )
 }
 
+/// `glm53f_selfcheck_division_free`: the E4M3 quantization's (BF16 value, BF16 amax) pairs
+/// whose code differs from IEEE division's, and the f32 values in [1, 2^126) whose
+/// division-free reciprocal (the router's sigmoid) differs from IEEE 1 / d, over every case
+/// (both 0 is the contract). Synchronizes `s`.
+pub fn selfcheck_division_free(s: &Stream) -> Result<[u64; 2], String> {
+    let count = DeviceBuffer::zeroed(16)?;
+    check(
+        unsafe { ffi::glm53f_selfcheck_division_free(count.mut_ptr(), s.0) },
+        "glm53f_selfcheck_division_free",
+    )?;
+    s.sync()?;
+    let v = count.download::<u64>(2)?;
+    Ok([v[0], v[1]])
+}
+
 /// The activations of a projection.
 pub enum GemmInput<'a> {
     /// BF16 `[rows][k]` (W8A16).
@@ -565,5 +580,247 @@ pub fn fp8_gemm_prefill(
             )
         },
         "glm53f_fp8_gemm_prefill",
+    )
+}
+
+// ---- Second revision: single-launch variants ------------------------------------------------
+
+/// Counters for the single-launch kernels (`sync` in the C ABI): `count` zeroed `u32`s. The
+/// kernels leave them zeroed; one buffer per concurrently running launch.
+pub fn sync_buffer(count: usize) -> Result<DeviceBuffer, String> {
+    DeviceBuffer::zeroed(count * 4)
+}
+
+/// The inputs of a single-launch decode boundary.
+pub struct BoundaryDecode<'a> {
+    pub streams_in: &'a DeviceBuffer,
+    /// The previous sublayer's expansion (its `streams_out` may be `streams_in`).
+    pub expand: Option<Expand<'a>>,
+    pub fn_: &'a DeviceBuffer,
+    pub base: &'a DeviceBuffer,
+    pub scale: &'a DeviceBuffer,
+    pub norm_weight: Option<&'a DeviceBuffer>,
+    /// Scratch: `[rows][hidden/128][25]` f32, also read later by `hc_comb`.
+    pub partials: &'a DeviceBuffer,
+    /// At least `rows` counters (see [`sync_buffer`]).
+    pub sync: &'a DeviceBuffer,
+}
+
+/// A whole boundary for 1..8 rows in one launch: bit-identical to `hc_project` + `hc_finish`.
+pub fn hc_boundary_decode(
+    b: &BoundaryDecode<'_>,
+    out: &FinishOut<'_>,
+    rows: usize,
+    hidden: usize,
+    s: &Stream,
+) -> R {
+    if !(1..=8).contains(&rows) {
+        return Err(format!("hc_boundary_decode: rows = {rows}, need 1..=8"));
+    }
+    need(b.streams_in, rows * 4 * hidden * 2, "streams_in")?;
+    need(b.fn_, 24 * 4 * hidden * 2, "fn")?;
+    need(b.base, 24 * 4, "base")?;
+    need(b.scale, 3 * 4, "scale")?;
+    need(b.partials, rows * (hidden / 128) * 25 * 4, "partials")?;
+    need(b.sync, rows * 4, "sync")?;
+    if let Some(w) = b.norm_weight {
+        need(w, hidden * 2, "norm_weight")?;
+    }
+    let (mut h1, mut h2, mut post_in, mut comb_in, mut so) =
+        (null(), null(), null(), null(), null_mut());
+    if let Some(e) = &b.expand {
+        check_expand(e, rows, hidden)?;
+        let o = e.streams_out.ok_or("expansion needs streams_out")?;
+        need(o, rows * 4 * hidden * 2, "streams_out")?;
+        h1 = e.block_out.ptr();
+        h2 = e.block_out2.map_or(null(), |x| x.ptr());
+        post_in = e.post.ptr();
+        comb_in = e.comb.ptr();
+        so = o.mut_ptr();
+    }
+    for (x, n, what) in [
+        (out.pre, rows * 16, "pre"),
+        (out.post, rows * 16, "post"),
+        (out.comb, rows * 64, "comb"),
+    ] {
+        if let Some(x) = x {
+            need(x, n, what)?;
+        }
+    }
+    for (x, what) in [(out.collapsed, "collapsed"), (out.normed, "normed")] {
+        if let Some(x) = x {
+            need(x, rows * hidden * 2, what)?;
+        }
+    }
+    if let Some((q, qs)) = out.quant {
+        need(q, rows * hidden, "normed_q")?;
+        need(qs, rows * (hidden / 128) * 4, "normed_scales")?;
+    }
+    check(
+        unsafe {
+            ffi::glm53f_hc_boundary_decode(
+                b.streams_in.ptr(),
+                h1,
+                h2,
+                post_in,
+                comb_in,
+                so,
+                b.fn_.ptr(),
+                b.base.ptr(),
+                b.scale.ptr(),
+                b.norm_weight.map_or(null(), |x| x.ptr()),
+                b.partials.mut_ptr(),
+                b.sync.mut_ptr(),
+                opt_mut(out.pre),
+                opt_mut(out.post),
+                opt_mut(out.comb),
+                opt_mut(out.collapsed),
+                opt_mut(out.normed),
+                opt_mut(out.quant.map(|q| q.0)),
+                opt_mut(out.quant.map(|q| q.1)),
+                i(rows, "rows")?,
+                i(hidden, "hidden")?,
+                s.0,
+            )
+        },
+        "glm53f_hc_boundary_decode",
+    )
+}
+
+/// comb from a boundary's partials (bit-identical to `hc_finish`'s comb).
+pub fn hc_comb(
+    partials: &DeviceBuffer,
+    base: &DeviceBuffer,
+    scale: &DeviceBuffer,
+    comb: &DeviceBuffer,
+    rows: usize,
+    hidden: usize,
+    s: &Stream,
+) -> R {
+    need(partials, rows * (hidden / 128) * 25 * 4, "partials")?;
+    need(base, 24 * 4, "base")?;
+    need(scale, 3 * 4, "scale")?;
+    need(comb, rows * 64, "comb")?;
+    check(
+        unsafe {
+            ffi::glm53f_hc_comb(
+                partials.ptr(),
+                base.ptr(),
+                scale.ptr(),
+                comb.mut_ptr(),
+                i(rows, "rows")?,
+                i(hidden, "hidden")?,
+                s.0,
+            )
+        },
+        "glm53f_hc_comb",
+    )
+}
+
+/// Router logits and selection in one launch (bit-identical to `router_logits` +
+/// `router_select`); `logits` is scratch and `sync` holds at least `rows` counters.
+#[allow(clippy::too_many_arguments)]
+pub fn router_fused(
+    x: &DeviceBuffer,
+    weight: &DeviceBuffer,
+    bias: &DeviceBuffer,
+    logits: &DeviceBuffer,
+    sync: &DeviceBuffer,
+    ids: &DeviceBuffer,
+    weights: &DeviceBuffer,
+    rows: usize,
+    experts: usize,
+    hidden: usize,
+    top_k: usize,
+    scale: f32,
+    s: &Stream,
+) -> R {
+    need(x, rows * hidden * 2, "x")?;
+    need(weight, experts * hidden * 2, "weight")?;
+    need(bias, experts * 4, "bias")?;
+    need(logits, rows * experts * 4, "logits")?;
+    need(sync, rows * 4, "sync")?;
+    need(ids, rows * top_k * 4, "ids")?;
+    need(weights, rows * top_k * 4, "weights")?;
+    check(
+        unsafe {
+            ffi::glm53f_router_fused(
+                x.ptr(),
+                weight.ptr(),
+                bias.ptr(),
+                logits.mut_ptr(),
+                sync.mut_ptr(),
+                ids.mut_ptr(),
+                weights.mut_ptr(),
+                i(rows, "rows")?,
+                i(experts, "experts")?,
+                i(hidden, "hidden")?,
+                i(top_k, "top_k")?,
+                scale,
+                s.0,
+            )
+        },
+        "glm53f_router_fused",
+    )
+}
+
+/// The decode GEMM with its K splits reduced in the same launch (bit-identical to
+/// `fp8_gemm_decode` + `splitk_reduce`). With `ksplit > 1`, `partials` holds
+/// `[ksplit][rows][n]` f32 and `sync` at least `n / 8` counters.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_decode_fused(
+    x: &GemmInput<'_>,
+    w: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    rows: usize,
+    n: usize,
+    k: usize,
+    ksplit: usize,
+    partials: Option<&DeviceBuffer>,
+    sync: Option<&DeviceBuffer>,
+    out: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    need(w, n * k, "w")?;
+    need(w_scales, n.div_ceil(128) * k.div_ceil(128) * 4, "w_scales")?;
+    need(out, rows * n * 2, "out")?;
+    let (xp, xs, a8): (*const c_void, *const f32, i32) = match x {
+        GemmInput::Bf16(b) => {
+            need(b, rows * k * 2, "x")?;
+            (b.ptr(), null(), 0)
+        }
+        GemmInput::Fp8 { q, scales } => {
+            need(q, rows * k, "x")?;
+            need(scales, rows * (k / 128) * 4, "x_scales")?;
+            (q.ptr(), scales.ptr(), 1)
+        }
+    };
+    if ksplit > 1 {
+        need(
+            partials.ok_or("K splits need partials")?,
+            ksplit * rows * n * 4,
+            "partials",
+        )?;
+        need(sync.ok_or("K splits need sync")?, n.div_ceil(8) * 4, "sync")?;
+    }
+    check(
+        unsafe {
+            ffi::glm53f_fp8_gemm_decode_fused(
+                xp,
+                xs,
+                a8,
+                w.ptr(),
+                w_scales.ptr(),
+                i(rows, "rows")?,
+                i(n, "n")?,
+                i(k, "k")?,
+                i(ksplit, "ksplit")?,
+                opt_mut(partials),
+                opt_mut(sync),
+                out.mut_ptr(),
+                s.0,
+            )
+        },
+        "glm53f_fp8_gemm_decode_fused",
     )
 }

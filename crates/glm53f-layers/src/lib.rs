@@ -14,7 +14,9 @@
 //!   embedding broadcast and the final hidden state.
 //! - `kernels/`: the CUDA kernels behind a C ABI (`kernels/glm53f_layers.h`); with the
 //!   `cuda` feature they are compiled by `build.rs` and exposed as `ffi` (raw),
-//!   `cuda` (device memory) and `ops` (checked launches).
+//!   `cuda` (device memory) and `ops` (checked launches). For decode, the boundary, the
+//!   router and the split-K GEMM also come as single launches whose last CTA finishes the
+//!   work (the second revision), bit-identical to the kernel pairs.
 //! - [`testkit`]: fixture loading and test data.
 //!
 //! # Numerics contract
@@ -30,7 +32,14 @@
 //!   (the in-block summation order of `mma` is the hardware's; that kernel is checked
 //!   against exact f64 block products within a bound);
 //! - **CPU versus the oracle** agrees within a stated tolerance, because the oracle's own
-//!   summation orders and `exp` differ from these in the last bits.
+//!   summation orders and `exp` differ from these in the last bits. On the oracle's BF16 run
+//!   the decoder layer's output streams match bit for bit, except on tokens where one f32 mHC
+//!   weight sits within a few dozen f32 ulps of a BF16 rounding boundary and the oracle's
+//!   value rounds the other way (`tests/goldens.rs`).
+//!
+//! Some kernels replace a division per value by cheaper arithmetic that gives the same bits
+//! on every input they can receive (the E4M3 quantization's quotients, the router's
+//! sigmoid); `glm53f_selfcheck_division_free` proves it exhaustively on the running GPU.
 //!
 //! The deliberate differences from the reference's arithmetic are: the mHC RMS scale is
 //! applied after the projection (`r * sum(x * fn)`); sums run in the kernels' fixed orders;

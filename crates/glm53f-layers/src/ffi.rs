@@ -107,6 +107,7 @@ unsafe extern "C" {
         inter: i32,
         stream: CudaStream,
     ) -> CudaError;
+    pub fn glm53f_selfcheck_division_free(mismatches: *mut u64, stream: CudaStream) -> CudaError;
     #[allow(clippy::too_many_arguments)]
     pub fn glm53f_fp8_gemm_decode(
         x: *const c_void,
@@ -145,6 +146,74 @@ unsafe extern "C" {
         stream: CudaStream,
     ) -> CudaError;
     pub fn glm53f_fp8_gemm_prefill_smem_bytes() -> i32;
+
+    // Second revision: single-launch variants (see the header's `sync` convention).
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_hc_boundary_decode(
+        streams_in: *const u16,
+        block_out: *const u16,
+        block_out2: *const u16,
+        post_in: *const f32,
+        comb_in: *const f32,
+        streams_out: *mut u16,
+        fn_: *const u16,
+        base: *const f32,
+        scale: *const f32,
+        norm_weight: *const u16,
+        partials: *mut f32,
+        sync: *mut u32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        collapsed: *mut u16,
+        normed: *mut u16,
+        normed_q: *mut u8,
+        normed_scales: *mut f32,
+        rows: i32,
+        hidden: i32,
+        stream: CudaStream,
+    ) -> CudaError;
+    pub fn glm53f_hc_comb(
+        partials: *const f32,
+        base: *const f32,
+        scale: *const f32,
+        comb: *mut f32,
+        rows: i32,
+        hidden: i32,
+        stream: CudaStream,
+    ) -> CudaError;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_router_fused(
+        x: *const u16,
+        weight: *const u16,
+        bias: *const f32,
+        logits: *mut f32,
+        sync: *mut u32,
+        ids: *mut i32,
+        weights: *mut f32,
+        rows: i32,
+        experts: i32,
+        hidden: i32,
+        top_k: i32,
+        scale: f32,
+        stream: CudaStream,
+    ) -> CudaError;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_fp8_gemm_decode_fused(
+        x: *const c_void,
+        x_scales: *const f32,
+        a8: i32,
+        w: *const u8,
+        w_scales: *const f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        ksplit: i32,
+        partials: *mut f32,
+        sync: *mut u32,
+        out: *mut u16,
+        stream: CudaStream,
+    ) -> CudaError;
 }
 
 /// `GLM53F_PREFILL_PROMOTE_K32`: add every k32 tensor-core product sum to the block sum in

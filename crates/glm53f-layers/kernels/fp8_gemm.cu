@@ -27,69 +27,89 @@ constexpr int kDecodeWarps = 4;
 constexpr int kRowsPerWarp = 2;
 constexpr int kDecodeRowsPerCta = kDecodeWarps * kRowsPerWarp;
 
-template <bool A8, int M>
+// FuseReduce: the K splits are added by the last CTA of each 8-output block to finish (a
+// per-block counter in `sync`), in split order, exactly as splitk_reduce_kernel adds them.
+template <bool A8, int M, bool FuseReduce = false>
 __global__ void __launch_bounds__(32 * kDecodeWarps) fp8_gemm_decode_kernel(
     const void* __restrict__ xv, const float* __restrict__ xs, const uint8_t* __restrict__ w,
-    const float* __restrict__ ws, int n, int k, int kc, float* __restrict__ partials, uint16_t* __restrict__ out) {
+    const float* __restrict__ ws, int n, int k, int kc, float* partials, uint16_t* __restrict__ out,
+    unsigned* __restrict__ sync = nullptr) {
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int n0 = (blockIdx.x * kDecodeWarps + warp) * kRowsPerWarp;
-  if (n0 >= n) return;
-  const int split = blockIdx.y;
-  const int lo = split * kc, hi = lo + kc;
-  const int kb_count = k >> 7;
-  const uint8_t* w0 = w + size_t(n0) * k;
-  const uint8_t* w1 = w0 + k;
-  const float* ws0 = ws + size_t(n0 >> 7) * kb_count;  // both rows share a 128-row block
-  float acc[kRowsPerWarp][M];
+  if (!FuseReduce && n0 >= n) return;
+  if (n0 < n) {
+    const int split = blockIdx.y;
+    const int lo = split * kc, hi = lo + kc;
+    const int kb_count = k >> 7;
+    const uint8_t* w0 = w + size_t(n0) * k;
+    const uint8_t* w1 = w0 + k;
+    const float* ws0 = ws + size_t(n0 >> 7) * kb_count;  // both rows share a 128-row block
+    float acc[kRowsPerWarp][M];
 #pragma unroll
-  for (int r = 0; r < kRowsPerWarp; ++r)
+    for (int r = 0; r < kRowsPerWarp; ++r)
 #pragma unroll
-    for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+      for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
 
 #pragma unroll 2
-  for (int k0 = lo + 16 * lane; k0 < hi; k0 += 512) {
-    float wf[kRowsPerWarp][16];
-    unpack_e4m3x16(ld_stream(w0 + k0), wf[0]);
-    unpack_e4m3x16(ld_stream(w1 + k0), wf[1]);
-    const int kb = k0 >> 7;
-    const float sw = __ldg(ws0 + kb);
+    for (int k0 = lo + 16 * lane; k0 < hi; k0 += 512) {
+      float wf[kRowsPerWarp][16];
+      unpack_e4m3x16(ld_stream(w0 + k0), wf[0]);
+      unpack_e4m3x16(ld_stream(w1 + k0), wf[1]);
+      const int kb = k0 >> 7;
+      const float sw = __ldg(ws0 + kb);
 #pragma unroll
-    for (int m = 0; m < M; ++m) {
-      float xf[16];
-      if (A8) {
-        unpack_e4m3x16(ld_cached(static_cast<const uint8_t*>(xv) + size_t(m) * k + k0), xf);
-      } else {
-        const uint16_t* xp = static_cast<const uint16_t*>(xv) + size_t(m) * k + k0;
-        float a[8], b[8];
-        unpack_bf16x8(ld_cached(xp), a);
-        unpack_bf16x8(ld_cached(xp + 8), b);
+      for (int m = 0; m < M; ++m) {
+        float xf[16];
+        if (A8) {
+          unpack_e4m3x16(ld_cached(static_cast<const uint8_t*>(xv) + size_t(m) * k + k0), xf);
+        } else {
+          const uint16_t* xp = static_cast<const uint16_t*>(xv) + size_t(m) * k + k0;
+          float a[8], b[8];
+          unpack_bf16x8(ld_cached(xp), a);
+          unpack_bf16x8(ld_cached(xp + 8), b);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { xf[j] = a[j]; xf[8 + j] = b[j]; }
-      }
-      const float s = A8 ? __fmul_rn(sw, __ldg(xs + size_t(m) * kb_count + kb)) : sw;
+          for (int j = 0; j < 8; ++j) { xf[j] = a[j]; xf[8 + j] = b[j]; }
+        }
+        const float s = A8 ? __fmul_rn(sw, __ldg(xs + size_t(m) * kb_count + kb)) : sw;
 #pragma unroll
-      for (int r = 0; r < kRowsPerWarp; ++r) {
-        float d = 0.0f;
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+          float d = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) d = __fmaf_rn(xf[j], wf[r][j], d);
-        acc[r][m] = __fmaf_rn(d, s, acc[r][m]);
+          for (int j = 0; j < 16; ++j) d = __fmaf_rn(xf[j], wf[r][j], d);
+          acc[r][m] = __fmaf_rn(d, s, acc[r][m]);
+        }
       }
     }
-  }
 
 #pragma unroll
-  for (int r = 0; r < kRowsPerWarp; ++r)
+    for (int r = 0; r < kRowsPerWarp; ++r)
 #pragma unroll
-    for (int m = 0; m < M; ++m) {
-      const float v = warp_sum(acc[r][m]);
-      // Spread the stores over lanes.
-      if (lane == ((r * M + m) & 31)) {
-        if (partials)
-          partials[(size_t(split) * M + m) * n + n0 + r] = v;
-        else
-          out[size_t(m) * n + n0 + r] = f32_to_bf16(v);
+      for (int m = 0; m < M; ++m) {
+        const float v = warp_sum(acc[r][m]);
+        // Spread the stores over lanes.
+        if (lane == ((r * M + m) & 31)) {
+          if (partials)
+            partials[(size_t(split) * M + m) * n + n0 + r] = v;
+          else
+            out[size_t(m) * n + n0 + r] = f32_to_bf16(v);
+        }
       }
+  }
+  if (FuseReduce) {
+    __shared__ int last;
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomic_add_acq_rel(sync + blockIdx.x, 1u) == gridDim.y - 1;
+    __syncthreads();
+    if (!last) return;
+    if (threadIdx.x == 0) sync[blockIdx.x] = 0;  // every split of this block has signalled
+    const size_t elements = size_t(M) * n;
+    for (int t = threadIdx.x; t < kDecodeRowsPerCta * M; t += blockDim.x) {
+      const size_t i = size_t(t / kDecodeRowsPerCta) * n + blockIdx.x * kDecodeRowsPerCta + t % kDecodeRowsPerCta;
+      float s = __ldcg(partials + i);
+      for (int kk = 1; kk < int(gridDim.y); ++kk) s = __fadd_rn(s, __ldcg(partials + size_t(kk) * elements + i));
+      out[i] = f32_to_bf16(s);
     }
+  }
 }
 
 __global__ void splitk_reduce_kernel(const float* __restrict__ partials, uint16_t* __restrict__ out, int ksplit,
@@ -268,6 +288,33 @@ cudaError_t launch_decode(const void* x, const float* xs, const uint8_t* w, cons
   return cudaGetLastError();
 }
 
+// The decode GEMM with its K splits reduced by the last CTA of each output block.
+template <bool A8>
+cudaError_t launch_decode_fused(const void* x, const float* xs, const uint8_t* w, const float* ws, int rows, int n,
+                                int k, int ksplit, float* partials, unsigned* sync, uint16_t* out, cudaStream_t stream) {
+  if (ksplit == 1) return launch_decode<A8>(x, xs, w, ws, rows, n, k, 1, nullptr, out, stream);
+  const dim3 grid((n + kDecodeRowsPerCta - 1) / kDecodeRowsPerCta, ksplit);
+  const dim3 block(32 * kDecodeWarps);
+  const int kc = k / ksplit;
+  switch (rows) {
+#define GLM53F_DECODE_CASE(M)                                                                               \
+  case M:                                                                                                    \
+    fp8_gemm_decode_kernel<A8, M, true><<<grid, block, 0, stream>>>(x, xs, w, ws, n, k, kc, partials, out, sync); \
+    break;
+    GLM53F_DECODE_CASE(1)
+    GLM53F_DECODE_CASE(2)
+    GLM53F_DECODE_CASE(3)
+    GLM53F_DECODE_CASE(4)
+    GLM53F_DECODE_CASE(5)
+    GLM53F_DECODE_CASE(6)
+    GLM53F_DECODE_CASE(7)
+    GLM53F_DECODE_CASE(8)
+#undef GLM53F_DECODE_CASE
+    default: return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
 }  // namespace
 }  // namespace glm53f
 
@@ -282,6 +329,18 @@ extern "C" int32_t glm53f_fp8_gemm_decode(const void* x, const float* x_scales, 
   if (ksplit > 1 ? !partials : !out) return cudaErrorInvalidValue;
   return a8 ? launch_decode<true>(x, x_scales, w, w_scales, rows, n, k, ksplit, partials, out, stream)
             : launch_decode<false>(x, nullptr, w, w_scales, rows, n, k, ksplit, partials, out, stream);
+}
+
+extern "C" int32_t glm53f_fp8_gemm_decode_fused(const void* x, const float* x_scales, int32_t a8, const uint8_t* w,
+                                                const float* w_scales, int32_t rows, int32_t n, int32_t k,
+                                                int32_t ksplit, float* partials, uint32_t* sync, uint16_t* out,
+                                                cudaStream_t stream) {
+  if (rows < 1 || rows > 8 || n < 128 || n % 128 || k < 128 || k % 128 || ksplit < 1 || (k / 128) % ksplit)
+    return cudaErrorInvalidValue;
+  if (!aligned16(x) || !aligned16(w) || !w_scales || (a8 && !x_scales) || !out) return cudaErrorInvalidValue;
+  if (ksplit > 1 && (!partials || !sync)) return cudaErrorInvalidValue;
+  return a8 ? launch_decode_fused<true>(x, x_scales, w, w_scales, rows, n, k, ksplit, partials, sync, out, stream)
+            : launch_decode_fused<false>(x, nullptr, w, w_scales, rows, n, k, ksplit, partials, sync, out, stream);
 }
 
 extern "C" int32_t glm53f_splitk_reduce(const float* partials, uint16_t* out, int32_t ksplit, int32_t rows, int32_t n,

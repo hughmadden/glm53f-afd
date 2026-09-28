@@ -51,9 +51,11 @@ __global__ void __launch_bounds__(256) rmsnorm_kernel(const uint16_t* __restrict
 __device__ __forceinline__ void quant4(const float (&v)[4], float amax_lane, uint8_t* __restrict__ q, float* __restrict__ s,
                                        int lane) {
   const float scale = group_scale(warp_max(amax_lane));
+  uint32_t code[4];
+  e4m3_of_quotients(v, scale, __fdiv_rn(1.0f, scale), code);
   uint32_t packed = 0;
 #pragma unroll
-  for (int i = 0; i < 4; ++i) packed |= f32_to_e4m3(__fdiv_rn(v[i], scale)) << (8 * i);
+  for (int i = 0; i < 4; ++i) packed |= code[i] << (8 * i);
   *reinterpret_cast<uint32_t*>(q) = packed;
   if (lane == 0) *s = scale;
 }
@@ -102,6 +104,41 @@ __global__ void __launch_bounds__(256) swiglu_kernel(const uint16_t* __restrict_
   if (q) quant4(v, amax, q + at, scales + row * groups + g, lane);
 }
 
+// glm53f_selfcheck_division_free, E4M3 part: CTA a takes amax = BF16 pattern a (0 .. +inf);
+// each thread quantizes 8 consecutive BF16 patterns x at a time with e4m3_of_quotients and
+// compares every code with f32_to_e4m3(__fdiv_rn(x, scale)).
+__global__ void __launch_bounds__(256) selfcheck_e4m3_quotients_kernel(unsigned long long* mismatches) {
+  const float amax = bf16_to_f32(blockIdx.x);
+  const float scale = group_scale(amax);
+  const float inv = __fdiv_rn(1.0f, scale);
+  unsigned long long bad = 0;
+  for (uint32_t x0 = 8 * threadIdx.x; x0 < 65536u; x0 += 8 * blockDim.x) {
+    float v[8];
+    uint32_t code[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = bf16_to_f32(x0 + i);
+    e4m3_of_quotients(v, scale, inv, code);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) bad += code[i] != f32_to_e4m3(__fdiv_rn(v[i], scale));
+  }
+  for (int off = 16; off; off >>= 1) bad += __shfl_xor_sync(0xffffffffu, bad, off);
+  if ((threadIdx.x & 31) == 0 && bad) atomicAdd(mismatches, bad);
+}
+
+// Reciprocal part: every f32 d in [1, 2^126), recip_ge1 against __fdiv_rn(1, d).
+__global__ void __launch_bounds__(256) selfcheck_reciprocals_kernel(unsigned long long* mismatches) {
+  unsigned long long bad = 0;
+  const uint32_t lo = 0x3f800000u, hi = 0x7e800000u;  // 1 and 2^126
+  for (uint32_t b = lo + blockIdx.x * blockDim.x + threadIdx.x; b < hi; b += gridDim.x * blockDim.x) {
+    const float d = __uint_as_float(b);
+    bool slow;
+    const float r = recip_ge1(d, slow);
+    bad += slow || __float_as_uint(r) != __float_as_uint(__fdiv_rn(1.0f, d));
+  }
+  for (int off = 16; off; off >>= 1) bad += __shfl_xor_sync(0xffffffffu, bad, off);
+  if ((threadIdx.x & 31) == 0 && bad) atomicAdd(mismatches, bad);
+}
+
 }  // namespace
 }  // namespace glm53f
 
@@ -129,5 +166,15 @@ extern "C" int32_t glm53f_swiglu(const uint16_t* gate_up, uint16_t* act, uint8_t
   if (!aligned16_or_null(act) || !aligned16_or_null(q) || (q && !scales)) return cudaErrorInvalidValue;
   const long warps = long(rows) * (inter / 128);
   swiglu_kernel<<<unsigned((warps + 7) / 8), 256, 0, stream>>>(gate_up, act, q, scales, rows, inter);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_selfcheck_division_free(uint64_t* mismatches, cudaStream_t stream) {
+  if (!mismatches) return cudaErrorInvalidValue;
+  const cudaError_t e = cudaMemsetAsync(mismatches, 0, 2 * sizeof(uint64_t), stream);
+  if (e != cudaSuccess) return e;
+  auto* m = reinterpret_cast<unsigned long long*>(mismatches);
+  selfcheck_e4m3_quotients_kernel<<<0x7f81, 256, 0, stream>>>(m);
+  selfcheck_reciprocals_kernel<<<1024, 256, 0, stream>>>(m + 1);
   return cudaGetLastError();
 }

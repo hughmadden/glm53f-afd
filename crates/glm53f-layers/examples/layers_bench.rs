@@ -3,7 +3,9 @@
 //! ```text
 //! cargo run -p glm53f-layers --features cuda --release --example layers_bench [-- SECTION...]
 //! ```
-//! Sections: `copy`, `decode`, `prefill`, `mhc`, `router`, `elementwise` (default: all).
+//! Sections: `copy`, `decode`, `prefill`, `mhc`, `router`, `elementwise`, `fused` (the
+//! single-launch variants against the pairs), `chain` (one token's 90 boundaries and 42
+//! routers in one graph) (default: all).
 //!
 //! Each figure is the best of 5 launches of a CUDA graph holding many calls, divided by the
 //! call count, so launch overhead is excluded. The decode GEMM cycles through enough weight
@@ -13,7 +15,9 @@
 use glm53f_layers::cuda::{self, DeviceBuffer, Stream, Timer};
 use glm53f_layers::mhc::PARTIAL;
 use glm53f_layers::mlp::decode_ksplit;
-use glm53f_layers::ops::{self, Expand, FinishOut, GemmInput, GemmOutput, Promotion};
+use glm53f_layers::ops::{
+    self, BoundaryDecode, Expand, FinishOut, GemmInput, GemmOutput, Promotion,
+};
 use glm53f_layers::router::{EXPERTS, ROUTED_SCALE, TOP_K};
 use glm53f_layers::testkit::Rng;
 
@@ -318,6 +322,322 @@ fn main() -> Res<()> {
             let (w, out) = (dev(&rng.bf16_vec(HIDDEN, 0.5))?, zeros(rows * HIDDEN * 2)?);
             let us = b.time(reps, &|s, _| ops::rmsnorm(&x, &w, &out, rows, HIDDEN, s))?;
             println!("| RMSNorm | {rows} x {HIDDEN} | {us:.2} |");
+        }
+    }
+
+    if section("fused", &only) {
+        println!("\n## Single-launch variants against the pairs they replace (decode)\n");
+        // 90 distinct fn matrices (70.8 MB) and 42 distinct router weights (99 MB), cycled so
+        // the weights stream from DRAM as they do across a token.
+        let nb = 90usize;
+        let fns: Vec<DeviceBuffer> = (0..nb)
+            .map(|_| dev(&rng.bf16_vec(24 * 4 * HIDDEN, 0.02)))
+            .collect::<Res<_>>()?;
+        let base = dev(&rng.f32_vec(24, 0.5))?;
+        let scale = dev(&[1.0f32, 1.0, 1.0])?;
+        let nw = dev(&rng.bf16_vec(HIDDEN, 0.5))?;
+        let slices = HIDDEN / 128;
+        println!("FFN-site boundary (expansion, RMSNorm, BF16 and FP8 outputs), hidden 4096:\n");
+        println!("| rows | pair (project + finish) us | one launch us | one launch, comb deferred us | glm53f_hc_comb alone us |");
+        println!("|---:|---:|---:|---:|---:|");
+        for rows in [1usize, 2, 4, 8] {
+            let st = dev(&rng.bf16_vec(rows * 4 * HIDDEN, 1.0))?;
+            let st2 = zeros(rows * 4 * HIDDEN * 2)?;
+            let h = dev(&rng.bf16_vec(rows * HIDDEN, 1.0))?;
+            let (pin, cin) = (
+                dev(&vec![1.0f32; rows * 4])?,
+                dev(&vec![0.25f32; rows * 16])?,
+            );
+            let parts = zeros(rows * slices * PARTIAL * 4)?;
+            let sync = ops::sync_buffer(rows)?;
+            let (pp, po, pc) = (zeros(rows * 16)?, zeros(rows * 16)?, zeros(rows * 64)?);
+            let (normed, q, qs) = (
+                zeros(rows * HIDDEN * 2)?,
+                zeros(rows * HIDDEN)?,
+                zeros(rows * slices * 4)?,
+            );
+            let fo = |comb: bool| FinishOut {
+                pre: Some(&pp),
+                post: Some(&po),
+                comb: comb.then_some(&pc),
+                normed: Some(&normed),
+                quant: Some((&q, &qs)),
+                ..Default::default()
+            };
+            let e = || Expand {
+                block_out: &h,
+                block_out2: None,
+                post: &pin,
+                comb: &cin,
+                streams_out: Some(&st2),
+            };
+            let pair = b.time(nb, &|s, i| {
+                ops::hc_project(&st, Some(&e()), Some((&fns[i], &parts)), rows, HIDDEN, s)?;
+                ops::hc_finish(
+                    &parts,
+                    &base,
+                    &scale,
+                    &st2,
+                    Some(&nw),
+                    &fo(true),
+                    rows,
+                    HIDDEN,
+                    s,
+                )
+            })?;
+            let one = |comb: bool| {
+                b.time(nb, &|s, i| {
+                    let bd = BoundaryDecode {
+                        streams_in: &st,
+                        expand: Some(e()),
+                        fn_: &fns[i],
+                        base: &base,
+                        scale: &scale,
+                        norm_weight: Some(&nw),
+                        partials: &parts,
+                        sync: &sync,
+                    };
+                    ops::hc_boundary_decode(&bd, &fo(comb), rows, HIDDEN, s)
+                })
+            };
+            let (inline, deferred) = (one(true)?, one(false)?);
+            let comb = b.time(nb, &|s, _| {
+                ops::hc_comb(&parts, &base, &scale, &pc, rows, HIDDEN, s)
+            })?;
+            println!("| {rows} | {pair:.2} | {inline:.2} | {deferred:.2} | {comb:.2} |");
+        }
+
+        println!("\nRouter (288 experts, top-8), 42 distinct weights:\n");
+        println!("| rows | pair (logits + select) us | one launch us |");
+        println!("|---:|---:|---:|");
+        let nr = 42usize;
+        let rws: Vec<DeviceBuffer> = (0..nr)
+            .map(|_| dev(&rng.bf16_vec(EXPERTS * HIDDEN, 0.02)))
+            .collect::<Res<_>>()?;
+        let bias = dev(&rng.f32_vec(EXPERTS, 0.01))?;
+        for rows in [1usize, 2, 4, 8] {
+            let x = dev(&rng.bf16_vec(rows * HIDDEN, 1.0))?;
+            let (lg, ids, wt) = (
+                zeros(rows * EXPERTS * 4)?,
+                zeros(rows * TOP_K * 4)?,
+                zeros(rows * TOP_K * 4)?,
+            );
+            let sync = ops::sync_buffer(rows)?;
+            let pair = b.time(nr, &|s, i| {
+                ops::router_logits(&x, &rws[i], &lg, rows, EXPERTS, HIDDEN, s)?;
+                ops::router_select(&lg, &bias, &ids, &wt, rows, EXPERTS, TOP_K, ROUTED_SCALE, s)
+            })?;
+            let one = b.time(nr, &|s, i| {
+                ops::router_fused(
+                    &x,
+                    &rws[i],
+                    &bias,
+                    &lg,
+                    &sync,
+                    &ids,
+                    &wt,
+                    rows,
+                    EXPERTS,
+                    HIDDEN,
+                    TOP_K,
+                    ROUTED_SCALE,
+                    s,
+                )
+            })?;
+            println!("| {rows} | {pair:.2} | {one:.2} |");
+        }
+
+        println!("\nFP8 decode GEMM with K splits (weights cycled past the L2):\n");
+        println!("| projection | n x k | ksplit | rows | GEMM + reduce us | one launch us |");
+        println!("|---|---|---:|---:|---:|---:|");
+        for (name, n, k) in [("DSA q_a", 1536usize, 4096usize), ("n 512", 512, 4096)] {
+            let ksplit = decode_ksplit(n, k);
+            let copies = (3 * l2).div_ceil(n * k).clamp(2, 64);
+            let w0 = rng.fp8_matrix(n, k);
+            let ws: Vec<DeviceBuffer> = (0..copies).map(|_| dev(&w0.data)).collect::<Res<_>>()?;
+            let sc = dev(&w0.scale_inv)?;
+            let sync = ops::sync_buffer(n / 8)?;
+            for rows in [1usize, 8] {
+                let x = dev(&rng.bf16_vec(rows * k, 1.0))?;
+                let (p, out) = (zeros(ksplit * rows * n * 4)?, zeros(rows * n * 2)?);
+                let pair = b.time(copies * 2, &|s, i| {
+                    ops::fp8_gemm_decode(
+                        &GemmInput::Bf16(&x),
+                        &ws[i % copies],
+                        &sc,
+                        rows,
+                        n,
+                        k,
+                        ksplit,
+                        &GemmOutput::Partials(&p),
+                        s,
+                    )?;
+                    ops::splitk_reduce(&p, &out, ksplit, rows, n, s)
+                })?;
+                let one = b.time(copies * 2, &|s, i| {
+                    ops::fp8_gemm_decode_fused(
+                        &GemmInput::Bf16(&x),
+                        &ws[i % copies],
+                        &sc,
+                        rows,
+                        n,
+                        k,
+                        ksplit,
+                        Some(&p),
+                        Some(&sync),
+                        &out,
+                        s,
+                    )
+                })?;
+                println!("| {name} | {n} x {k} | {ksplit} | {rows} | {pair:.2} | {one:.2} |");
+            }
+        }
+    }
+
+    if section("chain", &only) {
+        // One token's mHC boundaries and routers: 45 layers, each an attention boundary (the
+        // expansion of the previous FFN output, except layer 0) and an FFN boundary (the
+        // expansion of the attention output), and a router after the FFN boundary of layers
+        // 3..44. Distinct weights per boundary and per router (170 MB, past the L2). The
+        // sublayers are left out: their outputs are fixed buffers. "comb deferred" leaves the
+        // Sinkhorn out of the chain: in a decode step glm53f_hc_comb computes it on a second
+        // stream while the sublayer runs, off the critical path this chain measures.
+        println!("\n## One token: 90 boundaries + 42 routers, in one graph\n");
+        println!("| rows | pairs us | single launches, comb inline us | single launches, comb deferred us |");
+        println!("|---:|---:|---:|---:|");
+        let slices = HIDDEN / 128;
+        let fns: Vec<DeviceBuffer> = (0..90)
+            .map(|_| dev(&rng.bf16_vec(24 * 4 * HIDDEN, 0.02)))
+            .collect::<Res<_>>()?;
+        let bases: Vec<DeviceBuffer> = (0..90)
+            .map(|_| dev(&rng.f32_vec(24, 0.5)))
+            .collect::<Res<_>>()?;
+        let scale = dev(&[1.0f32, 1.0, 1.0])?;
+        let nws: Vec<DeviceBuffer> = (0..90)
+            .map(|_| dev(&rng.bf16_vec(HIDDEN, 0.5)))
+            .collect::<Res<_>>()?;
+        let rws: Vec<DeviceBuffer> = (0..42)
+            .map(|_| dev(&rng.bf16_vec(EXPERTS * HIDDEN, 0.02)))
+            .collect::<Res<_>>()?;
+        let bias = dev(&rng.f32_vec(EXPERTS, 0.01))?;
+        for rows in [1usize, 8] {
+            let s0 = dev(&rng.bf16_vec(rows * 4 * HIDDEN, 1.0))?;
+            let st = [zeros(rows * 4 * HIDDEN * 2)?, zeros(rows * 4 * HIDDEN * 2)?];
+            let (attn_out, ffn_out) = (
+                dev(&rng.bf16_vec(rows * HIDDEN, 0.5))?,
+                dev(&rng.bf16_vec(rows * HIDDEN, 0.5))?,
+            );
+            let post = [zeros(rows * 16)?, zeros(rows * 16)?];
+            let comb = [zeros(rows * 64)?, zeros(rows * 64)?];
+            let parts = zeros(rows * slices * PARTIAL * 4)?;
+            let (normed, q, qs) = (
+                zeros(rows * HIDDEN * 2)?,
+                zeros(rows * HIDDEN)?,
+                zeros(rows * slices * 4)?,
+            );
+            let (lg, ids, wt) = (
+                zeros(rows * EXPERTS * 4)?,
+                zeros(rows * TOP_K * 4)?,
+                zeros(rows * TOP_K * 4)?,
+            );
+            let sync = ops::sync_buffer(rows)?;
+            // Boundary b: residual streams, expansion input, weights in and out.
+            let token = |s: &Stream, fused: bool, comb_inline: bool| -> Res<()> {
+                for bnd in 0..90usize {
+                    let layer = bnd / 2;
+                    let ffn = bnd % 2 == 1;
+                    // Boundary 0 collapses the input streams; boundary 1 expands onto them; later
+                    // boundaries alternate between two stream buffers.
+                    let res = if bnd <= 1 { &s0 } else { &st[(bnd + 1) % 2] };
+                    let out = &st[bnd % 2];
+                    let e = (bnd > 0).then(|| Expand {
+                        block_out: if ffn { &attn_out } else { &ffn_out },
+                        block_out2: None,
+                        post: &post[(bnd + 1) % 2],
+                        comb: &comb[(bnd + 1) % 2],
+                        streams_out: Some(out),
+                    });
+                    let fo = FinishOut {
+                        post: Some(&post[bnd % 2]),
+                        comb: (comb_inline || !fused).then_some(&comb[bnd % 2]),
+                        normed: Some(&normed),
+                        quant: ffn.then_some((&q, &qs)),
+                        ..Default::default()
+                    };
+                    let collapse_from = if bnd == 0 { &s0 } else { out };
+                    if fused {
+                        let bd = BoundaryDecode {
+                            streams_in: res,
+                            expand: e,
+                            fn_: &fns[bnd],
+                            base: &bases[bnd],
+                            scale: &scale,
+                            norm_weight: Some(&nws[bnd]),
+                            partials: &parts,
+                            sync: &sync,
+                        };
+                        ops::hc_boundary_decode(&bd, &fo, rows, HIDDEN, s)?;
+                    } else {
+                        ops::hc_project(
+                            res,
+                            e.as_ref(),
+                            Some((&fns[bnd], &parts)),
+                            rows,
+                            HIDDEN,
+                            s,
+                        )?;
+                        ops::hc_finish(
+                            &parts,
+                            &bases[bnd],
+                            &scale,
+                            collapse_from,
+                            Some(&nws[bnd]),
+                            &fo,
+                            rows,
+                            HIDDEN,
+                            s,
+                        )?;
+                    }
+                    if ffn && layer >= 3 {
+                        let rw = &rws[layer - 3];
+                        if fused {
+                            ops::router_fused(
+                                &normed,
+                                rw,
+                                &bias,
+                                &lg,
+                                &sync,
+                                &ids,
+                                &wt,
+                                rows,
+                                EXPERTS,
+                                HIDDEN,
+                                TOP_K,
+                                ROUTED_SCALE,
+                                s,
+                            )?;
+                        } else {
+                            ops::router_logits(&normed, rw, &lg, rows, EXPERTS, HIDDEN, s)?;
+                            ops::router_select(
+                                &lg,
+                                &bias,
+                                &ids,
+                                &wt,
+                                rows,
+                                EXPERTS,
+                                TOP_K,
+                                ROUTED_SCALE,
+                                s,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            };
+            let old = b.time(1, &|s, _| token(s, false, true))?;
+            let new_inline = b.time(1, &|s, _| token(s, true, true))?;
+            let new_deferred = b.time(1, &|s, _| token(s, true, false))?;
+            println!("| {rows} | {old:.1} | {new_inline:.1} | {new_deferred:.1} |");
         }
     }
     Ok(())

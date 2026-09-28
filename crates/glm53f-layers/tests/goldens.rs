@@ -348,12 +348,95 @@ fn golden_fp32_layers() {
     }
 }
 
+/// How close (in f32 ulps) an f32 mHC weight must be to a BF16 rounding boundary for the
+/// reference's own f32 value, from a different projection sum order and `exp`, to round to
+/// the other side. The flips seen on the native set are 3, 29 and 41 ulps from the boundary.
+const FLIP_ULPS: f32 = 256.0;
+
+/// The BF16 value on the other side of the nearest BF16 rounding boundary, when `x` lies
+/// within `ulps` f32 ulps of it.
+fn other_rounding(x: f32, ulps: f32) -> Option<f32> {
+    let b = bf16::round(x);
+    if x == b || b == 0.0 || !x.is_normal() {
+        return None;
+    }
+    let u = b.to_bits() >> 16;
+    let up = (x > b) == (b > 0.0);
+    let n = f32::from_bits((if up { u + 1 } else { u - 1 }) << 16);
+    let boundary = (b + n) * 0.5; // exact: b and n are BF16 neighbours
+    let ulp = f32::from_bits(x.abs().to_bits() & 0x7f80_0000) * f32::EPSILON;
+    ((x - boundary).abs() <= ulps * ulp).then_some(n)
+}
+
+/// One token's stream flow (`[4][D]` streams) with given sublayer outputs, optionally with
+/// one mHC weight replaced: (boundary 0 = attention, 1 = FFN; index 0..4 = `post`, 4..20 =
+/// `comb`; the value).
+fn token_flow(
+    s: &[f32],
+    attn_out: &[f32],
+    mlp_out: &[f32],
+    p: &LayerParams,
+    flip: Option<(usize, usize, f32)>,
+) -> Vec<u16> {
+    let set = |m: &mut HcMix, b: usize| {
+        if let Some((fb, i, v)) = flip {
+            if fb == b {
+                if i < 4 {
+                    m.post[i] = v;
+                } else {
+                    m.comb[i - 4] = v;
+                }
+            }
+        }
+    };
+    let mut a = mhc::mix(s, &p.attn_hc, RMS_EPS);
+    set(&mut a, 0);
+    let mid = bf16::widen(&mhc::expand(attn_out, s, &a.post, &a.comb, D));
+    let mut f = mhc::mix(&mid, &p.ffn_hc, RMS_EPS);
+    set(&mut f, 1);
+    mhc::expand(mlp_out, &mid, &f.post, &f.comb, D)
+}
+
+/// The one mHC weight whose BF16 rounding, flipped across a boundary it lies within
+/// [`FLIP_ULPS`] of, makes this token's output streams equal `want`.
+fn explain_by_one_flip(
+    s: &[f32],
+    attn_out: &[f32],
+    mlp_out: &[f32],
+    p: &LayerParams,
+    want: &[u16],
+) -> Option<String> {
+    let a = mhc::mix(s, &p.attn_hc, RMS_EPS);
+    let mid = bf16::widen(&mhc::expand(attn_out, s, &a.post, &a.comb, D));
+    let f = mhc::mix(&mid, &p.ffn_hc, RMS_EPS);
+    for (b, m) in [(0usize, &a), (1, &f)] {
+        let w: Vec<f32> = m.post.iter().chain(&m.comb).copied().collect();
+        for (i, &x) in w.iter().enumerate() {
+            let Some(v) = other_rounding(x, FLIP_ULPS) else {
+                continue;
+            };
+            if token_flow(s, attn_out, mlp_out, p, Some((b, i, v))) == want {
+                let site = if b == 0 { "attn" } else { "ffn" };
+                let (name, k) = if i < 4 { ("post", i) } else { ("comb", i - 4) };
+                return Some(format!(
+                    "{site} {name}[{k}] = {x:e} rounds to {v:e} instead of {:e}",
+                    bf16::round(x)
+                ));
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn golden_native_stream_flow() {
     // The reference's BF16 run of each recorded layer, fed bf16(FP32 in_streams): this crate's
     // BF16 boundaries and expansions, with the reference's attention and FFN outputs, must
-    // give its output streams, up to the last-bit differences of the mHC projections' sum
-    // order (which can flip a BF16 rounding of a collapse or a stream).
+    // give its output streams bit for bit, except on tokens where one f32 mHC weight (`post`
+    // or `comb`, which the reference rounds to BF16 before the expansion) lies so close to a
+    // BF16 rounding boundary that the reference's value, from its own projection sum order
+    // and `exp`, rounds to the other side. Such a token must match exactly with that one
+    // weight rounded the other way.
     let sets = sets();
     let Some(native) = set_named(&sets, "native") else {
         eprintln!("skip: no native set");
@@ -405,9 +488,34 @@ fn golden_native_stream_flow() {
             "layer {layer} native out_streams: {count} of {} differ, worst {worst} ulp",
             tr.out.len()
         );
+        let per = 4 * D;
+        let mut flipped = 0;
+        for t in 0..rows {
+            let (got, want) = (
+                &tr.out[t * per..(t + 1) * per],
+                &want[t * per..(t + 1) * per],
+            );
+            if got == want {
+                continue;
+            }
+            let s = bf16::widen(&streams[t * per..(t + 1) * per]);
+            let why = explain_by_one_flip(
+                &s,
+                &bf16::widen(&attn_out[t * D..(t + 1) * D]),
+                &bf16::widen(&mlp_out[t * D..(t + 1) * D]),
+                &p,
+                want,
+            );
+            let n = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            let why = why.unwrap_or_else(|| {
+                panic!("layer {layer} token {t}: {n} values differ and no single weight rounding explains them")
+            });
+            eprintln!("  token {t}: {n} values differ; all match when {why}");
+            flipped += 1;
+        }
         assert!(
-            worst <= 4 && count * 100 <= tr.out.len(),
-            "layer {layer}: {count} differ, worst {worst} ulp"
+            flipped * 4 <= rows,
+            "layer {layer}: {flipped} of {rows} tokens need a flipped rounding"
         );
         // The MoE layers' routing on this crate's FFN input, against the native choice.
         if layer >= mlp::DENSE_LAYERS {
