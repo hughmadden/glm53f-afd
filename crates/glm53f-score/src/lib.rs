@@ -268,7 +268,8 @@ impl Options {
             windows,
             experts,
             lanes,
-            kda_chunked_prefill: chunked,
+            // The flag reaches either parser: glm53f-serve's numerics take it first.
+            kda_chunked_prefill: chunked || numerics.kda_chunked_prefill,
             fp8_act,
             promote_k32,
             numerics,
