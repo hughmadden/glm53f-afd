@@ -1397,9 +1397,17 @@ int g53r_device_identity(int* arch, int* sms, char* name, size_t namelen) {
 // neither changes a bit. Up to 64 rows a group's gate/up blocks run together and the down blocks chunk by chunk,
 // and the consumed partial sums are dropped from L2 (ord 2, discard 2: never slower on the development GPU, 3-9%
 // faster at 4-64 rows; the same bits).
+// On GB10 (sm_121, the ranks' GPU) the evict-first split loads, a prefetch ring of 2 and programmatic dependent
+// launch were fastest up to 64 rows on the target hardware (1.02-1.35x over the development default; README
+// "Measured on GB10"); the same bits. On the development GPU l2 2 was slower at 1-2 rows, so other GPUs keep it.
 void g53r_default_cfg(uint32_t rows, g53r_cfg* out) {
-    if (rows <= 64) *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 2, 8, 0, 2, 1, 1, 2, 1};
-    else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2, 1, 1, 1};
+    if (rows <= 64) {
+#if G53R_BAKED_ARCH == 121
+        *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 2, 8, 0, 2, 2, 2, 2, 2};
+#else
+        *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 2, 8, 0, 2, 1, 1, 2, 1};
+#endif
+    } else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2, 1, 1, 1};
     else *out = g53r_cfg{4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1, 1, 1, 1};
 }
 

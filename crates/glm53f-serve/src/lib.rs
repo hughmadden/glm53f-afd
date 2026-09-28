@@ -43,13 +43,13 @@
 //! | `--max-context T` | | the model's (1,048,576) | Tokens one request can hold |
 //! | `--kv-gib G` | | the free memory less the reserve | The KV page pool |
 //! | `--reserve-gib G` | | 1 | Device memory left free after everything is allocated (kernel modules loaded on first use, the sampler, allocator slack) |
-//! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 4096 | Rows of one prefill pass, every lane's together (at most 4,096 per lane: the wire's request cap) |
-//! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass, 1 to 4: from 2, each lane's attention overlaps the other lanes' experts on the ranks (N exchanges in flight over RDMA, as many as the ranks queue); 1 runs the pass serially ([Prefill rows and lanes](#prefill-rows-and-lanes)) |
-//! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (the prefill's first two: needs `--prefill-lanes 2` or more); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
+//! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 8192 | Rows of one prefill pass, every lane's together (at most 4,096 per lane: the wire's request cap) |
+//! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 4 | Lanes of a prefill pass, 1 to 4: from 2, each lane's attention overlaps the other lanes' experts on the ranks (N exchanges in flight over RDMA, as many as the ranks queue); 1 runs the pass serially ([Prefill rows and lanes](#prefill-rows-and-lanes)) |
+//! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | 2-16 | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (the prefill's first two: needs `--prefill-lanes 2` or more); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
-//! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 (68 MiB less per slot and per snapshot) |
+//! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states stored in BF16, computed in f32 (68 MiB less per slot and per snapshot); passed the KL gate on the target hardware (docs/KL-GATE.md §6b) |
 //! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (64 MiB of GEMM scratch) |
 //! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
 //! | `--kda-chunked-prefill` | `GLM53F_KDA_CHUNKED_PREFILL=1` | off | Numerics under test: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |
@@ -69,9 +69,9 @@
 //! `GLM53F_PROFILE` (the forward's lane trace: a `PIPE` line per prefill pass, a `STEP` line per
 //! decode step, see `glm53f-forward`'s `LaneTrace::step_summary`).
 //!
-//! **Numerics under test.** The `Numerics` options change the engine's arithmetic and are
-//! off by default: each becomes a default only after the KL gate (`docs/KL-GATE.md`) and speed
-//! runs on the target hardware. `glm53f-score` takes the same flags. The start-up log names the
+//! **Numerics under test.** The `Numerics` options change the engine's arithmetic; each becomes
+//! a default only after the KL gate (`docs/KL-GATE.md`) and speed runs on the target hardware.
+//! D8 (BF16 KDA states) passed and is on; the others are off. `glm53f-score` takes the same flags. The start-up log names the
 //! ones on.
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
@@ -93,8 +93,10 @@
 //! | 4,096 (2,048) | 17.4 ms | 14.2 ms | 34.9 ms | 8.5 us |
 //! | 8,192 (4,096) | 34.6 ms | 25.5 ms | 69.2 ms | 8.4 us |
 //!
-//! Today every size is coordinator-bound at about the same rate (about 2.7K tok/s over 42 MoE
-//! layers and the rest), so the pass is sized for its other costs: 4,096 rows keeps the lanes'
+//! The default is 8,192 rows in four lanes of 2,048: on the target hardware four lanes kept the GPU
+//! 86% busy and prefilled 4.1K tok/s at 4K-79K tokens, against 3.5-4.0K with two lanes of 2,048
+//! (docs/PERFORMANCE.md §0), and a 1,048,576-token request still fits at 16 slots. The sizing notes
+//! below predate the lanes: 4,096 rows keeps the lanes'
 //! scratch at about 1.1 GiB (8,192 rows take about 2.1 GiB; before the lanes shared their
 //! attention-kind buffers and the sparse MLA core ran in row blocks, 3.1 and 6.1 GiB; measured by
 //! allocation on the development GPU) and a pass at about 1.5 s (the longest a running request
@@ -158,10 +160,11 @@
 //! `--decode-lanes` runs a decode or verify pass in the prefill's first two lanes, cut between
 //! requests (`glm53f-forward`'s `ForwardConfig::decode_lane_rows`): one lane's attention on this
 //! GPU overlaps the other lane's routed experts on the ranks, exactly as the two passes over the
-//! lanes' requests would compute them. It is off by default because it pays only where the
-//! coordinator's work per layer is comparable with the ranks': each lane reads the coordinator's
-//! weights once, and the ranks read the experts each lane's rows name, so two lanes of many rows
-//! read most of the 288 experts twice. A run on the target hardware decides the range.
+//! lanes' requests would compute them. It pays only where the coordinator's work per layer is
+//! comparable with the ranks': each lane reads the coordinator's weights once, and the ranks read
+//! the experts each lane's rows name, so two lanes of many rows read most of the 288 experts
+//! twice. The default range, 2-16 rows, won on the target hardware (C2 +8%, C4 +11%, C8 +3%,
+//! neutral at 16 and 48 streams and single-stream).
 //!
 //! # Copy windows
 //!
@@ -208,9 +211,10 @@ options:
   --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
-numerics under test (off by default):
+numerics (each gated by KL; D8 on, the rest off by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
-  --kda-state-bf16    KDA recurrent states stored in BF16 (D8)
+  --kda-state-bf16    KDA recurrent states stored in BF16 (D8; the default)
+  --kda-state-f32     KDA recurrent states stored in F32 (the reference)
   --prefill-w8a16     FP8 projections over 8 rows with BF16 activations
   --kda-prefill-w8a8  with the two above: the FP8 KDA projections keep E4M3 activations
   --kda-chunked-prefill  the KDA of prefill passes through the chunked kernel
@@ -233,14 +237,14 @@ pub enum Experts {
     Local { dir: PathBuf, gib: f64 },
 }
 
-/// Numerics under test, each off by default (the KL gate and speed runs decide).
+/// Numerics under test (the KL gate and speed runs decide): D8 on by default, the rest off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Numerics {
     /// D2: the KDA layers' q|k|v|b and o projections quantized at load to FP8 E4M3 with
     /// 128 x 128 block scales (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
     pub kda_fp8: bool,
-    /// D8: the KDA recurrent states stored in BF16, computed in f32 (`--kda-state-bf16`,
-    /// `GLM53F_KDA_STATE_BF16=1`).
+    /// D8: the KDA recurrent states stored in BF16, computed in f32. On unless
+    /// `--kda-state-f32` or `GLM53F_KDA_STATE_BF16=0` (it passed the KL gate).
     pub kda_state_bf16: bool,
     /// FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3
     /// (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`).
@@ -259,7 +263,7 @@ impl Numerics {
         let on = |k: &str| env(k).is_some_and(|v| v != "0");
         Numerics {
             kda_fp8: on("GLM53F_KDA_FP8"),
-            kda_state_bf16: on("GLM53F_KDA_STATE_BF16"),
+            kda_state_bf16: env("GLM53F_KDA_STATE_BF16").map_or(true, |v| v != "0"),
             prefill_w8a16: on("GLM53F_PREFILL_W8A16"),
             kda_prefill_w8a8: on("GLM53F_KDA_PREFILL_W8A8"),
             kda_chunked_prefill: on("GLM53F_KDA_CHUNKED_PREFILL"),
@@ -271,6 +275,7 @@ impl Numerics {
         match flag {
             "--kda-fp8" => self.kda_fp8 = true,
             "--kda-state-bf16" => self.kda_state_bf16 = true,
+            "--kda-state-f32" => self.kda_state_bf16 = false,
             "--prefill-w8a16" => self.prefill_w8a16 = true,
             "--kda-prefill-w8a8" => self.kda_prefill_w8a8 = true,
             "--kda-chunked-prefill" => self.kda_chunked_prefill = true,
@@ -428,15 +433,16 @@ impl Options {
         let (mut max_context, mut kv_gib, mut reserve_gib) = (None, None, 1.0f64);
         let mut prefill_rows = match env("GLM53F_PREFILL_ROWS") {
             Some(v) => number("GLM53F_PREFILL_ROWS", &v)?,
-            None => 4096,
+            None => 8192,
         };
         let mut prefill_lanes = match env("GLM53F_PREFILL_LANES") {
             Some(v) => number("GLM53F_PREFILL_LANES", &v)?,
-            None => 2,
+            None => 4,
         };
+        let mut decode_lanes_set = env("GLM53F_DECODE_LANES").is_some();
         let mut decode_lanes = match env("GLM53F_DECODE_LANES") {
             Some(v) => parse_decode_lanes(&v)?,
-            None => (0, usize::MAX),
+            None => (2, 16),
         };
         let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
@@ -466,7 +472,10 @@ impl Options {
                 "--reserve-gib" => reserve_gib = number(k, &val()?)?,
                 "--prefill-rows" => prefill_rows = number(k, &val()?)?,
                 "--prefill-lanes" => prefill_lanes = number(k, &val()?)?,
-                "--decode-lanes" => decode_lanes = parse_decode_lanes(&val()?)?,
+                "--decode-lanes" => {
+                    decode_lanes = parse_decode_lanes(&val()?)?;
+                    decode_lanes_set = true;
+                }
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--copy-windows" => copy_windows = on_off(k, &val()?)?,
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
@@ -493,6 +502,11 @@ impl Options {
             return Err(format!(
                 "--prefill-lanes {prefill_lanes}: 1 to {MAX_PREFILL_LANES}"
             ));
+        }
+        // The default decode lanes need the prefill's first two lanes; one prefill lane turns them
+        // off unless they were asked for.
+        if !decode_lanes_set && prefill_lanes < 2 {
+            decode_lanes = (0, usize::MAX);
         }
         if decode_lanes.0 > 0 && prefill_lanes < 2 {
             return Err(
@@ -653,7 +667,7 @@ mod tests {
         assert_eq!((o.max_context, o.kv_gib, o.reserve_gib), (None, None, 1.0));
         assert_eq!(
             (o.prefill_rows, o.prefill_lanes, o.dev_layers, o.drafter),
-            (4096, 2, None, None)
+            (8192, 4, None, None)
         );
         // Flags win over the environment.
         let o = Options::parse(
@@ -683,6 +697,9 @@ mod tests {
         };
         let o = Options::parse(&[], &env2).unwrap();
         assert_eq!((o.prefill_rows, o.prefill_lanes), (2048, 1));
+        // One prefill lane turns the default decode lanes off; asking for them is refused.
+        assert_eq!(o.decode_lanes, (0, usize::MAX));
+        assert!(Options::parse(&args("--decode-lanes 2-16"), &env2).is_err());
         let o = Options::parse(&args("--prefill-rows 8192 --prefill-lanes 2"), &env2).unwrap();
         assert_eq!((o.prefill_rows, o.prefill_lanes), (8192, 2));
         // Up to four lanes of up to 4,096 rows each.
@@ -693,8 +710,8 @@ mod tests {
         }
         let n = Options::parse(&args("--prefill-lanes 4 --decode-lanes 2"), &env).unwrap();
         assert_eq!((n.prefill_lanes, n.decode_lanes), (4, (2, usize::MAX)));
-        // Decode lanes: off by default; from the environment, and the flag over it.
-        assert_eq!(o.decode_lanes, (0, usize::MAX));
+        // Decode lanes: 2-16 by default; from the environment, and the flag over it.
+        assert_eq!(o.decode_lanes, (2, 16));
         let env3 = |k: &str| match k {
             "GLM53F_DECODE_LANES" => Some("4-64".to_string()),
             _ => env(k),
@@ -749,7 +766,11 @@ mod tests {
     #[test]
     fn numerics_under_test_are_off_unless_asked_for() {
         let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        // D8 passed the KL gate and is on by default; the rest are off unless asked for.
         let o = Options::parse(&args("--checkpoint /c"), &env).unwrap();
+        assert_eq!(o.numerics, Numerics { kda_state_bf16: true, ..Numerics::default() });
+        assert_eq!(o.numerics.describe(), "BF16 KDA states (D8)");
+        let o = Options::parse(&args("--checkpoint /c --kda-state-f32"), &env).unwrap();
         assert_eq!(o.numerics, Numerics::default());
         assert_eq!(o.numerics.describe(), "none");
         let o = Options::parse(
@@ -799,7 +820,7 @@ mod tests {
             .ends_with("the FP8 KDA projections W8A8 at prefill"));
         let o = Options::parse(&args("--checkpoint /c --kda-chunked-prefill"), &env).unwrap();
         assert!(o.numerics.kda_chunked_prefill);
-        assert_eq!(o.numerics.describe(), "chunked KDA prefill");
+        assert_eq!(o.numerics.describe(), "BF16 KDA states (D8), chunked KDA prefill");
         let env3 = |k: &str| match k {
             "GLM53F_KDA_CHUNKED_PREFILL" => Some("1".to_string()),
             other => env(other),
@@ -871,7 +892,7 @@ mod tests {
             "--checkpoint /c --experts gpu",                       // unknown backend
             "--checkpoint /c --experts local --slots 0",           // no slots
             "--checkpoint /c --experts local --slots 65",          // too many
-            "--checkpoint /c --experts local --prefill-rows 8193", // over two lanes of 4,096
+            "--checkpoint /c --experts local --prefill-rows 8193 --prefill-lanes 2", // over two lanes
             "--checkpoint /c --experts local --prefill-rows 5000 --prefill-lanes 1",
             "--checkpoint /c --experts local --prefill-rows 12289 --prefill-lanes 3",
             "--checkpoint /c --experts local --prefill-rows 16385 --prefill-lanes 4",

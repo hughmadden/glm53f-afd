@@ -756,6 +756,31 @@ the conclusions are inferences until the options are swept on a Spark):
   gate/up kernel's end; the scale vectors are now fetched into L2 before they
   are needed.
 
+**The split kernels swept on GB10** (29 September 2026):
+- Layers 3 and 4 alternating (`--layer 3,4`), `--passes 8`, best of two runs.
+- Every configuration below printed the same output digest at every row count.
+
+| Rows | Before the sweep | `ord=1,discard=1` | `ord=2,discard=2` | `pf=2,pdl=2` | **`l2=2,pf=2,pdl=2`** |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.131 ms | 0.086 | 0.113 | **0.080** | 0.084 |
+| 2 | 0.248 | 0.233 | 0.228 | 0.220 | **0.195** |
+| 4 | 0.454 | 0.410 | 0.401 | 0.394 | **0.379** |
+| 8 | 0.852 | 0.766 | 0.736 | 0.732 | **0.719** |
+| 16 | 1.530 | 1.430 | 1.360 | 1.358 | **1.336** |
+| 32 | — | 2.317 | 2.199 | 2.199 | **2.150** |
+| 64 | 3.522 | 3.374 | 3.173 | 3.174 | **3.087** |
+
+- `l2=2,pf=2,pdl=2` is the fastest or within 5% of it at every size. On GB10 builds (sm_121) it is the small regime's default; other GPUs keep `l2=1,pf=1,pdl=1`, since on the development GPU `l2=2` was 10–12% slower at 1–2 rows.
+- Through the policy it reads 221–237 GB/s at 1–64 rows (234–237 from 8 rows). The one-row figure is noisy between runs (0.084–0.115 ms).
+- `pf=4` never helped (fewer blocks per SM). The prefill sizes with the middle and large regimes' defaults: 2,048 rows 6.755 ms, 4,096 rows 12.709 ms.
+- **Served** (the same four ranks, the rank trace):
+
+  | Rows per call | 1 | 2–3 | 4–12 | 13–32 | 33–64 | 65–128 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | GB/s | 198 | 198 | 220 | 226 | 226 | 233 |
+
+  That is 5–13% over the table above for 1–64 rows. End to end, single-stream decode rose 3–4% and 16 streams 6%.
+
 ## The rank directory
 
 A rank serves a directory with one image per MoE layer, named

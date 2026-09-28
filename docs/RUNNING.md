@@ -134,7 +134,7 @@ describes each.
   the snapshot banks would take of it if full) and what was left free.
 - **Decode lanes.** `--decode-lanes MIN[-MAX]` runs decode and verify passes of MIN to MAX rows
   (over two requests or more) in the prefill's first two lanes, cut between requests (it needs
-  `--prefill-lanes` 2 or more); off by default. Each
+  `--prefill-lanes` 2 or more); `2-16` by default. Each
   lane is exactly a pass over its own requests (`crates/glm53f-forward/tests/decode_lanes.rs`),
   so it changes timing only. It overlaps one lane's coordinator work with the other's routed
   experts, but each lane reads the coordinator's weights and the ranks read the experts each
@@ -310,11 +310,11 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
-| `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
-| `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 2); at most 4,096 rows per lane |
-| `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes` 2 or more) |
+| `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 8,192) |
+| `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
+| `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
-| `GLM53F_KDA_STATE_BF16=1` | `--kda-state-bf16` | Numerics under test, off by default (D8): the KDA recurrent states in BF16 |
+| `GLM53F_KDA_STATE_BF16` | `--kda-state-bf16` / `--kda-state-f32` | D8, **on by default** (passed the KL gate, docs/KL-GATE.md §6b): the KDA recurrent states stored in BF16, computed in f32; `0` or `--kda-state-f32` for F32 |
 | `GLM53F_PREFILL_W8A16=1` | `--prefill-w8a16` | Numerics under test, off by default: FP8 projections over 8 rows with BF16 activations |
 | `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With the two above: the FP8 KDA projections keep E4M3 activations over 8 rows |
 | `GLM53F_KDA_CHUNKED_PREFILL=1` | `--kda-chunked-prefill` | Numerics under test, off by default: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |

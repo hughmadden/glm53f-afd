@@ -438,7 +438,8 @@ mod tests {
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
             (false, Fp8Act::Bf16, true)
         );
-        assert_eq!(o.numerics, Numerics::default());
+        // The engine's defaults, as glm53f-serve's: D8 (BF16 KDA states) on since it passed the gate.
+        assert_eq!(o.numerics, Numerics { kda_state_bf16: true, ..Numerics::default() });
         assert!(!o.development());
         let o = Options::parse(
             &args(
@@ -491,7 +492,12 @@ mod tests {
             &Options::parse(&args("--plan p --out o"), &env).unwrap(),
             &b,
         );
-        assert!(plain.contains("BF16 KDA projections") && plain.contains("KDA states F32"));
+        assert!(plain.contains("BF16 KDA projections") && plain.contains("KDA states BF16"));
+        let f32_state = engine_line(
+            &Options::parse(&args("--plan p --out o --kda-state-f32"), &env).unwrap(),
+            &b,
+        );
+        assert!(f32_state.contains("KDA states F32"), "{f32_state}");
         assert!(
             plain.contains("W8A8 beyond with k32-promoted accumulation"),
             "{plain}"

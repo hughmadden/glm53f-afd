@@ -11,77 +11,126 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
 **Setup:**
 - One RTX 5090 coordinator and four DGX Spark (GB10) expert ranks, over RoCE v2 RDMA at 200 Gb/s.
 - EXL3 K4 experts, FP8 MLA cache, BF16 KDA projections, the embedding in host RAM.
-- All 45 layers, 16 slots. Thinking on (the model's default) unless stated.
-- Single runs; between runs, ±2–3% is typical.
+- All 45 layers, 16 slots, the DFlash2 drafter.
+- Defaults since 29 September 2026:
+  - four prefill lanes of 2,048 rows;
+  - BF16 KDA states (D8, which passed the KL gate);
+  - two decode lanes for passes of 2–16 rows;
+  - copy windows for greedy requests;
+  - the rank's GB10 decode schedule.
+- Thinking on (the model's default) unless stated. Single runs; between runs, ±2–3% is typical.
 
-**Decode, one stream:**
+**Decode, one stream** (tok/s; 1,024-token code and counting, a 903-token prose answer):
 
 | Case | Code | Prose | Counting |
 |---|---:|---:|---:|
-| No drafter | 52.7 | 52.7 | 52.7 |
-| DFlash2 (chain τ 0.7), greedy, thinking off | **111.3** | 62.4 | **128.4** |
-| DFlash2, greedy, thinking on | 82.7 | 73.3 | 169.1 |
-| DFlash2, sampled (T 0.7), thinking off | 113.5 | 67.0 | 123.1 |
+| No drafter (28 Sep) | 52.7 | 52.7 | 52.7 |
+| DFlash2 (chain τ 0.7), greedy, thinking off, 29 Sep (copy windows off) | **115.0** | 63.7 | **133.1** |
+| The same, 28 Sep | 111.3 | 62.4 | 128.4 |
+| DFlash2, greedy, thinking on (28 Sep) | 82.7 | 73.3 | 169.1 |
+| DFlash2, sampled (T 0.7), thinking off (28 Sep) | 113.5 | 67.0 | 123.1 |
 
-- Figures are tok/s. Without a drafter, 52.7 tok/s is 19.0 ms per token.
+- Without a drafter, 52.7 tok/s is 19.0 ms per token.
 - With the drafter, 51–71% of verified drafts are kept (τ 0.3–0.7), 3.0–3.4 tokens per verify window.
 - The model below expected 36–43 tok/s without a drafter (§2) and 110–130 / 75–105 / 125–145 with it (§3).
 
-**Where a one-row step goes** (traced medians per MoE layer): the coordinator's own work 0.25 ms,
-the rank kernel 0.168 ms, the wire about 33 µs beyond the rank's compute.
+**Like-for-like with the fastest public four-Spark TP4 recipe** ([mmastrac/glm-5.3-flash-4x-gx10](https://github.com/mmastrac/glm-5.3-flash-4x-gx10) branch `perf-2026-09-27`):
+- Its own `dev/repro/decode.py` prompts and method: 512 tokens, T 0, median of three after a warm-up, tok/s including the time to the first token.
+- Its "thinking off" renders the model's `Reasoning Effort: Low` with `<think>` left open. Here that is `reasoning_effort: "low"`.
 
-**Concurrency, aggregate** (400-token streams, DFlash2 τ 0.7 unless stated):
+| Mode | Structured | Code | Prose | Drafts kept |
+|---|---:|---:|---:|---|
+| **This engine, `reasoning_effort: "low"`** | **186.1** | **142.3** | **78.3** | 84.3%, 4.22 tokens a window |
+| This engine, thinking off (empty `<think></think>`) | 167.2 | 124.1 | 71.4 | — |
+| This engine, thinking on (default effort) | 167.5 | 131.3 | 85.7 | 84.2% |
+| That recipe (its README, its thinking off) | 167.2 | 118.7 | 64.4 | 88.5–97.2% on structured |
 
-| Streams | 16 slots (default) | 16 slots, `--decode-lanes 2-16` | 48 slots (`--slots 48 --prefill-rows 2048`) | 48 slots, no drafter |
-|---|---:|---:|---:|---:|
-| C4 | 141 tok/s | **157 tok/s** | — | — |
-| C16 | 300 tok/s | 299 tok/s | 295 tok/s | — |
-| C32 | — | — | 456 tok/s | — |
-| C48 | — | — | **573 tok/s** | 427 tok/s |
+In the matched mode this engine is 11% / 20% / 22% faster, with 4-bit experts that keep BF16 activations. That recipe's fastest build takes 4-bit activations in its prefill experts.
 
-- At 48 slots, the KV pool is 2.70 GiB (470,592 tokens) and the largest request is 462,336 tokens. At 16 slots, a 1,048,576-token request fits.
-- The model expected 350–480 tok/s at C16 (§4).
-- **Decode is bound by the ranks' weight reads.** At C16 the verify passes carry about 41 rows and take 101 ms. Of each MoE layer's 2.24 ms, 1.73 ms is the exchange and 0.34 ms the coordinator's attention.
-  - The rank's split kernels, which serve every call of up to 64 rows, read expert weights at 187–205 GB/s: 68–75% of GB10's 273 GB/s (`crates/glm53f-rank/README.md`, "Measured on GB10").
-  - More rows per call share more of those reads: 48 streams reach 573 tok/s.
-- Drafting is worth +34% at C48. A draft budget of 128 rows or τ 0.5 each cost about 1.5%.
-- Two decode lanes help only while verify passes stay small (C4: +11%); they are off by default.
+**Concurrency, aggregate** (tok/s; 400-token streams, DFlash2 τ 0.7):
 
-**Prefill**, with two-lane pipelining (the coordinator computes one half of a pass while the ranks
-serve the other; 4,096-row passes in two lanes of 2,048):
+| Streams | 16 slots, 29 Sep (copy windows off) | 16 slots, `--decode-lanes 2-16` (now the default) | 48 slots, D8, four prefill lanes, 29 Sep | 16 slots, 28 Sep | 48 slots, 28 Sep |
+|---|---:|---:|---:|---:|---:|
+| C2 | 107.7 | **116.2** | — | — | — |
+| C4 | 147.7 | 157 (28 Sep) | — | 141 | — |
+| C8 | 210.4 | **216.6** | — | — | — |
+| C16 | 316.5 (325.9 with copy windows on) | 299 (28 Sep) | 325.9 | 300 | 295 |
+| C32 | — | — | 476.8 | — | 456 |
+| C48 | — | — | **600.8** | — | 573 (427 without drafting) |
+
+- **Context at 48 slots:** with D8 and four lanes the pool is 4.94 GiB (859,072 tokens) and the largest request 850,816 tokens (28 Sep: 470,592 and 462,336). At 16 slots a 1,048,576-token request fits.
+- **Decode is bound by the ranks' weight reads.** At C16 the verify passes carry about 41 rows. Of each MoE layer's 2.24 ms (28 Sep), 1.73 ms was the exchange and 0.34 ms the coordinator's attention.
+  - The rank's GB10 decode schedule (`crates/glm53f-rank/README.md`, "Measured on GB10") reads expert weights at 221–237 GB/s in its bench and 198–233 GB/s in service (28 Sep: 187–234). GB10's reads top out at about 225–241 GB/s in practice (273 on paper).
+  - More rows per call share more of those reads: 48 streams reach 601 tok/s.
+- **Drafting** is worth +34% at C48. A draft budget of 128 rows or τ 0.5 each cost about 1.5%.
+
+**Copy windows** (greedy requests copy spans of their own context in place of drafts; lossless):
+- Measured with mimo26f-afd's `harness/copy_bench.py` at v1.3.0, thinking off, 3 runs.
+- Replies are byte-identical with copy windows on and off.
+
+| Case | On | Off | Change |
+|---|---:|---:|---:|
+| Rewrite a file (two cases) | 173.5 / 167.1 | 133.1 / 127.1 | **+30% / +31%** |
+| Quote a function | 117.9 | 107.7 | +9% |
+| An `edit_file` tool call (end to end) | 165.4 | 158.3 | +4.5% |
+| Fresh code / fresh prose | 114.4 / 76.2 | 114.4 / 76.3 | 0 / 0 |
+
+Copied windows averaged 7.8 tokens with 97.1% of copied tokens kept.
+
+**Prefill** (tok/s; one prompt at a time):
 
 | Prompt | 4K | 19K | 79K |
 |---|---:|---:|---:|
-| Two lanes of 4,096 rows (`--prefill-rows 8192`), rank kernel tuned for GB10 | **3,577 tok/s** | **3,663 tok/s** | **3,733 tok/s** |
-| Two lanes of 2,048 (default), rank kernel tuned for GB10 | 3,338 tok/s | 3,678 tok/s | 3,626 tok/s |
-| Two lanes of 2,048, with the exchange fast paths, the rank kernel before | 3,033 tok/s | 3,369 tok/s | 3,350 tok/s |
-| Two lanes, host encode and pageable uploads | 2,717 tok/s | 2,964 tok/s | 2,899 tok/s |
-| One lane | 1,633 tok/s | 1,725 tok/s | 1,715 tok/s |
+| **Four lanes of 2,048 (default since 29 Sep)** | **4,145** | **4,138** | **4,089** |
+| Three lanes of 2,048 | 4,138 | 4,048 | 4,074 |
+| Two lanes of 4,096 | 3,771 | 4,041 | 4,013 |
+| Two lanes of 2,048, 29 Sep | 3,505 | 4,014 | 3,978 |
+| Four lanes with `--kda-chunked-prefill --prefill-w8a16` (opt-in; see below) | **4,956** | **5,180** | **5,190** |
+| Two lanes of 2,048, 28 Sep (rank kernel tuned for GB10) | 3,338 | 3,678 | 3,626 |
+| Two lanes of 2,048, 28 Sep (exchange fast paths, earlier rank kernel) | 3,033 | 3,369 | 3,350 |
+| Two lanes, host encode and pageable uploads | 2,717 | 2,964 | 2,899 |
+| One lane | 1,633 | 1,725 | 1,715 |
 
-- A 79K-token prompt takes 21–22 s.
-- This is still a **MISS** against the 4.5–6K tok/s of §5.
-- 8,192-row passes took 3.3 GiB more buffers. At 16 slots that shrank the pool to 742,592 tokens, below a 1M-token request, so they are not the default. Since the lane scratch is shared within a lane and the sparse MLA core runs in blocks (§5a), lanes of 4,096 rows take less than lanes of 2,048 took (all forward buffers 2.88 GiB against 3.67): not yet measured on the target.
-- Without the fast paths, the GPU is busy 66% of a 27.5 ms MoE layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
-- With them, the host's per-lane work falls to about 0.25 ms, and the layer to 25.1 ms with the GPU 72% busy.
-- With the rank kernel tuned for GB10 (6–8% faster end to end), the exchange of a 2,048-row lane fell to 12 ms and the MoE layer to 22.2 ms.
-- **The coordinator's attention is now the bound:** 4.3 µs per row per MoE layer, 84% of the GPU's time with lanes of 4,096 rows (36.5 of 43.4 ms per layer).
-- **Three and four lanes** (`--prefill-lanes 3`, 4; built 29 September 2026, not yet run on the target hardware). A 2,048-row lane's exchange (12.0 ms) is longer than the other lane's attention (8.7 ms), so in two lanes each lane's chain of attention, then exchange, sets the pace and the GPU waits. In N lanes the exchange hides while it takes at most the other N − 1 lanes' attention. Estimated, not measured: up to about +20% with three lanes today (in two lanes the GPU idles 16–18% of a MoE layer), more once the chunked KDA prefill and the FP8 KDA projections shorten the attention; the ranks' own limit is about 14 ms per 4,096 rows per layer (the rank kernel's 13.3 ms on GB10). The development GPU's side of it is §5b.
-- The reduce-scatter return is slower over a TCP mesh between the ranks. They encode and sum peer rows on the CPU, so it stays off.
+- **With four lanes:**
+  - A 79K-token prompt takes 19.3 s; a 207K-token one 53.7 s (3.9K tok/s).
+  - The GPU is 86% busy, attention is the bound again, and each lane's exchange hides behind the other lanes' attention.
+  - At 16 slots all forward buffers take 2.80 GiB and a 1M-token request fits (KV pool 8.26 GiB).
+- **The 5090's attention per 2,048-row lane** (`GLM53F_PROFILE_OPS=1`, §5a has the development GPU):
 
-**Against a vLLM recipe on the same four Sparks without a coordinator GPU**
-([tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark), TP4, NVFP4 experts, its README's figures):
+  | Layer | Attention | Main ops |
+  |---|---:|---|
+  | KDA | 8.52 ms | the serial chain 5.25 ms (59%); the `[q\|k\|v\|b]` projection 1.94 ms (22%) |
+  | DSA | 9.66 ms | the sparse attention 5.23 ms (52%) |
 
-| Metric | That recipe | This engine |
-|---|---|---|
-| Single stream | ~55 tok/s | 111–128 on code and counting, 62 on prose |
-| Aggregate | 530 tok/s at 48 streams | **573 tok/s at 48 streams** (48 slots, requests up to 462K tokens); 300 at 16 (16 slots, 1M) |
-| Prefill, short prompts | **3.5–4.1K tok/s** (warmed, ~9K) | 3.3–3.6K at 4K |
-| Prefill, 114K prompt | 1.9K tok/s | **3.6–3.7K at 79K** |
+  The shared expert takes 0.41 ms. The chunked KDA prefill replaces the chain. The sparse attention is the next lever.
+- **The opt-in pair** (the chunked KDA prefill with W8A16 projections) lowers the mean KL (0.0263 against 0.0282; [KL-GATE.md](KL-GATE.md) §6b). The 25-window gate cannot yet show it non-inferior, so it stays off until a larger panel decides.
+  - Its row was measured on an unbalanced RDMA bond (62.8% of the return traffic on one port), which slows the exchange it is bound by. It is probably an underestimate.
+- **The earlier story, in order:**
+  - Without the exchange fast paths, the GPU was busy 66% of a 27.5 ms MoE layer. With them it was 72% of 25.1 ms.
+  - With the GB10-tuned rank kernel a 2,048-row lane's exchange fell to 12 ms, longer than the other lane's attention (8.7 ms). That is why two lanes left the GPU idle and four do not.
+  - The reduce-scatter return is slower over a TCP mesh between the ranks: they encode and sum peer rows on the CPU. It stays off.
 
-This engine leads at one stream, on long prompts and, with 48 slots, on aggregate throughput. It is
-level to slightly behind on short-prompt prefill. The levers: the coordinator's attention kernels for
-prefill; the rank's split kernels (68–75% of the memory bandwidth) and memory for more slots for
-the aggregate.
+**KV snapshots and the host RAM tier** (first run on the target, 29 Sep; `GLM53F_HOST_CACHE_GB=24`):
+
+| Step | Time to first token |
+|---|---:|
+| A 207,436-token prompt, cold | 53.67 s |
+| The same prompt again (device snapshot) | 0.01 s |
+| Again, after 30 other long prompts pushed its snapshot out of the device (restored from RAM) | 0.04 s |
+
+The restore itself took 21.4 ms. A 36K-token snapshot's store to RAM took 9.3 ms.
+
+**Against the public four-Spark recipes** (their READMEs' figures; this engine as above):
+
+| Metric | [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark) (vLLM TP4, NVFP4) | mmastrac `perf-2026-09-27` (vLLM TP4, NVFP4) | This engine |
+|---|---|---|---|
+| Single stream | ~55 tok/s | 167.2 / 118.7 / 64.4 (structured / code / prose) | 186.1 / 142.3 / 78.3 in the same mode |
+| Aggregate | 530 tok/s at 48 streams | 253 tok/s at 16 streams | 316–326 at 16; **601 at 48** (48 slots) |
+| Prefill | 3.5–4.1K tok/s short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | 4.1K at 4K–79K; 5.2K with the opt-in pair |
+| Context | 1M | 512K | 1M (16 slots); 851K at 48 slots |
+
+- mmastrac's prefill takes 4-bit activations in its experts, which its own test puts 13–62% away from BF16 activations at the MoE output.
+- This engine's experts keep BF16 activations. Its KL against the BF16 teacher equals the published figure for its 4-bit expert checkpoint.
 
 **Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
 in 44–49 s (§6).
@@ -90,11 +139,11 @@ in 44–49 s (§6).
 - a number hidden at 37% depth is retrieved from 8.8K and 79K tokens of filler, with and without the drafter;
 - `harness/api_contract.py` passes all 12 rows on the real model.
 
-**KL gate** against the published BF16 teacher ([KL-GATE.md](KL-GATE.md) §6a):
+**KL gate** against the published BF16 teacher ([KL-GATE.md](KL-GATE.md) §6a, §6b):
 - decode path 0.0245 nats, top-1 95.1%, equal within its standard error to the published 0.0246
-  for the same 4-bit experts;
-- prefill path 0.0282 nats, top-1 94.7%;
-- both pass.
+  for the same 4-bit experts; prefill path 0.0282 nats, top-1 94.7%; both pass;
+- every change merged by 29 September left the engine's output bit-identical;
+- D8 passed and is on; D2 (FP8 KDA projections at 128 × 128 scales) failed and stays off.
 
 ## 1. Anchors
 

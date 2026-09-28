@@ -451,6 +451,39 @@ pass, 1 error, 3 gate failed.
 
 **Timings:** loading 4.3 s, then 23.8 s for the whole plan at 4,096 rows per pass and 279 s at 8.
 
+## 6b. The numerics options on the target hardware (29 September 2026)
+
+**The regression check:**
+- The engine at main `af0c565`, with every option off, gave **exactly** section 6a's result at 4,096 rows: mean 0.028249107…, top-1 0.94707.
+- The changes merged between the two runs are these:
+  - the rank kernel's large-M and split schedules;
+  - the lane scratch and MLA row blocks;
+  - up to four prefill lanes;
+  - copy windows;
+  - the options themselves, when off.
+- None of them moved a bit of the engine's output. Section 6a's 8-row run therefore stands as the 8-row baseline.
+
+**Each option, paired against that baseline** (`compare --margin 0.002`, 4,725 rows). "Mean A−B" is the change in mean KL over the same rows; "upper" is the 95% window-bootstrap bound.
+
+| Option | Rows per pass | Mean KL | Mean A−B | Upper | Verdict |
+|---|---:|---:|---:|---:|---|
+| `--kda-state-bf16` (D8) | 8 | 0.02398 | −0.0005 | +0.0008 | **PASS** |
+| `--kda-state-bf16` (D8) | 4,096 | 0.02767 | −0.0006 | +0.0010 | **PASS** |
+| `--kda-fp8` (D2, 128 × 128 weight scales) | 8 | 0.02831 | +0.0039 | +0.0083 | FAIL (top-1 McNemar p = 0.027) |
+| `--kda-fp8` | 4,096 | 0.03136 | +0.0031 | +0.0074 | FAIL |
+| `--prefill-w8a16` | 4,096 | 0.02613 | −0.0021 | +0.0021 | FAIL (interval) |
+| `--kda-chunked-prefill` | 4,096 | 0.03036 | +0.0021 | +0.0047 | FAIL |
+| `--kda-chunked-prefill --prefill-w8a16` | 4,096 | 0.02626 | −0.0020 | +0.0026 | FAIL (interval) |
+| the same plus D8 | 4,096 | 0.02678 | −0.0015 | +0.0029 | FAIL (interval) |
+| D2 combined with W8A16, D8 or chunked | 4,096 / 8 | 0.0265–0.0292 | −0.0018 to +0.0047 | +0.0021 to +0.0087 | FAIL |
+
+**Decisions:**
+- **D8 is on by default.** `glm53f-serve` and `glm53f-score` both take it. `--kda-state-f32` (or `GLM53F_KDA_STATE_BF16=0`) reproduces section 6a's configuration.
+- **D2 is rejected in this form:** it moves decode by +0.0039 nats and flips top-1 on significantly more rows. A finer weight scale (MXFP8's one scale per 32 values) is the variant to gate next.
+- **W8A16, and the chunked KDA prefill with it, lower the mean KL** (they close most of the prefill-versus-decode gap of section 6a). But at this per-row correlation (0.72–0.76), 25 windows give an interval of about ±0.005 nats, too wide to show non-inferiority at 0.002. They stay opt-in until a larger panel (about 100 windows, which halves the interval) decides.
+  - Speed is the reason to try: with four lanes they prefill about 5.2K tok/s against 4.1K (`docs/PERFORMANCE.md` §0).
+  - The chunked kernel alone is worse (+0.0021), so it would only ever be paired with W8A16.
+
 ## 7. Open points
 
 - The SE of the subsample treats systematic sampling as simple random sampling, and the per-window
