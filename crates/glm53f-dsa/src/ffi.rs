@@ -189,6 +189,26 @@ unsafe extern "C" {
 
     pub fn glm53f_dsa_mla_unabsorb_v(o_lat: *const f32, kv_b: *const u16, rows: i32, o: *mut f32, stream: CudaStream)
         -> CudaError;
+
+    pub fn glm53f_dsa_mla_absorb_q_bf16(
+        q: *const u16,
+        ldq: i64,
+        rows: i32,
+        kv_b: *const u16,
+        q_abs_bf16: *mut u16,
+        q_abs_f32: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+
+    pub fn glm53f_dsa_mla_unabsorb_v_rows(
+        o_lat: *const f32,
+        kv_b: *const u16,
+        rows: i32,
+        o_bf16: *mut u16,
+        ldo: i64,
+        o_f32: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
 }
 
 // CUDA runtime (only what the tests and benchmarks use).

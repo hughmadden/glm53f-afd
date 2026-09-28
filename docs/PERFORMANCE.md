@@ -60,7 +60,7 @@ serve the other; 4,096-row passes in two lanes of 2,048):
 
 - A 79K-token prompt takes 21–22 s.
 - This is still a **MISS** against the 4.5–6K tok/s of §5.
-- 8,192-row passes take 3.3 GiB more buffers. At 16 slots that shrinks the pool to 742,592 tokens, below a 1M-token request, so they are not the default.
+- 8,192-row passes took 3.3 GiB more buffers. At 16 slots that shrank the pool to 742,592 tokens, below a 1M-token request, so they are not the default. Since the lane scratch is shared within a lane and the sparse MLA core runs in blocks (§5a), lanes of 4,096 rows take less than lanes of 2,048 took (all forward buffers 2.88 GiB against 3.67): not yet measured on the target.
 - Without the fast paths, the GPU is busy 66% of a 27.5 ms MoE layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
 - With them, the host's per-lane work falls to about 0.25 ms, and the layer to 25.1 ms with the GPU 72% busy.
 - With the rank kernel tuned for GB10 (6–8% faster end to end), the exchange of a 2,048-row lane fell to 12 ms and the MoE layer to 22.2 ms.
@@ -207,6 +207,154 @@ returning one plane (see [DESIGN.md](DESIGN.md) §3). The coordinator therefore
 receives a quarter of the bytes that a four-plane return would carry. This
 matters on switches without priority flow control, where four ranks converging on
 one port drop packets.
+
+### 5a. Where a lane's coordinator time goes (development GPU, 28 September 2026)
+
+**Setup:**
+- One RTX 4090 (`sm_89`, 128 SMs). This card is capped at 250 W; its SM clock read 2.52 GHz
+  under load.
+- `crates/glm53f-forward/examples/prefill_bench.rs`: all 45 layers on the weights of layers
+  0–4 (every later KDA MoE layer runs layer 4's, every DSA layer layer 3's), the routed experts
+  returning zeros, one request in two-lane passes.
+- `GLM53F_PROFILE_OPS=1` medians of the third pass (positions 8,192–12,288 with lanes of 2,048
+  rows; 16,384–24,576 with lanes of 4,096), so every DSA row selects its full 2,051 tokens.
+- Cross-checked once with an `nsys` timeline of the same pass: kernel medians within 1–3% of
+  the op times, which also count launch gaps.
+- The GPU is shared with other jobs. Runs were repeated; a figure a repeat did not match within
+  about 2% says so.
+
+**Peaks assumed:**
+
+| | RTX 4090 | RTX 5090 | Ratio |
+|---|---:|---:|---:|
+| BF16/F16 tensor, FP32 accumulation, dense (NVIDIA's Ada and Blackwell GeForce whitepapers) | 165.2 TFLOPS | 209.5 TFLOPS | 1.27 |
+| FP32, CUDA cores | 82.6 TFLOPS | 104.8 TFLOPS | 1.27 |
+| DRAM | 1,008 GB/s | 1,792 GB/s | 1.78 |
+
+- cuBLAS reached **145 TFLOPS** of BF16 here, so the 4090's BF16 rate is not the "about 83"
+  sometimes quoted: that is its TF32 or CUDA-core FP32 rate. The 5090's tensor and FP32 rates
+  are only **1.27×** the 4090's (tensor cores × clock); its DRAM is 1.78×.
+- FP8 GEMMs are scaled by the same 1.27. No FP8 peak is assumed.
+- "5090 floor" is the op's work at the 5090's peak for its bound. "5090 estimate" is the 4090
+  time divided by the ratio for that bound, the 4090's efficiency kept.
+
+**KDA MoE layer** (31 of the 42 MoE layers; the `PIPE` line's median is one of these):
+
+| Op | 2,048 rows (ms) | 4,096 rows (ms) | Work per 2,048-row lane | Bound | 5090 floor | 5090 estimate |
+|---|---:|---:|---|---|---:|---:|
+| `attn_hc_project`: mHC attention boundary, expand and project | 0.199 | 0.402 | 172 MB | DRAM | 0.096 | 0.11 |
+| `attn_hc_finish`: weights, Sinkhorn, collapse, norm, E4M3 | 0.097 | 0.222 | 99 MB | DRAM | 0.055 | 0.06 |
+| `kda_proj`: the `[q\|k\|v\|b]` projection (cuBLAS BF16) | 2.852 | 5.671 | 413 GFLOP | BF16 tensor | 1.97 | 2.24 |
+| `kda_proj`: the forget and output gate projections | 0.136 | 0.254 | 13 GFLOP, writes 67 MB | BF16, DRAM | 0.06 | 0.09 |
+| `kda_core`: the KDA chain (conv, norms, gates, delta rule, gated norm) and the conv shift | 6.313 | 12.331 | 2,048 dependent steps per head | latency | — | ≈5.0 (inferred) |
+| `kda_o`: `o_proj` (cuBLAS BF16) | 1.004 | 1.955 | 137 GFLOP | BF16 tensor | 0.66 | 0.79 |
+| `ffn_hc_project`: mHC FFN boundary, expand and project | 0.181 | 0.346 | 158 MB | DRAM | 0.088 | 0.10 |
+| `ffn_hc_finish` | 0.095 | 0.222 | 99 MB | DRAM | 0.055 | 0.06 |
+| `router`: FP32 logits, top-8 of 288 | 0.241 | 0.459 | 4.8 GFLOP | FP32 | 0.046 | 0.19 |
+| **attention** | **11.21** | **22.04** | | | | **8.68 measured on the target** |
+| shared expert (FP8 gate and up, SwiGLU, down) | 0.538 | 1.003 | 103 GFLOP | FP8 tensor | — | 0.42 (target: 0.39) |
+
+- The profile reports a KDA layer's three stages (`kda_proj`, `kda_core`, `kda_o`) from the marks
+  in its code, which carries no hooks of its own. The rows here split `kda_proj` with finer
+  events in a development build.
+- The chain is serial in the rows: one block of 1,024 threads per head, 64 blocks. It spends
+  3.1 µs per row per layer here and occupies 64 of the 5090's 170 SMs.
+- Its 5090 figure is **inferred**, not measured: the target's measured 8.68 ms less the other
+  ops' estimates (3.6 ms).
+- On the 5090 the BF16 projections are then about 3.1 ms of the 8.7 and the chain about 5.0.
+
+**DSA MoE layer** (11 of 42):
+
+| Op | 2,048 rows (ms) | 4,096 rows (ms) | Work per 2,048-row lane | Bound | 5090 floor | 5090 estimate |
+|---|---:|---:|---|---|---:|---:|
+| mHC boundaries, both (as above) | 0.561 | 1.212 | 528 MB | DRAM | 0.29 | 0.32 |
+| `q_a`, `kv_a`, the `q_a` norm and its E4M3 form (FP8) | 0.254 | 0.349 | 34 GFLOP | FP8 tensor | — | 0.20 |
+| `q_b` (FP8) | 0.492 | 0.961 | 103 GFLOP | FP8 tensor | — | 0.39 |
+| indexer projections (cuBLAS BF16) | 0.222 | 0.467 | 31 GFLOP | BF16 tensor | 0.15 | 0.18 |
+| widening the index query and gates to f32 | 0.060 | 0.129 | 60 MB | DRAM | 0.03 | 0.03 |
+| latent, pooled-key and tail writes | 0.019 | 0.022 | small | launches | — | 0.02 |
+| index selection (top-512 pools) | 0.480 | 1.755 | grows with the context (8–12K, 16–24K) | F16 tensor, latency | — | 0.38 |
+| absorb (`W_UK` into the query; FP32, separate multiply and add, bit-exact with the CPU) | 1.258 | 2.628 | 34 G FP32 instructions | FP32 issue | 0.66 | 0.99 |
+| sparse MLA over 2,051 latents (F16 tensor cores) | 5.711 | 12.374 | 551 GFLOP | F16 tensor | 2.63 | 4.50 |
+| un-absorb (`W_UV`; 3 FP32 instructions per 2 products), BF16 out | 1.533 | 3.292 | 26 G FP32 instructions | FP32 issue | 0.49 | 1.21 |
+| E4M3 form of the heads' output | 0.095 | 0.195 | 100 MB | DRAM | 0.056 | 0.05 |
+| `o_proj` (FP8) | 1.182 | 2.609 | 275 GFLOP | FP8 tensor | — | 0.93 |
+| router | 0.226 | 0.496 | 4.8 GFLOP | FP32 | 0.046 | 0.18 |
+| **attention** | **12.08** | **26.87** | | | | **≈9.4** |
+
+- The sparse MLA kernel runs at 58% of the 4090's F16 peak, and the absorb at 66% of its FP32
+  issue rate. The un-absorb (41%) and the selection have the most headroom.
+- The selection grows with the context: 0.16 ms at 0–4K, 0.48 ms at 8–12K and 1.76 ms at
+  16–24K (4,096-row lanes), about 0.2 µs per row per 10K tokens of context.
+- At 79K it would be about 3.5 ms a lane, the layer's second-largest op (extrapolated, not
+  measured). There it is bound by its F16 products: 162 MFLOP a row.
+
+**What this package changed** (bit-identical; the same digest of 162 rows of logits before and
+after, and with MLA blocks of 8, 64, 100, 512 and 1,000 rows; `examples/logits_digest.rs`):
+
+| Per lane and layer | 2,048 rows: before → after | 4,096 rows: before → after |
+|---|---:|---:|
+| Un-absorb, 16 rows per block in shared memory, 32 outputs per warp reduced by recursive halving, BF16 out | 2.643 → 1.533 | 5.668 → 3.292 |
+| Query widening (the absorb reads BF16) | 0.286 → 0.060 | 0.567 → 0.129 |
+| f32 → BF16 copy (now in the un-absorb) and E4M3 | 0.285 → 0.095 | 0.614 → 0.195 |
+| Router, 4 experts × 8 rows per warp | 0.33–0.35 → 0.23–0.24 | 0.66–0.71 → 0.46–0.50 |
+| mHC finish, collapsed row written only for taps | 0.110 → 0.096 | 0.245 → 0.222 |
+| **DSA MoE layer** (the changed ops: −1.66 ms at 2,048 rows) | **13.98 → 12.08** | **31.46 → 26.87** |
+| **KDA MoE layer** (the changed ops: −0.14 ms) | 11.60 → 11.21 | 22.75 → 22.04 |
+| **Pass wall** (both lanes, all 45 layers) | **1,214 → 1,143–1,146 ms** | **2,491 → 2,311 ms** (2,455 in a run another job shared) |
+
+The layer rows also move by the run-to-run variation of unchanged kernels: the chain and the
+BF16 projections vary by about 3% between runs.
+
+- The un-absorb kernel with 32 rows per block and one block per SM, and one reading o_lat
+  through L1, both measured slower.
+- 32 rows per absorb block measured no faster: the absorb is bound by its separate multiplies
+  and adds.
+- With 2 head groups per sparse MLA block instead of 4 (the same bits), and with MLA blocks of
+  256, 512 or a whole lane, sparse MLA timed within 1.5% of the default on the 4090.
+- On `sm_120` the 4-group kernel spills registers (the DSA crate's README), so the target
+  should time 2 groups: `GLM53F_BENCH_HEAD_GROUPS=2` in `prefill_bench`.
+
+**The lane scratch** (`ForwardBuffers`, 16 slots, 128 verify rows, page tables for 1M tokens;
+allocated and measured on the development GPU):
+
+| | Before | After |
+|---|---:|---:|
+| Per row, lane A (lane B has no tap buffer: 32 KiB less) | 799,416 B | 286,136 B |
+| Sparse MLA block buffers, shared by the lanes (`mla_block_rows` 512) | — | 128 MiB |
+| Lanes of 2,048 rows | 1.60 + 1.46 GiB | 0.62 + 0.48 GiB |
+| Lanes of 4,096 rows | 3.13 + 2.93 GiB | 1.17 + 0.97 GiB |
+| All forward buffers, lanes of 4,096 | 6.67 GiB | 2.88 GiB |
+
+- The "before" rows are the figures the target's start-up log printed.
+- A KDA layer's buffers, a DSA layer's and an FFN's are now views of one region per lane:
+  129,796 B a row, the DSA set, the largest.
+- The sparse MLA core's absorbed queries and latent outputs (256 KiB a row) are sized for one
+  block of rows.
+- Lanes of 4,096 now take less memory than lanes of 2,048 took before.
+
+**Levers**, by expected ms saved per 2,048-row lane on the 5090 (estimates from the tables
+above):
+
+| # | Lever | Per KDA layer | Per DSA layer | Per pass per lane (45 layers) | Bits | Cost |
+|---|---|---:|---:|---:|---|---|
+| 1 | **Chunked KDA prefill** (the kernel exists: `ForwardConfig::kda_chunked_prefill`). Measured here: chain 6.31 → 1.92–2.12 ms (12.3 → 4.0–4.1 at 4,096 rows), pass 1,206–1,228 → 980–1,045 ms | ≈ −3.5 | — | ≈ −120 | change (f32 rounding; KL gate) | a serve flag and a gate run |
+| 2 | **FP8 KDA projections (D2)** with E4M3 activations in prefill (`--kda-fp8 --kda-prefill-w8a8`). Measured on the 4090 per 2,048-row lane: projections 3.31–3.63 → 2.31 ms and `o_proj` 1.04–1.06 → 0.70–0.86 ms, about −1.3 to −1.5 ms (−30%); scaled by 1.27 | ≈ −1.0 to −1.2 | — | ≈ −35 to −40 | change (KL gate) | the flags exist; a gate run |
+| 3 | The KDA chain alongside the projections: row blocks of `[q\|k\|v\|b]` and `o_proj` on the 106 SMs the chain leaves idle | up to −3 | — | up to −100 | same, with a GEMM algorithm fixed per row block | moderate; moot after (1) |
+| 4 | Sparse MLA prefill: consecutive rows' selections shared (each latent tile decoded once for several rows), a causal kernel for the dense start | — | −1 to −2 | −11 to −22 | same, if each row keeps its tile order and products | a new kernel |
+| 5 | Index selection with FP8 × FP8 products: at long context it is bound by its F16 products (row blocks, the DSA README's other step, save only L2 traffic there) | — | small now; ≈ −1.4 at 79K | ≈ −15 at 79K | change (KL gate) | a kernel change |
+| 6 | **Done here:** the DSA core, router and boundary changes above | −0.1 | ≈ −1.3 | ≈ −18 | same | done |
+| 7 | Un-absorb staging double-buffered (1.21 against a floor of 0.49) | — | ≈ −0.5 | ≈ −5 | same | small |
+| 8 | Absorb with fused multiply-adds or on tensor cores | — | ≈ −0.6 | ≈ −7 | change (the absorb is bit-exact with the CPU by contract) | small, plus the gate |
+| 9 | mHC finish fused into the projection (the last CTA of a row finishes it, as the decode boundary does) | ≈ −0.05 | ≈ −0.05 | ≈ −2 | same | moderate |
+
+- (1), (2) and (3) change the KDA kernels or their dispatch: (1) and (2) are behind their own
+  switches and wait for the KL gate; (3) is a proposal.
+- D2 is chiefly a decode lever (half the KDA weight bytes). In prefill it saves about 12–14% of
+  a KDA layer on the 5090, and about 20–23% once the chunked kernel has removed the chain.
+  From the same measurements: `--prefill-w8a16` (BF16 activations for the FP8 projections over
+  8 rows) costs 12–14 µs a token, and D2 with `--kda-prefill-w8a8` saves about 12 µs a token net
+  (estimated).
 
 ## 6. Start-up
 

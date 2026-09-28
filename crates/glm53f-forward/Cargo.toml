@@ -60,5 +60,13 @@ name = "decode_bench"
 required-features = ["cuda"]
 
 [[example]]
+name = "prefill_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "logits_digest"
+required-features = ["cuda"]
+
+[[example]]
 name = "wire_paths"
 required-features = ["coordinator"]

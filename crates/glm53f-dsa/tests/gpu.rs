@@ -1043,6 +1043,101 @@ fn absorb_and_unabsorb_row_counts() {
     eprintln!("un-absorb: worst error / (gamma_512 sum |w o|) = {worst:.3}");
 }
 
+/// The prefill-sized kernels give the decode kernels' bits: absorb from a BF16 query (32 rows
+/// per block, strided rows) equals absorb from its f32 widening, and the row-blocked un-absorb
+/// equals `glm53f_dsa_mla_unabsorb_v` (its f32 output bit for bit, its BF16 output that result
+/// rounded), for row counts on and off its 8- and 32-row blocks, zero rows included.
+#[test]
+fn prefill_absorb_and_unabsorb_match_bitwise() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let mut rng = Rng::new(12);
+    let kv_b: Vec<u16> = rng.normals(64 * 512 * 512, 0.05).into_iter().map(f32_to_bf16_bits).collect();
+    let dkv = DeviceBuffer::from_slice(&kv_b).unwrap();
+    let (ldq, ldo) = (64 * 256 + 64, 64 * 256 + 128);
+    for rows in [1usize, 3, 8, 9, 31, 32, 33, 100, 257] {
+        let q16: Vec<u16> = rng.normals(rows * ldq, 1.0).into_iter().map(f32_to_bf16_bits).collect();
+        let q32: Vec<f32> = (0..rows * 16384).map(|i| bf16_bits_to_f32(q16[(i / 16384) * ldq + i % 16384])).collect();
+        let mut o_lat = rng.normals(rows * 64 * 512, 1.0);
+        // A row of zeros and a row of large values.
+        o_lat[..64 * 512].iter_mut().for_each(|v| *v = 0.0);
+        if rows > 2 {
+            o_lat[2 * 64 * 512..3 * 64 * 512].iter_mut().for_each(|v| *v *= 1e20);
+        }
+        let (dq16, dq32, dol) =
+            (DeviceBuffer::from_slice(&q16).unwrap(), DeviceBuffer::from_slice(&q32).unwrap(), DeviceBuffer::from_slice(&o_lat).unwrap());
+        let n_abs = rows * 64 * 512;
+        let (a16, a32) = (DeviceBuffer::zeroed(n_abs * 2).unwrap(), DeviceBuffer::zeroed(n_abs * 4).unwrap());
+        let (b16, b32) = (DeviceBuffer::zeroed(n_abs * 2).unwrap(), DeviceBuffer::zeroed(n_abs * 4).unwrap());
+        let o_old = DeviceBuffer::zeroed(rows * 64 * 256 * 4).unwrap();
+        let (o16, o32) = (DeviceBuffer::zeroed(rows * ldo * 2).unwrap(), DeviceBuffer::zeroed(rows * 64 * 256 * 4).unwrap());
+        unsafe {
+            check(ffi::glm53f_dsa_mla_absorb_q(dq32.as_ptr(), dkv.as_ptr(), rows as i32, a16.as_mut_ptr(), a32.as_mut_ptr(), ptr::null_mut()), "absorb").unwrap();
+            check(ffi::glm53f_dsa_mla_absorb_q_bf16(dq16.as_ptr(), ldq as i64, rows as i32, dkv.as_ptr(), b16.as_mut_ptr(), b32.as_mut_ptr(), ptr::null_mut()), "absorb bf16").unwrap();
+            check(ffi::glm53f_dsa_mla_unabsorb_v(dol.as_ptr(), dkv.as_ptr(), rows as i32, o_old.as_mut_ptr(), ptr::null_mut()), "unabsorb").unwrap();
+            check(ffi::glm53f_dsa_mla_unabsorb_v_rows(dol.as_ptr(), dkv.as_ptr(), rows as i32, o16.as_mut_ptr(), ldo as i64, o32.as_mut_ptr(), ptr::null_mut()), "unabsorb rows").unwrap();
+        }
+        gpu::sync().unwrap();
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+        assert_eq!(a16.download::<u16>(n_abs).unwrap(), b16.download::<u16>(n_abs).unwrap(), "{rows} rows: BF16 absorb");
+        assert_eq!(bits(a32.download::<f32>(n_abs).unwrap()), bits(b32.download::<f32>(n_abs).unwrap()), "{rows} rows: f32 absorb");
+        let want = o_old.download::<f32>(rows * 64 * 256).unwrap();
+        assert_eq!(bits(o32.download::<f32>(rows * 64 * 256).unwrap()), bits(want.clone()), "{rows} rows: un-absorb");
+        let got16 = o16.download::<u16>(rows * ldo).unwrap();
+        for r in 0..rows {
+            for i in 0..64 * 256 {
+                assert_eq!(got16[r * ldo + i], f32_to_bf16_bits(want[r * 16384 + i]), "{rows} rows: BF16 un-absorb row {r} element {i}");
+            }
+        }
+    }
+}
+
+/// Unsplit sparse attention (the prefill plan) gives the same bits with 1, 2 or 4 head groups
+/// per block: a group's heads are computed the same way whichever groups share its tiles.
+#[test]
+fn sparse_attn_head_groups_are_bitwise() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let mut rng = Rng::new(13);
+    let tokens = 2400;
+    let case = build_attn_case(&mut rng, tokens);
+    let dev = DevCache::upload(&case.layer, &case.table, case.table.len());
+    let rows = 12;
+    let mut toks = vec![-1i32; rows * 2051];
+    let mut counts = vec![0i32; rows * 2];
+    for r in 0..rows {
+        let n = [2051usize, 2048, 777, 64, 1, 33][r % 6];
+        for (i, t) in random_token_list(&mut rng, tokens, n).iter().enumerate() {
+            toks[r * 2051 + i] = *t as i32;
+        }
+        counts[2 * r + 1] = n as i32;
+    }
+    let q: Vec<u16> = rng.normals(rows * 64 * 512, 1.0).into_iter().map(f32_to_bf16_bits).collect();
+    let (dq, dt, dc) = (DeviceBuffer::from_slice(&q).unwrap(), DeviceBuffer::from_slice(&toks).unwrap(), DeviceBuffer::from_slice(&counts).unwrap());
+    let dreq = DeviceBuffer::from_slice(&vec![0i32; rows]).unwrap();
+    let mut outs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    for groups in [1, 2, 4] {
+        let (o_lat, lse) = (DeviceBuffer::zeroed(rows * 64 * 512 * 4).unwrap(), DeviceBuffer::zeroed(rows * 64 * 4).unwrap());
+        check(
+            unsafe {
+                ffi::glm53f_dsa_mla_sparse_attn(
+                    dq.as_ptr(), dt.as_ptr(), 2051, dc.as_ptr(), dreq.as_ptr(), rows as i32, 0.0625, dev.view(), 1, groups, ptr::null_mut(), 0, o_lat.as_mut_ptr(), lse.as_mut_ptr(), ptr::null_mut(),
+                )
+            },
+            "sparse_attn",
+        )
+        .unwrap();
+        gpu::sync().unwrap();
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+        outs.push((bits(o_lat.download(rows * 64 * 512).unwrap()), bits(lse.download(rows * 64).unwrap())));
+    }
+    for g in 1..outs.len() {
+        assert!(outs[g] == outs[0], "head groups {} against 1", [1, 2, 4][g]);
+    }
+}
+
 #[test]
 fn dense_rows_and_no_pools() {
     let Some(_gpu) = gpu_ready() else {

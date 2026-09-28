@@ -149,6 +149,21 @@ describes each.
   return path (row slices, four planes) the exchanges and the medians of the host's time in
   `submit` (of it, waiting for the device's copies), in `finish` waiting for the returns, and
   placing them. The ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
+- **Profiling a prefill pass by operation.** With `GLM53F_PROFILE_OPS=1` the forward records a
+  CUDA event after every operation of each prefill lane's attention sublayer and shared expert,
+  and each prefill pass prints an `OPS` table after its `PIPE` line (the setting turns the lane
+  trace on). Per layer kind (KDA MoE, DSA MoE, the dense layers 0–2) and lane size, the table
+  gives each operation's median GPU time over the pass's layers and lanes and its share of the
+  lane's time in that kind of layer.
+  - An operation's time runs from the previous operation's event to its own, so the operations
+    add up to the `PIPE` line's "GPU attention" and "shared". The table's last line repeats
+    those two medians from its own events.
+  - It needs only the CUDA runtime (no `nsys`).
+  - On, it costs about 30 events per lane and layer and one synchronization per pass. On the
+    development GPU that was within run-to-run noise: pass time +0.5% with lanes of 2,048 rows,
+    +0.9% with lanes of 4,096. Off, it costs one check per operation.
+  - `crates/glm53f-forward/examples/prefill_bench.rs` prints the same tables on one GPU: all 45
+    layers on the weights of layers 0–4, routed experts returning zeros.
 - **Tracing a decode step.** With `GLM53F_PROFILE=1` each decode step prints a `STEP` line: the
   mode (decode, or verify with its drafts and commit), the requests per lane, the host times of
   the step (the gap since the forward's last call, the drafts, the pass, the commit), the MoE
@@ -191,6 +206,10 @@ logits are meaningless.
   from `--experts-dir` (a checkpoint holding the experts of the layers run).
 - `--dev-layers 0-N` runs decoder layers 0 to N only, then the head, so the whole serving loop
   runs with a slice of the weights. **The output is meaningless text by design.**
+- `crates/glm53f-forward/examples/logits_digest.rs` scores a fixed 6,000-token prompt in two-lane
+  prefill passes and prints a digest of 162 rows of logits. A change meant to move no bit (a
+  kernel's schedule, where buffers live) is checked by running it before and after the change on
+  the same GPU: the two lines must be equal.
 - Four ranks can share one GPU over loopback: cut layers 3 and 4 for each rank
   (`--layers 3-4`), start each with `--listen 127.0.0.1:0 --allow-partial`, then point
   `glm53f-serve --dev-layers 0-4 --ranks ...` at the four printed addresses. Each rank with two

@@ -288,6 +288,86 @@ __global__ void __launch_bounds__(32 * kFusedExperts) router_fused_kernel(
   }
 }
 
+// Logits and selection above 8 rows, with router_fused_kernel's bits. CTA (b, y) of 8 warps
+// takes experts 32 b .. 32 b + 31 and the rows of block-row y; warp w takes experts
+// 32 b + 4 w .. + 3 for all 8 rows, so every activation load serves 4 experts and every
+// weight load 8 rows (logits_warp<8> reuses a weight load for 8 rows only, and its 4 warps of a
+// CTA re-read the rows for each expert). Each logit is logits_warp's: lane l accumulates
+// k = 8 l + 256 i + j with fma over i then j. The warp's 32 logits are then reduced together by
+// recursive halving: at offset 16 a lane keeps the 16 logits of its half and adds its partner's
+// partials of them, then 8 at offset 8, and so on, so every add pairs the same two subtree sums
+// as warp_sum's butterfly (addition commutes) and lane i ends with logit i, in 31 shuffles for
+// 32 logits instead of 5 each. The last CTA of each block-row selects, as router_fused_kernel.
+constexpr int kRowsExperts = 32;
+
+template <int Off>
+__device__ __forceinline__ void halve32(float (&v)[32], int lane) {
+  const bool upper = (lane & Off) != 0;
+#pragma unroll
+  for (int i = 0; i < Off; ++i) {
+    const float send = upper ? v[i] : v[i + Off];
+    const float keep = upper ? v[i + Off] : v[i];
+    v[i] = __fadd_rn(keep, __shfl_xor_sync(0xffffffffu, send, Off));
+  }
+}
+
+template <int S>
+__global__ void __launch_bounds__(256) router_fused_rows_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ bias, float* logits,
+    unsigned* __restrict__ sync, int32_t* __restrict__ ids, float* __restrict__ weights, int rows, int experts,
+    int hidden, int top_k, float scale) {
+  __shared__ int last;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int e0 = blockIdx.x * kRowsExperts + 4 * warp;
+  const int r0 = blockIdx.y * kRows;
+  const int nr = min(kRows, rows - r0);
+  if (e0 < experts) {
+    float acc[32];  // logit 4 r + e: row r0 + r, expert e0 + e
+#pragma unroll
+    for (int q = 0; q < 32; ++q) acc[q] = 0.0f;
+    const int steps = hidden >> 8;
+#pragma unroll 1
+    for (int i = 0; i < steps; ++i) {
+      const int k = 256 * i + 8 * lane;
+      float wf[4][8];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) unpack_bf16x8(ld_stream(w + size_t(min(e0 + e, experts - 1)) * hidden + k), wf[e]);
+#pragma unroll
+      for (int r = 0; r < kRows; ++r) {
+        float xf[8];
+        if (r < nr) {
+          unpack_bf16x8(ld_cached(x + size_t(r0 + r) * hidden + k), xf);
+        } else {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) xf[j] = 0.0f;
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+#pragma unroll
+          for (int j = 0; j < 8; ++j) acc[4 * r + e] = __fmaf_rn(xf[j], wf[e][j], acc[4 * r + e]);
+      }
+    }
+    halve32<16>(acc, lane);
+    halve32<8>(acc, lane);
+    halve32<4>(acc, lane);
+    halve32<2>(acc, lane);
+    halve32<1>(acc, lane);
+    const int r = lane >> 2, e = e0 + (lane & 3);
+    if (r < nr && e < experts) logits[size_t(r0 + r) * experts + e] = acc[0];
+  }
+  // Signal (atomic_add_acq_rel); the last CTA of the block-row selects, one warp per row.
+  __syncthreads();
+  if (threadIdx.x == 0) last = atomic_add_acq_rel(sync + blockIdx.y, 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!last) return;
+  if (threadIdx.x == 0) sync[blockIdx.y] = 0;  // every CTA of the block-row has signalled
+  if (warp < nr) {
+    const size_t row = size_t(r0 + warp);
+    select_row_warp<S, true>(logits + row * experts, bias, experts, top_k, scale, ids + row * top_k,
+                             weights + row * top_k, lane);
+  }
+}
+
 }  // namespace
 }  // namespace glm53f
 
@@ -337,8 +417,9 @@ static int32_t launch_router_fused(const uint16_t* x, const uint16_t* weight, co
     router_fused_kernel<1, S><<<dim3(eblocks, rows), block, 0, stream>>>(x, weight, bias, logits, sync, ids, weights,
                                                                              rows, experts, hidden, top_k, scale);
   else
-    router_fused_kernel<kRows, S><<<dim3(eblocks, (rows + kRows - 1) / kRows), block, 0, stream>>>(
-        x, weight, bias, logits, sync, ids, weights, rows, experts, hidden, top_k, scale);
+    router_fused_rows_kernel<S><<<dim3((experts + kRowsExperts - 1) / kRowsExperts, (rows + kRows - 1) / kRows), 256,
+                                  0, stream>>>(x, weight, bias, logits, sync, ids, weights, rows, experts, hidden,
+                                               top_k, scale);
   return cudaGetLastError();
 }
 

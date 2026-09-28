@@ -78,16 +78,39 @@ __global__ __launch_bounds__(128) void latent_write_kernel(const float* latent, 
 // Absorb for up to R rows per block. Block (head, row group, column half): 128
 // threads x 2 columns. Rows of W^K are loaded eight at a time before their
 // multiply-adds, which stay in the CPU reference's sequential order (bit-exact).
+// The query is f32, or BF16 (its f32 value is exact, so the results are the
+// same bits); row r of it starts at q + r * ldq.
 template <int R>
-__global__ __launch_bounds__(128) void absorb_kernel(const float* q, const __nv_bfloat16* kv_b, int rows,
+__device__ __forceinline__ void fill_q(const float* q, int64_t ldq, int h, int r0, int nr, float (&qs)[R][kNope]) {
+  for (int i = threadIdx.x; i < R * kNope; i += blockDim.x) {
+    const int r = i / kNope, c = i % kNope;
+    qs[r][c] = r < nr ? q[int64_t(r0 + r) * ldq + h * kNope + c] : 0.f;
+  }
+}
+// BF16 rows (16-byte aligned): eight values per load, widened exactly.
+template <int R>
+__device__ __forceinline__ void fill_q(const __nv_bfloat16* q, int64_t ldq, int h, int r0, int nr,
+                                       float (&qs)[R][kNope]) {
+  for (int i = threadIdx.x; i < R * (kNope / 8); i += blockDim.x) {
+    const int r = i / (kNope / 8), c = 8 * (i % (kNope / 8));
+    const uint4 v = r < nr ? __ldg(reinterpret_cast<const uint4*>(q + int64_t(r0 + r) * ldq + h * kNope + c))
+                           : make_uint4(0u, 0u, 0u, 0u);
+    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      qs[r][c + 2 * k] = __uint_as_float(u[k] << 16);
+      qs[r][c + 2 * k + 1] = __uint_as_float(u[k] & 0xFFFF0000u);
+    }
+  }
+}
+
+template <int R, typename Q>
+__global__ __launch_bounds__(128) void absorb_kernel(const Q* q, int64_t ldq, const __nv_bfloat16* kv_b, int rows,
     __nv_bfloat16* q_abs_bf16, float* q_abs_f32) {
   __shared__ float qs[R][kNope];
   const int h = blockIdx.x, r0 = blockIdx.y * R;
   const int nr = min(R, rows - r0);
-  for (int i = threadIdx.x; i < R * kNope; i += blockDim.x) {
-    const int r = i / kNope, c = i % kNope;
-    qs[r][c] = r < nr ? q[(int64_t(r0 + r) * kHeads + h) * kNope + c] : 0.f;
-  }
+  fill_q<R>(q, ldq, h, r0, nr, qs);
   __syncthreads();
   const int l = 256 * blockIdx.z + 2 * threadIdx.x;
   float acc[R][2];
@@ -156,6 +179,102 @@ __global__ __launch_bounds__(256) void unabsorb_kernel(const float* o_lat, const
       for (int r = 0; r < R; ++r) {
         const float s = warp_sum(acc[r]);
         if (lane == 0 && r < nr) o[(int64_t(r0 + r) * kHeads + h) * kNope + v0 + vp + e] = s;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Un-absorb for passes of more than 8 rows, with unabsorb_kernel's bits and the
+// output rounded to BF16 (optionally the f32 value too).
+//
+// unabsorb_kernel sums o[r][h][v] in two stages: lane k of a warp takes the
+// pairs m = k + 32 j (latent columns 2m, 2m + 1), j = 0 .. 7 in order, each
+// pair as fma(w[2m], o[2m], w[2m+1] * o[2m+1]) added to its partial (nvcc
+// contracts the expression so; the kernel is built without --fmad=false), then
+// the partials of the 32 lanes go through the butterfly warp_sum (xor 16, 8, 4,
+// 2, 1). That kernel reduces one output per butterfly (five shuffles) and re-reads
+// the 256 KiB value half of kv_b for every 8 rows. Here each warp accumulates
+// 32 outputs at once (8 rows x 4 value rows: every o_lat pair it loads serves 4
+// products, every weight pair 8) and reduces them by recursive halving: at
+// offset 16 a lane keeps the 16 outputs of its half and adds its partner's
+// partials of them, then 8 at offset 8, and so on, so every add pairs the same
+// two subtree sums as the butterfly (addition commutes) and lane i ends with
+// output i, in 31 shuffles for 32 outputs. A block is (value quarter, head,
+// 16 rows): it stages the rows' o_lat in shared memory (32 KiB; two blocks per
+// multiprocessor, so one computes while the other loads), the four quarters of
+// a head's rows run next to each other and share o_lat through L2, and each
+// warp keeps its value rows' weights in registers across the block's two 8-row
+// groups. On the RTX 4090 at 2,048 rows: about twice as fast as unabsorb_kernel
+// (blocks of 32 rows, one per multiprocessor, and reading o_lat through L1
+// instead of staging it measured slower).
+constexpr int kUnRows = 16;  // rows per block
+
+template <int Off>
+__device__ __forceinline__ void halve(float (&v)[32], int lane) {
+  const bool upper = (lane & Off) != 0;
+#pragma unroll
+  for (int i = 0; i < Off; ++i) {
+    const float send = upper ? v[i] : v[i + Off];
+    const float keep = upper ? v[i + Off] : v[i];
+    v[i] = __fadd_rn(keep, __shfl_xor_sync(0xffffffffu, send, Off));
+  }
+}
+
+template <int RB, int MinBlocks>
+__global__ __launch_bounds__(256, MinBlocks) void unabsorb_rows_kernel(const float* __restrict__ o_lat,
+    const __nv_bfloat16* __restrict__ kv_b, int rows, __nv_bfloat16* __restrict__ o_bf16, int64_t ldo,
+    float* __restrict__ o_f32) {
+  extern __shared__ __align__(16) unsigned char un_smem[];
+  float2* ol = reinterpret_cast<float2*>(un_smem);  // [RB][256] latent pairs
+  const int quarter = blockIdx.x, h = blockIdx.y, rb = blockIdx.z * RB;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int nrows = min(RB, rows - rb);
+  for (int i = threadIdx.x; i < RB * (kLatentDim / 4); i += blockDim.x) {
+    const int r = i / (kLatentDim / 4), c = i % (kLatentDim / 4);
+    reinterpret_cast<float4*>(ol)[i] =
+        r < nrows ? __ldg(reinterpret_cast<const float4*>(o_lat + (int64_t(rb + r) * kHeads + h) * kLatentDim) + c)
+                  : make_float4(0.f, 0.f, 0.f, 0.f);
+  }
+  __syncthreads();
+#pragma unroll 1
+  for (int vg = 0; vg < 2; ++vg) {
+    // Value rows v0 .. v0 + 3 of the quarter's 64: groups warp and warp + 8.
+    const int v0 = 64 * quarter + 4 * (warp + 8 * vg);
+    float2 w[4][8];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const __nv_bfloat162* wr =
+          reinterpret_cast<const __nv_bfloat162*>(kv_b + (int64_t(h) * kKvRows + kNope + v0 + e) * kLatentDim);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) w[e][j] = __bfloat1622float2(__ldg(wr + lane + 32 * j));
+    }
+#pragma unroll 1
+    for (int rg = 0; rg < RB / 8; ++rg) {
+      const int r0 = rb + 8 * rg;
+      if (r0 >= rows) break;
+      float p[32];  // output 4 r + e: row r0 + r, value row v0 + e
+#pragma unroll
+      for (int i = 0; i < 32; ++i) p[i] = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          const float2 x = ol[(8 * rg + r) * (kLatentDim / 2) + lane + 32 * j];
+#pragma unroll
+          for (int e = 0; e < 4; ++e)
+            p[4 * r + e] = __fadd_rn(p[4 * r + e], __fmaf_rn(w[e][j].x, x.x, __fmul_rn(w[e][j].y, x.y)));
+        }
+      }
+      halve<16>(p, lane);
+      halve<8>(p, lane);
+      halve<4>(p, lane);
+      halve<2>(p, lane);
+      halve<1>(p, lane);
+      const int r = r0 + (lane >> 2), v = v0 + (lane & 3);
+      if (r < rows) {
+        o_bf16[int64_t(r) * ldo + h * kNope + v] = __float2bfloat16_rn(p[0]);
+        if (o_f32) o_f32[(int64_t(r) * kHeads + h) * kNope + v] = p[0];
       }
     }
   }
@@ -832,10 +951,31 @@ extern "C" int32_t glm53f_dsa_mla_absorb_q(const float* q, const uint16_t* kv_b,
   const auto* w = reinterpret_cast<const __nv_bfloat16*>(kv_b);
   auto* qb = reinterpret_cast<__nv_bfloat16*>(q_abs_bf16);
   // Rows per block: the smallest of 1, 2, 4, 8 that covers `rows` (8 beyond).
-  if (rows == 1) absorb_kernel<1><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, w, rows, qb, q_abs_f32);
-  else if (rows == 2) absorb_kernel<2><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, w, rows, qb, q_abs_f32);
-  else if (rows <= 4) absorb_kernel<4><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, w, rows, qb, q_abs_f32);
-  else absorb_kernel<8><<<dim3(kHeads, (rows + 7) / 8, 2), 128, 0, s>>>(q, w, rows, qb, q_abs_f32);
+  const int64_t ld = kHeads * kNope;
+  if (rows == 1) absorb_kernel<1, float><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, ld, w, rows, qb, q_abs_f32);
+  else if (rows == 2) absorb_kernel<2, float><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, ld, w, rows, qb, q_abs_f32);
+  else if (rows <= 4) absorb_kernel<4, float><<<dim3(kHeads, 1, 2), 128, 0, s>>>(q, ld, w, rows, qb, q_abs_f32);
+  else absorb_kernel<8, float><<<dim3(kHeads, (rows + 7) / 8, 2), 128, 0, s>>>(q, ld, w, rows, qb, q_abs_f32);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_dsa_mla_absorb_q_bf16(const uint16_t* q, int64_t ldq, int32_t rows, const uint16_t* kv_b,
+                                                uint16_t* q_abs_bf16, float* q_abs_f32, void* stream) {
+  if (rows < 0 || !q || !kv_b || ldq < kHeads * kNope || ldq % 8 || (reinterpret_cast<uintptr_t>(q) & 15) ||
+      (!q_abs_bf16 && !q_abs_f32))
+    return cudaErrorInvalidValue;
+  if (rows == 0) return cudaSuccess;
+  auto s = static_cast<cudaStream_t>(stream);
+  const auto* x = reinterpret_cast<const __nv_bfloat16*>(q);
+  const auto* w = reinterpret_cast<const __nv_bfloat16*>(kv_b);
+  auto* qb = reinterpret_cast<__nv_bfloat16*>(q_abs_bf16);
+  // The blocks of glm53f_dsa_mla_absorb_q. (32 rows per block, reading each weight once
+  // for 32 rows, measured no faster on the RTX 4090: the multiply-adds bound it.)
+  if (rows == 1) absorb_kernel<1, __nv_bfloat16><<<dim3(kHeads, 1, 2), 128, 0, s>>>(x, ldq, w, rows, qb, q_abs_f32);
+  else if (rows == 2) absorb_kernel<2, __nv_bfloat16><<<dim3(kHeads, 1, 2), 128, 0, s>>>(x, ldq, w, rows, qb, q_abs_f32);
+  else if (rows <= 4) absorb_kernel<4, __nv_bfloat16><<<dim3(kHeads, 1, 2), 128, 0, s>>>(x, ldq, w, rows, qb, q_abs_f32);
+  else
+    absorb_kernel<8, __nv_bfloat16><<<dim3(kHeads, (rows + 7) / 8, 2), 128, 0, s>>>(x, ldq, w, rows, qb, q_abs_f32);
   return cudaGetLastError();
 }
 
@@ -849,6 +989,18 @@ extern "C" int32_t glm53f_dsa_mla_unabsorb_v(const float* o_lat, const uint16_t*
   else if (rows == 2) unabsorb_kernel<2><<<dim3(kHeads, 1, 4), 256, 0, s>>>(o_lat, w, rows, o);
   else if (rows <= 4) unabsorb_kernel<4><<<dim3(kHeads, 1, 4), 256, 0, s>>>(o_lat, w, rows, o);
   else unabsorb_kernel<8><<<dim3(kHeads, (rows + 7) / 8, 4), 256, 0, s>>>(o_lat, w, rows, o);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_dsa_mla_unabsorb_v_rows(const float* o_lat, const uint16_t* kv_b, int32_t rows,
+                                                  uint16_t* o_bf16, int64_t ldo, float* o_f32, void* stream) {
+  if (rows < 0 || !o_lat || !kv_b || !o_bf16 || ldo < kHeads * kNope) return cudaErrorInvalidValue;
+  if (rows == 0) return cudaSuccess;
+  if ((rows + kUnRows - 1) / kUnRows > 65535) return cudaErrorInvalidValue;
+  constexpr int smem = kUnRows * kLatentDim * 4;
+  unabsorb_rows_kernel<kUnRows, 2><<<dim3(4, kHeads, (rows + kUnRows - 1) / kUnRows), 256, smem,
+                                     static_cast<cudaStream_t>(stream)>>>(
+      o_lat, reinterpret_cast<const __nv_bfloat16*>(kv_b), rows, reinterpret_cast<__nv_bfloat16*>(o_bf16), ldo, o_f32);
   return cudaGetLastError();
 }
 

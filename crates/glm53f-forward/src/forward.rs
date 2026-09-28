@@ -106,6 +106,19 @@
 //! workspaces for the largest pass at any context. A drafter's tap buffer and working memory are
 //! sized up front too (`crate::draft::Dflash::reserve`). A pass allocates no device memory, so a
 //! server can size its KV page pool from what is left and never run out mid-pass.
+//!
+//! In a lane's scratch the buffers only a KDA attention uses, those only a DSA attention uses and
+//! those only an FFN uses share one region (a layer's attention is one or the other, and its FFN
+//! runs after it). A DSA layer's sparse MLA core (absorb, attention, un-absorb) runs in blocks of
+//! [`ForwardConfig::mla_block_rows`] rows whose buffers the lanes share. About 280 KiB a row
+//! remain, against 780 KiB with every buffer of its own (`docs/PERFORMANCE.md` §5a).
+//!
+//! # Op profile
+//!
+//! [`GlmForward::set_op_trace`] (`GLM53F_PROFILE_OPS=1` at construction) records a CUDA event
+//! after every operation of each prefill lane's attention and shared expert, and each prefill
+//! pass prints an `OPS` table of their median GPU times per layer kind (`crate::opprof`). The
+//! hooks are the `op` calls in the layer's functions; off, each is one check.
 
 use core::ffi::c_void;
 use std::cell::RefCell;
@@ -127,6 +140,7 @@ use crate::ffi;
 use crate::gemm::{act_quant, Fp8Input, Gemm, GemmPolicy};
 use crate::kv::{GlmKv, KvPool};
 use crate::kvplan::{KvLayout, LAYER_PAGE_BYTES, TAIL};
+use crate::opprof::{LayerKind, OpProfile, OpTrace, Segment};
 use crate::shape::*;
 use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW, ProjW};
 
@@ -167,6 +181,11 @@ pub struct ForwardConfig {
     /// request), and its value-column blocks per head (fixed, so the bits do not depend on the GPU).
     pub kda_prefill_rows: usize,
     pub kda_prefill_value_blocks: i32,
+    /// Rows of the blocks a DSA layer's sparse MLA core (absorb, attention, un-absorb) runs in:
+    /// its buffers (the absorbed query and the latent output, 256 KiB a row) are sized for one
+    /// block, shared by the lanes, instead of for a whole lane. The core is row-independent, so
+    /// the blocks change no bit. At least 8 (a decode or verify window runs in one block).
+    pub mla_block_rows: usize,
 }
 
 impl ForwardConfig {
@@ -193,6 +212,7 @@ impl Default for ForwardConfig {
             kda_chunked_prefill: false,
             kda_prefill_rows: 256,
             kda_prefill_value_blocks: 2,
+            mla_block_rows: 512,
         }
     }
 }
@@ -275,6 +295,7 @@ pub struct Tap<'a> {
     pub mode: Mode,
     pub rows: usize,
     s: &'a Scratch,
+    ws: &'a Workspaces,
 }
 
 impl Tap<'_> {
@@ -314,13 +335,13 @@ impl Tap<'_> {
             TapBuf::KdaGates => (&s.ag, 2 * KDA_WIDTH * 2),
             TapBuf::KdaNormOut => (&s.kda_out, KDA_WIDTH * 2),
             TapBuf::DsaQResid => (&s.q_resid, Q_LORA * 2),
-            TapBuf::DsaQ => (&s.q32, MLA_HEADS * QK_HEAD * 4),
+            TapBuf::DsaQ => (&s.q16, MLA_HEADS * QK_HEAD * 2),
             TapBuf::DsaKvA => (&s.kva, KV_LORA * 2),
             TapBuf::DsaIdxQ => (&s.idx_q32, INDEX_HEADS * INDEX_DIM * 4),
             TapBuf::DsaIdxProj => (&s.idx_p, IDX_PROJ_COLS * 2),
             TapBuf::DsaTokens => (&s.tokens, MAX_SELECTED * 4),
             TapBuf::DsaCounts => (&s.counts, 8),
-            TapBuf::DsaHeads => (&s.o32, MLA_HEADS * V_HEAD * 4),
+            TapBuf::DsaHeads => (&self.ws.o32, MLA_HEADS * V_HEAD * 4),
             TapBuf::RouterLogits => (&s.router_logits, EXPERTS * 4),
             TapBuf::RouterIds => (&s.ids, TOP_K * 4),
             TapBuf::RouterWeights => (&s.weights, TOP_K * 4),
@@ -329,8 +350,24 @@ impl Tap<'_> {
 
     /// The first `rows` rows of a buffer as raw bytes.
     pub fn bytes(&self, b: TapBuf) -> Result<Vec<u8>> {
+        if b == TapBuf::DsaHeads && self.rows > self.ws.mla_rows {
+            return Err(invalid!(
+                "a DsaHeads tap holds passes of up to {} rows (ForwardConfig::mla_block_rows)",
+                self.ws.mla_rows
+            ));
+        }
         let (buf, row) = self.buf(b);
-        buf.download::<u8>(self.rows * row)
+        let bytes = buf.download::<u8>(self.rows * row)?;
+        if b == TapBuf::DsaQ {
+            // The query stays in BF16 (the absorb reads it so); its f32 value is exact.
+            return Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|h| f32::from_bits(u32::from(u16::from_le_bytes(*h)) << 16).to_le_bytes())
+                .collect());
+        }
+        Ok(bytes)
     }
 
     pub fn f32(&self, b: TapBuf) -> Result<Vec<f32>> {
@@ -422,8 +459,35 @@ fn buf(bytes: usize) -> Result<DeviceBuffer> {
     DeviceBuffer::alloc(bytes.max(16))
 }
 
+/// Views laid out one after another from the start of a region, each at a 256-byte boundary.
+struct Carve<'a> {
+    region: &'a DeviceBuffer,
+    at: usize,
+}
+
+impl Carve<'_> {
+    /// Bytes a set of views of these sizes takes.
+    fn size(bytes: &[usize]) -> usize {
+        bytes.iter().map(|&b| b.max(16).next_multiple_of(256)).sum()
+    }
+
+    fn take(&mut self, bytes: usize) -> Result<DeviceBuffer> {
+        let b = bytes.max(16);
+        // SAFETY: every view is a field of the scratch that owns the region, dropped with it.
+        let v = unsafe { self.region.view(self.at, b) }?;
+        self.at += b.next_multiple_of(256);
+        Ok(v)
+    }
+}
+
 /// Every per-pass buffer of one lane, sized for `rows` rows and `logits` logit rows. The
 /// attention workspaces are shared by the lanes ([`Workspaces`]).
+///
+/// A layer's attention is KDA or DSA, and its FFN runs after it, so the buffers only a KDA
+/// attention uses, those only a DSA attention uses and those only an FFN uses are views of one
+/// region (`shared`), the largest of the three sets, not three allocations. Nothing reads one
+/// set's buffers after the next set's first write: taps read the attention's at `AttnDone` and
+/// the FFN's outputs (not its intermediates) at `FfnDone`.
 pub(crate) struct Scratch {
     rows: usize,
     logit_rows: usize,
@@ -443,19 +507,20 @@ pub(crate) struct Scratch {
     ffn_out: DeviceBuffer,
     ffn_out2: DeviceBuffer,
     sync: DeviceBuffer,
-    // KDA
+    /// The region the KDA, DSA and FFN views below share.
+    shared: DeviceBuffer,
+    // KDA (views)
     p: DeviceBuffer,
     fga: DeviceBuffer,
     ag: DeviceBuffer,
     kda_out: DeviceBuffer,
-    // DSA
+    // DSA (views); the sparse MLA core's buffers are per block, in the workspaces
     qa: DeviceBuffer,
     kva: DeviceBuffer,
     q_resid: DeviceBuffer,
     q_resid_q: DeviceBuffer,
     q_resid_s: DeviceBuffer,
     q16: DeviceBuffer,
-    q32: DeviceBuffer,
     idx_q16: DeviceBuffer,
     idx_q32: DeviceBuffer,
     idx_p: DeviceBuffer,
@@ -463,17 +528,15 @@ pub(crate) struct Scratch {
     k_raw: DeviceBuffer,
     gate: DeviceBuffer,
     w32: DeviceBuffer,
-    q_abs: DeviceBuffer,
     tokens: DeviceBuffer,
     pools: DeviceBuffer,
     counts: DeviceBuffer,
-    o_lat: DeviceBuffer,
-    lse: DeviceBuffer,
-    o32: DeviceBuffer,
     o16: DeviceBuffer,
+    /// The E4M3 form of an attention's output rows (DSA's heads, or a KDA `o_proj`'s input): not
+    /// a view, since either kind of layer may use it.
     o_q: DeviceBuffer,
     o_s: DeviceBuffer,
-    // FFN
+    // FFN (views)
     gu: DeviceBuffer,
     act: DeviceBuffer,
     act_q: DeviceBuffer,
@@ -493,6 +556,47 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
+    /// Bytes of the KDA, DSA and FFN views for `r` rows, in the order [`Scratch::new`] takes them.
+    fn kda_views(r: usize) -> [usize; 4] {
+        [
+            r * KDA_P_COLS * 2,
+            r * 2 * KDA_DIM * 2,
+            r * 2 * KDA_WIDTH * 2,
+            r * KDA_WIDTH * 2,
+        ]
+    }
+
+    fn dsa_views(r: usize) -> [usize; 17] {
+        [
+            r * Q_LORA * 2,
+            r * KV_LORA * 2,
+            r * Q_LORA * 2,
+            r * Q_LORA,
+            r * (Q_LORA / 128) * 4,
+            r * MLA_HEADS * QK_HEAD * 2,
+            r * INDEX_HEADS * INDEX_DIM * 2,
+            r * INDEX_HEADS * INDEX_DIM * 4,
+            r * IDX_PROJ_COLS * 2,
+            r * KV_LORA * 4,
+            r * INDEX_DIM * 4,
+            r * INDEX_DIM * 4,
+            r * INDEX_HEADS * 4,
+            r * MAX_SELECTED * 4,
+            r * TOP_POOLS * 4,
+            r * 2 * 4,
+            r * MLA_HEADS * V_HEAD * 2,
+        ]
+    }
+
+    fn ffn_views(r: usize) -> [usize; 4] {
+        [
+            r * 2 * DENSE_INTER * 2,
+            r * DENSE_INTER * 2,
+            r * DENSE_INTER,
+            r * (DENSE_INTER / 128) * 4,
+        ]
+    }
+
     /// `taps`: the lane that taps read and `run_layers` returns from (lane A); lane B's
     /// scratch has no tap buffer (passes with a tap run in one lane).
     fn new(
@@ -504,6 +608,38 @@ impl Scratch {
         taps: bool,
     ) -> Result<Scratch> {
         let r = rows;
+        let (kv, dv, fv) = (Self::kda_views(r), Self::dsa_views(r), Self::ffn_views(r));
+        let shared = buf(Carve::size(&kv).max(Carve::size(&dv)).max(Carve::size(&fv)))?;
+        let mut k = Carve {
+            region: &shared,
+            at: 0,
+        };
+        let (p, fga, ag, kda_out) = (
+            k.take(kv[0])?,
+            k.take(kv[1])?,
+            k.take(kv[2])?,
+            k.take(kv[3])?,
+        );
+        let mut d = Carve {
+            region: &shared,
+            at: 0,
+        };
+        let mut dsa = Vec::with_capacity(dv.len());
+        for b in dv {
+            dsa.push(d.take(b)?);
+        }
+        let mut dsa = dsa.into_iter();
+        let mut next = || dsa.next().expect("a DSA view");
+        let mut f = Carve {
+            region: &shared,
+            at: 0,
+        };
+        let (gu, act, act_q, act_s) = (
+            f.take(fv[0])?,
+            f.take(fv[1])?,
+            f.take(fv[2])?,
+            f.take(fv[3])?,
+        );
         Ok(Scratch {
             rows,
             logit_rows,
@@ -523,38 +659,33 @@ impl Scratch {
             ffn_out: buf(r * HIDDEN * 2)?,
             ffn_out2: buf(r * HIDDEN * 2)?,
             sync: DeviceBuffer::zeroed(r.max(64) * 4)?,
-            p: buf(r * KDA_P_COLS * 2)?,
-            fga: buf(r * 2 * KDA_DIM * 2)?,
-            ag: buf(r * 2 * KDA_WIDTH * 2)?,
-            kda_out: buf(r * KDA_WIDTH * 2)?,
-            qa: buf(r * Q_LORA * 2)?,
-            kva: buf(r * KV_LORA * 2)?,
-            q_resid: buf(r * Q_LORA * 2)?,
-            q_resid_q: buf(r * Q_LORA)?,
-            q_resid_s: buf(r * (Q_LORA / 128) * 4)?,
-            q16: buf(r * MLA_HEADS * QK_HEAD * 2)?,
-            q32: buf(r * MLA_HEADS * QK_HEAD * 4)?,
-            idx_q16: buf(r * INDEX_HEADS * INDEX_DIM * 2)?,
-            idx_q32: buf(r * INDEX_HEADS * INDEX_DIM * 4)?,
-            idx_p: buf(r * IDX_PROJ_COLS * 2)?,
-            kva32: buf(r * KV_LORA * 4)?,
-            k_raw: buf(r * INDEX_DIM * 4)?,
-            gate: buf(r * INDEX_DIM * 4)?,
-            w32: buf(r * INDEX_HEADS * 4)?,
-            q_abs: buf(r * MLA_HEADS * KV_LORA * 2)?,
-            tokens: buf(r * MAX_SELECTED * 4)?,
-            pools: buf(r * TOP_POOLS * 4)?,
-            counts: buf(r * 2 * 4)?,
-            o_lat: buf(r * MLA_HEADS * KV_LORA * 4)?,
-            lse: buf(r * MLA_HEADS * 4)?,
-            o32: buf(r * MLA_HEADS * V_HEAD * 4)?,
-            o16: buf(r * MLA_HEADS * V_HEAD * 2)?,
+            p,
+            fga,
+            ag,
+            kda_out,
+            qa: next(),
+            kva: next(),
+            q_resid: next(),
+            q_resid_q: next(),
+            q_resid_s: next(),
+            q16: next(),
+            idx_q16: next(),
+            idx_q32: next(),
+            idx_p: next(),
+            kva32: next(),
+            k_raw: next(),
+            gate: next(),
+            w32: next(),
+            tokens: next(),
+            pools: next(),
+            counts: next(),
+            o16: next(),
             o_q: buf(r * MLA_HEADS * V_HEAD)?,
             o_s: buf(r * (MLA_HEADS * V_HEAD / 128) * 4)?,
-            gu: buf(r * 2 * DENSE_INTER * 2)?,
-            act: buf(r * DENSE_INTER * 2)?,
-            act_q: buf(r * DENSE_INTER)?,
-            act_s: buf(r * (DENSE_INTER / 128) * 4)?,
+            gu,
+            act,
+            act_q,
+            act_s,
             router_logits: buf(r * EXPERTS * 4)?,
             ids: buf(r * TOP_K * 4)?,
             weights: buf(r * TOP_K * 4)?,
@@ -565,9 +696,11 @@ impl Scratch {
             meta: buf(64 * 1024 + r * 64 + requests * (128 + 16 * dsa_layers))?,
             batch_table: buf(requests * max_pages * 4)?,
             batch_tails: buf(dsa_layers * requests * TAIL)?,
+            shared,
         })
     }
 
+    /// Device bytes the scratch allocated (the views take none of their own).
     fn bytes(&self) -> usize {
         let v = [
             &self.streams[0],
@@ -587,38 +720,9 @@ impl Scratch {
             &self.ffn_out,
             &self.ffn_out2,
             &self.sync,
-            &self.p,
-            &self.fga,
-            &self.ag,
-            &self.kda_out,
-            &self.qa,
-            &self.kva,
-            &self.q_resid,
-            &self.q_resid_q,
-            &self.q_resid_s,
-            &self.q16,
-            &self.q32,
-            &self.idx_q16,
-            &self.idx_q32,
-            &self.idx_p,
-            &self.kva32,
-            &self.k_raw,
-            &self.gate,
-            &self.w32,
-            &self.q_abs,
-            &self.tokens,
-            &self.pools,
-            &self.counts,
-            &self.o_lat,
-            &self.lse,
-            &self.o32,
-            &self.o16,
+            &self.shared,
             &self.o_q,
             &self.o_s,
-            &self.gu,
-            &self.act,
-            &self.act_q,
-            &self.act_s,
             &self.router_logits,
             &self.ids,
             &self.weights,
@@ -630,7 +734,7 @@ impl Scratch {
             &self.batch_table,
             &self.batch_tails,
         ];
-        v.iter().map(|b| b.bytes()).sum()
+        v.iter().map(|b| b.allocated()).sum()
     }
 }
 
@@ -690,6 +794,15 @@ struct Workspaces {
     /// The chunked KDA prefill kernel's (when [`ForwardConfig::kda_chunked_prefill`] is on at
     /// construction; switched on later, it grows on the first chunked pass).
     kda: DeviceBuffer,
+    /// The sparse MLA core's buffers for one block of `mla_rows` rows
+    /// ([`ForwardConfig::mla_block_rows`], at most a pass's): the absorbed query (BF16), the
+    /// latent output and its log-sum-exp, and the per-head output in f32 (passes of up to 8
+    /// rows, and taps).
+    mla_rows: usize,
+    q_abs: DeviceBuffer,
+    o_lat: DeviceBuffer,
+    lse: DeviceBuffer,
+    o32: DeviceBuffer,
 }
 
 impl Workspaces {
@@ -736,16 +849,40 @@ impl Workspaces {
         [idx, mla, kda]
     }
 
-    fn new(sizes: [usize; 3]) -> Result<Workspaces> {
+    /// Rows of one sparse MLA block for passes of up to `rows` rows.
+    fn mla_rows(cfg: &ForwardConfig, rows: usize, dsa_layers: usize) -> usize {
+        if dsa_layers == 0 {
+            0
+        } else {
+            rows.min(cfg.mla_block_rows)
+        }
+    }
+
+    fn new(sizes: [usize; 3], mla_rows: usize) -> Result<Workspaces> {
+        let r = mla_rows;
         Ok(Workspaces {
             idx: buf(sizes[0])?,
             mla: buf(sizes[1])?,
             kda: buf(sizes[2])?,
+            mla_rows,
+            q_abs: buf(r * MLA_HEADS * KV_LORA * 2)?,
+            o_lat: buf(r * MLA_HEADS * KV_LORA * 4)?,
+            lse: buf(r * MLA_HEADS * 4)?,
+            o32: buf(r * MLA_HEADS * V_HEAD * 4)?,
         })
     }
 
+    /// The sparse MLA core's: split partials and the block's buffers.
+    fn mla_bytes(&self) -> usize {
+        self.mla.bytes()
+            + self.q_abs.bytes()
+            + self.o_lat.bytes()
+            + self.lse.bytes()
+            + self.o32.bytes()
+    }
+
     fn bytes(&self) -> usize {
-        self.idx.bytes() + self.mla.bytes() + self.kda.bytes()
+        self.idx.bytes() + self.mla_bytes() + self.kda.bytes()
     }
 }
 
@@ -756,7 +893,8 @@ pub struct BufferBytes {
     pub lanes: [usize; 2],
     /// The verify round's saved inputs.
     pub verify: usize,
-    /// The indexer, sparse MLA and chunked KDA workspaces.
+    /// The indexer, sparse MLA (split partials and the core's block buffers) and chunked KDA
+    /// workspaces.
     pub workspaces: [usize; 3],
     /// The GEMM engine's cuBLAS workspace and split-K scratch.
     pub gemm: usize,
@@ -809,6 +947,7 @@ impl ForwardBuffers {
             || !groups_ok(cfg.decode_head_groups)
             || !groups_ok(cfg.prefill_head_groups)
             || !matches!(cfg.kda_prefill_value_blocks, 1 | 2 | 4)
+            || cfg.mla_block_rows < 8
         {
             return Err(invalid!("bad forward config {cfg:?}"));
         }
@@ -833,7 +972,10 @@ impl ForwardBuffers {
             None
         };
         let v = VerifyScratch::new(cfg.max_verify_rows, shape.kda_layers, dl)?;
-        let ws = Workspaces::new(Workspaces::plan(cfg, rows, sms, dl))?;
+        let ws = Workspaces::new(
+            Workspaces::plan(cfg, rows, sms, dl),
+            Workspaces::mla_rows(cfg, rows, dl),
+        )?;
         Ok(ForwardBuffers {
             cfg: *cfg,
             max_pages,
@@ -862,7 +1004,7 @@ impl ForwardBuffers {
             verify: self.v.bytes(),
             workspaces: [
                 self.ws.idx.bytes(),
-                self.ws.mla.bytes(),
+                self.ws.mla_bytes(),
                 self.ws.kda.bytes(),
             ],
             gemm: self.gemm.bytes(),
@@ -1202,6 +1344,8 @@ pub struct GlmForward {
     timer: RefCell<Option<Timer>>,
     tap: Option<Box<TapFn>>,
     trace: Option<Tracer>,
+    /// The op profile (`GLM53F_PROFILE_OPS`, [`GlmForward::set_op_trace`]).
+    ops: RefCell<Option<OpTrace>>,
     sms: i32,
     /// The DFlash2 drafter, when attached.
     draft: Option<Dflash>,
@@ -1276,7 +1420,7 @@ impl GlmForward {
             ws,
             ..
         } = bufs;
-        Ok(GlmForward {
+        let mut fwd = GlmForward {
             gemm,
             sms,
             model: Arc::new(model),
@@ -1294,10 +1438,16 @@ impl GlmForward {
             timer: RefCell::new(None),
             tap: None,
             trace: None,
+            ops: RefCell::new(None),
             draft: None,
             lane_b: None,
             decode_lane_passes: 0,
-        })
+        };
+        if std::env::var("GLM53F_PROFILE_OPS").is_ok_and(|v| !v.is_empty() && v != "0") {
+            // Every prefill pass prints its `PIPE` line and its `OPS` table.
+            fwd.set_op_trace(true, true);
+        }
+        Ok(fwd)
     }
 
     pub fn shape(&self) -> &ModelShape {
@@ -1360,6 +1510,31 @@ impl GlmForward {
         })
     }
 
+    /// Record the op profile of later prefill passes (`crate::opprof`): the GPU time of every
+    /// operation of each lane's attention and shared expert, per layer
+    /// ([`GlmForward::take_op_profile`]); with `print`, each pass's `OPS` table goes to stderr,
+    /// and the lane trace is turned on (printing) if it is off, for the `PIPE` line it adds up
+    /// to. `GLM53F_PROFILE_OPS=1` does this at construction.
+    pub fn set_op_trace(&mut self, on: bool, print: bool) {
+        *self.ops.borrow_mut() = on.then(|| OpTrace::new(print));
+        if on && print && self.trace.is_none() {
+            self.set_lane_trace(true, true);
+        }
+    }
+
+    /// The last prefill pass's op profile (op profile on).
+    pub fn take_op_profile(&mut self) -> Option<OpProfile> {
+        self.ops.borrow_mut().as_mut().and_then(|o| o.last.take())
+    }
+
+    /// The end of op `name` in the active lane's current segment (op profile on).
+    fn op(&self, name: &'static str) -> Result<()> {
+        match self.ops.borrow_mut().as_mut() {
+            Some(o) => o.op(&self.stream, name),
+            None => Ok(()),
+        }
+    }
+
     /// Replace the expert backend (returns the old one).
     pub fn set_experts(&mut self, experts: Box<dyn ExpertBackend>) -> Box<dyn ExpertBackend> {
         std::mem::replace(&mut self.experts, experts)
@@ -1393,6 +1568,11 @@ impl GlmForward {
     fn mark(&self, layer: usize, stage: &'static str) -> Result<()> {
         if let Some(t) = self.timer.borrow_mut().as_mut() {
             t.mark(&self.stream, layer, stage)?;
+        }
+        if stage.starts_with("kda_") {
+            // A KDA layer's stages (`kda_proj`, `kda_core`, `kda_o`) are its ops in the op
+            // profile: its body carries no hooks of its own.
+            self.op(stage)?;
         }
         Ok(())
     }
@@ -2385,6 +2565,9 @@ impl GlmForward {
             Vec::new()
         };
         self.finish_trace(&lanes)?;
+        if let Some(o) = self.ops.get_mut().as_mut() {
+            o.finish(&self.stream)?;
+        }
         if mode == Mode::Verify {
             // Pending rows; they reach the drafter at their commit.
             for (kv, &r) in kvs.iter_mut().zip(rows) {
@@ -2439,6 +2622,13 @@ impl GlmForward {
         let depth = self.experts.depth().clamp(1, 2);
         let mut flight: VecDeque<usize> = VecDeque::new();
         let model = self.model.clone();
+        if let Some(o) = self.ops.get_mut().as_mut() {
+            // Prefill passes only.
+            o.begin_pass(
+                mode == Mode::Prefill,
+                lanes.iter().map(|l| l.rows).collect(),
+            );
+        }
         if let Some(t) = self.trace.as_mut() {
             t.active = true;
             t.mode = mode;
@@ -2553,6 +2743,7 @@ impl GlmForward {
                 self.s.streams[lane.cur].ptr(0),
                 &self.stream,
             )?;
+            self.op("draft_capture")?;
         }
         self.mark(l, "attn_hc")?;
         match &lw.attn {
@@ -2560,6 +2751,7 @@ impl GlmForward {
             AttnW::Dsa(w) => {
                 if let Some((k, n)) = lane.continues {
                     self.continue_tail(l, k, n, lane.reqs.len())?;
+                    self.op("dsa_continue_tail")?;
                 }
                 self.dsa(l, mode, lane.rows, lane.base, &lane.reqs, &lane.meta, w)?
             }
@@ -2795,8 +2987,24 @@ impl GlmForward {
 
     // ---- Lane trace ----------------------------------------------------------------------------
 
-    /// Record a trace event on the stream (tracing a pass).
+    /// Record a trace event on the stream (tracing a pass). The op profile's segments start
+    /// right after `AttnStart` and `SharedStart`, and end at `RouterEnd` and `SharedEnd`.
     fn trace_event(&mut self, layer: usize, lane: usize, at: At) -> Result<()> {
+        if let Some(o) = self.ops.get_mut().as_mut() {
+            match at {
+                At::RouterEnd | At::SharedEnd => o.end(),
+                At::AttnStart | At::SharedStart => {
+                    let sh = &self.model.shape;
+                    let kind = LayerKind::new(sh.dsa_index[layer].is_some(), sh.is_moe(layer));
+                    let seg = if matches!(at, At::AttnStart) {
+                        Segment::Attention
+                    } else {
+                        Segment::Shared
+                    };
+                    o.begin(&self.stream, layer, lane, kind, seg)?;
+                }
+            }
+        }
         if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
             if t.used == t.events.len() {
                 t.events.push(Event::new()?);
@@ -2940,6 +3148,7 @@ impl GlmForward {
             mode,
             rows,
             s: &self.s,
+            ws: &self.ws,
         });
         self.tap = Some(f);
         r
@@ -2975,6 +3184,12 @@ impl GlmForward {
             ),
         };
         let st = self.stream.raw().cast();
+        // The collapsed row is only a tap's (the sublayer reads its RMSNorm).
+        let collapsed: *mut u16 = if self.tap.is_some() {
+            s.collapsed.ptr(0)
+        } else {
+            core::ptr::null_mut()
+        };
         if rows <= 8 {
             // SAFETY: scratch sized for `rows`; `sync` zeroed.
             launched(
@@ -2995,7 +3210,7 @@ impl GlmForward {
                         s.pre.ptr(0),
                         post.ptr(0),
                         comb.ptr(0),
-                        s.collapsed.ptr(0),
+                        collapsed,
                         s.normed.ptr(0),
                         s.normed_q.ptr(0),
                         s.normed_s.ptr(0),
@@ -3006,6 +3221,11 @@ impl GlmForward {
                 },
                 "glm53f_hc_boundary_decode",
             )?;
+            self.op(if attn {
+                "attn_hc_boundary"
+            } else {
+                "ffn_hc_boundary"
+            })?;
         } else {
             let projected = if prev.is_some() {
                 sout as *const u16
@@ -3031,6 +3251,11 @@ impl GlmForward {
                 },
                 "glm53f_hc_project",
             )?;
+            self.op(if attn {
+                "attn_hc_project"
+            } else {
+                "ffn_hc_project"
+            })?;
             launched(
                 unsafe {
                     lffi::glm53f_hc_finish(
@@ -3042,7 +3267,7 @@ impl GlmForward {
                         s.pre.ptr(0),
                         post.ptr(0),
                         comb.ptr(0),
-                        s.collapsed.ptr(0),
+                        collapsed,
                         s.normed.ptr(0),
                         s.normed_q.ptr(0),
                         s.normed_s.ptr(0),
@@ -3053,6 +3278,11 @@ impl GlmForward {
                 },
                 "glm53f_hc_finish",
             )?;
+            self.op(if attn {
+                "attn_hc_finish"
+            } else {
+                "ffn_hc_finish"
+            })?;
         }
         Ok(prev.is_some())
     }
@@ -3436,7 +3666,9 @@ impl GlmForward {
         let x = self.normed_input();
         // Query and latent projections (FP8), the query latent's RMSNorm.
         unsafe { self.gemm.fp8(&x, &w.q_a.mat(), rows, s.qa.ptr(0), &st) }?;
+        self.op("dsa_q_a")?;
         unsafe { self.gemm.fp8(&x, &w.kv_a.mat(), rows, s.kva.ptr(0), &st) }?;
+        self.op("dsa_kv_a")?;
         // SAFETY (all launches in this function): scratch sized for `rows`; weights of this
         // layer; the cache view covers the batch's page tables.
         launched(
@@ -3452,6 +3684,7 @@ impl GlmForward {
             },
             "glm53f_rmsnorm",
         )?;
+        self.op("dsa_q_norm")?;
         if quant {
             unsafe {
                 act_quant(
@@ -3463,6 +3696,7 @@ impl GlmForward {
                     &st,
                 )
             }?;
+            self.op("dsa_q_quant")?;
         }
         let qr = Fp8Input {
             bf16: s.q_resid.ptr(0),
@@ -3470,6 +3704,7 @@ impl GlmForward {
             scales: s.q_resid_s.ptr(0),
         };
         unsafe { self.gemm.fp8(&qr, &w.q_b.mat(), rows, s.q16.ptr(0), &st) }?;
+        self.op("dsa_q_b")?;
         // Indexer projections (BF16).
         unsafe {
             self.gemm.bf16(
@@ -3485,6 +3720,7 @@ impl GlmForward {
                 &st,
             )
         }?;
+        self.op("dsa_idx_q")?;
         unsafe {
             self.gemm.bf16(
                 s.normed.ptr(0),
@@ -3499,6 +3735,7 @@ impl GlmForward {
                 &st,
             )
         }?;
+        self.op("dsa_idx_proj")?;
         self.mark(l, "dsa_proj")?;
         // f32 views the DSA kernels take.
         let widen = |src: *const u16,
@@ -3534,14 +3771,7 @@ impl GlmForward {
         } else {
             (s.k_raw.ptr(0), s.gate.ptr(0))
         };
-        widen(
-            s.q16.ptr(0),
-            MLA_HEADS * QK_HEAD,
-            s.q32.ptr(0),
-            MLA_HEADS * QK_HEAD,
-            MLA_HEADS * QK_HEAD,
-            1.0,
-        )?;
+        // (The absorb reads the MLA query in BF16.)
         widen(
             s.idx_q16.ptr(0),
             INDEX_HEADS * INDEX_DIM,
@@ -3550,6 +3780,7 @@ impl GlmForward {
             INDEX_HEADS * INDEX_DIM,
             1.0,
         )?;
+        self.op("dsa_widen_idx_q")?;
         widen(s.kva.ptr(0), KV_LORA, s.kva32.ptr(0), KV_LORA, KV_LORA, 1.0)?;
         let ip: *const u16 = s.idx_p.ptr(0);
         widen(ip, IDX_PROJ_COLS, k_raw, INDEX_DIM, INDEX_DIM, 1.0)?;
@@ -3570,6 +3801,7 @@ impl GlmForward {
             INDEX_HEADS,
             wscale,
         )?;
+        self.op("dsa_widen_small")?;
         let cache = self.dsa_cache(j);
         let tails: *mut u8 = s.batch_tails.byte_ptr(j * reqs.len() * TAIL);
         launched(
@@ -3587,6 +3819,7 @@ impl GlmForward {
             },
             "glm53f_dsa_mla_latent_write",
         )?;
+        self.op("dsa_latent_write")?;
         launched(
             unsafe {
                 dffi::glm53f_dsa_index_pool_write(
@@ -3606,6 +3839,7 @@ impl GlmForward {
             },
             "glm53f_dsa_index_pool_write",
         )?;
+        self.op("dsa_pool_write")?;
         if !verify {
             launched(
                 unsafe {
@@ -3623,6 +3857,7 @@ impl GlmForward {
                 },
                 "glm53f_dsa_index_tail_commit",
             )?;
+            self.op("dsa_tail_commit")?;
         }
         self.mark(l, "dsa_cache")?;
         // Selection.
@@ -3685,69 +3920,112 @@ impl GlmForward {
             },
             "glm53f_dsa_index_select",
         )?;
+        self.op("dsa_index_select")?;
         self.mark(l, "dsa_index")?;
-        // Sparse MLA in latent space.
-        launched(
-            unsafe {
-                dffi::glm53f_dsa_mla_absorb_q(
-                    s.q32.ptr(0),
-                    w.kv_b.ptr(0),
-                    rows as i32,
-                    s.q_abs.ptr(0),
-                    core::ptr::null_mut(),
-                    raw,
-                )
-            },
-            "glm53f_dsa_mla_absorb_q",
-        )?;
-        launched(
-            unsafe {
-                dffi::glm53f_dsa_mla_sparse_attn(
-                    s.q_abs.ptr(0),
-                    s.tokens.ptr(0),
-                    MAX_SELECTED as i32,
-                    s.counts.ptr(0),
-                    meta.row_req,
-                    rows as i32,
-                    MLA_SCALE,
-                    cache,
-                    splits as i32,
-                    groups as i32,
-                    self.ws.mla.ptr(0),
-                    self.ws.mla.bytes() as u64,
-                    s.o_lat.ptr(0),
-                    s.lse.ptr(0),
-                    raw,
-                )
-            },
-            "glm53f_dsa_mla_sparse_attn",
-        )?;
-        launched(
-            unsafe {
-                dffi::glm53f_dsa_mla_unabsorb_v(
-                    s.o_lat.ptr(0),
-                    w.kv_b.ptr(0),
-                    rows as i32,
-                    s.o32.ptr(0),
-                    raw,
-                )
-            },
-            "glm53f_dsa_mla_unabsorb_v",
-        )?;
-        launched(
-            unsafe {
-                ffi::glm53f_fwd_f32_to_bf16(
-                    s.o32.ptr(0),
-                    (MLA_HEADS * V_HEAD) as i64,
-                    s.o16.ptr(0),
-                    (MLA_HEADS * V_HEAD) as i64,
-                    rows as i32,
-                    (MLA_HEADS * V_HEAD) as i32,
-                    raw,
-                )
-            },
-            "glm53f_fwd_f32_to_bf16",
-        )?;
+        // Sparse MLA in latent space, in blocks of the workspaces' rows (a whole pass up to
+        // `ForwardConfig::mla_block_rows`): absorb from the BF16 query, attend, un-absorb into the
+        // BF16 per-head output. Every kernel of the core computes each row alone, and the plan
+        // (`splits`, `groups`) is the pass's, so the blocks change no bit. Up to 8 rows the
+        // decode un-absorb writes f32 and a copy rounds it; beyond, the prefill un-absorb writes
+        // BF16 directly (and f32 for a tap: one block when a tap reads it).
+        let ws = &self.ws;
+        let block = ws.mla_rows.max(1);
+        let ld = MLA_HEADS * QK_HEAD;
+        let tap_o32: *mut f32 = if self.tap.is_some() {
+            ws.o32.ptr(0)
+        } else {
+            core::ptr::null_mut()
+        };
+        let mut b0 = 0;
+        while b0 < rows {
+            let n = block.min(rows - b0);
+            launched(
+                unsafe {
+                    dffi::glm53f_dsa_mla_absorb_q_bf16(
+                        s.q16.ptr::<u16>(b0 * ld),
+                        ld as i64,
+                        n as i32,
+                        w.kv_b.ptr(0),
+                        ws.q_abs.ptr(0),
+                        core::ptr::null_mut(),
+                        raw,
+                    )
+                },
+                "glm53f_dsa_mla_absorb_q_bf16",
+            )?;
+            self.op("dsa_absorb_q")?;
+            launched(
+                unsafe {
+                    dffi::glm53f_dsa_mla_sparse_attn(
+                        ws.q_abs.ptr(0),
+                        s.tokens.ptr::<i32>(b0 * MAX_SELECTED),
+                        MAX_SELECTED as i32,
+                        s.counts.ptr::<i32>(2 * b0),
+                        meta.row_req.wrapping_add(b0),
+                        n as i32,
+                        MLA_SCALE,
+                        cache,
+                        splits as i32,
+                        groups as i32,
+                        ws.mla.ptr(0),
+                        ws.mla.bytes() as u64,
+                        ws.o_lat.ptr(0),
+                        ws.lse.ptr(0),
+                        raw,
+                    )
+                },
+                "glm53f_dsa_mla_sparse_attn",
+            )?;
+            self.op("dsa_sparse_attn")?;
+            let o16: *mut u16 = s.o16.ptr(b0 * MLA_HEADS * V_HEAD);
+            if small {
+                launched(
+                    unsafe {
+                        dffi::glm53f_dsa_mla_unabsorb_v(
+                            ws.o_lat.ptr(0),
+                            w.kv_b.ptr(0),
+                            n as i32,
+                            ws.o32.ptr(0),
+                            raw,
+                        )
+                    },
+                    "glm53f_dsa_mla_unabsorb_v",
+                )?;
+                self.op("dsa_unabsorb_v")?;
+                launched(
+                    unsafe {
+                        ffi::glm53f_fwd_f32_to_bf16(
+                            ws.o32.ptr(0),
+                            (MLA_HEADS * V_HEAD) as i64,
+                            o16,
+                            (MLA_HEADS * V_HEAD) as i64,
+                            n as i32,
+                            (MLA_HEADS * V_HEAD) as i32,
+                            raw,
+                        )
+                    },
+                    "glm53f_fwd_f32_to_bf16",
+                )?;
+                self.op("dsa_o_bf16")?;
+            } else {
+                launched(
+                    unsafe {
+                        dffi::glm53f_dsa_mla_unabsorb_v_rows(
+                            ws.o_lat.ptr(0),
+                            w.kv_b.ptr(0),
+                            n as i32,
+                            o16,
+                            (MLA_HEADS * V_HEAD) as i64,
+                            tap_o32,
+                            raw,
+                        )
+                    },
+                    "glm53f_dsa_mla_unabsorb_v_rows",
+                )?;
+                self.op("dsa_unabsorb_v")?;
+            }
+            b0 += n;
+        }
         if quant {
             unsafe {
                 act_quant(
@@ -3759,6 +4037,7 @@ impl GlmForward {
                     &st,
                 )
             }?;
+            self.op("dsa_o_quant")?;
         }
         self.mark(l, "dsa_attn")?;
         let o = Fp8Input {
@@ -3767,6 +4046,7 @@ impl GlmForward {
             scales: s.o_s.ptr(0),
         };
         unsafe { self.gemm.fp8(&o, &w.o.mat(), rows, s.attn_out.ptr(0), &st) }?;
+        self.op("dsa_o")?;
         self.mark(l, "dsa_o")?;
         Ok(())
     }
@@ -3778,6 +4058,11 @@ impl GlmForward {
         let st = self.stream.clone();
         let quant = self.gemm.policy.fp8_needs_quant(rows);
         let s = &self.s;
+        let ops = if m.inter == DENSE_INTER {
+            ["dense_gate_up", "dense_swiglu", "dense_down"]
+        } else {
+            ["shared_gate_up", "shared_swiglu", "shared_down"]
+        };
         unsafe {
             self.gemm.fp8(
                 &self.normed_input(),
@@ -3787,6 +4072,7 @@ impl GlmForward {
                 &st,
             )
         }?;
+        self.op(ops[0])?;
         // SAFETY: gate_up [rows][2 inter]; act and its E4M3 form sized for the dense width.
         launched(
             unsafe {
@@ -3810,12 +4096,14 @@ impl GlmForward {
             },
             "glm53f_swiglu",
         )?;
+        self.op(ops[1])?;
         let a = Fp8Input {
             bf16: s.act.ptr(0),
             q: s.act_q.ptr(0),
             scales: s.act_s.ptr(0),
         };
-        unsafe { self.gemm.fp8(&a, &m.down.mat(), rows, out, &st) }
+        unsafe { self.gemm.fp8(&a, &m.down.mat(), rows, out, &st) }?;
+        self.op(ops[2])
     }
 
     /// The router over the lane's rows (top-8 of 288 with the bias for the choice; weights x 2.5).
@@ -3846,7 +4134,8 @@ impl GlmForward {
                 )
             },
             "glm53f_router_fused",
-        )
+        )?;
+        self.op("router")
     }
 
     /// The routes to the host: the step's one host round trip (the backend builds its frames

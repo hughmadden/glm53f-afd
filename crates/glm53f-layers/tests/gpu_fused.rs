@@ -262,7 +262,7 @@ fn router_fused_is_the_pair_bitwise() {
         let weight = rng.bf16_vec(EXPERTS * hidden, 0.02);
         let bias = rng.f32_vec(EXPERTS, 0.01);
         let (dw, db) = (up(&weight), up(&bias));
-        for rows in [1usize, 2, 5, 8, 9, 13, 64, 100] {
+        for rows in [1usize, 2, 5, 8, 9, 13, 64, 100, 1027] {
             let x = up(&rng.bf16_vec(rows * hidden, 1.0));
             let (l1, i1, w1) = (
                 zeros(rows * EXPERTS * 4),

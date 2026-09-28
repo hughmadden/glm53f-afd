@@ -50,11 +50,14 @@ impl Pod for u32 {}
 impl Pod for i64 {}
 impl Pod for u8 {}
 
-/// One device allocation, freed on drop. Device memory is outside Rust's aliasing rules:
-/// every method takes `&self`, and kernels write through the raw pointers.
+/// One device allocation, freed on drop, or a view of part of one ([`DeviceBuffer::view`]).
+/// Device memory is outside Rust's aliasing rules: every method takes `&self`, and kernels
+/// write through the raw pointers.
 pub struct DeviceBuffer {
     ptr: *mut c_void,
     bytes: usize,
+    /// Freed on drop (false for a view).
+    owned: bool,
 }
 
 // SAFETY: a device allocation is usable from any host thread of the process; the buffer frees
@@ -80,7 +83,35 @@ impl DeviceBuffer {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
         }
-        Ok(DeviceBuffer { ptr, bytes })
+        Ok(DeviceBuffer {
+            ptr,
+            bytes,
+            owned: true,
+        })
+    }
+
+    /// Bytes `[at, at + bytes)` of this buffer as a buffer of their own that frees nothing:
+    /// buffers whose uses never overlap in time can share memory this way.
+    ///
+    /// # Safety
+    ///
+    /// The view must not be used after this buffer is dropped.
+    pub unsafe fn view(&self, at: usize, bytes: usize) -> Result<DeviceBuffer> {
+        self.check_range(at, bytes, "view")?;
+        Ok(DeviceBuffer {
+            ptr: self.byte_ptr(at).cast(),
+            bytes,
+            owned: false,
+        })
+    }
+
+    /// Device bytes this buffer allocated: its size, or 0 for a view.
+    pub fn allocated(&self) -> usize {
+        if self.owned {
+            self.bytes
+        } else {
+            0
+        }
     }
 
     /// `bytes` of zeroed device memory.
@@ -300,7 +331,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.owned && !self.ptr.is_null() {
             // SAFETY: allocated by cudaMalloc, freed once; cudaFree waits for work in flight.
             unsafe { cuda::cudaFree(self.ptr) };
         }

@@ -295,8 +295,24 @@ all 64 heads per block) changed where measurements disagreed:
 The same entry points take prefill-sized row counts. `index_select` puts one
 block per row and chunk (the plan gives one chunk per row at 4,096 rows);
 `sparse_attn` runs unsplit with 2 or 4 head groups per block, so each decoded
-tile serves 32 or 64 heads. Measured costs are below. **Design for the next
-step:**
+tile serves 32 or 64 heads. Unsplit, 1, 2 and 4 head groups give the same bits
+(`tests/gpu.rs`, `sparse_attn_head_groups_are_bitwise`). Two entry points are
+for prefill-sized passes, each with the bits of the one it replaces
+(`prefill_absorb_and_unabsorb_match_bitwise`, 1 to 257 rows):
+
+- `glm53f_dsa_mla_absorb_q_bf16` reads the BF16 query in place, with a row
+  stride (its f32 value is exact), so the forward no longer widens it to f32
+  first;
+- `glm53f_dsa_mla_unabsorb_v_rows` writes the BF16 output the forward rounds
+  anyway (and the f32 one only for a test's tap). A block stages 16 rows of the
+  latent output in shared memory. Each warp sums 32 outputs at once (8 rows × 4
+  value rows), each lane in `unabsorb_kernel`'s order (pairs of latent columns
+  as `fma(w0, o0, w1 * o1)`, the product nvcc contracts there), then reduces
+  them by recursive halving, which adds the same subtree sums as the butterfly.
+  On the RTX 4090, in the forward: 1.53 ms for 2,048 rows against 2.64 ms
+  (3.29 against 5.67 at 4,096).
+
+Measured costs are below. **Design for the next step:**
 
 - **Indexer, row blocks.** A block holds 2–4 consecutive rows' queries
   (64–128 MMA rows) and streams each key tile once for all of them, cutting L2

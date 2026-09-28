@@ -136,6 +136,12 @@ int32_t glm53f_dsa_mla_latent_write(const float* latent, const float* norm_w, fl
 int32_t glm53f_dsa_mla_absorb_q(const float* q, const uint16_t* kv_b, int32_t rows,
                                 uint16_t* q_abs_bf16, float* q_abs_f32, void* stream);
 
+// glm53f_dsa_mla_absorb_q from a BF16 query (row r at q + r * ldq; q 16-byte aligned, ldq a
+// multiple of 8 and at least 64 * 256): the same bits, without widening the query to f32
+// first.
+int32_t glm53f_dsa_mla_absorb_q_bf16(const uint16_t* q, int64_t ldq, int32_t rows, const uint16_t* kv_b,
+                                     uint16_t* q_abs_bf16, float* q_abs_f32, void* stream);
+
 // Sparse attention in latent space. For row r, over tokens[r][0 .. counts[r*2+1])
 // (ascending), per head h: o[r][h] = sum_j softmax_j(scale q_abs[r][h] . c_j) c_j,
 // with c_j decoded from the FP8 record (F16 tensor-core products of the exact
@@ -176,6 +182,12 @@ int32_t glm53f_dsa_mla_sparse_attn_v1(const uint16_t* q_abs, const int32_t* toke
 // o[r][h][v] = sum_l kv_b[h * 512 + 256 + v][l] * o_lat[r][h][l]. o: [rows][64][256] f32.
 int32_t glm53f_dsa_mla_unabsorb_v(const float* o_lat, const uint16_t* kv_b, int32_t rows,
                                   float* o, void* stream);
+
+// glm53f_dsa_mla_unabsorb_v's bits for passes of any size, faster for many rows,
+// rounded to BF16 into o_bf16 (row r at o_bf16 + r * ldo, ldo >= 64 * 256) and,
+// if o_f32 is not null, also written as glm53f_dsa_mla_unabsorb_v writes o.
+int32_t glm53f_dsa_mla_unabsorb_v_rows(const float* o_lat, const uint16_t* kv_b, int32_t rows,
+                                       uint16_t* o_bf16, int64_t ldo, float* o_f32, void* stream);
 
 // One-time per-process setup (shared-memory limits). Call before any launch.
 int32_t glm53f_dsa_init(void);
