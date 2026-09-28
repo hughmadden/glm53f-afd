@@ -12,13 +12,14 @@ pub enum SpecPolicy {
     /// (`GLM53F_SPEC_COST_A` / `_B`).
     Confidence { a_ms: f64, b_ms: f64 },
     /// Chain cut (the default): verify drafts while the product of the drafter's probabilities
-    /// stays at or above `tau` (`GLM53F_SPEC_TAU`, default 0.3).
+    /// stays at or above `tau` (`GLM53F_SPEC_TAU`, default 0.7: on GLM-5.3-Flash with DFlash2, 0.5 and
+    /// 0.7 were equal or faster than MiMo's 0.3 on code, prose and counting, and verify fewer drafts).
     Chain { tau: f64 },
 }
 
 impl Default for SpecPolicy {
     fn default() -> Self {
-        SpecPolicy::Chain { tau: 0.3 }
+        SpecPolicy::Chain { tau: 0.7 }
     }
 }
 
@@ -29,7 +30,7 @@ impl SpecPolicy {
         match std::env::var("GLM53F_SPEC_POLICY").as_deref() {
             Ok("fixed") => SpecPolicy::Fixed,
             Ok("conf") => SpecPolicy::Confidence { a_ms: num("GLM53F_SPEC_COST_A", 25.0), b_ms: num("GLM53F_SPEC_COST_B", 3.7) },
-            _ => SpecPolicy::Chain { tau: num("GLM53F_SPEC_TAU", 0.3) },
+            _ => SpecPolicy::Chain { tau: num("GLM53F_SPEC_TAU", 0.7) },
         }
     }
 
@@ -121,6 +122,7 @@ mod tests {
         // The policy never verifies more drafts than there are.
         let ks = SpecPolicy::Fixed.lengths(&[vec![0.5; 3], vec![0.5; 7]], &[7, 5]);
         assert_eq!(ks, vec![3, 5]);
-        assert_eq!(SpecPolicy::default().lengths(&[p.to_vec()], &[7]), vec![4]);
+        // The default tau (0.7) keeps the first two (0.9, 0.72).
+        assert_eq!(SpecPolicy::default().lengths(&[p.to_vec()], &[7]), vec![2]);
     }
 }
