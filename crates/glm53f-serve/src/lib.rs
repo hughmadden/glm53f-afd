@@ -51,6 +51,7 @@
 //! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 (68 MiB less per slot and per snapshot) |
 //! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (64 MiB of GEMM scratch) |
 //! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
+//! | `--kda-chunked-prefill` | `GLM53F_KDA_CHUNKED_PREFILL=1` | off | Numerics under test: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
@@ -92,8 +93,10 @@
 //!
 //! Today every size is coordinator-bound at about the same rate (about 2.7K tok/s over 42 MoE
 //! layers and the rest), so the pass is sized for its other costs: 4,096 rows keeps the lanes'
-//! scratch at about 3.0 GiB (8,192 would double it, out of the KV pool) and a pass at about
-//! 1.5 s (the longest a running request waits for its next token). Lanes of 1,024 rows are
+//! scratch at about 1.1 GiB (8,192 rows take about 2.1 GiB; before the lanes shared their
+//! attention-kind buffers and the sparse MLA core ran in row blocks, 3.1 and 6.1 GiB; measured by
+//! allocation on the development GPU) and a pass at about 1.5 s (the longest a running request
+//! waits for its next token). Lanes of 1,024 rows are
 //! balanced today but fall behind once the coordinator gets faster: the ranks then set the pace,
 //! at 6.9 us per row with lanes of 2,048 against 8.6 with lanes of 1,024 (6.2 with 4,096). The
 //! flags let a run on the real hardware compare them; `glm53f-forward`'s lane trace
@@ -127,9 +130,12 @@
 //!
 //! A request of the model's full 1,048,576 tokens needs 6.03 GiB of pages, so above 16 slots it
 //! does not fit, and the start-up log says so; many shorter requests do. `--prefill-rows 2048`
-//! (lanes of 1,024 rows) frees 1.6 GiB of lane buffers, tap buffer and exchange buffers: 5.65 GiB
+//! (lanes of 1,024 rows) freed 1.6 GiB of lane buffers, tap buffer and exchange buffers: 5.65 GiB
 //! (0.98 M tokens) at 32 slots, 2.71 GiB (0.47 M tokens) at 48, at some cost in prefill rate.
-//! 64 slots leave at most 0.37 GiB (`--prefill-rows 2048` and a budget of 128 rows).
+//! 64 slots left at most 0.37 GiB (`--prefill-rows 2048` and a budget of 128 rows). This table
+//! predates the lanes' shared scratch (about 2 GiB more pool at 4,096 prefill rows) and the
+//! options under test (`--kda-fp8` 4.26 GiB, `--kda-state-bf16` 68 MiB a slot); the start-up
+//! log gives the current plan.
 //!
 //! # Decode lanes
 //!
@@ -168,6 +174,7 @@ numerics under test (off by default):
   --kda-state-bf16    KDA recurrent states stored in BF16 (D8)
   --prefill-w8a16     FP8 projections over 8 rows with BF16 activations
   --kda-prefill-w8a8  with the two above: the FP8 KDA projections keep E4M3 activations
+  --kda-chunked-prefill  the KDA of prefill passes through the chunked kernel
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
 /// Expert ranks.
@@ -200,6 +207,9 @@ pub struct Numerics {
     /// With `kda_fp8` and `prefill_w8a16`: the FP8 KDA projections keep E4M3 activations over 8
     /// rows (`--kda-prefill-w8a8`, `GLM53F_KDA_PREFILL_W8A8=1`).
     pub kda_prefill_w8a8: bool,
+    /// The KDA of prefill passes through the chunked kernel instead of the serial chain
+    /// (`--kda-chunked-prefill`, `GLM53F_KDA_CHUNKED_PREFILL=1`); decode and verify keep the chain.
+    pub kda_chunked_prefill: bool,
 }
 
 impl Numerics {
@@ -211,6 +221,7 @@ impl Numerics {
             kda_state_bf16: on("GLM53F_KDA_STATE_BF16"),
             prefill_w8a16: on("GLM53F_PREFILL_W8A16"),
             kda_prefill_w8a8: on("GLM53F_KDA_PREFILL_W8A8"),
+            kda_chunked_prefill: on("GLM53F_KDA_CHUNKED_PREFILL"),
         }
     }
 
@@ -221,6 +232,7 @@ impl Numerics {
             "--kda-state-bf16" => self.kda_state_bf16 = true,
             "--prefill-w8a16" => self.prefill_w8a16 = true,
             "--kda-prefill-w8a8" => self.kda_prefill_w8a8 = true,
+            "--kda-chunked-prefill" => self.kda_chunked_prefill = true,
             _ => return false,
         }
         true
@@ -236,6 +248,7 @@ impl Numerics {
                 self.kda_prefill_w8a8,
                 "the FP8 KDA projections W8A8 at prefill",
             ),
+            (self.kda_chunked_prefill, "chunked KDA prefill"),
         ]
         .iter()
         .filter(|x| x.0)
@@ -678,6 +691,7 @@ mod tests {
             kda_state_bf16: true,
             prefill_w8a16: true,
             kda_prefill_w8a8: false,
+            kda_chunked_prefill: false,
         };
         assert_eq!(o.numerics, all);
         assert_eq!(
@@ -699,6 +713,7 @@ mod tests {
                 kda_state_bf16: false,
                 prefill_w8a16: true,
                 kda_prefill_w8a8: false,
+                kda_chunked_prefill: false,
             }
         );
         let o = Options::parse(
@@ -711,6 +726,15 @@ mod tests {
             .numerics
             .describe()
             .ends_with("the FP8 KDA projections W8A8 at prefill"));
+        let o = Options::parse(&args("--checkpoint /c --kda-chunked-prefill"), &env).unwrap();
+        assert!(o.numerics.kda_chunked_prefill);
+        assert_eq!(o.numerics.describe(), "chunked KDA prefill");
+        let env3 = |k: &str| match k {
+            "GLM53F_KDA_CHUNKED_PREFILL" => Some("1".to_string()),
+            other => env(other),
+        };
+        let o = Options::parse(&args("--checkpoint /c"), &env3).unwrap();
+        assert!(o.numerics.kda_chunked_prefill);
         // The flags take no value.
         let o = Options::parse(&args("--kda-state-bf16 --checkpoint /c"), &env).unwrap();
         assert!(o.numerics.kda_state_bf16 && o.checkpoint == PathBuf::from("/c"));

@@ -154,6 +154,7 @@ mod daemon {
         };
         fcfg.policy.prefill_w8a16 = num.prefill_w8a16;
         fcfg.policy.kda_prefill_w8a8 = num.kda_prefill_w8a8;
+        fcfg.kda_chunked_prefill = num.kda_chunked_prefill;
         if drafter.is_some() {
             fcfg.max_verify_rows =
                 fcfg.max_verify_rows

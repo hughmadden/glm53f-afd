@@ -272,6 +272,7 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_KDA_STATE_BF16=1` | `--kda-state-bf16` | Numerics under test, off by default (D8): the KDA recurrent states in BF16 |
 | `GLM53F_PREFILL_W8A16=1` | `--prefill-w8a16` | Numerics under test, off by default: FP8 projections over 8 rows with BF16 activations |
 | `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With the two above: the FP8 KDA projections keep E4M3 activations over 8 rows |
+| `GLM53F_KDA_CHUNKED_PREFILL=1` | `--kda-chunked-prefill` | Numerics under test, off by default: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the
