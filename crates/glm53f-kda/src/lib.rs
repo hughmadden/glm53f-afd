@@ -13,17 +13,17 @@
 //!   model's definition and the kernels' order of operations, so it doubles as an exact model
 //!   of the kernels' state update.
 //! - [`chunked`]: the chunked (WY) form of the same recurrence, as the reference writes it for
-//!   prefill, to pin how the two forms relate and to serve as the numerics reference for a
-//!   chunked prefill kernel.
-//! - `kernels/`: the CUDA kernels behind a C ABI (`kernels/glm53f_kda.h`), ported from
+//!   prefill and as the prefill kernel evaluates it (the kernel's host model).
+//! - `kernels/`: the CUDA kernels behind a C ABI (`kernels/glm53f_kda.h`). Ported from
 //!   TensorFold: a fused per-layer chain over R rows, replays that rebuild the state after a
-//!   kept prefix bit for bit, and the conv-window shift. With the `cuda` feature they are
-//!   compiled by `build.rs` and exposed as [`ffi`] (raw) and [`kernel`] (checked wrappers over
-//!   [`device`] buffers).
+//!   kept prefix bit for bit, and the conv-window shift. New: the chunked prefill, which runs a
+//!   prompt segment of any length from a committed state and agrees with the chain to f32
+//!   rounding. With the `cuda` feature they are compiled by `build.rs` and exposed as [`ffi`]
+//!   (raw) and [`kernel`] (checked wrappers over [`device`] buffers).
 //! - [`goldens`]: a loader for the oracle's golden fixtures.
 //!
-//! See `README.md` for the numerics contract and the prefill design note, and
-//! `PROVENANCE.md` for where each unit comes from.
+//! See `README.md` for the numerics contract and the prefill's design, accuracy and
+//! throughput, and `PROVENANCE.md` for where each unit comes from.
 
 pub mod bf16;
 pub mod chunked;

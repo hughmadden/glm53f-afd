@@ -7,7 +7,7 @@
 //!
 //! 1. **Conv.** `x_c = SiLU(sum_tap w[c][tap] * u[c][t - 3 + tap])` over the q | k | v projection
 //!    rows `u`, where the three rows before the window come from the conv window. Rounded to
-//!    bfloat16 (see [`ConvRounding`]).
+//!    bfloat16 (see [`Rounding`]).
 //! 2. **Gates.** Per key channel `g = lower * sigmoid(exp(A_log[h]) * (a + dt_bias))` (log
 //!    space, `lower = -5`, so `g` lies in (-5, 0)); the state decays by `exp(g)`.
 //!    `beta = bf16(sigmoid(b))`.
@@ -53,16 +53,30 @@
 use crate::bf16;
 use crate::{channels, state_len, DK, DV, L2_EPS, TAPS, WINDOW};
 
-/// Rounding of the conv output.
+/// Where an evaluation rounds to bfloat16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConvRounding {
-    /// Conv and SiLU in f32, one bfloat16 rounding. The kernels do this, as does the fused
-    /// `causal_conv1d` kernel the reference uses when it is installed.
+pub enum Rounding {
+    /// The model's bfloat16 activations, as the kernels evaluate them: conv and SiLU in f32 with
+    /// one rounding (as the fused `causal_conv1d` kernel the reference uses when it is
+    /// installed), beta, the read-out and the output each rounded once.
     #[default]
     Fused,
-    /// The conv output rounded to bfloat16, then SiLU, rounded again: the reference's
-    /// pure-torch fallback (`F.conv1d` in bfloat16, then the activation).
+    /// As `Fused`, but the conv output is also rounded before the SiLU: the reference's
+    /// pure-torch path (`F.conv1d` in bfloat16, then the activation).
     Unfused,
+    /// No rounding anywhere: the reference evaluated in f32 throughout, as the oracle's primary
+    /// goldens are. Not what the kernels compute; it isolates the formulas from the rounding.
+    F32,
+}
+
+impl Rounding {
+    /// `x` rounded to bfloat16, unless this is [`Rounding::F32`].
+    pub fn round(self, x: f32) -> f32 {
+        match self {
+            Rounding::F32 => x,
+            _ => bf16::round(x),
+        }
+    }
 }
 
 /// One KDA layer's parameters. bfloat16 tensors are widened to f32 exactly.
@@ -246,7 +260,7 @@ fn conv_channel(
     rows: &Rows,
     r: usize,
     c: usize,
-    mode: ConvRounding,
+    mode: Rounding,
 ) -> f32 {
     let cn = p.channels();
     let mut acc = 0.0f32;
@@ -260,8 +274,9 @@ fn conv_channel(
         acc = acc + p.conv_w[c * TAPS + tap] * x;
     }
     match mode {
-        ConvRounding::Fused => bf16::round(silu(acc)),
-        ConvRounding::Unfused => bf16::round(silu(bf16::round(acc))),
+        Rounding::Fused => bf16::round(silu(acc)),
+        Rounding::Unfused => bf16::round(silu(bf16::round(acc))),
+        Rounding::F32 => silu(acc),
     }
 }
 
@@ -272,7 +287,7 @@ pub fn conv_qkv(
     rows: &Rows,
     r: usize,
     h: usize,
-    mode: ConvRounding,
+    mode: Rounding,
 ) -> ([f32; DK], [f32; DK], [f32; DV]) {
     let hd = p.heads * DK;
     let mut q = [0.0f32; DK];
@@ -339,12 +354,23 @@ pub fn read_out(s: &[f32], q: &[f32]) -> [f32; DV] {
 
 /// The gated RMSNorm in the kernels' order, rounded to bfloat16.
 pub fn gated_rmsnorm(y: &[f32], norm_w: &[f32], gate: &[f32], eps: f32) -> [f32; DV] {
+    gated_rmsnorm_as(y, norm_w, gate, eps, Rounding::Fused)
+}
+
+/// The gated RMSNorm in the kernels' order, rounded as `mode` says.
+pub fn gated_rmsnorm_as(
+    y: &[f32],
+    norm_w: &[f32],
+    gate: &[f32],
+    eps: f32,
+    mode: Rounding,
+) -> [f32; DV] {
     let rinv = 1.0 / (dot128(y, y) / DV as f32 + eps).sqrt();
     let mut o = [0.0f32; DV];
     for t in 0..DV {
         let yn = y[t] * rinv;
         let yw = norm_w[t] * yn;
-        o[t] = bf16::round(yw * sigmoid(gate[t]));
+        o[t] = mode.round(yw * sigmoid(gate[t]));
     }
     o
 }
@@ -356,7 +382,7 @@ pub fn chain(
     conv: &[f32],
     state: &[f32],
     rows: &Rows,
-    mode: ConvRounding,
+    mode: Rounding,
 ) -> ChainOut {
     p.check();
     rows.check();
@@ -386,13 +412,13 @@ pub fn chain(
                     p.lower,
                 );
             }
-            let b = beta(rows.b[r * hn + h]);
+            let b = mode.round(sigmoid(rows.b[r * hn + h]));
             let qn = l2norm(&q, Some(q_scale()));
             let kn = l2norm(&k, None);
             update(s, &kn, &g, &v, b);
-            let y = read_out(s, &qn).map(bf16::round);
+            let y = read_out(s, &qn).map(|x| mode.round(x));
             let gate = &rows.gate[(r * hn + h) * DV..(r * hn + h + 1) * DV];
-            let o = gated_rmsnorm(&y, &p.norm_w, gate, p.eps);
+            let o = gated_rmsnorm_as(&y, &p.norm_w, gate, p.eps, mode);
             let at = (r * hn + h) * DV;
             out[at..at + DV].copy_from_slice(&o);
             ys[at..at + DV].copy_from_slice(&y);
@@ -537,6 +563,17 @@ pub mod literal {
 
     /// `Glm5NextTextRMSNormGated`, rounded to bfloat16.
     pub fn gated_rmsnorm(y: &[f32], norm_w: &[f32], gate: &[f32], eps: f32) -> [f32; DV] {
+        gated_rmsnorm_as(y, norm_w, gate, eps, Rounding::Fused)
+    }
+
+    /// `Glm5NextTextRMSNormGated`, rounded as `mode` says.
+    pub fn gated_rmsnorm_as(
+        y: &[f32],
+        norm_w: &[f32],
+        gate: &[f32],
+        eps: f32,
+        mode: Rounding,
+    ) -> [f32; DV] {
         let mut ss = 0.0f32;
         for &yi in y.iter().take(DV) {
             ss = ss + yi * yi;
@@ -544,7 +581,7 @@ pub mod literal {
         let r = 1.0 / (ss / DV as f32 + eps).sqrt();
         let mut o = [0.0f32; DV];
         for t in 0..DV {
-            o[t] = bf16::round(norm_w[t] * (y[t] * r) * sigmoid(gate[t]));
+            o[t] = mode.round(norm_w[t] * (y[t] * r) * sigmoid(gate[t]));
         }
         o
     }
@@ -556,7 +593,7 @@ pub mod literal {
         conv: &[f32],
         state: &[f32],
         rows: &Rows,
-        mode: ConvRounding,
+        mode: Rounding,
     ) -> ChainOut {
         p.check();
         rows.check();
@@ -578,10 +615,10 @@ pub mod literal {
                         p.lower,
                     );
                 }
-                let b = beta(rows.b[r * hn + h]);
-                let y = step(s, &q, &k, &v, &g, b).map(bf16::round);
+                let b = mode.round(sigmoid(rows.b[r * hn + h]));
+                let y = step(s, &q, &k, &v, &g, b).map(|x| mode.round(x));
                 let gate = &rows.gate[(r * hn + h) * DV..(r * hn + h + 1) * DV];
-                let o = gated_rmsnorm(&y, &p.norm_w, gate, p.eps);
+                let o = gated_rmsnorm_as(&y, &p.norm_w, gate, p.eps, mode);
                 let at = (r * hn + h) * DV;
                 out[at..at + DV].copy_from_slice(&o);
                 ys[at..at + DV].copy_from_slice(&y);

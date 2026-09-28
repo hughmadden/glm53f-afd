@@ -158,6 +158,61 @@ int glm53f_kda_conv_shift_batch(int32_t channels, int32_t layers, int32_t batch,
                                 const glm53f_bf16* p, int64_t p_layer_stride, int64_t p_stride,
                                 glm53f_stream_t stream);
 
+/**
+ * Workspace bytes for glm53f_kda_prefill(_batch) to process `rows_per_pass` rows of every request
+ * per pass: 34,816 bytes per 16-row chunk, head and request (2.2 MB per chunk of a 64-head request).
+ * The prefill runs as many passes as the longest request needs, and each pass costs a round trip of
+ * the state and a fixed overhead, so larger passes are faster, with diminishing returns (README.md
+ * has measurements).
+ */
+int64_t glm53f_kda_prefill_workspace_bytes(int32_t heads, int32_t batch, int32_t rows_per_pass);
+
+/**
+ * Prefill: one layer, one request, `rows` rows (any number >= 0) from the committed state and conv
+ * window, through the chunked form of the delta rule (kda_prefill.cu). Same inputs and outputs as
+ * glm53f_kda_chain without replay inputs; in addition the conv window is advanced past the rows, in
+ * place, so the next segment or decode step continues from it.
+ *
+ * state_out must not be NULL; it may equal state_in. lower must lie in [-5.8, 0]: fifteen rows of
+ * decay must stay inside f32's normal range.
+ * value_blocks: blocks per head, 1, 2 or 4, each owning 128 / value_blocks value columns, or 0 for
+ * the most that still run as one wave (value_blocks × heads × requests ≤ SMs, else 1). The choice
+ * changes the order of some sums, so pass it explicitly where bits must not depend on the GPU or
+ * the batch.
+ * workspace: device memory of workspace_bytes, at least one chunk's worth
+ * (glm53f_kda_prefill_workspace_bytes(heads, 1, 16)); its size sets the rows per pass.
+ * Results agree with the chain to f32 rounding, not bit for bit. They do not depend on the
+ * workspace size or on how requests are batched (for a given value_blocks).
+ */
+int glm53f_kda_prefill(int32_t heads, int32_t rows,
+                       const glm53f_bf16* p, int64_t p_stride, int64_t b_off,
+                       const glm53f_bf16* a, int64_t a_stride,
+                       const glm53f_bf16* g, int64_t g_stride,
+                       glm53f_bf16* conv, const glm53f_bf16* conv_w,
+                       const float* state_in, float* state_out,
+                       const float* a_log, const float* dt_bias, const glm53f_bf16* norm_w,
+                       float eps, float lower,
+                       glm53f_bf16* out, int64_t out_stride, int32_t value_blocks,
+                       float* workspace, int64_t workspace_bytes, glm53f_stream_t stream);
+
+/**
+ * glm53f_kda_prefill for a batch of requests, each with its own row range (cu_rows), state
+ * (state_off) and conv window (conv_off), as in glm53f_kda_chain_batch. max_rows (host) must be at
+ * least the longest request's rows. The requests' conv windows and states must not overlap. The
+ * workspace is per request: glm53f_kda_prefill_workspace_bytes(heads, batch, rows_per_pass).
+ */
+int glm53f_kda_prefill_batch(int32_t heads, int32_t batch, const int32_t* cu_rows, int32_t max_rows,
+                             const glm53f_bf16* p, int64_t p_stride, int64_t b_off,
+                             const glm53f_bf16* a, int64_t a_stride,
+                             const glm53f_bf16* g, int64_t g_stride,
+                             glm53f_bf16* conv, const int64_t* conv_off,
+                             const glm53f_bf16* conv_w,
+                             const float* state_in, float* state_out, const int64_t* state_off,
+                             const float* a_log, const float* dt_bias, const glm53f_bf16* norm_w,
+                             float eps, float lower,
+                             glm53f_bf16* out, int64_t out_stride, int32_t value_blocks,
+                             float* workspace, int64_t workspace_bytes, glm53f_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

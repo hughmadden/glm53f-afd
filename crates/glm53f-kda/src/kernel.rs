@@ -844,3 +844,271 @@ pub fn conv_shift_batch(
     };
     launched(code, "glm53f_kda_conv_shift_batch")
 }
+
+/// The gate lower bounds the prefill accepts: fifteen rows of decay must stay inside f32's
+/// normal range in its in-chunk products.
+pub const PREFILL_LOWER_MIN: f32 = -5.8;
+
+fn check_lower(lower: f32) -> Result<(), Error> {
+    if !(PREFILL_LOWER_MIN..=0.0).contains(&lower) {
+        return Err(Error::Invalid(format!(
+            "prefill: gate lower bound {lower} outside [{PREFILL_LOWER_MIN}, 0]"
+        )));
+    }
+    Ok(())
+}
+
+/// Device workspace for the prefill: the per-chunk results passed from its first pass to its
+/// second, for `rows_per_pass` rows of every request at a time (2.2 MB per 16 rows of a
+/// 64-head request). Each pass costs a round trip of the state and a fixed overhead, so larger
+/// passes are faster, with diminishing returns; see the README's prefill section.
+pub struct PrefillWorkspace {
+    pub heads: usize,
+    pub batch: usize,
+    pub rows_per_pass: usize,
+    pub buf: DeviceBuffer,
+}
+
+impl PrefillWorkspace {
+    /// Room for `rows_per_pass` rows (rounded up to 16) of `batch` requests of `heads` heads.
+    pub fn new(heads: usize, batch: usize, rows_per_pass: usize) -> Result<Self, Error> {
+        // SAFETY: a pure size computation.
+        let bytes = unsafe {
+            ffi::glm53f_kda_prefill_workspace_bytes(
+                to_i32(heads, "heads")?,
+                to_i32(batch, "batch")?,
+                to_i32(rows_per_pass.max(1), "rows_per_pass")?,
+            )
+        };
+        Ok(PrefillWorkspace {
+            heads,
+            batch,
+            rows_per_pass: rows_per_pass.max(1).div_ceil(16) * 16,
+            buf: DeviceBuffer::alloc(bytes as usize)?,
+        })
+    }
+
+    /// The rows per pass that keep the workspace within `bytes` (at least one 16-row chunk).
+    pub fn within(heads: usize, batch: usize, bytes: usize) -> Result<Self, Error> {
+        // SAFETY: a pure size computation.
+        let chunk = unsafe {
+            ffi::glm53f_kda_prefill_workspace_bytes(
+                to_i32(heads, "heads")?,
+                to_i32(batch, "batch")?,
+                16,
+            )
+        } as usize;
+        Self::new(heads, batch, (bytes / chunk.max(1)).max(1) * 16)
+    }
+
+    fn args(&self, heads: usize, batch: usize) -> Result<(*mut f32, i64), Error> {
+        if heads != self.heads || batch > self.batch {
+            return Err(Error::Invalid(format!(
+                "workspace for {} heads x {} requests used for {heads} x {batch}",
+                self.heads, self.batch
+            )));
+        }
+        // The kernels size their passes from the bytes they are given, for the launch's batch.
+        Ok((self.buf.ptr(0), self.buf.bytes() as i64))
+    }
+}
+
+fn check_value_blocks(value_blocks: usize) -> Result<i32, Error> {
+    match value_blocks {
+        0 | 1 | 2 | 4 => Ok(value_blocks as i32),
+        _ => Err(Error::Invalid(format!(
+            "value_blocks {value_blocks}: 0 (choose), 1, 2 or 4"
+        ))),
+    }
+}
+
+/// One layer, one request: a prompt segment through the chunked prefill
+/// (`glm53f_kda_prefill`), from the state and conv window it is given. The conv window is
+/// advanced past the rows in place; the state after the rows goes to `state_out`.
+pub struct Prefill<'a> {
+    pub weights: &'a Weights,
+    pub rows: usize,
+    /// Row `r`: q | k | v in columns `[0, C)`, the beta logits in `[b_off, b_off + H)`.
+    pub p: RowView<'a>,
+    pub b_off: i64,
+    pub a: RowView<'a>,
+    pub g: RowView<'a>,
+    /// The conv window `[WINDOW][C]` at this element offset (updated in place).
+    pub conv: &'a DeviceBuffer,
+    pub conv_offset: usize,
+    pub state: &'a DeviceBuffer,
+    pub state_offset: usize,
+    /// `InPlace` or `To`; the prefill always writes its state.
+    pub state_out: StateOut<'a>,
+    pub out: RowView<'a>,
+    /// 1, 2 or 4 blocks per head, or 0 for the most that run as one wave on this GPU. The
+    /// choice changes the order of some sums; pin it where bits must not depend on the GPU.
+    pub value_blocks: usize,
+    pub workspace: &'a PrefillWorkspace,
+}
+
+impl Prefill<'_> {
+    pub fn launch(&self, stream: &Stream) -> Result<(), Error> {
+        let h = self.weights.heads;
+        let vb = check_value_blocks(self.value_blocks)?;
+        check_lower(self.weights.lower)?;
+        let c = channels(h) as i64;
+        let (lo, hi) = (self.b_off.min(0), c.max(self.b_off + h as i64));
+        self.p.check("p", 2, 0, self.rows, lo, hi)?;
+        self.a.check("a", 2, 0, self.rows, 0, (h * DK) as i64)?;
+        self.g.check("g", 2, 0, self.rows, 0, (h * DV) as i64)?;
+        self.out.check("out", 2, 0, self.rows, 0, (h * DV) as i64)?;
+        if self.rows > 1 && self.out.stride < h * DV {
+            return Err(Error::Invalid("out rows overlap".into()));
+        }
+        check_region("conv", self.conv, 2, self.conv_offset, WINDOW * channels(h))?;
+        check_region("state", self.state, 4, self.state_offset, state_len(h))?;
+        let state_out = match self.state_out {
+            StateOut::Skip => {
+                return Err(Error::Invalid("a prefill always writes its state".into()));
+            }
+            StateOut::InPlace => self.state.ptr::<f32>(self.state_offset),
+            StateOut::To(buf, off) => {
+                check_region("state_out", buf, 4, off, state_len(h))?;
+                if same(buf, self.state)
+                    && !coincide_or_disjoint(off, self.state_offset, state_len(h))
+                {
+                    return Err(Error::Invalid("state_out partly overlaps the state".into()));
+                }
+                buf.ptr::<f32>(off)
+            }
+        };
+        let (ws, ws_bytes) = self.workspace.args(h, 1)?;
+        let w = self.weights;
+        // SAFETY: every region the kernels touch was checked above.
+        let code = unsafe {
+            ffi::glm53f_kda_prefill(
+                to_i32(h, "heads")?,
+                to_i32(self.rows, "rows")?,
+                self.p.buf.ptr(self.p.offset),
+                self.p.stride as i64,
+                self.b_off,
+                self.a.buf.ptr(self.a.offset),
+                self.a.stride as i64,
+                self.g.buf.ptr(self.g.offset),
+                self.g.stride as i64,
+                self.conv.ptr(self.conv_offset),
+                w.conv_w.ptr(0),
+                self.state.ptr(self.state_offset),
+                state_out,
+                w.a_log.ptr(0),
+                w.dt_bias.ptr(0),
+                w.norm_w.ptr(0),
+                w.eps,
+                w.lower,
+                self.out.buf.ptr(self.out.offset),
+                self.out.stride as i64,
+                vb,
+                ws,
+                ws_bytes,
+                stream.raw(),
+            )
+        };
+        launched(code, "glm53f_kda_prefill")
+    }
+}
+
+/// One layer, a batch of prompt segments (`glm53f_kda_prefill_batch`): request rows consecutive
+/// in `p`, `a`, `g` and `out` in the order of the metadata, each request with its own state and
+/// conv window (advanced in place).
+pub struct PrefillBatch<'a> {
+    pub weights: &'a Weights,
+    pub p: RowView<'a>,
+    pub b_off: i64,
+    pub a: RowView<'a>,
+    pub g: RowView<'a>,
+    pub conv: &'a DeviceBuffer,
+    pub state: &'a DeviceBuffer,
+    /// `InPlace`, or `To(buf, _)`: each request's state at its `state_offset` in `buf`.
+    pub state_out: StateOut<'a>,
+    pub out: RowView<'a>,
+    /// As in [`Prefill`]; with 0 the choice depends on the batch size too.
+    pub value_blocks: usize,
+    pub workspace: &'a PrefillWorkspace,
+}
+
+impl PrefillBatch<'_> {
+    pub fn launch(&self, meta: &BatchMeta, stream: &Stream) -> Result<(), Error> {
+        let h = self.weights.heads;
+        let vb = check_value_blocks(self.value_blocks)?;
+        check_lower(self.weights.lower)?;
+        let batch = meta.batch()?;
+        let total = meta.total_rows();
+        let c = channels(h) as i64;
+        let (lo, hi) = (self.b_off.min(0), c.max(self.b_off + h as i64));
+        self.p.check("p", 2, 0, total, lo, hi)?;
+        self.a.check("a", 2, 0, total, 0, (h * DK) as i64)?;
+        self.g.check("g", 2, 0, total, 0, (h * DV) as i64)?;
+        self.out.check("out", 2, 0, total, 0, (h * DV) as i64)?;
+        if total > 1 && self.out.stride < h * DV {
+            return Err(Error::Invalid("out rows overlap".into()));
+        }
+        // The windows are written: they must not overlap.
+        meta.check_regions("conv", self.conv, 2, 0, WINDOW * channels(h), true, |r| {
+            r.conv_offset
+        })?;
+        meta.check_regions("state", self.state, 4, 0, state_len(h), true, |r| {
+            r.state_offset
+        })?;
+        let state_out = match self.state_out {
+            StateOut::Skip => {
+                return Err(Error::Invalid("a prefill always writes its state".into()));
+            }
+            StateOut::InPlace => self.state.ptr::<f32>(0),
+            StateOut::To(buf, _) => {
+                meta.check_regions("state_out", buf, 4, 0, state_len(h), true, |r| {
+                    r.state_offset
+                })?;
+                if same(buf, self.state) {
+                    return Err(Error::Invalid(
+                        "state_out is the state buffer: use InPlace".into(),
+                    ));
+                }
+                buf.ptr::<f32>(0)
+            }
+        };
+        let (ws, ws_bytes) = self.workspace.args(h, batch as usize)?;
+        let max_rows = meta.requests().iter().map(|r| r.rows).max().unwrap_or(0);
+        let (cu_rows, _, conv_off, state_off) = meta.device_arrays();
+        let w = self.weights;
+        // SAFETY: every region was checked above against the metadata's host copy.
+        let code = unsafe {
+            ffi::glm53f_kda_prefill_batch(
+                to_i32(h, "heads")?,
+                batch,
+                cu_rows,
+                to_i32(max_rows, "max_rows")?,
+                self.p.buf.ptr(self.p.offset),
+                self.p.stride as i64,
+                self.b_off,
+                self.a.buf.ptr(self.a.offset),
+                self.a.stride as i64,
+                self.g.buf.ptr(self.g.offset),
+                self.g.stride as i64,
+                self.conv.ptr(0),
+                conv_off,
+                w.conv_w.ptr(0),
+                self.state.ptr(0),
+                state_out,
+                state_off,
+                w.a_log.ptr(0),
+                w.dt_bias.ptr(0),
+                w.norm_w.ptr(0),
+                w.eps,
+                w.lower,
+                self.out.buf.ptr(self.out.offset),
+                self.out.stride as i64,
+                vb,
+                ws,
+                ws_bytes,
+                stream.raw(),
+            )
+        };
+        launched(code, "glm53f_kda_prefill_batch")
+    }
+}

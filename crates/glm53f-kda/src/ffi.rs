@@ -143,6 +143,66 @@ unsafe extern "C" {
         p_stride: i64,
         stream: Stream,
     ) -> CudaError;
+
+    pub fn glm53f_kda_prefill_workspace_bytes(heads: i32, batch: i32, rows_per_pass: i32) -> i64;
+
+    pub fn glm53f_kda_prefill(
+        heads: i32,
+        rows: i32,
+        p: *const Bf16,
+        p_stride: i64,
+        b_off: i64,
+        a: *const Bf16,
+        a_stride: i64,
+        g: *const Bf16,
+        g_stride: i64,
+        conv: *mut Bf16,
+        conv_w: *const Bf16,
+        state_in: *const f32,
+        state_out: *mut f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        norm_w: *const Bf16,
+        eps: f32,
+        lower: f32,
+        out: *mut Bf16,
+        out_stride: i64,
+        value_blocks: i32,
+        workspace: *mut f32,
+        workspace_bytes: i64,
+        stream: Stream,
+    ) -> CudaError;
+
+    pub fn glm53f_kda_prefill_batch(
+        heads: i32,
+        batch: i32,
+        cu_rows: *const i32,
+        max_rows: i32,
+        p: *const Bf16,
+        p_stride: i64,
+        b_off: i64,
+        a: *const Bf16,
+        a_stride: i64,
+        g: *const Bf16,
+        g_stride: i64,
+        conv: *mut Bf16,
+        conv_off: *const i64,
+        conv_w: *const Bf16,
+        state_in: *const f32,
+        state_out: *mut f32,
+        state_off: *const i64,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        norm_w: *const Bf16,
+        eps: f32,
+        lower: f32,
+        out: *mut Bf16,
+        out_stride: i64,
+        value_blocks: i32,
+        workspace: *mut f32,
+        workspace_bytes: i64,
+        stream: Stream,
+    ) -> CudaError;
 }
 
 /// The source kernels, compiled verbatim from `kernels/parity/tensorfold_kda.cu`, for the

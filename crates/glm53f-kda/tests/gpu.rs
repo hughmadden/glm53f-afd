@@ -6,7 +6,7 @@
 
 mod common;
 
-use glm53f_kda::cpu::{self, ConvRounding, LayerParams, Rows};
+use glm53f_kda::cpu::{self, LayerParams, Rounding, Rows};
 use glm53f_kda::device::{self, DeviceBuffer, Error, Stream};
 use glm53f_kda::ffi;
 use glm53f_kda::goldens::{self, Comparison, Init, Role, Set};
@@ -322,7 +322,7 @@ fn chain_matches_the_cpu_reference() {
             bits(&g.state),
             "R={r}: CPU replay of the kernel's saves"
         );
-        let c = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+        let c = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
         // Decay multipliers: three chained exponentials (exp(A_log), the sigmoid, the decay); an
         // ulp or two in each moves exp(g) by up to a few 1e-6 relative.
         let eg = max_rel(&g.saves.g, &c.saves.g);

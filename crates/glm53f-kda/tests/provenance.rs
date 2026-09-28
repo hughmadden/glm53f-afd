@@ -56,11 +56,14 @@ fn bindings_cover_the_header() {
         v.dedup();
         v
     }
-    let declared = after(&read("kernels/glm53f_kda.h"), "int glm53f_kda_");
+    let header = read("kernels/glm53f_kda.h");
+    let mut declared = after(&header, "int glm53f_kda_");
+    declared.extend(after(&header, "int64_t glm53f_kda_"));
+    declared.sort();
     let bound: Vec<String> = after(&read("src/ffi.rs"), "pub fn glm53f_kda_")
         .into_iter()
         .filter(|n| !n.starts_with("parity_"))
         .collect();
-    assert_eq!(declared.len(), 7, "{declared:?}");
+    assert_eq!(declared.len(), 10, "{declared:?}");
     assert_eq!(declared, bound);
 }

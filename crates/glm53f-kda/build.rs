@@ -37,11 +37,13 @@ fn main() {
     let cuda_lib = env::var("GLM53F_CUDA_LIB").unwrap_or_else(|_| "/usr/local/cuda/lib64".into());
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // kda.cu: the kernels. parity/tensorfold_kda.cu: the source kernels, verbatim, for the parity
-    // tests only; it is a separate object, so a binary that does not call it never links it.
+    // kda.cu: the chain, replays and conv shift. kda_prefill.cu: the chunked prefill.
+    // parity/tensorfold_kda.cu: the source kernels, verbatim, for the parity tests only; it is a
+    // separate object, so a binary that does not call it never links it.
     let mut objs = Vec::new();
     for (src, name) in [
         ("kda.cu", "kda.o"),
+        ("kda_prefill.cu", "kda_prefill.o"),
         ("parity/tensorfold_kda.cu", "tensorfold_kda.o"),
     ] {
         println!("cargo:rerun-if-changed=kernels/{src}");

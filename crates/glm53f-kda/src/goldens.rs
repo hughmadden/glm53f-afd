@@ -39,7 +39,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::cpu::{self, ConvRounding, LayerParams, Rows};
+use crate::cpu::{self, LayerParams, Rounding, Rows};
 use crate::json::{self, Value};
 use crate::{bf16, channels, is_kda_layer, state_len, DK, DV, TAPS, WINDOW};
 
@@ -496,7 +496,7 @@ pub const ROLES: &[(Role, &[&str])] = &[
     (Role::NormW, &["o_norm.weight", "norm_w"]),
 ];
 
-const MODULES: &[&str] = &["kda", "self_attn", "linear_attn", "forget_gate"];
+const MODULES: &[&str] = &["weights", "kda", "self_attn", "linear_attn", "forget_gate"];
 
 /// The (layer, role) of a tensor name. `set_layer` is the layer the set's name gives, used when
 /// the tensor name holds none. Only KDA layers qualify.
@@ -652,6 +652,45 @@ pub struct Comparison {
     pub differing: usize,
     /// The tolerance applied: `max_abs <= tol * max(max_ref, 1e-3)`.
     pub tol: f32,
+    /// How the comparison counts in [`verdict`].
+    pub weight: Weight,
+}
+
+/// How a comparison counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weight {
+    /// Must pass.
+    Required,
+    /// Reported only.
+    Informational,
+    /// One of several evaluations that could have produced the golden: every comparison of at
+    /// least one group must pass.
+    OneOf(&'static str),
+}
+
+/// Whether a set of comparisons passes: every required one, and one whole group of alternatives
+/// when there are any.
+pub fn verdict(results: &[Comparison]) -> bool {
+    let required = results
+        .iter()
+        .filter(|c| c.weight == Weight::Required)
+        .all(Comparison::passes);
+    let mut groups: Vec<&str> = results
+        .iter()
+        .filter_map(|c| match c.weight {
+            Weight::OneOf(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    groups.dedup();
+    let alternatives = groups.is_empty()
+        || groups.iter().any(|g| {
+            results
+                .iter()
+                .filter(|c| c.weight == Weight::OneOf(g))
+                .all(Comparison::passes)
+        });
+    required && alternatives
 }
 
 impl Comparison {
@@ -665,6 +704,7 @@ impl Comparison {
             max_ulp: 0,
             differing: 0,
             tol,
+            weight: Weight::Required,
         };
         for (&g, &w) in got.iter().zip(want) {
             let d = (g - w).abs();
@@ -693,8 +733,19 @@ impl fmt::Display for Comparison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}: {} elements, max |diff| {:.3e} (max |ref| {:.3e}, tolerance {:.1e} relative), max {} bf16 ulp, {} differ",
-            self.what, self.elements, self.max_abs, self.max_ref, self.tol, self.max_ulp, self.differing
+            "{}: {} elements, max |diff| {:.3e} (max |ref| {:.3e}, tolerance {:.1e} relative), max {} bf16 ulp, {} differ{}",
+            self.what,
+            self.elements,
+            self.max_abs,
+            self.max_ref,
+            self.tol,
+            self.max_ulp,
+            self.differing,
+            match self.weight {
+                Weight::Required => "",
+                Weight::Informational => " [reported only]",
+                Weight::OneOf(_) => " [one of the conv roundings]",
+            }
         )
     }
 }
@@ -1143,20 +1194,37 @@ pub fn check_layer(
         .map(|e| e.dtype)
         .unwrap_or(DType::BF16);
     let tol = tolerance(dtype, recurrent(set, lf, t)?);
+    // An f32 golden is the reference evaluated in f32 throughout: its formulas are checked by
+    // the f32 evaluation; the kernels' bfloat16 roundings are reported beside it. A bfloat16
+    // golden came from one of the two conv roundings.
+    let modes: &[(Rounding, &str, Weight)] = if matches!(dtype, DType::F32 | DType::F64) {
+        &[
+            (Rounding::F32, "f32 evaluation", Weight::Required),
+            (
+                Rounding::Fused,
+                "kernels' bf16 rounding",
+                Weight::Informational,
+            ),
+        ]
+    } else {
+        &[
+            (Rounding::Fused, "fused conv", Weight::OneOf("fused")),
+            (Rounding::Unfused, "unfused conv", Weight::OneOf("unfused")),
+        ]
+    };
     let mut out = Vec::new();
-    for (mode, label) in [
-        (ConvRounding::Fused, "fused conv"),
-        (ConvRounding::Unfused, "unfused conv"),
-    ] {
+    for &(mode, label, weight) in modes {
         let r = cpu::chain(&case.params, &case.conv, &case.state, &case.rows, mode);
-        out.push(Comparison::compare(
+        let mut c = Comparison::compare(
             &format!("layer {} norm output, {label} ({t} rows)", lf.layer),
             &r.out,
             &case.norm_out,
             tol,
-        ));
+        );
+        c.weight = weight;
+        out.push(c);
         if let Some(so) = &case.state_out {
-            out.push(Comparison::compare(
+            let mut c = Comparison::compare(
                 &format!(
                     "layer {} state after the rows, {label} ({t} rows)",
                     lf.layer
@@ -1164,7 +1232,9 @@ pub fn check_layer(
                 &r.state,
                 so,
                 tol,
-            ));
+            );
+            c.weight = weight;
+            out.push(c);
         }
     }
     Ok(out)

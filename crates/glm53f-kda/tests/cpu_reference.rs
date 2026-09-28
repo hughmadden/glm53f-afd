@@ -1,7 +1,7 @@
 //! The CPU reference against hand-checked values, invariants of the recurrence, its own two
 //! formulations, and the chunked form. No GPU needed.
 
-use glm53f_kda::cpu::{self, ConvRounding, LayerParams, Rows};
+use glm53f_kda::cpu::{self, LayerParams, Rounding, Rows};
 use glm53f_kda::{bf16, chunked, synth, DK, DV, WINDOW};
 
 fn bits(xs: &[f32]) -> Vec<u32> {
@@ -78,12 +78,12 @@ fn conv_hand_values() {
     // Row 0: 1*1 + 2*2 + 3*3 + 4*4 = 30; row 1: 1*2 + 2*3 + 3*4 + 4*5 = 40. SiLU(x) rounds to x
     // in bfloat16 for both.
     for (r, want) in [(0, 30.0), (1, 40.0)] {
-        let (q, k, v) = cpu::conv_qkv(&p, &conv, &rows, r, 0, ConvRounding::Fused);
+        let (q, k, v) = cpu::conv_qkv(&p, &conv, &rows, r, 0, Rounding::Fused);
         assert!(q.iter().chain(&k).chain(&v).all(|&x| x == want), "row {r}");
     }
     // A negative sum is squashed: SiLU(-30) = -30 / (1 + e^30).
     rows.qkv[..c].fill(-11.0);
-    let (q, _, _) = cpu::conv_qkv(&p, &conv, &rows, 0, 0, ConvRounding::Fused);
+    let (q, _, _) = cpu::conv_qkv(&p, &conv, &rows, 0, 0, Rounding::Fused);
     let want = bf16::round(-30.0 / (1.0 + 30f32.exp()));
     assert_eq!(q[0], want);
     assert!(q[0] < 0.0 && q[0] > -1e-11);
@@ -182,7 +182,7 @@ fn gates_saturated() {
     let mut rows = synth::rows(heads, 20, 4);
     rows.a.fill(1e4);
     rows.b.fill(-200.0);
-    let r = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+    let r = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
     assert!(r.saves.beta.iter().all(|&b| b == 0.0));
     let e5 = cpu::decay(1e4, 0.0, 1.0, -5.0);
     assert!(r.saves.g.iter().all(|&g| g == e5));
@@ -201,7 +201,7 @@ fn gates_saturated() {
     );
     // No decay, beta 0: the state is unchanged.
     rows.a.fill(-1e4);
-    let r = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+    let r = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
     assert!(r.saves.g.iter().all(|&g| g == 1.0));
     assert_eq!(r.state, s0);
 }
@@ -213,10 +213,10 @@ fn replay_of_a_prefix_equals_the_shorter_chain_bitwise() {
     let conv = synth::conv_window(heads, 11);
     let s0 = synth::state(heads, 11, 0.5);
     let rows = synth::rows(heads, 8, 11);
-    let full = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+    let full = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
     assert_eq!(bits(&cpu::replay(&s0, &full.saves, 8)), bits(&full.state));
     for keep in 0..=8 {
-        let short = cpu::chain(&p, &conv, &s0, &rows.slice(0, keep), ConvRounding::Fused);
+        let short = cpu::chain(&p, &conv, &s0, &rows.slice(0, keep), Rounding::Fused);
         assert_eq!(
             bits(&cpu::replay(&s0, &full.saves, keep)),
             bits(&short.state),
@@ -238,11 +238,11 @@ fn serial_steps_equal_one_window_bitwise() {
     let conv0 = synth::conv_window(heads, 12);
     let s0 = synth::state(heads, 12, 0.5);
     let rows = synth::rows(heads, 8, 12);
-    let window = cpu::chain(&p, &conv0, &s0, &rows, ConvRounding::Fused);
+    let window = cpu::chain(&p, &conv0, &s0, &rows, Rounding::Fused);
     let (mut conv, mut s) = (conv0.clone(), s0.clone());
     for r in 0..8 {
         let row = rows.slice(r, 1);
-        let step = cpu::chain(&p, &conv, &s, &row, ConvRounding::Fused);
+        let step = cpu::chain(&p, &conv, &s, &row, Rounding::Fused);
         let n = heads * DV;
         assert_eq!(
             bits(&step.out),
@@ -263,8 +263,8 @@ fn kernel_order_agrees_with_the_literal_formulation() {
     let conv = synth::conv_window(heads, 13);
     let s0 = synth::state(heads, 13, 0.5);
     let rows = synth::rows(heads, 8, 13);
-    let a = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
-    let b = cpu::literal::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+    let a = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
+    let b = cpu::literal::chain(&p, &conv, &s0, &rows, Rounding::Fused);
     // The same conv and gates; only the order of the sums and the norms' division differ.
     assert_eq!(bits(&a.saves.v), bits(&b.saves.v));
     assert_eq!(bits(&a.saves.beta), bits(&b.saves.beta));
@@ -296,8 +296,8 @@ fn conv_roundings_differ_slightly() {
     let (mut differ, mut total, mut worst_ulp, mut worst_abs) = (0, 0, 0, 0.0f32);
     for r in 0..4 {
         for h in 0..heads {
-            let (q1, k1, v1) = cpu::conv_qkv(&p, &conv, &rows, r, h, ConvRounding::Fused);
-            let (q2, k2, v2) = cpu::conv_qkv(&p, &conv, &rows, r, h, ConvRounding::Unfused);
+            let (q1, k1, v1) = cpu::conv_qkv(&p, &conv, &rows, r, h, Rounding::Fused);
+            let (q2, k2, v2) = cpu::conv_qkv(&p, &conv, &rows, r, h, Rounding::Unfused);
             let (a, b) = ([q1, k1, v1].concat(), [q2, k2, v2].concat());
             let (u, n) = bf16_diff(&a, &b);
             for (x, y) in a.iter().zip(&b) {
@@ -390,4 +390,61 @@ fn rows_slice() {
     assert_eq!(s.rows, 3);
     assert_eq!(s.b, rows.b[2..8]);
     assert_eq!(s.slice(2, 1).gate, rows.slice(3, 1).gate);
+}
+
+/// The prefill kernel's chunked form ([`chunked::prefill`]) against the chain: the same
+/// prologue bits, the recurrence regrouped into 16-row chunks with decays as products of the
+/// chain's multipliers. Includes saturated gates, where the in-chunk products reach e^-75.
+#[test]
+fn prefill_form_matches_the_chain() {
+    let heads = 2;
+    for (t, gates) in [
+        (1, "random"),
+        (5, "random"),
+        (16, "random"),
+        (17, "random"),
+        (40, "random"),
+        (100, "random"),
+        (48, "strongest"),
+        (48, "mixed"),
+    ] {
+        let p = synth::layer(heads, 60 + t as u64);
+        let conv = synth::conv_window(heads, 60 + t as u64);
+        let s0 = synth::state(heads, 60 + t as u64, 0.5);
+        let mut rows = synth::rows(heads, t, 60 + t as u64);
+        match gates {
+            // Every channel at the lower bound: each row decays by exp(-5).
+            "strongest" => rows.a.fill(1e4),
+            // Alternate strong and no decay by row, so products span e^0 .. e^-75.
+            "mixed" => {
+                for (i, x) in rows.a.iter_mut().enumerate() {
+                    *x = if (i / (heads * DK)).is_multiple_of(3) {
+                        -1e4
+                    } else {
+                        1e4
+                    };
+                }
+            }
+            _ => {}
+        }
+        let c = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
+        let f = chunked::prefill(&p, &conv, &s0, &rows, Rounding::Fused);
+        let e_state = rel_err(&f.state, &c.state);
+        let e_y = rel_err(&f.y, &c.y);
+        let e_out = rel_err(&f.out, &c.out);
+        let (ulp_out, n_out) = bf16_diff(&f.out, &c.out);
+        eprintln!(
+            "prefill form vs chain, T={t} ({gates} gates): state {e_state:.2e}, read-out {e_y:.2e}, output {e_out:.2e} normwise, {n_out}/{} outputs differ (max {ulp_out} bf16 ulp)",
+            c.out.len()
+        );
+        assert!(e_state < 1e-5, "T={t}: state {e_state}");
+        // Read-out and outputs are bfloat16: an f32 difference of 1e-7 flips a rounding now
+        // and then. Bound them normwise at one bfloat16 ulp, with few elements differing.
+        assert!(
+            e_y < 1.0 / 256.0 && e_out < 1.0 / 256.0,
+            "T={t}: read-out {e_y}, output {e_out}"
+        );
+        assert!(n_out * 1000 <= c.out.len(), "T={t}: {n_out} outputs differ");
+        assert!(f.state.iter().all(|x| x.is_finite()));
+    }
 }

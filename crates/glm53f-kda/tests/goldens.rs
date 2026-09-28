@@ -7,12 +7,11 @@ mod common;
 use std::path::Path;
 
 use common::{core, scratch, write, write_oracle_pair, Owned};
-use glm53f_kda::cpu::{self, ConvRounding};
+use glm53f_kda::cpu::{self, Rounding};
 use glm53f_kda::goldens::{self, Comparison, DType, Init, Role, Set};
 use glm53f_kda::{channels, synth, DK, DV, LOWER_BOUND, RMS_EPS, TAPS, WINDOW};
 
-/// Every check a set's KDA tensors allow. The fused conv rounding is the kernels'; the unfused
-/// comparisons of the layer check are informational.
+/// Every check a set's KDA tensors allow, judged by `goldens::verdict`.
 fn check_set(dir: &Path) -> Vec<Comparison> {
     let set = Set::load(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     set.verify_all()
@@ -41,17 +40,12 @@ fn check_set(dir: &Path) -> Vec<Comparison> {
         for c in &results {
             eprintln!("{}: {c}", set.name());
         }
-        let checked: Vec<&Comparison> = results
-            .iter()
-            .filter(|c| !c.what.contains("unfused"))
-            .collect();
-        let unfused: Vec<&Comparison> = results
-            .iter()
-            .filter(|c| c.what.contains("unfused"))
-            .collect();
-        let ok = checked.iter().all(|c| c.passes())
-            || (!unfused.is_empty() && unfused.iter().all(|c| c.passes()));
-        assert!(ok, "{}: layer {} outside tolerance", set.name(), lf.layer);
+        assert!(
+            goldens::verdict(&results),
+            "{}: layer {} outside tolerance",
+            set.name(),
+            lf.layer
+        );
         all.extend(results);
     }
     all
@@ -111,7 +105,7 @@ fn layer_tensors(layer: usize, heads: usize, t: usize, seed: u64) -> Vec<Owned> 
     let rows = synth::rows(heads, t, seed);
     let conv = synth::conv_window(heads, seed);
     let s0 = synth::state(heads, seed, 0.5);
-    let r = cpu::chain(&p, &conv, &s0, &rows, ConvRounding::Fused);
+    let r = cpu::chain(&p, &conv, &s0, &rows, Rounding::Fused);
     let c = channels(heads);
     // The reference's conv cache: [C][4], oldest first; its first column is not used.
     let mut cache = vec![0.0f32; c * TAPS];

@@ -5,7 +5,9 @@
 //! ```
 //!
 //! 1. Long windows (the prefill question): one request, one layer, 1K / 4K / 16K rows, then
-//!    2 and 3 requests of 4K rows in one launch (more blocks than one request's 64).
+//!    2 and 3 requests of 4K rows in one launch (more blocks than one request's 64). 1b runs
+//!    the chunked prefill over such windows, for each value-block count and several workspace
+//!    sizes (rows per pass).
 //! 2. One decode or verify step's recurrent part over all 34 layers, each layer with its own
 //!    states (so nothing sits in L2 that would not in a real step), for 1 and 8 requests of
 //!    R = 1, 2, 4, 8 rows; then the commit (replay of every layer) and the conv shift.
@@ -22,6 +24,10 @@ use glm53f_kda::kernel::{
 use glm53f_kda::{bf16, channels, cuda, state_len, synth, DK, DV, HEADS, LAYERS, WINDOW};
 
 const H: usize = HEADS;
+
+/// A prefill case: requests, rows per request, and the (value blocks, rows of every request
+/// per pass) to run it with.
+type PrefillCase = (usize, usize, &'static [(usize, usize)]);
 
 /// `n` rows in the engine's projection layout (`[q|k|v | f_a g_a | b]`), plus the gate rows
 /// and the outputs.
@@ -244,6 +250,80 @@ fn main() {
         per_row * LAYERS as f64
     );
     drop((saves, state));
+
+    // 1b. The chunked prefill over the same windows.
+    println!("\n1b. chunked prefill: {H} heads, one layer, state in place, conv window advanced");
+    println!(
+        "{:>9} {:>8} {:>7} {:>9} {:>9} {:>10} {:>10} {:>18}",
+        "requests", "rows", "blocks", "rows/pass", "ws MB", "ms", "us/row", "x34 layers us/tok"
+    );
+    // 1,024 rows per pass is the main configuration; the other sizes show what the workspace
+    // size buys.
+    let prefills: &[PrefillCase] = if quick {
+        &[(1, 1024, &[(2, 1024)]), (2, 1024, &[(1, 1024)])]
+    } else {
+        &[
+            (1, 1024, &[(1, 1024), (2, 1024), (4, 1024)]),
+            (
+                1,
+                4096,
+                &[
+                    (1, 1024),
+                    (2, 1024),
+                    (4, 1024),
+                    (2, 64),
+                    (2, 256),
+                    (2, 4096),
+                ],
+            ),
+            (1, 16384, &[(1, 1024), (2, 1024), (4, 1024)]),
+            (2, 4096, &[(1, 1024), (2, 1024)]),
+            (4, 4096, &[(1, 1024), (1, 256), (1, 2048)]),
+            (8, 1024, &[(1, 1024), (1, 64), (1, 256)]),
+        ]
+    };
+    for &(batch, n, configs) in prefills {
+        let total_rows = batch * n;
+        let r = rows(total_rows, 3);
+        let conv = DeviceBuffer::zeroed(batch * WINDOW * c * 2).unwrap();
+        let state = DeviceBuffer::zeroed(batch * slot * 4).unwrap();
+        let requests: Vec<Request> = (0..batch)
+            .map(|b| Request {
+                rows: n,
+                conv_offset: b * WINDOW * c,
+                state_offset: b * slot,
+            })
+            .collect();
+        let mut meta = BatchMeta::new(batch).unwrap();
+        meta.set(&requests, None).unwrap();
+        for &(vb, per_pass) in configs {
+            let ws = kernel::PrefillWorkspace::new(H, batch, per_pass).unwrap();
+            let launch = || {
+                kernel::PrefillBatch {
+                    weights: &w,
+                    p: RowView::new(&r.p, 0, r.p_stride),
+                    b_off: r.b_off,
+                    a: RowView::dense(&r.a, H * DK),
+                    g: RowView::dense(&r.g, H * DV),
+                    conv: &conv,
+                    state: &state,
+                    state_out: StateOut::InPlace,
+                    out: RowView::dense(&r.out, H * DV),
+                    value_blocks: vb,
+                    workspace: &ws,
+                }
+                .launch(&meta, &stream)
+                .unwrap()
+            };
+            let ms = time(&stream, 3, launch);
+            let per_row = ms * 1e3 / total_rows as f64;
+            println!(
+                "{batch:>9} {n:>8} {vb:>7} {per_pass:>9} {:>9.1} {ms:>10.3} {per_row:>10.4} {:>18.2}",
+                ws.buf.bytes() as f64 / 1e6,
+                per_row * LAYERS as f64
+            );
+        }
+    }
 
     // 2. Decode and verify steps.
     println!("\n2. one step's recurrent part, {LAYERS} layers x {H} heads, each layer its own states (ms per step)");
