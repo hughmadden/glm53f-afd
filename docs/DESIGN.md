@@ -250,10 +250,17 @@ to about C1 throughput. This design rules that out.
 
 - **Thinking is on by default**, as the checkpoint's template renders it: the prompt ends with
   `<|assistant|>` followed by an opened think tag.
-- **The template has no off switch.** A request that turns thinking off (`enable_thinking` false,
-  `thinking.type` "disabled", or `reasoning_effort` "none") ends the prompt with an empty think
-  block instead. That is the form the template itself writes for an assistant turn without
-  reasoning.
+- **The template has no off switch.** It renders a reasoning effort of Low, High or Max (the
+  default) and always opens the think block.
+  - A request that turns thinking off (`enable_thinking` false, or `thinking.type` "disabled") gets
+    the template's **Low** effort, as other hosts of this model do. The model writes a short plan,
+    returned under `reasoning_content`, then answers.
+  - `reasoning_effort: "none"` asks for no reasoning at all. The prompt then ends with an empty
+    think block, the form the template writes for an assistant turn without reasoning.
+  - Why (29 September 2026): the empty block under the template's Max effort takes long,
+    low-entropy output off the model's distribution. Draft acceptance dropped, and other stacks
+    report corrupted long structured output. In the same benchmark, Low effort decoded 10–15%
+    faster (docs/PERFORMANCE.md §0).
 - **Earlier turns keep their reasoning** unless the request sets `clear_thinking`. Re-rendering the
   history unchanged is what lets a follow-up turn resume from the previous turn's snapshot.
 

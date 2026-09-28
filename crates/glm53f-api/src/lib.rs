@@ -24,7 +24,9 @@
 //! 4. `reasoning_effort: "none"` (top level, else in `chat_template_kwargs`): off.
 //!
 //! Otherwise the dialect's default applies ([`Dialect::default_thinking`]; on for
-//! GLM-5.3-Flash). The engine gets the switch with `reasoning_effort` as sent (top
+//! GLM-5.3-Flash). A dialect whose chat template has no off mode maps "off" to its lowest
+//! effort with thinking on ([`Dialect::thinking_off_effort`]; GLM-5.3-Flash: `"low"`), except
+//! for `reasoning_effort: "none"`, which keeps thinking off: no reasoning at all. The engine gets the switch with `reasoning_effort` as sent (top
 //! level, else in `chat_template_kwargs`; the chat template decides what a value
 //! means) and `clear_thinking` (`chat_template_kwargs`, else `thinking`; off unless
 //! sent), which drops the reasoning of assistant turns before the last user

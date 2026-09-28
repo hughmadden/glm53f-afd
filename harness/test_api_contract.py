@@ -164,9 +164,17 @@ class Fake:
             h.close_connection = True
             return
         thinking = thinking_of(body, mode)
+        # `off-low-effort`: a template with no off mode (GLM-5.3-Flash) maps "off" to its Low
+        # effort: thinking on, a short reasoning, and a prompt unlike thinking on's.
+        kw_effort = body.get("reasoning_effort") or (body.get("chat_template_kwargs") or {}).get("reasoning_effort")
+        low = mode == "off-low-effort" and thinking is False and kw_effort != "none"
+        if low:
+            thinking = True
         tools = body.get("tools") or []
         reasoning, content, calls = self.reply_text(q, tools, thinking)
-        pt = len(render(messages, thinking, clear_of(body, mode)))
+        if low:
+            reasoning = "Brief."
+        pt = len(render(messages, thinking, clear_of(body, mode))) + (3 if low else 0)
         ct = len(reasoning) // 4 + len(content) // 4 + 1
         usage = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct + (1 if mode == "usage-mismatch" else 0)}
         created = int(time.time()) * (1000 if mode == "created-ms" else 1)
@@ -236,6 +244,13 @@ def run(mode, *extra):
 
 
 class GoodServer(unittest.TestCase):
+    def test_off_as_low_effort_passes(self):
+        """A server whose template has no off mode maps thinking off to its Low effort (a short
+        reasoning, a different prompt); reasoning_effort=none still gives no reasoning."""
+        p, rows, _, _ = run("off-low-effort")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual({k for k, r in rows.items() if r["verdict"] != "PASS"}, set(), p.stdout)
+
     def test_every_row_passes(self):
         p, rows, rec, md = run("good")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)

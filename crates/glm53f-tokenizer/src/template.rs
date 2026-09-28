@@ -32,7 +32,9 @@
 //!   reasoning block.
 //!
 //! **Thinking off is not in the template.** The template always opens the think block; it has
-//! no `enable_thinking` variable (the reference ignores one). [`Options::thinking`] = false ends
+//! no `enable_thinking` variable (the reference ignores one). The API renders "thinking off" as
+//! the template's Low effort (`glm53f-api`'s `Dialect::thinking_off_effort`) and uses
+//! [`Options::thinking`] = false only for `reasoning_effort: "none"`. [`Options::thinking`] = false ends
 //! the prompt with `<|assistant|>` and an empty think block instead: the form the template itself
 //! writes for an assistant turn without reasoning, so the model continues exactly as after such
 //! a turn. The goldens pin that form (`rendered_with_answer`). Every other output equals the

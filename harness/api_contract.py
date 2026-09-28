@@ -39,9 +39,11 @@ Rows:
   TOOLS-stream    that are a JSON object; finish_reason is `tool_calls` exactly when there are
                   calls; no markup in content (M: a call is made, every call names the declared
                   tool, and it reads the file asked for)
-  THINK-OFF       chat_template_kwargs.enable_thinking=false, thinking.type=disabled and
-                  reasoning_effort=none each give an empty reasoning field (also when streamed)
-                  and a prompt that differs from thinking on (M: thinking on reasons; off answers
+  THINK-OFF       reasoning_effort=none gives an empty reasoning field (also when streamed);
+                  chat_template_kwargs.enable_thinking=false and thinking.type=disabled give no
+                  reasoning or, where the chat template has no off mode (GLM-5.3-Flash: its Low
+                  effort), a reasoning only under the reasoning field; each off form renders a
+                  prompt that differs from thinking on (M: thinking on reasons; off answers
                   directly)
   CLEAR-THINKING  clear_thinking (in chat_template_kwargs, or thinking.clear_thinking) drops an
                   earlier turn's reasoning from the prompt; it is off by default
@@ -642,16 +644,30 @@ def row_think_off(ctx):
             continue
         msg = message(rep.body) or {}
         rv, others = msg.get(field), other_reasoning_names(msg, field)
-        r.check(S, rv in (None, "") and not others, f"{label}: empty reasoning",
-                (f"{field} absent" if rv is None else f"{field} {clip(rv, 80)!r}") + (f", also under {others}" if others else ""))
+        seen = (f"{field} absent" if rv is None else f"{field} {clip(rv, 80)!r}") + (f", also under {others}" if others else "")
+        if extra.get("reasoning_effort") == "none":
+            r.check(S, rv in (None, "") and not others, f"{label}: empty reasoning", seen)
+        else:
+            # A template with no off mode maps "off" to its lowest effort: a short reasoning is
+            # allowed, under the reasoning field only.
+            r.check(S, not others, f"{label}: reasoning, if any, only under {field}", seen)
+            r.check(I, True, f"{label}: reasoning", "none" if rv in (None, "") else f"{len(rv)} chars (low effort)")
         pt = counts[label] = prompt_tokens(rep.body)
-        r.check(S, pt is not None and on_pt is not None and pt != on_pt, f"{label}: the prompt differs from thinking on",
-                f"prompt_tokens {pt} (on: {on_pt})")
+        differs = pt is not None and on_pt is not None and pt != on_pt
+        if extra.get("reasoning_effort") == "none":
+            r.check(S, differs, f"{label}: the prompt differs from thinking on", f"prompt_tokens {pt} (on: {on_pt})")
+        else:
+            # Low effort may render a prompt of the same length as thinking on (only the effort
+            # word changes); then it must reason less than thinking on did.
+            on_r = on_msg.get(field) or ""
+            shorter = rv in (None, "") or len(rv) < len(on_r)
+            r.check(S, differs or shorter, f"{label}: honoured (another prompt, or less reasoning than thinking on)",
+                    f"prompt_tokens {pt} (on: {on_pt}); reasoning {len(rv or '')} chars (on: {len(on_r)})")
         content = msg.get("content") or ""
         r.check(M, "4" in content, f"{label}: a direct answer", repr(clip(content, 80)))
     r.check(I, len(set(counts.values())) == 1, "the off forms render one prompt", json.dumps(counts))
-    st = ctx.http.stream(dict(base, **THINK_OFF_FORMS[0][1]))
-    if r.streamed(st, f"streamed, {THINK_OFF_FORMS[0][0]}"):
+    st = ctx.http.stream(dict(base, **THINK_OFF_FORMS[2][1]))
+    if r.streamed(st, f"streamed, {THINK_OFF_FORMS[2][0]}"):
         g = Gathered(st, field)
         r.check(S, not g.reasoning and not g.others, "streamed with thinking off: no reasoning deltas",
                 f"{clip(g.reasoning, 80)!r} {sorted(set(g.others))}" if g.reasoning or g.others else "none")

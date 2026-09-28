@@ -27,9 +27,16 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
         return Err(ApiError::bad_request("this server has no image encoder; image parts are rejected"));
     }
 
-    // The thinking switch: the request's, else the dialect's default (the chat template's).
-    let thinking = req.enable_thinking.unwrap_or_else(|| dialect.default_thinking());
-    let opts = PromptOptions { thinking, reasoning_effort: req.reasoning_effort.clone(), clear_thinking: req.clear_thinking };
+    // The thinking switch: the request's, else the dialect's default (the chat template's). A
+    // template with no off mode maps "off" to its lowest effort, thinking on
+    // (`Dialect::thinking_off_effort`); `reasoning_effort: "none"` keeps the switch off.
+    let requested = req.enable_thinking.unwrap_or_else(|| dialect.default_thinking());
+    let effort_none = req.reasoning_effort.as_deref() == Some("none");
+    let (thinking, reasoning_effort) = match dialect.thinking_off_effort() {
+        Some(low) if !requested && !effort_none => (true, Some(low.to_string())),
+        _ => (requested, req.reasoning_effort.clone()),
+    };
+    let opts = PromptOptions { thinking, reasoning_effort, clear_thinking: req.clear_thinking };
     let prompt_tokens = engine.tokenize_prompt(&req.messages, &req.tools, &opts);
     if let Some(max) = engine.max_context() {
         if prompt_tokens >= max {

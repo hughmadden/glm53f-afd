@@ -5,8 +5,10 @@
 //!
 //! - **Reasoning.** With thinking on, the prompt ends by opening the think block, so a
 //!   completion starts inside it: the text up to the first &lt;/think&gt; is reasoning
-//!   ([`GlmDialect::reasoning_first`] is the thinking switch). With thinking off the prompt ends
-//!   with an empty think block and the completion starts in content. A think block the model
+//!   ([`GlmDialect::reasoning_first`] is the thinking switch). A request that turns thinking off
+//!   renders with the template's Low effort, thinking on ([`GlmDialect::thinking_off_effort`]);
+//!   only `reasoning_effort: "none"` ends the prompt with an empty think block, and then the
+//!   completion starts in content. A think block the model
 //!   opens later is reasoning too, up to its first closing tag; an unclosed block runs to the end.
 //! - **Tool calls.** &lt;tool_call&gt;NAME, then per argument
 //!   &lt;arg_key&gt;KEY&lt;/arg_key&gt;&lt;arg_value&gt;VALUE&lt;/arg_value&gt;, then
@@ -55,8 +57,9 @@ const AK_END: &str = concat!("<", "/arg_key", ">");
 const AV: &str = concat!("<", "arg_value", ">");
 const AV_END: &str = concat!("<", "/arg_value", ">");
 
-/// GLM-5.3-Flash's completion markup (see the module doc). Its chat template always thinks
-/// unless a request turns thinking off, so thinking is on by default.
+/// GLM-5.3-Flash's completion markup (see the module doc). Its chat template always thinks, at
+/// a reasoning effort of Low, High or Max (the default), and has no off switch: thinking is on by
+/// default, and a request that turns it off gets Low effort.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GlmDialect;
 
@@ -76,6 +79,15 @@ impl Dialect for GlmDialect {
 
     fn default_thinking(&self) -> bool {
         true
+    }
+
+    /// The template has no off mode: "off" is its Low effort ("Reasoning Effort: Low", the think
+    /// block open). An empty think block under the template's default Max effort put long
+    /// low-entropy output off the model's distribution: fewer drafts accepted, and reported
+    /// corruption of long structured output on other stacks. `reasoning_effort: "none"` still
+    /// gives the empty block.
+    fn thinking_off_effort(&self) -> Option<&'static str> {
+        Some("low")
     }
 }
 
@@ -753,20 +765,22 @@ mod tests {
         (reasoning, content)
     }
 
-    /// Thinking off end to end: the engine is told (to render the prompt and to count it), and
-    /// the completion is read as content, whole and streamed.
+    /// No reasoning at all (`reasoning_effort: "none"`) end to end: the engine is told thinking is
+    /// off (to render the prompt and to count it), and the completion is read as content, whole
+    /// and streamed. (Thinking turned off any other way is the template's Low effort:
+    /// `tests/acceptance.rs` `glm_thinking_off_is_low_effort`.)
     #[test]
-    fn thinking_off_reaches_the_engine_and_the_parse() {
+    fn reasoning_effort_none_reaches_the_engine_as_off_and_the_parse() {
         let stub = stub("Just the answer.", 4);
         let base = serve(stub.clone());
-        let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"reasoning_effort":"low"}"#;
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}"#;
         let v = json::parse(&post(&base, body)).unwrap();
         let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
         assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Just the answer."));
         assert!(msg.get("reasoning_content").is_none() && msg.get("reasoning").is_none());
-        let streamed = body.replace(r#""reasoning_effort":"low""#, r#""reasoning_effort":"low","stream":true"#);
+        let streamed = body.replace(r#""reasoning_effort":"none""#, r#""reasoning_effort":"none","stream":true"#);
         assert_eq!(streamed_text(&post(&base, &streamed)), (String::new(), "Just the answer.".to_string()));
-        let off = PromptOptions { thinking: false, reasoning_effort: Some("low".into()), clear_thinking: None };
+        let off = PromptOptions { thinking: false, reasoning_effort: Some("none".into()), clear_thinking: None };
         assert_eq!(stub.seen.lock().unwrap().as_slice(), [off.clone(), off.clone()]);
         assert_eq!(stub.counted.lock().unwrap().as_slice(), [off.clone(), off]);
     }
@@ -784,14 +798,15 @@ mod tests {
         let cases = [
             // No switch: GLM-5.3-Flash's template thinks.
             ("", opts(true, None, None)),
-            // vLLM and SGLang.
-            (r#""chat_template_kwargs":{"enable_thinking":false}"#, opts(false, None, None)),
+            // vLLM and SGLang. The template has no off mode: "off" is its Low effort.
+            (r#""chat_template_kwargs":{"enable_thinking":false}"#, opts(true, Some("low"), None)),
             (r#""chat_template_kwargs":{"enable_thinking":true}"#, opts(true, None, None)),
-            (r#""enable_thinking":false"#, opts(false, None, None)),
+            (r#""enable_thinking":false"#, opts(true, Some("low"), None)),
             // GLM and Anthropic.
-            (r#""thinking":{"type":"disabled"}"#, opts(false, None, None)),
+            (r#""thinking":{"type":"disabled"}"#, opts(true, Some("low"), None)),
             (r#""thinking":{"type":"enabled","budget_tokens":1024}"#, opts(true, None, None)),
-            // OpenAI's effort: "none" turns thinking off; every value goes to the template as sent.
+            // OpenAI's effort: "none" is thinking off with no reasoning at all (the empty think
+            // block); every other value goes to the template as sent.
             (r#""reasoning_effort":"none""#, opts(false, Some("none"), None)),
             (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(false, Some("none"), None)),
             (r#""reasoning_effort":"low""#, opts(true, Some("low"), None)),
@@ -801,7 +816,7 @@ mod tests {
                 opts(true, Some("none"), None)),
             (r#""enable_thinking":true,"thinking":{"type":"disabled"}"#, opts(true, None, None)),
             (r#""thinking":{"type":"enabled"},"reasoning_effort":"none""#, opts(true, Some("none"), None)),
-            (r#""thinking":{"type":"disabled"},"reasoning_effort":"high""#, opts(false, Some("high"), None)),
+            (r#""thinking":{"type":"disabled"},"reasoning_effort":"high""#, opts(true, Some("low"), None)),
             // clear_thinking: chat_template_kwargs, then thinking.
             (r#""chat_template_kwargs":{"clear_thinking":true}"#, opts(true, None, Some(true))),
             (r#""thinking":{"type":"enabled","clear_thinking":true}"#, opts(true, None, Some(true))),

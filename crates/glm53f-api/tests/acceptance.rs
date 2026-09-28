@@ -1175,7 +1175,13 @@ fn glm_call(name: &str, key: &str, value: &str) -> String {
 struct GlmScript;
 
 fn glm_script_prompt(messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> String {
-    let mut s = String::new();
+    // The template's effort line: low or high when asked for, else max (same length each).
+    let effort = match opts.reasoning_effort.as_deref() {
+        Some("low") => "low",
+        Some("high") => "hig",
+        _ => "max",
+    };
+    let mut s = format!("[effort:{effort}]");
     if let Some(t) = tools.first() {
         let props = t.function.parameters.as_ref().and_then(|p| p.get("properties")).and_then(|p| p.as_object());
         let param = props.and_then(|p| p.first()).map_or("", |(k, _)| k.as_str());
@@ -1204,6 +1210,8 @@ fn glm_script_prompt(messages: &[ChatMessage], tools: &[Tool], opts: &PromptOpti
 
 /// The script's completion for a prompt: reasoning first when the prompt opened the think block.
 fn glm_script_completion(prompt: &str) -> String {
+    let low = prompt.starts_with("[effort:low]");
+    let prompt = prompt.split_once(']').map_or(prompt, |(_, rest)| rest); // past the effort tag
     let question = prompt.rsplit("[user]").next().and_then(|q| q.rsplit_once("[assistant]")).map_or("", |(q, _)| q);
     let tool = prompt.strip_prefix("[tools]").and_then(|t| t.split_once('(')).map(|(n, rest)| (n, rest.split(')').next().unwrap_or("")));
     let (reasoning, answer) = if let Some((name, param)) = tool {
@@ -1215,7 +1223,7 @@ fn glm_script_completion(prompt: &str) -> String {
     } else if question.starts_with("What is the secret word") {
         ("There is no earlier message.", "NONE".to_string())
     } else if question.contains("2 + 2") {
-        ("Two and two.", "4".to_string())
+        (if low { "2+2." } else { "Two and two." }, "4".to_string())
     } else {
         ("Let me think about it.", "The answer is 42.".to_string())
     };
@@ -1369,4 +1377,64 @@ fn api_contract_harness_passes_against_the_glm_script() {
         assert!(stdout.lines().any(|l| l.split_whitespace().take(2).eq([row, "PASS"])), "{row} did not pass:\n{stdout}");
     }
     assert!(stdout.contains("RESULT: PASS api contract"), "{stdout}");
+}
+
+/// Records the prompt options each request renders with, and answers with a short think block
+/// then "OK" (the prompt opened the block when thinking is on).
+struct OptionsStub(Arc<std::sync::Mutex<Vec<(bool, Option<String>)>>>);
+
+impl Engine for OptionsStub {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        last_content(messages)
+    }
+    fn render_prompt(&self, messages: &[ChatMessage], _tools: &[Tool], opts: &PromptOptions) -> String {
+        self.0.lock().unwrap().push((opts.thinking, opts.reasoning_effort.clone()));
+        last_content(messages)
+    }
+    fn generate(
+        &self,
+        _prompt: &str,
+        params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        // With thinking on the prompt opened the block: a short plan, its closing tag, the answer.
+        let text = if params.thinking { "Answer briefly.\u{3c}/think\u{3e}OK" } else { "OK" };
+        on_delta(text);
+        Ok(GenerateOutcome { text: text.into(), finish_reason: "stop".into(), completion_tokens: 3 })
+    }
+}
+
+/// GLM-5.3-Flash's chat template has no thinking-off mode: a request that turns thinking off
+/// (`enable_thinking: false` either way, or `thinking.type: "disabled"`) renders with the
+/// template's Low effort and thinking on, and its short reasoning comes back as reasoning, not
+/// content. `reasoning_effort: "none"` still renders with thinking off (no reasoning at all), and
+/// a request that sets no switch keeps the template's default (thinking on, its own effort).
+#[test]
+fn glm_thinking_off_is_low_effort() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let srv = start_engine_with(OptionsStub(seen.clone()), Arc::new(GlmDialect));
+    let cases = [
+        (r#""chat_template_kwargs":{"enable_thinking":false}"#, (true, Some("low")), true),
+        (r#""enable_thinking":false"#, (true, Some("low")), true),
+        (r#""thinking":{"type":"disabled"}"#, (true, Some("low")), true),
+        (r#""chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high""#, (true, Some("low")), true),
+        (r#""reasoning_effort":"none""#, (false, Some("none")), false),
+        (r#""reasoning_effort":"low""#, (true, Some("low")), true),
+        (r#""chat_template_kwargs":{"enable_thinking":true}"#, (true, None), true),
+    ];
+    for (extra, want, reasons) in cases {
+        let body = format!(r#"{{"model":"glm-5.3-flash","messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
+        let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
+        assert_eq!(status, 200, "{extra}: {resp}");
+        let got = seen.lock().unwrap().pop().expect("the prompt was rendered");
+        assert_eq!((got.0, got.1.as_deref()), want, "{extra}");
+        let v = glm53f_api::json::parse(&resp).unwrap();
+        let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
+        assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("OK"), "{extra}: {resp}");
+        let reasoning = msg.get("reasoning_content").and_then(|c| c.as_str()).unwrap_or("");
+        assert_eq!(reasoning.is_empty(), !reasons, "{extra}: {resp}");
+    }
 }

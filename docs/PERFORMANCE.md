@@ -30,6 +30,7 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
 | DFlash2, greedy, thinking on (28 Sep) | 82.7 | 73.3 | 169.1 |
 | DFlash2, sampled (T 0.7), thinking off (28 Sep) | 113.5 | 67.0 | 123.1 |
 
+- "Thinking off" in this table is the empty think block rendered until 29 September; since then thinking off is the template's Low effort (below, and `docs/DESIGN.md`).
 - Without a drafter, 52.7 tok/s is 19.0 ms per token.
 - With the drafter, 51–71% of verified drafts are kept (τ 0.3–0.7), 3.0–3.4 tokens per verify window.
 - The model below expected 36–43 tok/s without a drafter (§2) and 110–130 / 75–105 / 125–145 with it (§3).
@@ -40,8 +41,8 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
 
 | Mode | Structured | Code | Prose | Drafts kept |
 |---|---:|---:|---:|---|
-| **This engine, `reasoning_effort: "low"`** | **186.1** | **142.3** | **78.3** | 84.3%, 4.22 tokens a window |
-| This engine, thinking off (empty `<think></think>`) | 167.2 | 124.1 | 71.4 | — |
+| **This engine, `reasoning_effort: "low"`** (what its thinking off renders since 29 Sep) | **186.1** | **142.3** | **78.3** | 84.3%, 4.22 tokens a window |
+| This engine, empty `<think></think>` (its thinking off until 29 Sep; now `reasoning_effort: "none"`) | 167.2 | 124.1 | 71.4 | — |
 | This engine, thinking on (default effort) | 167.5 | 131.3 | 85.7 | 84.2% |
 | That recipe (its README, its thinking off) | 167.2 | 118.7 | 64.4 | 88.5–97.2% on structured |
 
