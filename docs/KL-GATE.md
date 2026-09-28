@@ -4,7 +4,8 @@
 pass** (section 6a). The decode path scores 0.0245 nats against the BF16 teacher, equal within its
 standard error to the published figure for the same 4-bit experts. On 29 September the numerics
 options were gated (section 6b): BF16 KDA states (D8) passed and are now the default; FP8 KDA
-projections (D2) failed.
+projections (D2) failed. A 125-window panel for paired comparisons (section 6c) had its first
+result the same day (section 6d).
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -15,9 +16,10 @@ same method. It answers two questions:
 2. **Relative:** does a numerics change (FP8 KDA projections, FP8 wire rows, W8A8 prefill GEMMs,
    the chunked KDA prefill) make it measurably worse? A paired comparison on the same positions.
 
-Files: [`harness/klgate.py`](../harness/klgate.py) (the gate),
-[`harness/klgate_fetch.py`](../harness/klgate_fetch.py) (the teacher subset),
-[`harness/PROVENANCE-klgate.md`](../harness/PROVENANCE-klgate.md) (sources). Both tools use only the Python
+Files: [`harness/klgate.py`](../harness/klgate.py) (the gate; `klgate.py selftest`),
+[`harness/klgate_fetch.py`](../harness/klgate_fetch.py) (the teacher subset; its test
+[`harness/test_klgate_fetch.py`](../harness/test_klgate_fetch.py) runs against a dataset in memory),
+[`harness/PROVENANCE-klgate.md`](../harness/PROVENANCE-klgate.md) (sources). The tools use only the Python
 standard library (tested with Python 3.12). The engine's logits come from
 [`crates/glm53f-score`](../crates/glm53f-score) and `GlmForward::score` (section 4).
 
@@ -55,8 +57,9 @@ attention, no KV cache (`use_cache: false`), TF32 off, expert-parallel over four
   reasoning/termination 6. Role `final` marks them qualification-only (never used to calibrate);
   a third-party scan found shared text between 8 of them and the calibration windows, hence the
   "clean17" scope (section 6).
-- **The rest of the repository (not used):** `logits/full-panel/` (640 calibration windows,
-  811.6 GB), `calibration/main-ep4-full/` (464.4 GB of hidden states and router choices),
+- **The rest of the repository:** `logits/full-panel/` (640 more windows in four other roles,
+  811.6 GB; section 6c takes 100 of them for paired comparisons), and, not used,
+  `calibration/main-ep4-full/` (464.4 GB of hidden states and router choices),
   `calibration/mtp45-ep4-full/` (10.8 GB), `source-inventory.json` (13.4 MB). 1,517 files,
   1.32 TB in all.
 
@@ -280,11 +283,12 @@ FP8 experts on the coordinator's GPU instead of the ranks. The crate documentati
 (`crates/glm53f-score/src/lib.rs`) lists every option.
 
 **Input.** `klgate.py plan --teacher <teacher-dir> --out plan.json` writes the plan: schema
-`glm53f-kl-plan.v1`, the teacher panel's identity, `vocab` 154880, and per window `window_id`,
-`tokens` (2,048 ids), `tokens_sha256` (sha256 of the ids as little-endian u32) and `positions`
-(the rows to write: the teacher rows available, ascending). The scorer checks the schema, the
-vocabulary, every id (below 154,856), each window's digest, and that the positions are distinct,
-ascending rows below the window's last token.
+`glm53f-kl-plan.v1`, the teacher panel's identity (with the full-panel manifest's when section
+6c's windows are in it, and `panel`: the window count, roles and the sha256 of the window ids),
+`vocab` 154880, and per window `window_id`, `role`, `tokens` (2,048 ids), `tokens_sha256` (sha256
+of the ids as little-endian u32) and `positions` (the rows to write: the teacher rows available,
+ascending). The scorer checks the schema, the vocabulary, every id (below 154,856), each window's
+digest, and that the positions are distinct, ascending rows below the window's last token.
 
 **Per window:**
 
@@ -391,17 +395,15 @@ line.
 
 ## 5. Cost
 
-- **Engine:** the 25 windows are 51,200 tokens. At the current prefill rate of about 1.7K tok/s
-  that is **about 30 s**, plus 25 fresh slots, the LM head on 4,725 rows (6 TFLOP in BF16, well
-  under a second) and writing 2.93 GB: **under a minute** after the model is loaded. Scoring
-  every row changes only the output size, not the prefill. The decode-path run (`--pass-rows 8`)
-  is 6,400 passes of 8 rows: a few minutes if a pass takes tens of milliseconds (an estimate for
-  the target hardware; not measured there). On the development GPU (an RTX 4090; all 45 layers
-  on repeats of layers 0-4, routed outputs of zeros, so no expert exchange), the whole plan ran
-  in 20.4 s at `--pass-rows 4096` (0.7-0.9 s a window) and 136.8 s at `--pass-rows 8` (5.4 s a
-  window, about 21 ms a pass), model load included, each writing 2.93 GB. *Measured on the target
-  hardware since (section 6a): 23.8 s for the whole plan at 4,096 rows per pass and 279 s at 8,
-  after 4.3 s of loading.*
+- **Engine:** the 25 windows are 51,200 tokens, 25 fresh slots, the LM head on 4,725 rows (6 TFLOP
+  in BF16, well under a second) and 2.93 GB written. Measured on the target hardware, model load
+  included (sections 6a and 6b): 17–28 s at `--pass-rows 4096` and 247–283 s at `--pass-rows 8`
+  (6,400 passes of 8 rows, about 40 ms each). The 125 windows of section 6c took 83–88 s at 4,096
+  rows (section 6d). Scoring every row changes only the output size, not the prefill. On the
+  development GPU (an RTX 4090; all 45 layers on repeats of layers 0-4, routed outputs of zeros,
+  so no expert exchange), the whole plan ran in 20.4 s at `--pass-rows 4096` (0.7-0.9 s a window)
+  and 136.8 s at `--pass-rows 8` (5.4 s a window, about 21 ms a pass), model load included, each
+  writing 2.93 GB.
 - **Harness** (measured on the fetched subset with a stand-in engine): 37 ms per row per core
   (pure Python, float64), so **30 s** for the first gate's 4,725 rows with 8 processes (175 s of
   CPU); the teacher canary, twice the rows, 54 s. The full panel, 51,175 rows, is about 32 CPU
@@ -424,11 +426,12 @@ python3 harness/klgate.py compare candidate.json baseline.json --margin 0.002
 
 `score` prints the position-weighted mean with the SE of the subsample, the window bootstrap
 (percentile and BCa), the clustered SE and design effect, top-1 agreement, ln(PPL ratio),
-quantiles, per domain, per position bucket (0–256, 256–1024, 1024 on) and per window; `--json`
-keeps every row's KL for later paired comparisons. `--windows` and `--exclude` select windows; the
-registry's calibration-clean scope ("clean17") excludes `final-0003`, `-0007`, `-0011`, `-0015`,
-`-0019`, `-0021`, `-0022` and `-0023`, and is compared only with clean17 figures. Exit status: 0
-pass, 1 error, 3 gate failed.
+quantiles, per domain, per role, per position bucket (0–256, 256–1024, 1024 on) and per window;
+`--json` keeps every row's KL for later paired comparisons. By default the commands take the
+panel the fetch recorded (`FETCH-MANIFEST.json`), else the final windows. `--windows`, `--roles`
+(e.g. `final`) and `--exclude` select windows; the registry's calibration-clean scope ("clean17")
+excludes `final-0003`, `-0007`, `-0011`, `-0015`, `-0019`, `-0021`, `-0022` and `-0023`, and is
+compared only with clean17 figures. Exit status: 0 pass, 1 error, 3 gate failed.
 
 ## 6a. First result on the target hardware (28 September 2026)
 
@@ -486,12 +489,275 @@ pass, 1 error, 3 gate failed.
 **Decisions:**
 - **D8 is on by default.** `glm53f-serve` and `glm53f-score` both take it. `--kda-state-f32` (or `GLM53F_KDA_STATE_BF16=0`) reproduces section 6a's configuration.
 - **D2 is rejected in this form:** it moves decode by +0.0039 nats and flips top-1 on significantly more rows. A finer weight scale (MXFP8's one scale per 32 values) is the variant to gate next.
-- **W8A16, and the chunked KDA prefill with it, lower the mean KL** (they close most of the prefill-versus-decode gap of section 6a). But at this per-row correlation (0.72–0.76), 25 windows give an interval of about ±0.005 nats, too wide to show non-inferiority at 0.002. They stay opt-in until a larger panel (about 100 windows, which halves the interval) decides.
+- **W8A16, and the chunked KDA prefill with it, lower the mean KL** (they close most of the prefill-versus-decode gap of section 6a). But at this per-row correlation (0.72–0.76), 25 windows give an interval of about ±0.005 nats, too wide to show non-inferiority at 0.002. They stay opt-in until the 125-window panel of section 6c decides (section 6d has its first result; making
+them defaults also waits for the speed comparison).
   - Speed is the reason to try: with four lanes they prefill about 5.2K tok/s against 4.1K (`docs/PERFORMANCE.md` §0).
   - The chunked kernel alone is worse (+0.0021), so it would only ever be paired with W8A16.
 
+## 6c. A larger panel for paired comparisons: 125 windows
+
+**More windows, not more rows.** In section 6b's reports the interval's width comes from how much
+the windows differ: for the W8A16 pairs the row subsample adds only 13–18% of the variance of the
+windows' paired means. More rows per window would barely narrow it; more windows do.
+
+**What the dataset holds.** 665 windows of 2,048 tokens (2,047 positions each; a file of
+1,268,157,840 or 1,268,157,848 bytes a window, 117.1 MB for the 189 rows), from 20 packed source
+documents, five per domain, each document in a single role:
+
+| Role | Windows | Documents (windows each) | Listed in |
+|---|---:|---|---|
+| `final` | 25 | 4 (7, 6, 6, 6) | `dataset-manifest.json` |
+| `confirmation` | 64 | 4 (17, 16, 16, 15) | `logits/full-panel/full-panel-manifest.json` |
+| `selection` | 64 | 4 (16 each) | the same |
+| `conditional-fit` | 128 | 4 (38, 37, 37, 16) | the same |
+| `fit` | 384 | 4 (132, 104, 132, 16) | the same |
+
+- A role's windows take its four documents (one per domain) in turn, while they last.
+- The full panel's capture receipts record the final panel's method: the same model revision,
+  eager attention, no KV cache, four-way expert parallelism, F32 tensors kept. Its file headers
+  carry the same metadata as the final windows'.
+- `full-panel-manifest.json` (sha256 `c0c70608c6436324852732720afa6d060e7e220f2a6ce2945e8fe63ba8b99a8f`;
+  its `full_panel_manifest_sha256` field `8397ef9d3eedbb256d09f2166fdb3e337dde907fd7b710510bb293b7190c7917`)
+  binds each file's size, sha256 and token digest. Both tools check it against
+  `dataset-manifest.json`: the same model revision, token panel and vocabulary, and no repeated or
+  final window.
+- **Caveat.** The dataset's README says captures over the non-final windows were used by the
+  checkpoint author's routed-expert campaigns. The K4 experts may have been fitted or chosen on
+  them, so their absolute KL may be lower than on unseen text. They serve paired comparisons of
+  non-expert numerics, where both arms have the same experts; absolute figures stay on the final
+  windows (`--roles final`).
+
+**The rule.** `klgate_fetch.py --panel N` takes the first N windows in the order final,
+confirmation, selection, conditional-fit, fit, each role in window-id order, with the first gate's
+189 rows each. The panels are nested and N = 25 is the first gate's, so earlier reports stay
+comparable on their rows. The order puts first the roles whose names suggest the least use in
+building a checkpoint (an inference from the names).
+
+**How many windows.** For window w, d_w is the mean of A − B over its positions (`compare`'s
+interval is the percentile bootstrap of the mean of the d_w; every window has 2,047 positions, so
+that is the plain mean). The three pairs of section 6b that bear on the prefill options, from their
+per-row reports (4,096 rows per pass, the 25 final windows):
+
+| Pair | Mean A − B | SD of d_w | Skew | Row sampling's share of the variance |
+|---|---:|---:|---:|---:|
+| chunked + W8A16 against flags off | −0.00199 | 0.0136 | −2.2 | 13% |
+| W8A16 against flags off | −0.00212 | 0.0129 | −2.6 | 14% |
+| chunked + W8A16 + D8 against D8 (today's defaults) | −0.00089 | 0.0115 | −0.7 | 18% |
+
+Two windows carry much of the spread. On `final-0004` the prefill path without W8A16 scores
+0.124–0.137 (the decode path 0.082–0.089) and W8A16 closes the gap: d = −0.041 to −0.057. On `final-0000`
+W8A16 is worse than both paths: d = +0.025 to +0.032. Without those two windows the SDs are
+0.004–0.005.
+
+**Windows needed for 90% power.** The probability that `compare --margin 0.002` passes depends on
+the true mean difference δ. Each cell is the smallest panel with at least 90% power, by the
+normal approximation / by the bootstrap of the rule / by the bootstrap keeping today's 25 windows
+as measured (methods below; the bootstrap sizes are good to about ±5):
+
+| Pair | δ = −0.002 | δ = −0.001 | δ = 0.000 |
+|---|---:|---:|---:|
+| chunked + W8A16 against flags off | 123 / 90 / 80 | 217 / 180 / 150 | 489 / 400 / 350 |
+| W8A16 against flags off | 110 / 75 / 65 | 195 / 145 / 115 | 438 / 365 / 290 |
+| chunked + W8A16 + D8 against D8 | 87 / 80 / 85 | 154 / 140 / 130 | 346 / 325 / 285 |
+
+**What 125 windows decide.** The probability that the panel of this section passes, at a true
+difference δ (normal / bootstrap / keeping the 25):
+
+| δ | chunked + W8A16 against flags off | W8A16 against flags off | chunked + W8A16 + D8 against D8 |
+|---:|---|---|---|
+| −0.0030 | 0.98 / 1.00 / 1.00 | 0.99 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 |
+| −0.0020 | 0.91 / 0.96 / 0.98 | 0.93 / 0.99 / 0.99 | 0.97 / 0.98 / 0.98 |
+| −0.0015 | 0.82 / 0.91 / 0.94 | 0.86 / 0.94 / 0.97 | 0.93 / 0.94 / 0.94 |
+| −0.0010 | 0.69 / 0.79 / 0.87 | 0.74 / 0.86 / 0.92 | 0.83 / 0.85 / 0.88 |
+| −0.0005 | 0.54 / 0.60 / 0.74 | 0.58 / 0.68 / 0.82 | 0.68 / 0.72 / 0.77 |
+| 0.0000 | 0.37 / 0.43 / 0.59 | 0.41 / 0.47 / 0.67 | 0.50 / 0.54 / 0.63 |
+| +0.0010 | 0.13 / 0.12 / 0.25 | 0.14 / 0.13 / 0.30 | 0.16 / 0.18 / 0.27 |
+| +0.0020 | 0.03 / 0.02 / 0.06 | 0.03 / 0.02 / 0.07 | 0.03 / 0.02 / 0.06 |
+
+- **The rule at 125 windows** passes when the panel's mean difference is below about zero
+  (−0.0002 to +0.0001): the bound sits 0.0019–0.0022 above the mean and the margin is 0.002. A pass
+  shows, with 95% confidence, that the candidate is not worse than the baseline by 0.002 nats, 8%
+  of the K4 figure. (The half-width, 1.96 SD/√W for the first pair: 0.0053, 0.0038, 0.0027, 0.0024
+  and 0.0019 at 25, 50, 100, 125 and 200 windows.)
+- **A gain of 0.002 or more** passes with probability 0.91–0.99. Against today's defaults the 25
+  windows measured a gain of 0.0009 (the 125, 0.0014: section 6d): 0.83–0.88 at a true 0.001.
+- **No change (0.000)** passes 37–67% of the time. 125 windows cannot show non-inferiority for a
+  candidate that is only as good as the baseline; that takes 285–490 windows (the last column
+  above; the dataset has 665 windows).
+- **A change worse by the margin (+0.002)** passes 2–7% of the time; worse by 0.001, 12–30%.
+- So a pass is a finding. A fail with a mean difference between 0 and +0.002 is inconclusive, not a
+  sign of harm: the interval then holds both zero and the margin. `compare` prints the difference
+  per role, so an effect that differs between the final windows and the others shows in the report.
+
+**The method.**
+
+- **The rule** is `compare`'s: the upper end of the 95% percentile bootstrap (B = 5,000) of
+  mean(d_w) below the margin.
+- **Normal:** SE = s/√W with s the SD of the 25 observed d_w; the rule passes when the mean plus
+  1.96 SE is below the margin, so the power is Φ((0.002 − δ)/SE − 1.96) and 90% power needs
+  W = (1.96 + 1.2816)² s²/(0.002 − δ)².
+- **Bootstrap:** the rule itself, by Monte Carlo. A panel of W windows is drawn with replacement
+  from the 25 observed d_w shifted to mean δ (this keeps their skew and the two outlying windows)
+  and judged by `compare`'s percentile bootstrap; the power is the fraction of panels that pass.
+  The sizes come from 1,500 panels of 1,500 resamples at each size searched (steps of about 12% of
+  the normal answer, interpolated linearly); simulated again at the sizes found, with 4,000 panels
+  of 5,000 resamples, they give 0.89–0.91. The power at 125 windows is from 4,000 panels of 5,000
+  resamples (Monte Carlo error about ±0.015).
+- **Keeping the 25:** the same, but the panel is today's 25 windows as measured plus W − 25 drawn
+  ones. That is the design: the panel contains the 25, which a run of the panel measures again on
+  the same rows, and only the added windows are unknown. It is higher wherever the 25's mean is
+  below δ.
+- **Assumed:** the added windows' d_w follow the final windows' distribution; windows are
+  independent (a one-way analysis by domain puts the between-domain share of the variance at 0 for
+  all three pairs, but with one document per domain, domain and document cannot be told apart);
+  the true difference is the same in every role. The teacher's own statistics do not tell the roles
+  apart (mean entropy per window 0.86, 0.89 and 0.87 nats for final, confirmation and selection
+  windows, SD 0.44–0.46; the teacher's top-1 is the next token at 0.73, 0.73 and 0.74 of the rows),
+  which supports the assumption weakly and does not test it: the added windows' d_w are what the run
+  measures.
+
+Its limits:
+- The SD rests on 25 windows, two of which dominate. Bootstrapping the 25, the SD's 10th, 50th and
+  90th percentiles are 0.0046, 0.0133 and 0.0188 (first pair), which means 14, 116 or 231 windows
+  for 90% power at δ = −0.002 (normal), and 56, 466 or 924 at δ = 0. If windows like those two are
+  rare among the added ones, 125 is far more than needed; if they are as common as in the 25 (2 in
+  25), it is about enough for a true gain of 0.002.
+- Against today's defaults (D8 on), chunked + W8A16 measured −0.0009 over the 25 windows, not
+  −0.002. At a true −0.001, 125 windows pass with probability 0.83–0.88 for that pair, and 90%
+  needs 130–154. `--panel 153`, the next balanced size (all the confirmation and selection
+  windows: 28 more, 3.3 GB), gives 0.90 (normal).
+- Fix the panel before scoring. Growing it after an inconclusive result is a second look, which
+  the 95% bound does not account for.
+
+**125 windows** is the smallest balanced size with at least 90% power at δ = −0.002 for all three
+pairs by the normal method (which needs 123, 110 and 87; the bootstrap needs fewer): the 25 final
+windows, the 64 confirmation windows and the first 36 selection windows, nine from each selection
+document. Domains 33/31/31/30 windows (general, legal, code, reasoning), 12 documents, window-id
+sha256 `4e25ad0a446cfd796348aae53c218e5200e7e6e81db93b70fde2bc94a37e4645` (`panel.window_ids_sha256`
+in `FETCH-MANIFEST.json`, and in every plan and report on it).
+
+**Fetching and checking it.**
+
+```sh
+python3 harness/klgate_fetch.py --revision 95f4fdd94bf29989db2e0d1054e4931f55edb6aa \
+    --panel 125 --reuse <first-gate-dir> --rate 5e6 --max-bytes 12e9 --connections 24 --out <teacher-dir>
+```
+
+- **What it holds:** 125 windows × 189 rows = 23,625 rows, 14.64 GB in 262 files (`SHA256SUMS`
+  sha256 `0a0ebf6efb78be6e5293281904a6022d936ada654f0a9aea2b6596c659a73035`). The first 25
+  windows and one more came from earlier fetches; the other 99 windows' 18,711 rows and the whole
+  files, 11.59 GB in all, took 39 minutes over 24 connections (4.95 MB/s).
+- **A resumed fetch.** This run stopped after its last row, inside its closing step (every row
+  read again, the files renamed, the manifest written). Running the same command finished it:
+  no row was fetched again, 0.5 MB came from the Hub (its listing and each window's header).
+  `FETCH-MANIFEST.json` records the 35 windows the stopped run had finished by their rows only
+  (`rows_sha256` null); `SHA256SUMS` binds their bytes.
+- **Checked:** `sha256sum -c SHA256SUMS` (262 files). `klgate.py canary` over the 125 windows: the
+  teacher against itself exactly 0 at 23,625 rows; each row against the next row of its window
+  15.4 nats on average, 15.8 times the teacher's mean entropy (0.98); the teacher's top-1 equal to
+  the next token at 0.51–0.92 of every window's rows; at most 5.9e-5 of the teacher's probability
+  on the padded columns (2.1e-5 in the final windows). `klgate.py plan`: 1,336,059 bytes, sha256
+  `121684e8bfa728211e41216b7cb50f2b312d8f8fa467aafd0c9514d815d16323`, 23,625 rows, 14.64 GB of F32
+  logits per engine run. `glm53f-score`'s plan reader accepts it as it is
+  (`GLM53F_KL_TEACHER=<teacher-dir> cargo test -p glm53f-score` plans the directory and reads
+  the plan back with the model's widths).
+- **Consistency with the first gate:** the 25 final windows of this directory, scored with
+  `--roles final` against the fourteen engine outputs of section 6b's runs (25 windows each),
+  reproduce those reports' every row: each window's KL and top-1 at every row, and the means,
+  exactly.
+- **Stand-in engines.** Two (the teacher's rows plus Gaussian noise of 0.05 and 0.06, written in
+  `glm53f-score`'s format) over the whole plan: `score` reads all 23,625 rows; its report does not
+  depend on the number of processes; the final windows score identically alone and inside the
+  125-window run; `compare` pairs the two, and refuses a 125-window report against a final-only one.
+
+**Running it.** As section 4.3, with the plan of this directory, and `score` twice per arm: over
+the whole panel (what `compare` pairs), and over `--roles final` for the absolute gate, whose
+thresholds were set on the final windows.
+
+```sh
+python3 harness/klgate.py plan --teacher <teacher-dir> --out plan-125.json
+glm53f-score --checkpoint <coordinator-dir> --ranks <a,b,c,d> --plan plan-125.json \
+    --pass-rows 4096 --out <engine-dir>           # per arm; the options under test as flags
+python3 harness/klgate.py score --teacher <teacher-dir> --engine <engine-dir> --json <arm>.json
+python3 harness/klgate.py score --teacher <teacher-dir> --engine <engine-dir> --roles final \
+    --max-mean 0.040 --min-top1 0.93 --json <arm>-final.json
+python3 harness/klgate.py compare <candidate>.json <baseline>.json --margin 0.002
+```
+
+**Cost.** The engine scored the 125 windows in 88 s at 4,096 rows per pass with the defaults and in
+83 s with the chunked KDA prefill and W8A16 (section 6d; the 4.3 s model load included), and wrote
+14.64 GB per run; at 8 rows per pass it is five times the 25-window runs of section 6b, about 20–22
+minutes (an estimate). `klgate.py score` over the 125 windows is about 1,000 CPU-seconds (44 ms a
+row): 69 s with 16 processes, 115 s with 8 (the default), reading 29 GB (the engine's rows and the
+teacher's; page cache warm) on a shared machine; `compare` takes under a second. The teacher's
+11.6 GB took 39 minutes at 5 MB/s (once). Two engine runs for a comparison are 29 GB on disk.
+
+## 6d. First use of the 125-window panel (29 September 2026)
+
+Target hardware, 29 September, engine `073b553`, the plan of section 6c, `--pass-rows 4096`. A is
+the chunked KDA prefill with W8A16 (`--kda-chunked-prefill --prefill-w8a16`), B today's defaults
+(BF16 KDA states on). Each engine run scored the 125 windows in 88 s (B) and 83 s (A), the 4.3 s
+model load included, and wrote 14.64 GB.
+
+```text
+paired over 23,625 rows in 125 windows: A 0.024928, B 0.026295
+  mean difference A - B       -0.001367  window bootstrap 95% [-0.002988, +0.000192]  clustered SE 0.000800
+  ratio A / B                 0.9480  95% [0.8931, 1.0079]
+  per-row correlation         0.8560
+  top-1 (rows): A agrees and B not 477, B agrees and A not 497; McNemar p 0.543
+  mean A - B per role         final 25 windows -0.000891; confirmation 64 windows -0.001186; selection 36 windows -0.002019
+gate: PASS: upper 95% bound of A - B +0.000192 < margin 0.002
+```
+
+The absolute gate on the 25 final windows (`--roles final --max-mean 0.040 --min-top1 0.93`): B
+0.02767 (top-1 0.9470), A 0.02678 (0.9482); both pass.
+
+- **Result:** chunked KDA prefill with W8A16 is not worse than the defaults by more than the
+  margin: the upper bound, +0.0002, is a tenth of it. The mean gain is 0.0014 nats (5%); its
+  interval reaches just above zero, so the gain itself is not shown at 95%. Top-1 agreement moves
+  on as many rows one way as the other (477 against 497, McNemar p = 0.54). The difference has the
+  same sign in every role.
+- **Regression check:** the defaults at 4,096 rows per pass, scored on the first gate's 25-window plan,
+  are identical row for row (4,725 rows) to section 6b's D8 arm: the changes merged since leave the
+  defaults' output bit for bit. The 25 final windows of this panel give the same d_w as before
+  (−0.000891).
+- **The KL result only:** the two options stay opt-in. Making them defaults waits for the speed
+  comparison.
+
+**How the estimate of section 6c held.** It was made before this run, from the 25 final windows.
+The panel's window-level spread, for this pair:
+
+| Windows | n | Mean A − B | SD of d_w | Skew |
+|---|---:|---:|---:|---:|
+| final | 25 | −0.00089 | 0.0115 | −0.7 |
+| confirmation | 64 | −0.00119 | 0.0061 | +0.6 |
+| selection | 36 | −0.00202 | 0.0112 | −1.9 |
+| added (confirmation and selection) | 100 | −0.00149 | 0.0083 | −1.6 |
+| all | 125 | −0.00137 | 0.0090 | −1.3 |
+
+- **The assumption held for this pair, on the side of caution.** The added windows have outliers
+  of the finals' size (`selection-0033`, d = −0.053, and `selection-0009`, +0.032, against
+  `final-0004`, −0.041, and `final-0000`, +0.032), but fewer of them: two windows with |d_w| above
+  0.03 in 100 against two in 25. The SD over the 125 windows is 0.0090, not 0.0115, so the bound
+  sits 0.0016 above the mean where the estimate expected 0.0019 for this pair. The measured gain,
+  −0.0014, lies between the rows −0.001 and −0.0015 of the table for this pair (0.83–0.94); the
+  panel passed.
+- **The per-row correlation** of A and B is 0.856 over the 125 windows and 0.694 in the 25 final
+  windows alone; the three pairs of section 6c have 0.69–0.72 on the final windows (section 6b
+  quoted 0.72–0.76 for its pairs). The estimate does not assume a correlation: it takes the pairs'
+  window-level spread as measured, and the spread carries it. That the added windows' paired rows
+  agree more closely than the finals' is part of why the interval came out narrower.
+- **For planning** another comparison of this kind, the 125-window SD, 0.0090, is a better input than
+  the 25-window 0.0115: 90% power (normal) needs 94 windows at δ = −0.001 and 210 at δ = 0.000
+  (154 and 346 by the 25's SD), and 125 windows pass with probability 0.96 and 0.71.
+
 ## 7. Open points
 
+- The non-final windows of section 6c may have served in building the K4 experts; they are used
+  only for paired comparisons.
+- Section 6c's estimate assumed that the added windows' paired differences resemble the final
+  windows'. Section 6d's first result supports it for one pair (the added windows' SD was lower, not
+  higher); another pair's spread is measured by its own run.
 - The SE of the subsample treats systematic sampling as simple random sampling, and the per-window
   SDs behind the expected precision come from the K4 offline run, not this engine.
 - The window-0 runtime figures (0.0246 and 0.0548) and the 25-window figures are different
