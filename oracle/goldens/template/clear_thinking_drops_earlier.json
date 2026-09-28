@@ -1,0 +1,62 @@
+{
+ "name": "clear_thinking_drops_earlier",
+ "messages": [
+  {
+   "role": "system",
+   "content": "Be brief."
+  },
+  {
+   "role": "user",
+   "content": "2+2?"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "Simple arithmetic: 4.",
+   "content": "4"
+  },
+  {
+   "role": "user",
+   "content": "And 3+3?"
+  }
+ ],
+ "tools": null,
+ "kwargs": {
+  "clear_thinking": true
+ },
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|system|\u003eBe brief.\u003c|user|\u003e2+2?\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003e4\u003c|user|\u003eAnd 3+3?\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154826,
+  3430,
+  9809,
+  13,
+  154827,
+  17,
+  10,
+  17,
+  30,
+  154828,
+  154841,
+  154842,
+  19,
+  154827,
+  3036,
+  220,
+  18,
+  10,
+  18,
+  30,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|system|\u003eBe brief.\u003c|user|\u003e2+2?\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003e4\u003c|user|\u003eAnd 3+3?\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

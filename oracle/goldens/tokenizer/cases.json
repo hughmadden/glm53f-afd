@@ -1,0 +1,482 @@
+[
+ {
+  "id": "empty",
+  "text": ""
+ },
+ {
+  "id": "ascii_sentence",
+  "text": "Hello, world! This is a test of the tokenizer."
+ },
+ {
+  "id": "prose",
+  "text": "The quick brown fox jumps over the lazy dog. It was the best of times; it was the worst of times. Numbers like 42, 3.14 and 1,000,000 appear too."
+ },
+ {
+  "id": "leading_space",
+  "text": " leading space"
+ },
+ {
+  "id": "multi_space",
+  "text": "a  b   c    d     e"
+ },
+ {
+  "id": "trailing_spaces",
+  "text": "trailing   "
+ },
+ {
+  "id": "spaces_before_newline",
+  "text": "line one   \nline two"
+ },
+ {
+  "id": "newlines",
+  "text": "a\n\nb\n\n\nc\n"
+ },
+ {
+  "id": "crlf",
+  "text": "a\r\nb\r\n\r\nc\r"
+ },
+ {
+  "id": "tabs",
+  "text": "\tindented\n\t\tdouble\t\n"
+ },
+ {
+  "id": "ws_newline_ws",
+  "text": "x \n \n  y"
+ },
+ {
+  "id": "only_whitespace",
+  "text": "   \n\t  "
+ },
+ {
+  "id": "space_then_letters_digits",
+  "text": " a1 b22 c333 d4444"
+ },
+ {
+  "id": "digits",
+  "text": "1 12 123 1234 12345 123456 1234567890"
+ },
+ {
+  "id": "digits_mixed",
+  "text": "v1.2.3 3.14159 2026-09-28 0x1F 1e-7 -0.5"
+ },
+ {
+  "id": "contractions",
+  "text": "I'm you're he's they've we'll she'd can't it's"
+ },
+ {
+  "id": "contractions_upper",
+  "text": "I'M YOU'RE HE'S THEY'VE WE'LL SHE'D CAN'T IT'S"
+ },
+ {
+  "id": "contraction_prefix",
+  "text": "'salut 'tree 'really 'velvet 'mmm 'llama 'done"
+ },
+ {
+  "id": "apostrophes",
+  "text": "rock 'n' roll '' ''' 'x ' s"
+ },
+ {
+  "id": "long_s_contraction",
+  "text": "it'\u017f old'\u017fx"
+ },
+ {
+  "id": "punct_runs",
+  "text": "Wait... what?!?! (really) [x] {y} \u003cz\u003e ;:,. --- ***"
+ },
+ {
+  "id": "punct_newlines",
+  "text": "end.\n\nNext;\r\n!!\n\n"
+ },
+ {
+  "id": "code_python",
+  "text": "def f(x):\n    return x ** 2  # square\n\n\nprint(f(3))\n"
+ },
+ {
+  "id": "code_rust",
+  "text": "fn main() {\n    let v: Vec\u003cu32\u003e = (0..10).collect();\n    println!(\"{:?}\", v);\n}\n"
+ },
+ {
+  "id": "json_text",
+  "text": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}"
+ },
+ {
+  "id": "markdown",
+  "text": "# Title\n\n- item one\n- item two\n\n```bash\nls -la\n```\n\n| a | b |\n|---|---|\n"
+ },
+ {
+  "id": "url_email",
+  "text": "See https://example.com/path?q=1&r=two#frag or mail a.b@example.org"
+ },
+ {
+  "id": "chinese",
+  "text": "\u4f60\u597d\uff0c\u4e16\u754c\uff01\u4eca\u5929\u5929\u6c14\u5f88\u597d\u3002"
+ },
+ {
+  "id": "japanese",
+  "text": "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c\u3001\u30ab\u30bf\u30ab\u30ca\u3002"
+ },
+ {
+  "id": "korean",
+  "text": "\uc548\ub155\ud558\uc138\uc694 \uc138\uacc4"
+ },
+ {
+  "id": "arabic",
+  "text": "\u0645\u0631\u062d\u0628\u0627 \u0661\u0662\u0663\u0664\u0665"
+ },
+ {
+  "id": "hindi_marks",
+  "text": "\u0928\u092e\u0938\u094d\u0924\u0947 \u0915\u093f"
+ },
+ {
+  "id": "latin_accents",
+  "text": "caf\u00e9 cafe\u0301 na\u00efve Stra\u00dfe \u03a9mega"
+ },
+ {
+  "id": "emoji",
+  "text": "\ud83d\ude00 \ud83d\udc4d\ud83c\udffd \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 \ud83c\udde6\ud83c\uddfa 1\ufe0f\u20e3"
+ },
+ {
+  "id": "odd_spaces",
+  "text": "a\u00a0b\u3000c\u2002d\u2028e\u2029f\u0085g\u200bh\ufeffi\u1680j"
+ },
+ {
+  "id": "controls",
+  "text": "a\u0000b\u0007c\u001bd\u007fe\u001cf\u001fg\u000bh\fi"
+ },
+ {
+  "id": "space_before_odd_space",
+  "text": " \u00a0x \u3000 y"
+ },
+ {
+  "id": "numerics",
+  "text": "\u00b2 \u00bd \u216b \u2460\u2461 x\u00b2\u00b31234"
+ },
+ {
+  "id": "symbols",
+  "text": "\u2211\u222b\u2264\u2265\u2192 a\u2192b \u20ac5"
+ },
+ {
+  "id": "modifier_letters",
+  "text": "\u02b0a\u02b7 \u3005\u4e00"
+ },
+ {
+  "id": "specials_misc",
+  "text": "\ue000 \ufffd \udbff\udfff \ufdd0x\ufdd1"
+ },
+ {
+  "id": "kelvin_dotted_i",
+  "text": "'\u212a 'K \u0130stanbul \u0131"
+ },
+ {
+  "id": "long_letters",
+  "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ },
+ {
+  "id": "long_pair",
+  "text": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+ },
+ {
+  "id": "long_digits",
+  "text": "12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"
+ },
+ {
+  "id": "long_punct",
+  "text": "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-"
+ },
+ {
+  "id": "long_spaces_then_word",
+  "text": "                                                                                                    x"
+ },
+ {
+  "id": "long_newlines",
+  "text": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nx"
+ },
+ {
+  "id": "mixed_ws_run",
+  "text": " \t \n \t\n  \r\n \t x"
+ },
+ {
+  "id": "chat_prefix",
+  "text": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003ehi\u003c|assistant|\u003e\u003cthink\u003e"
+ },
+ {
+  "id": "think_block",
+  "text": "\u003cthink\u003ereasoning here\u003c/think\u003eanswer"
+ },
+ {
+  "id": "tool_call_markup",
+  "text": "\u003ctool_call\u003eget_weather\u003carg_key\u003ecity\u003c/arg_key\u003e\u003carg_value\u003eParis\u003c/arg_value\u003e\u003c/tool_call\u003e"
+ },
+ {
+  "id": "nothink",
+  "text": "/nothink please and x/nothinky"
+ },
+ {
+  "id": "partial_tags",
+  "text": "\u003cthink \u003c|user| \u003c/think \u003e \u003ctool_call \u003c\u003cthink\u003e\u003e [gMASK [sMASK]"
+ },
+ {
+  "id": "tags_with_spaces",
+  "text": " \u003cthink\u003e \n\u003c/think\u003e  \u003c|user|\u003e \n "
+ },
+ {
+  "id": "stop_tokens_inline",
+  "text": "done\u003c|endoftext|\u003emore\u003c|observation|\u003e\u003c|user|\u003ex"
+ },
+ {
+  "id": "image_markers",
+  "text": "\u003c|begin_of_image|\u003e\u003c|image|\u003e\u003c|end_of_image|\u003ecaption \u003c|video|\u003e\u003c|begin_of_video|\u003e"
+ },
+ {
+  "id": "adjacent_specials",
+  "text": "a\u003c|user|\u003eb\u003c|assistant|\u003e\u003c|assistant|\u003ec"
+ },
+ {
+  "id": "observation_block",
+  "text": "\u003c|observation|\u003e\u003ctool_response\u003e{\"temp\": 21}\u003c/tool_response\u003e"
+ },
+ {
+  "id": "random_00",
+  "text": "'ve\ud83d\ude04,\ud83d\ude2d\u003c|user|\u003e\u092a \n\u0433\u0443\uff118\u003c|endoftext|\u003e]\u0424\uac2c\u0416,}V!'M\u042c\ue000?'d  \u03b5\"\u00b2I0(\u0441\u0665u+\r\nd1\u044a\u0944\u003cthink\u003e\u2002\ud83d\ude2b\u4e33h\u2002\u4e2e\u03a8A;\u0663\u0319\u4e84\"\ufdd0/\t(g\u0912\r\n\u03ba\t\u4e3b![C'LL\u4e98/\r\n \t\u042esl\u03bd\u4f1b\r\n\u0396  U\u03b7J\uac70a\u0669v/\u212a\u0311\uac11V\nu\u003c|image|\u003e\u043dd\u4edf~\u2460\u4f31\u044a\u4e4e\u041e\u0317\ufffd.\r\nFV\ud83d\ude47&\u003c|image|\u003e\ud83d\ude00\u0907\t\u003c|endoftext|\u003e\uac524\uff11\u4e5b\u0669\u000b\n\r\nG\u4e2e'd\u003c\u040dqz\u4f3e\u0302\ud83d\ude42j\u2460'T"
+ },
+ {
+  "id": "random_01",
+  "text": "t\ud83d\ude46\u03bce]\u003c/think\u003excP8[gMASK]  3  \uac6e\u096a\u0902\t"
+ },
+ {
+  "id": "random_02",
+  "text": "\t\u042d\u03a4\u003c|endoftext|\u003ej\u03b4\u4f75C've\n~\u4f0e  \u040aF`\u017f\r\n\ud83d\ude2dhG~\u4e6b\u4ebc%\u0426\u4f347\u043e\u4e4d\u0424\u4f11O \ud83d\ude17\r\n\u4ef9 +\u4e751\u4e76\u4f03\u001co_\u4e8a\u030dbQ\uacac\u042bp\u0330,)\uac6b \ud83d\ude16wt\u0393B|pw\u040e_\u003c|endoftext|\u003e\u042c\ud83d\ude01cH*\t`\"'d\u4e0f\u4ec6\to \u039d\u0393 d\u0433O~  ;%\u03bc\u003e_\u032e\u216b\\z\u4f863zFG\u0333]T\u0669Ha\u0908p\u0438\u06643^\u001c\r\n/nothink\r\nv  \u0313 'LL"
+ },
+ {
+  "id": "random_03",
+  "text": "g\u4efc\u043a\"\u4ebdH\u0313\u0936\u003c\ud83d\ude1b\ud83d\ude23\uacc2've\u003c|user|\u003e\t\u094duJ\r\nPw\u003ctool_call\u003e\u030b:j  \ufffd\ud83d\ude3b 're\u003c|user|\u003e\u0449\ud83d\ude1b1\u216bGX\t\u090d\u003ctool_call\u003e,\u4eb0]\uac6a\u0130H\uacab\ud83d\ude23\uff11\u031d\ud83d\ude02\n \tu\t\u0447e\r\n\u0306w\r\nO3A\u00bdr\u0427\u017f'd\u0437B\ud83d\ude03P\u0440\u4f8180"
+ },
+ {
+  "id": "random_04",
+  "text": "\u03bb\u0324n\u003cthink\u003e\u4ef1\u0668\u2029`b\u4f06\u044d\u003c/nothink\ud83d\ude19\ud83d\ude14\u0449r %tXB\u4f08)\u4f7bB\u095dK\ud83d\ude4b=G\u003carg_key\u003e@d\u033f\u4f85b\u4f81N  xY\u0446p]$w\u003cthink\u003e\u0329X\u003c|user|\u003eL\u03c7g\u4f3e \uac05%B\u4f1a\u091f4\u06626\ud83d\ude12\u095a\u0667\ud83d\ude21\n\u003c 0dy{\\\u03b1\u03c2\u0668'sO \ud83d\ude25-'ve\u2029\ud83d\ude37W\u00b2[W  \r\nq\n\t\u0325Gx\u4e73"
+ },
+ {
+  "id": "random_05",
+  "text": " cj\n'M\u0399O\u4e27\u03b0uh\u03bfc\ud83d\ude1d \ud83d\ude3f  k\u4eb2F'T{5'T?\uff11\u2460f\u2028u*\r\na9$\u003carg_key\u003eD'd8\ud83d\ude0d\u4e26're\u0328Zx\u0318Q23\r\nb6\\\ue000\u4e92\u4e2f1G\uff11\u0668\ud83d\ude40\udbff\udfff\u00bdY,\t\u200bm\u03a6]\u032cK\u0946:pu\u4f0a\r\n "
+ },
+ {
+  "id": "random_06",
+  "text": "\u03961\u044c\uaca3'veK\r\n\u2028/\u03af5X\u044c\u003cthink\u003e\r\n{ \u0449\u2460\u0668"
+ },
+ {
+  "id": "random_07",
+  "text": ";x\u4f5b\u03bc\u4e65\ny}_\u4e0e\u041c'veUI\u4e32\uac35(\ud835\udfd8\t\u003carg_key\u003e\uac5c\u031b\u2028\u03b9lV\u0429\u0410\u0331_~2\uac80/\r\n\u001c\ud83d\ude0f"
+ },
+ {
+  "id": "random_08",
+  "text": "l\u3000 D \u0420\"\uac6c\u0449\u003e\u0429?{|,}\u4f42 \u4ea2\u4e10!\r\n\u0391\u003c|user|\u003e!iF]\u0932've\u0401\u0405\ud83d\ude2b\u003c/think\u003e\ud83d\ude37\ufeff\u0300n\u041d \u4eed\u03abo%\u00bd\u044f\uacb6:c?n.\ud83d\ude2b\u000b?\u003eF\u030c\u017f\u03aa\u0665\t\u4f1a\ud83d\ude10\u4f5e%D\u4f73\u043a\u0428\u039av`\u0412\ud83d\ude4dVL_'T'd\ud83d\ude25\ud83d\ude11\u2028M\ud83d\ude12\uff11.\u030b\u4f21\n\u03b1;\u4e0e\u039b   ;.p\u003carg_key\u003e\u03b3A\u03b2~\ufffd\ud83d\ude3f{k+4r1l\u033c\u003carg_key\u003e\u4e11'dA w&\f\ud83d\ude36\ue000\u0399\u4e02'reG\u4f22\u0338\u0429KY \u033d\u0422[\tC\uac708\u094c'T-E"
+ },
+ {
+  "id": "random_09",
+  "text": " \ud83d\ude2f\u043f\u0660mV`\u0419\n(\u001f\u003c/think\u003e]\u03b1\u0404\n\u033bE\u03ac\u4f35t\u0660\u4f07U\u4eb5t\u4eaf4_p\u0426\u0414D\u001f$\u003ctool_call\u003e\u4e8d\ud83d\ude4b\u4e25\u4e93w4\r\n\u0662~m\u0423eB\u0660k\n\u042c7 \u003carg_key\u003eIA}'T\u0956'M\uaca8\u0320 \u09648\u00bdN\u4f48\ud83d\ude12  \u03a1\n'LLE\u0661w\uacb2 2\u017fd\uac7c$\u4e88\u003c/think\u003e\n\r\n\u0416nj\uac10\u0311\u0402\u044bwD'*6\u4f4c\u003c|image|\u003e\u043e'y\u003cthink\u003ew[gMASK]@Zivey\u043a3"
+ },
+ {
+  "id": "random_10",
+  "text": "(  \u03af\u003c/think\u003ewl\u042b\n\ud83d\ude11\t,\ud83d\ude0c\\/nothink(_\u003c|image|\u003e\u3000\t\u4eb0\ud83d\ude43\u0300\u03022\u4f71\ue000Y\u03a2\u0421A\u2029\u4eeeq\u0669\u03bae28Ga    \uac7a\t\u042dr\u4ee5\u0304\u0321[gMASK]\u095e\u4e51\u0442Hr\uac1eOX}\f\ud83d\ude46=\u03314\u4eeb\u0427\u031f \u032e\u0443\u091f C8\ud83d\ude20[gMASK]A\u4e05idn&'MqJ{sP\u4e74\u0423uL'reB[\u0447\u091e"
+ },
+ {
+  "id": "random_11",
+  "text": "\u0669\u216bf\u003cthink\u003e6g\u4ef8 T\u003c\u200b\t9\u03aa\u4e1d\nVb\u043cH\u2002\u0666[gMASK]9  }WIW\r\n\r\n\uac859/nothink\u4e7a\u0321\u039c\u4e79il\t\u4f53 e\u03c2'T\u03a1\u2460"
+ },
+ {
+  "id": "random_12",
+  "text": "\u03c8\u4f05\u003carg_key\u003eg's\u0393k\u0663\ud83d\ude3b]\ud83d\ude38\u0665\n\u039f\u003ctool_call\u003e  's\u4eb92"
+ },
+ {
+  "id": "random_13",
+  "text": "5lcm'd|:\u0667,\t\u042f\u4ef7\ud83d\ude46\u4f33k\u0329S\ufffd\u4f15\u003c\u06695\\\u03a0\tx\uacb8\u003c/think\u003e  'LLn_IZ,\n\ud83d\ude1f6\u003c's\ud83d\ude25]P$\u0085 w\u0327j\tG'veC\u3000\u001cv0g\u031b\u040b\u4f87x\u0907 \u4ee0\u4efe1j`\u0933h-\u0926[gMASK]=\u0307&l\ud83d\ude12+\uac42\u2460 \u0412'rew=B"
+ },
+ {
+  "id": "random_14",
+  "text": "I,0\u03bf\ufeff\u0449 \u4e2bJ #\u4e89\u003c|user|\u003eE\uac41|  \uac4d\u0913\n\u032aE\u003c|image|\u003e"
+ },
+ {
+  "id": "random_15",
+  "text": "N\ud83d\ude28.\n\u003ctool_call\u003ep\u4e0a*\u4eb3  w s\u042f'T+ h \u03c1\r\nX\uac87\u4e06\u003carg_key\u003e\uac2b\ud83d\ude46'T A$\u041f\u042d]e;\u033co  \uac95\uac473\ud83d\ude49U\u4e6bb\u4f17W\ud83d\ude0e\ud83d\ude08\u03c2\u0309Bk\u03c3\u03be\u4edb\u00b2\u4e0e0=\u03ac(ga\ufeffO\u031f\uaca0y]zs\u031f'LL\u4e43a  \u0968\u039f$\u0660n\u4ef2\n|\u003e\u0336\t9're'M\u031a\u0933\u4f4b\udbff\udfff~g \u039d\ud835\udfd8\u4f33\u0919\u4f66\u091f\ud83d\ude48\u0667'TSz[  \u03bdU\u00bd(${~/nothink: -\u042c\u03a1%\u4ef2j\u003cthink\u003eP9:\u0333}E\r\n\u03b7H\uac17V\u212a\u4f80"
+ },
+ {
+  "id": "random_16",
+  "text": "\fn've-[gMASK]\u0939'T\u0436E\u0438K\u0400\ud83d\ude40|\tN'M\u200b\u03c8,\n \u0662]\u4f41@\u0336\n\u041eH\u4e1fT\u003c/think\u003e(\u0404\uac6e \t#P\u4e7f\u0662\t+\u0405\u4eab\u4effM\u040a\t\u03be\u4f07\t'tsBer\u00bdq\u0947\uac53Y\ud83d\ude4c[\u4f4cn0j\u000b\ta\t\"\u4f35i\r\nT\u4ea5\u0436yl\uac44w\u003c/think\u003e,\u0310z\u043e\u216b  \u041e\u0422 /"
+ },
+ {
+  "id": "random_17",
+  "text": "\u4f2d\u043843/nothinkW  {A\t\u4eef(\u0428\u003carg_key\u003ep\u2460\u0396\u0436g /nothink"
+ },
+ {
+  "id": "random_18",
+  "text": "/\u0929\u0446@YS{\u0660\ud83d\ude37\u003c/think\u003e\u0666M\u216b\u03ba\ud83d\ude1a#\u3000E\u003co\u03b3 \uac70\u00bdR\ud83d\ude20\u001fE \u040f\u4f2e \u003c/think\u003e\u09312\u003e%]J;\u4f22Q\u0665\u039f\r\n\u4f19T_\u4f2c\u4e08X,\u2028\u4e13'LL\u0663\u092a\u0399D\ud83d\ude20\u2460;]G\u044dP\u03a4\uac1c\uff11\n\n\t3\thX\u2029Hu  \u0130\uac2a\u003carg_key\u003e\u2029\ud83d\ude03\u032e  \ufeff KT\u003ctool_call\u003e\u2002m\u4e25W\u0663\u2029\u044c\u0669z\u4e26%\u00b2\u0447X\u003ctool_call\u003e \u0420o\u03b0've\u094a| \u0404t\u00b2\u0331\u0663"
+ },
+ {
+  "id": "random_19",
+  "text": "f\u0959?\u031f\u2460K\u2002\u043e C\u0408\ufeff"
+ },
+ {
+  "id": "random_20",
+  "text": "C$L\u096a\u03a1$\u0429\tH~\u4e2cd\\\u00b2  \u4f39a\u042bF\u4e75'd\"oS1W\ud83d\ude47\uac5dc3    vn\r\n@\ud83d\ude16POt  K|5\ud83d\ude23=\r\n *P\ufdd0Oh0-\n'h\ud83d\ude45\u0306w@\u093eq 5R\"g:\u03c6\u003c|endoftext|\u003e\uac74\u03a8g/\"\u003carg_key\u003eN\ud83d\ude02\ud83d\ude45V}|d\u4f1b ;w\ud83d\ude36W\u039d\u003carg_key\u003e've\u033frd ;3\ud83d\ude02=#C\u0332\u042a\u4ec6W\u4ecdfK@\u00b2f\u30009\u003cC0 T }\u0321  \u03a1\u4e9d\u0303 \uac3f\u0957apg\ue000\u0426\u003c/think\u003e\u00a0\u0415b_0y(Io!\u4ef3D\r\n\u00bd\u033fB\u4f3c7|c\r\n\u0324\uac57"
+ },
+ {
+  "id": "random_21",
+  "text": "\u000b\u0948\u4e3e   oQ\u4eea1 \u0443`a.\r\n\u033e\u095e\u03bd7ia\u0401Z\u4f68\u0667i\u0668\u031a\ufdd0;\u4f174d\u0312K  i\u0420\u0422D\u039b  \u00a0&\r\n're\u0432 "
+ },
+ {
+  "id": "random_22",
+  "text": "\u4f1b\u042b\u0669\u4f4b,i\u0966\u0331\u003c/think\u003e)\u039aupW\r\n_\u003c|endoftext|\u003e^^\u00b2  \u030b\u0445\ufeff\u0959b're\u030cs-\ud801\udc00  xj0\u4f825j\r\n$\u0325`:zu;E\u0413Lx\uac9e\u044c\uac6fkn  V'sW\u03bb,\u0332 t\u4e93^O\u0662're\u4edf\u0936 6\t\t\u4ed6&\u4f88\u0398'MC\u4e98\u000bAO\uac99\ud835\udfd8\u041d_v\u0440\uac2c\r\nV\u0397M\uacb3~\u0130\u00a0 A\u000b\u4f58\u4f03"
+ },
+ {
+  "id": "random_23",
+  "text": "B\ud83d\ude0bz'r\r\nZ\u4e3dr. e\u043f$\f\u2029  =\u4f45'd\u2028\u094c\"\u00a0\u001c  k6\u0402\u4e24 \"\uac52's\u4eba\u4f29\u0661mDm s\ud83d\ude413  \u4f1a\r\n\tjAI\u039f^\r\n'd\u00b2q\u4f0b\ud83d\ude2f2\ufeff  *\ud83d\ude24'L\t\u4e90LB \ud83d\ude4e've's\u001f \u0664\r\n\ud83d\ude42'd\u03262\u092b\u0957\tKp\ud83d\ude2b\u4f0f\u003c|user|\u003e\u03c15\ud83d\ude0f\ud83d\ude44=%\u0085=sN\u0669 H\u091ff\u3000\u0322\u0396\u0666,\uac4f\u0667I \ud83d\ude4b\ud83d\ude28\n]_\u003carg_key\u003ez\r\nm\ud83d\ude05\uac0e\u4f47 q\u2028\u0932 \t\u0661R\uacb4;0\u0445 \u4e8ay\u4e03\u032c\u4f52\u4f0buMu\u093f/\u0333\u4ecc\n\u003c|user|\u003e"
+ },
+ {
+  "id": "random_24",
+  "text": "c\u0305n]  pF\u03a1'\ud83d\ude3b\u2460i\r\nN\uac01gR\u03b8Ok&*\u0407\u06626{\u0338{^j\u0666\u2460\u040bq \t\ud83d\ude17\u0669\u040e\ud83d\ude4bb&\u4ef4\ud83d\ude44'[gMASK]\uac4b(y^\u4ee6nk\u0323/nothink\u216b  }E`\u0130\uacb6\n\u0669/B-\ud83d\ude05r!\u4f7b\u4eb0^\u0668$*_tf\u0905'LL\u4f74+'T\u03ac\u0327@\u03a5m\u043dU\u4edeF\u4ef8i\u031f \uac9e\uac6f \u4e4c\u03a6-\u0950\u003c\u041f=\ufdd0\u4eae4  \uff11M\u4e7b\"\\\u033b\"=Yo&f'\u003c|user|\u003e6"
+ },
+ {
+  "id": "random_25",
+  "text": "\uac95'M[\u0401\u03a7\ud83d\ude00'M\r\n\u4f14'veZ\u001cD^%J$=t[Wtz\t\u4ea9E\u0415W\u216b\u003c|user|\u003e(\u2028\u03af \u0314D,\r\nD\u4e21\u0917\r\n\u4e87]\u0666Y@Y\u4f38\u003e^X \u0947V \u040eR\u0329k\u0407\tqU\u4e9c\u03bf\uac9ec O,\n98fx\u4edd\nl+s\r\n\uaca5\u4e2a|\u0396's\n'vei'dM\u003ctool_call\u003e\"?\nj\u4f66GK\t[~j\u095e! \u031fq\u0438\u031d\ud83d\ude4d\u0932\ud83d\ude02\uac84\ud83d\ude32\u001f[J\u090d\ud83d\ude35\u4e06  P\u0393"
+ },
+ {
+  "id": "random_26",
+  "text": "   \u4e7b\u4f77g\u0942\u003e`c\u03ac  \u001f\u4ea8 \u0305\u03c0\u003c|endoftext|\u003ez\uac96lS\u03a4\n\u001f9P\r\n\u4e44ohf]Vzi\ud83d\ude11\u4f75~\u03a6\u4e08's\n  o\u0956've\u4f5d\u4ee0\u4e293  X\uac70\u0391\u0421\"d\u0669eoD\u0666\u4f3e   Q\u00a0\ud801\udc00\u03b5U\u4e63\u4f07\u0308\u0444b \u0432#X\u0662\u003e\u0320^"
+ },
+ {
+  "id": "random_27",
+  "text": "E /,\u0927\u0444k\u090bs\u0948`h  +\u03c4\u0431S)\u4e7b\ud83d\ude0e'TW\u0668i\u03a4\u0660\u216b\u003carg_key\u003e\"\u0944m\u2002\u0665\u003c|image|\u003e\u0660\uac07]P\u200b\u003c|user|\u003ey\t\u4e14\u212a\u001f88\uac148\u0669\ufeff\r\n\u0660\ud83d\ude4f\u4e4c5\u0945\ud83d\ude2f\t'0\u043e'T \u4f80\n\u033e\ud801\udc00\u4ebaO9j;\u090a\ud83d\ude4bla\u0902\u0668'T\"\ud83d\ude2c\u0429\u4e75 \ud83d\ude0eF\u003c/think\u003e~\u0663V\u0325\t\u4f37\r\n\u003c|user|\u003e\u032f\ndW\u0319H \ud83d\ude0b\u003ctool_call\u003e\u03a0V\uac72g\u4f89\"^\u00b2 \u093c&\u093f\u0661k(v\u091f\u200b\u0397\u00b2\u4f40 \u003c"
+ },
+ {
+  "id": "random_28",
+  "text": "!A\uaca3\u030a\uac58\u0419\u4f16\u003eOh\ud83d\ude3c\u096bn\u0665,\u0413B\\   \r\n\u03b5'sO\u4f03\u4f6dmq 'M$\u0431\u0419G\u0667\ud83d\ude2e\u4eda e\u003c|image|\u003eM\u003c|endoftext|\u003ef\u003c|endoftext|\u003e\n3\uac0en\u041c\u4e85Oms (\ud83d\ude34zG\u092a[F)'T\u0666\nV\u0661\f\u0323C;95\uff11f\u093d]\u03a4\u03b0\ud83d\ude19\\'M6 $ \n@\n{  \u4e87]\u0302\u4f2b\u003cthink\u003e\uff11\u4f37 \u4e22?\u216b \u017f\u0424\u216bB\u0448\nv\n=\u4f4c\uacc6\u00b2\u041cU$&@\uac69\" r\u003c/think\u003e*\ud83d\ude47\u0667b`G\u4f53\u4f78\uac98 f\ud83d\ude24\u0437\u040f\u4e72\n\u4ed3RO\"\u003c/think\u003e\u212a\u0413\u040d/p\ud835\udfd8\t\u044c\u0664"
+ },
+ {
+  "id": "random_29",
+  "text": "\uac4d\ud83d\ude24\u4ebdm\u003c/think\u003exT\u4e19\u001f2\uac7d@t}\t  \uac07X's\u0660%\r\n\r\n\u03bb\u03c0\u096a\\\t  \u003e're\u03c5PXm\ud83d\ude0fS\ud83d\ude0b\u4f1cF\u216b\u03b1\ud83d\ude05\ud83d\ude2c\u0663\u0434\u0665\u0407\u4e06\u4f71?\ud83d\ude35L\uac55''LL\uac93Rk\u003c    S\ud83d\ude13\u4f30\u4f89  j-sR\u041fI_\u03a8%"
+ },
+ {
+  "id": "random_30",
+  "text": "b\u039d\u003cthink\u003e  r\u03ab\u017f\ud83d\ude41\"\u0948\u0414\u003cthink\u003eC\uac0dM\u4e1a\u03b7\u0660\u003c:\u03b6'dV:\u4f88*\u003e\u2460\u000biN\uac48\u0418T=o\u4f31\u0085P\u0392m\u0446\u0432\"\u093cB\u0923\u032a\u0934jM\t0"
+ },
+ {
+  "id": "random_31",
+  "text": "7S'M\n\u0668\ud83d\ude2c\u4f04+.ei \u03ba\ud83d\ude0a|#)aJJ\ufdd0ON'?\u0337Y\u04148\u4e48  1)%\u0333y\u041dl\u017fQ42\u00a0'd{\u03102\u0313\uac0d\u4f1a'LLrb3\u4e58\u03b2\u003e\ufffd~^%\u06662\u0661902\ud83d\ude3c\u4eeei*J$\u0414\u2029\ud801\udc00O\tv\u0329Y\ud83d\ude4b\u003c|user|\u003e&@T\\\u0951\t}\ud83d\ude18F'd\u003carg_key\u003e}wA   \uaca6pj1\uac6e\u03b9F=\ud83d\ude34\f\u0661W\ud83d\ude08\r\n\r\n's\u4e8e)\u001f\u0665"
+ },
+ {
+  "id": "random_32",
+  "text": "5*\ud83d\ude07\u003ctool_call\u003e)"
+ },
+ {
+  "id": "random_33",
+  "text": "\t\uacbb\u4f79  \u003carg_key\u003e:(\uac33\u0662\u4ec1\u4f7dP\u0660  \u0334\\\uac36  \u0317uO   7'LL 4\r\n\u4eece9\u042fB9\ud83d\ude1f\u4e10\ue000f\u0665\u0305g4\uac316bv[\u0913\u0665wY :\u0085h\ngZ\u003c\n b\u032e\u03c5X\u003e\u03b4\n\u4e8bi\u4ea0/nothinkaZ(\t\u4e5b\u0669\t\u0302\u0668'ver\u4ea7\u03a4\ud83d\ude37;\u03912\u095a\u03a7o\u003c/think\u003e\ud83d\ude3c\u0303\u0313u\uac07o\u0301-\u0960  \u4e26E^I\u4f73  ;d'd3\u4e2b\n\r\n6@n[gkA've`\u031d+.\ufeffE?\t\ud83d\ude30i\u4e2c\u003carg_key\u003eDbz"
+ },
+ {
+  "id": "random_34",
+  "text": ",\ud83d\ude11 \ufeff\t'T\u03affU\ud83d\ude12v\u0419\u0934\u0304\u4ed0G\u003c|endoftext|\u003e\u0669t1`{\u041f\u0661X:[\u4f59\u4e2d_?\u030c]6CD's!'LLje \u0665\u03c2\u03b4P\u03065?LG\ud83d\ude10\u0435\u4eeb\u001c\u0903\u003c|user|\u003e\ud83d\ude1cN\u001f\u003c|endoftext|\u003e\ud83d\ude4ff\u0428[gMASK]\ud83d\ude07\u003c/think\u003eD\u03abp\u0445hlBA\u0668 \u0432\ud83d\ude38\r\n2\u2460\u4f2fo\u094a\u001c\u043b\ue000\r\nb  \u032f\u0441\nt(\u0411D\u031dD\u03a5v\ud83d\ude2d\u003c|endoftext|\u003e 2\u090fi\ud83d\ude35V\u003ctool_call\u003e\u0916[ue-\u4f6d\u0914d(\u4ed6*\u4e80\u033e \u03bd"
+ },
+ {
+  "id": "random_35",
+  "text": "\u0434\u003ctool_call\u003eT\ufdd0\u0444'veaK  \u0666J\u092c8E\u200bw\u003carg_key\u003erG\f\u4f4fq\u0664\t\ud83d\ude19\r\n  6\u4e3b   \ud835\udfd8\u0938G\u00b2 [t\u4e236\u4eect\u0411z\ud835\udfd8|  D\u003c|endoftext|\u003e\uff11 \u4f29'd\ud83d\ude30Jh\u0405\ufdd0k\n\u0401\u031f\r\nzP/\u0335\uacab\ud83d\ude4d'dHb\r\nR\tt\uacc6k\u003c'LLO\u003c|image|\u003e/nothinkK\u4f217\uacb8\u0306e\u216b\ud83d\ude18\"l'rek\u032fw=\u03b1\u00b2HCOi \ud83d\ude44{\ud83d\ude29Q+L"
+ },
+ {
+  "id": "random_36",
+  "text": "?MJ'do\u0445i \uac28\u03c0\u090cz\u03a66,    C]\r\n\u00b2\n\u2460\uac9d\\k\u03c4\u0085R're\u4e73\u044ae\u4e2fw\ud83d\ude35's*h\ufeff\uac2dkm\uac1f\ud83d\ude19["
+ },
+ {
+  "id": "random_37",
+  "text": "[\u041e\u0925\u4e23?\u003carg_key\u003e\u0665#\u0419  \u0313\u03a4_\u03b9t#\ud83d\ude4ao\u032e\u03b9'df\u003c\u3000 ^\u0947\u003c/think\u003e\u0667\u030c\uacba2\u000b\uac66\ud83d\ude2dr_\r\n\u4eae~bm\ud835\udfd8h\t\r\n\ud83d\ude16Y}v ?O\t\u03c6#\u0664V \u003ctool_call\u003e\u033d57\u00b2\u096d\u095f    \u2029\u0309\ud83d\ude1bT\u4f86\u091f (  \r\n!\ud83d\ude35\u4f83j\u03c5\uac00IEV\u0663}"
+ },
+ {
+  "id": "random_38",
+  "text": "\"Z\u212aTA\u040d\u4f69\u4ee3~(\u031d\uac26've\ud83d\ude0b'sL4\u003e\u03c4TG\ud83d\ude01G\u4e90\u0435\u06652\u03ac\\\u4f6d\u4e5bd\u216b4b[gMASK]K\ud83d\ude11H\u0428\ud83d\ude1e\u200b\r\n\u4e65 \u003carg_key\u003e\u4ef0'L\u00a0g\\\u4f5c\ud83d\ude35\u4e06\u2460ys\tEM.\u039dJ\udbff\udfff\u003e\u0130\u0302FU\tX\u0948\u003ctool_call\u003e|\ufdd0\u0401\t8're\u4e02\u04134\ud83d\ude25\u044a\u003c70\u4f36 \u0424\u4e491\u0311#)  \t%\uac8cd&q\u039e!\u4e32\u03c6\u0664\u4e30\u4ed3've\u4f3b\t\u001f\u003c/think\u003e}\u0308\uac2ez\u0432O}\u4e63\u003e\u03c3\ud83d\ude450 _Gfp}M#\u0665t'M\u4ee4^\f\u4ec1\u4e7a\u0331\ud83d\ude13.\t\u003c|endoftext|\u003ep\"\r\n\u0130\u00a0\u0320/"
+ },
+ {
+  "id": "random_39",
+  "text": "\u003c\u031f\u4e47\u030eI\u0425A`\u0405a\ud83d\ude45\r\n\ud83d\ude15-\u003ctool_call\u003eL\u4e25\ud83d\ude35\u0418#D\t's\u0436\u4e8c\u0393\tZ\u0412\ud83d\ude2d\n\u003c/think\u003e\u2002j\u4e15\u06676*\u03b4r\u4f68!h\uac38\u03a6\u03a2\n9\u0307\r\n\u003c|user|\u003e:\u0400\u4e58\u0404\u000b\u042d\u042c've\u0421\u0417-\u0660i\u4e6f\uff11O+n\ud83d\ude2a$j\u4e18\u0931\u4e24\uac57q\u0085eQ\u003c/think\u003e\u4f57\u4e71\ud83d\ude48$#0\u003c|endoftext|\u003e\u2002'Ttz\u030a%"
+ },
+ {
+  "id": "words_00",
+  "text": "sm_120 Hello Flash == ) \n Flash request GLM reasoning : -- ; tool request value ) , server x86-64 : the stream server    of    value don't . stream"
+ },
+ {
+  "id": "words_01",
+  "text": "request stream -- reasoning 3.5 tokenizer call ) \n , : 3.5 request World of request server reasoning don't request reasoning reasoning"
+ },
+ {
+  "id": "words_02",
+  "text": ", -- ( ) stream -\u003e 3.5 don't ; 3.5 , don't 3.5 tokenizer x86-64"
+ },
+ {
+  "id": "words_03",
+  "text": ". stream , stream server reasoning -- . and \"quoted\" don't tool sm_120 ) call GLM 1024 ; == . \"quoted\" server ( reasoning sm_120 \n Flash GLM call -\u003e Flash reasoning . tokenizer it's Flash World x86-64 it's stream \"quoted\" ) -- stream : reasoning -\u003e \t -- \n model \t -\u003e ; reasoning -- -\u003e Hello x86-64 don't tool    call x86-64 tool : and it's x86-64 \t 3.5 model =="
+ },
+ {
+  "id": "words_04",
+  "text": "1024 3.5 -\u003e request don't 3.5 server request == it's and call request tool Flash \n tokenizer    Hello call call . World ; , . ; reasoning \"quoted\" ;    model x86-64 3.5 server tool call Hello server sm_120 x86-64 == World == sm_120 -- call of stream \n ( don't stream , \t stream ) 1024 stream . 1024 stream : . it's stream request ( \t x86-64 \n == World x86-64 \t == \t GLM -\u003e World of it's GLM value x86-64 value 1024 tokenizer Flash World model"
+ },
+ {
+  "id": "words_05",
+  "text": "World GLM -\u003e and Flash == don't 3.5    and GLM stream of \t . ; tokenizer value \t ; request don't call x86-64 it's server model and . it's == 3.5 call World ) stream 1024 Flash ( -\u003e request don't model call == Hello ) -- stream stream == World it's -\u003e 1024 sm_120 GLM value of ( Hello -\u003e x86-64 ; \"quoted\" it's model Hello stream server reasoning , ) x86-64 GLM tokenizer GLM \"quoted\" \"quoted\" 1024 value . x86-64 it's it's \"quoted\" 1024 \"quoted\" stream"
+ },
+ {
+  "id": "words_06",
+  "text": ") server call World -- == Flash    ; sm_120 Flash , , stream x86-64 \t \"quoted\" -\u003e and ( call x86-64 ( \n World 3.5 model request ) ("
+ },
+ {
+  "id": "words_07",
+  "text": "World -- and World Hello Flash == \"quoted\" the x86-64 -\u003e don't of tool it's Hello tool request : Flash Hello \n 1024 World tokenizer 3.5 server -\u003e it's don't of stream it's value ( ) the -- request \"quoted\" 3.5 -- it's GLM ; sm_120 and request it's 3.5 1024 the \n       server ( value \n x86-64 it's GLM request    , 3.5 , reasoning 1024 Flash 3.5 of ( x86-64 \"quoted\" call tool"
+ },
+ {
+  "id": "words_08",
+  "text": "-\u003e \"quoted\" \"quoted\" and World reasoning -\u003e reasoning don't Hello reasoning the 1024 Flash : , of World model request , GLM model -\u003e call model \n and 1024 x86-64 . -- call Flash call -- tokenizer -\u003e x86-64 Hello -\u003e -- World -- : 3.5 . sm_120 . GLM ( -\u003e request reasoning sm_120 ) call == tool Flash ; stream tokenizer ; x86-64 ; server server \t stream tool"
+ },
+ {
+  "id": "words_09",
+  "text": "; Flash -- : Flash tokenizer the \t tool call ) it's reasoning GLM of tokenizer and call -\u003e \t Flash Flash Hello stream reasoning : call ; ( tokenizer GLM it's call model call : \"quoted\" Flash : server x86-64 tool World value . == tool \"quoted\" , \"quoted\" it's sm_120 World don't call the call : call the request World ; it's , , tool GLM \t    sm_120 World the : -\u003e --"
+ },
+ {
+  "id": "words_10",
+  "text": "server ; x86-64 , server stream World ; Hello -\u003e . Hello ) it's sm_120 , , sm_120 it's Hello \"quoted\" value GLM tool -\u003e ( ; the -- model of tokenizer model ( Flash the sm_120    reasoning tool \"quoted\" \t ; . ) server Flash sm_120 the 1024 reasoning -\u003e call"
+ },
+ {
+  "id": "words_11",
+  "text": "stream the model ( of it's stream -- GLM ; , it's \t . and stream request : . don't    -- \n \"quoted\" \"quoted\" 1024"
+ },
+ {
+  "id": "words_12",
+  "text": "value , ( \"quoted\" sm_120 x86-64 server Hello World ) \"quoted\" server sm_120 ) model and of server ) , the the 1024 stream ; request tool value reasoning GLM value \t tool \"quoted\" stream reasoning , tokenizer stream -\u003e request it's -- \t and \"quoted\"    1024 1024 x86-64 stream \n : ( request \"quoted\" == request sm_120 value value stream reasoning ( . 3.5 it's tool ( 3.5 3.5 sm_120 the"
+ },
+ {
+  "id": "words_13",
+  "text": "\n -- World    call : call and Hello ) the it's model call ; request GLM value ( and == -\u003e Hello request 1024 == == -- 1024 reasoning request and request ) \"quoted\" World server call server it's and it's ; , -- Flash and sm_120 \t \n == . ) ( value server Hello ; -\u003e value    ( tokenizer -\u003e 1024 reasoning : Hello ( ( == , tokenizer . server Hello value 1024 sm_120 -\u003e : ) tokenizer Hello call Hello \"quoted\" call sm_120 1024 value"
+ },
+ {
+  "id": "words_14",
+  "text": "and \"quoted\" and . x86-64 3.5 x86-64 GLM Hello the model World it's the Flash don't ; -\u003e : ( don't stream ; the 3.5    and ) x86-64 \t \t \t \"quoted\" 3.5 ) it's server tokenizer \n -\u003e it's ( Hello"
+ },
+ {
+  "id": "words_15",
+  "text": "GLM tokenizer ; \n it's GLM tokenizer 1024 sm_120 it's ; request \t tokenizer reasoning value ) model ; sm_120 ; 3.5 \n model ;    tool 1024 tool == -- call model \n    , , and model Hello ( \"quoted\" \"quoted\" x86-64 sm_120 Hello value of it's -\u003e don't Flash 3.5 x86-64 value    -- value \n \t"
+ },
+ {
+  "id": "words_16",
+  "text": "reasoning GLM call -\u003e \"quoted\" sm_120 : \"quoted\" of \n GLM .    . server don't 1024 \"quoted\" . tokenizer , == of    3.5 -\u003e \"quoted\" stream \"quoted\" stream Hello \t call ) Hello -\u003e reasoning . the Flash -\u003e call request call reasoning x86-64 \n 1024 of \"quoted\" reasoning value ( don't 1024 request Hello"
+ },
+ {
+  "id": "words_17",
+  "text": "; tokenizer value : World and , request it's stream stream Flash don't and Flash ) value ( 3.5    , call , and tool Hello . GLM of server -- 1024 ) ) of Flash ) . server    -- don't don't tokenizer reasoning don't Hello : : ; -\u003e model tool tokenizer . Flash sm_120 reasoning World value value don't stream"
+ },
+ {
+  "id": "words_18",
+  "text": "the the Hello the tool 3.5 reasoning stream World : \"quoted\" 3.5 model 3.5 tool tokenizer server : \"quoted\" Hello GLM Hello Flash    request x86-64 == model request Hello tool tokenizer it's 3.5 tool \t"
+ },
+ {
+  "id": "words_19",
+  "text": "   and request \"quoted\" \t don't tokenizer 3.5 of \"quoted\" and sm_120 , ) call \"quoted\" sm_120 1024 it's x86-64 call request GLM ; ( don't the ( ; ( tool sm_120 ; request Hello == request don't \t x86-64 don't 3.5 it's : the ; : it's 1024 Flash of ==    ( 3.5 GLM Hello stream Hello \n x86-64 , == and it's . : == ; request model the ; it's 3.5 the"
+ },
+ {
+  "id": "base64_blob",
+  "text": "jbyVsNclKOh8NwxTxmp1GLD/qP+2TSULS56pDPVTxS3ZjfTL6A1U6JJTHG6T3KbbPbdFNFMh1wqUoFhOpA5v7fHvxwvmydFk6atecf7syMJW3hNhV+s7pXjK6OsbST0DSoTpktDFzXrkTTJm/tjVhdjqh3n6dWb/F/crAeMEjDosCi6oKoEt7fn8GtyNoGrYHcDgzFoVLyJBOvq9FMn07DrsUi1qfj+WiAxUi4Vd09OQu5BwapwIGvjMPINNO6sjymobuuJVNrIyFWGt3dpfv6DcC2iNxyuAv/8TDSqyRWcT1qNrdSTqfR8c1aSHgsX2aHjzKZzoSqgScN8XbkkoaHQgVyQ0I3a1IRz7kecZ5qyyD9EJ+Zb5Jq5kG930nS18ulQfV9WQdl0R/zkfUNDC3lIANoSraesxReCDbN6vk8a+U03b8U/bt2Lu3vlyPejJErdzzGUS6N9wSxbH49ZsZPA3S2eDV7IJMv93r+zrFmcrnQ2jRqk76JF9QyA+tcLVKktlCn/B66kR6zzoKbc0VhPoEJSWGBW6gHPkaXiqHQlPH7QCiqY2uF+4xXwu9R3LOgbpYs4fXtFz+mpo5PC/zFu1"
+ }
+]

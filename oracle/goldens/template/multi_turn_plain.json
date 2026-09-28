@@ -1,0 +1,53 @@
+{
+ "name": "multi_turn_plain",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "content": "Hello! How can I help?"
+  },
+  {
+   "role": "user",
+   "content": "Tell me a joke."
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eHi\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eHello! How can I help?\u003c|user|\u003eTell me a joke.\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  13041,
+  154828,
+  154841,
+  154842,
+  9703,
+  0,
+  2585,
+  646,
+  358,
+  1492,
+  30,
+  154827,
+  40229,
+  752,
+  264,
+  21594,
+  13,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eHi\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eHello! How can I help?\u003c|user|\u003eTell me a joke.\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

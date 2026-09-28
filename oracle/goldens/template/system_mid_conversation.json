@@ -1,0 +1,45 @@
+{
+ "name": "system_mid_conversation",
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "system",
+   "content": "Now answer in French."
+  },
+  {
+   "role": "user",
+   "content": "b"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003ea\u003c|system|\u003eNow answer in French.\u003c|user|\u003eb\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  64,
+  154826,
+  7039,
+  4226,
+  304,
+  8584,
+  13,
+  154827,
+  65,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003ea\u003c|system|\u003eNow answer in French.\u003c|user|\u003eb\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

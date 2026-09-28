@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use crate::dialect::{Dialect, ParseResult, ParsedCall, StreamTags};
-use crate::engine::{Engine, GenerateOutcome, GenerateParams};
+use crate::engine::{Engine, GenerateOutcome, GenerateParams, PromptOptions};
 use crate::http::{self, json_response, Response};
 use crate::json::{self, Json};
 use crate::types::{self, ApiError, ChatRequest, Tool, ToolCall, MODEL_ID};
@@ -20,7 +20,10 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
         return Err(ApiError::bad_request("this server has no image encoder; image parts are rejected"));
     }
 
-    let prompt_tokens = engine.tokenize(&req.messages, &req.tools, req.enable_thinking);
+    // The thinking switch: the request's, else the dialect's default (the chat template's).
+    let thinking = req.enable_thinking.unwrap_or_else(|| dialect.default_thinking());
+    let opts = PromptOptions { thinking, reasoning_effort: req.reasoning_effort.clone(), clear_thinking: req.clear_thinking };
+    let prompt_tokens = engine.tokenize_prompt(&req.messages, &req.tools, &opts);
     if let Some(max) = engine.max_context() {
         if prompt_tokens >= max {
             return Err(ApiError::bad_request(format!(
@@ -28,7 +31,7 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
             )));
         }
     }
-    let prompt = engine.render_chat(&req.messages, &req.tools, req.enable_thinking);
+    let prompt = engine.render_prompt(&req.messages, &req.tools, &opts);
     let params = GenerateParams {
         max_tokens: req.max_tokens.unwrap_or(65_536) as usize,
         temperature: req.temperature.unwrap_or(0.0),
@@ -37,7 +40,7 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
         min_p: req.min_p.unwrap_or(0.0),
         seed: req.seed,
         stop: req.stop.clone(),
-        thinking: req.enable_thinking,
+        thinking,
         cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
         images: req.images.clone(),
         place: Default::default(),
@@ -80,7 +83,7 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
         // cap is a coordinator policy, off in the API by default (a request may
         // legitimately call more than the storm cap, e.g. the 7-tool replay_exact).
         let cap = 0;
-        let parsed = dialect.parse(&outcome.text, &req.tools, req.enable_thinking, cap);
+        let parsed = dialect.parse(&outcome.text, &req.tools, thinking, cap);
         if let Some(e) = parsed.error {
             return Err(ApiError::bad_request(format!("tool call parse error: {e}")));
         }

@@ -98,6 +98,18 @@ pub struct GenerateOutcome {
     pub completion_tokens: usize,
 }
 
+/// A request's chat-template switches beyond its messages and tools, for
+/// [`Engine::render_prompt`] and [`Engine::tokenize_prompt`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PromptOptions {
+    /// The thinking switch: the request's, else the dialect's default.
+    pub thinking: bool,
+    /// `reasoning_effort` as the client sent it; the chat template decides what it means.
+    pub reasoning_effort: Option<String>,
+    /// `clear_thinking`: drop the reasoning of assistant turns before the last user message.
+    pub clear_thinking: Option<bool>,
+}
+
 /// A model backend. All methods are `&self` so a single engine serves many
 /// concurrent connections without interior synchronization.
 pub trait Engine {
@@ -106,6 +118,18 @@ pub trait Engine {
 
     /// Render the chat into the model's native input (chat template).
     fn render_chat(&self, messages: &[ChatMessage], tools: &[Tool], thinking: bool) -> String;
+
+    /// Token count of the prompt rendered with all of the request's template options (the API
+    /// calls this). Default: [`Engine::tokenize`] with the thinking switch alone.
+    fn tokenize_prompt(&self, messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> usize {
+        self.tokenize(messages, tools, opts.thinking)
+    }
+
+    /// The prompt rendered with all of the request's template options (the API calls this).
+    /// Default: [`Engine::render_chat`] with the thinking switch alone.
+    fn render_prompt(&self, messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> String {
+        self.render_chat(messages, tools, opts.thinking)
+    }
 
     /// The longest request (prompt plus output) this deployment can hold, when it
     /// is bounded (the coordinator's KV pool); prompts at or over it are refused

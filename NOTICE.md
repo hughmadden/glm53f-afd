@@ -11,7 +11,7 @@ authors under their own terms.
 ## mimo26f-afd: MIT
 
 - **Source:** <https://github.com/hughmadden/mimo26f-afd> v1.2.0 (`bab9fa2`). Copyright (c) 2026 Turquoise Bay AI Pty Ltd.
-- **What was taken:** the wire codec (`crates/glm53f-wire`), the RDMA RC transport (`crates/glm53f-rdma`), and the OpenAI-compatible API with its MiMo tool-call parser as the reference dialect and that parser's goldens (`crates/glm53f-api`). Each crate's `PROVENANCE.md` lists the files, digests and changes.
+- **What was taken:** the wire codec (`crates/glm53f-wire`), the RDMA RC transport (`crates/glm53f-rdma`), the OpenAI-compatible API with its MiMo tool-call parser as the reference dialect and that parser's goldens (`crates/glm53f-api`), and the BPE tokenizer, adapted (`crates/glm53f-tokenizer`). Each crate's `PROVENANCE.md` lists the files, digests and changes.
 - **Licence:** the same MIT terms and holder as this repository's [LICENSE](LICENSE).
 
 ## DS41RT: MIT

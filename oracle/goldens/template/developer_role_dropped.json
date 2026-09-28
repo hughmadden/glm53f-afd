@@ -1,0 +1,33 @@
+{
+ "name": "developer_role_dropped",
+ "messages": [
+  {
+   "role": "developer",
+   "content": "Developer instructions."
+  },
+  {
+   "role": "user",
+   "content": "q"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eq\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  80,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eq\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

@@ -1,0 +1,15 @@
+{
+ "generator": "oracle/tokenizer_goldens.py",
+ "tokenizers": "0.23.2",
+ "transformers": "5.17.0",
+ "python": "3.12.3",
+ "image": "sha256:8344d4bd3f0a",
+ "files": {
+  "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+  "tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"
+ },
+ "encode": "Tokenizer.encode(text, add_special_tokens=False) (True gives the same ids for every case)",
+ "decode": "Tokenizer.decode(ids, skip_special_tokens=False|True)",
+ "cases": 120,
+ "decode_cases": 300
+}

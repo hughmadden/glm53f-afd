@@ -1,0 +1,42 @@
+{
+ "name": "system_user",
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a helpful assistant."
+  },
+  {
+   "role": "user",
+   "content": "Hi there."
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|system|\u003eYou are a helpful assistant.\u003c|user|\u003eHi there.\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154826,
+  2610,
+  525,
+  264,
+  10945,
+  17821,
+  13,
+  154827,
+  13041,
+  1052,
+  13,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|system|\u003eYou are a helpful assistant.\u003c|user|\u003eHi there.\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

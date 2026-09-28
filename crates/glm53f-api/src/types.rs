@@ -106,6 +106,11 @@ pub struct ChatMessage {
     /// Flattened text content (after media validation).
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// An assistant turn's reasoning as the client carries it back (`reasoning_content`, else
+    /// `reasoning`); chat templates that keep reasoning in history render it.
+    pub reasoning_content: Option<String>,
+    /// The call a tool result answers (`tool_call_id`); templates order results by it.
+    pub tool_call_id: Option<String>,
 }
 
 /// Sampling/control parameters decoded from the request.
@@ -125,7 +130,17 @@ pub struct ChatRequest {
     pub stop: Vec<String>,
     pub stream: bool,
     pub include_usage: bool,
-    pub enable_thinking: bool,
+    /// The request's thinking switch, the first of: `chat_template_kwargs.enable_thinking`,
+    /// top-level `enable_thinking`, `thinking.type` (`disabled` is off, any other type on), and
+    /// `reasoning_effort: "none"` (off). `None` when the request says nothing: the dialect's
+    /// default applies ([`crate::Dialect::default_thinking`]).
+    pub enable_thinking: Option<bool>,
+    /// `reasoning_effort` (top level, else `chat_template_kwargs`), as sent: the chat template
+    /// decides what a value means.
+    pub reasoning_effort: Option<String>,
+    /// `clear_thinking` (`chat_template_kwargs`, else `thinking`): drop the reasoning of assistant
+    /// turns before the last user message, where the template supports it.
+    pub clear_thinking: Option<bool>,
     pub parallel_tool_calls: bool,
     /// Decoded images in prompt order (perf reset V2); each stands in a message as an image marker.
     pub images: Vec<std::sync::Arc<crate::engine::ImageInput>>,
@@ -246,7 +261,10 @@ fn parse_message(v: &Json, images: &mut Images<'_>) -> Result<ChatMessage, ApiEr
             tool_calls.push(ToolCall { id, r#type: "function".into(), name, arguments });
         }
     }
-    Ok(ChatMessage { role, content, tool_calls })
+    let text = |key: &str| v.get(key).and_then(|x| x.as_str());
+    let reasoning_content = text("reasoning_content").or_else(|| text("reasoning")).map(clean);
+    let tool_call_id = text("tool_call_id").map(|s| s.to_string());
+    Ok(ChatMessage { role, content, tool_calls, reasoning_content, tool_call_id })
 }
 
 fn parse_tool(v: &Json) -> Result<Tool, ApiError> {
@@ -340,8 +358,17 @@ impl ChatRequest {
         let stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         let include_usage = body.get("stream_options")
             .and_then(|so| so.get("include_usage")).and_then(|u| u.as_bool()).unwrap_or(false);
-        let enable_thinking = body.get("chat_template_kwargs")
-            .and_then(|k| k.get("enable_thinking")).and_then(|t| t.as_bool()).unwrap_or(false);
+        let kwargs = body.get("chat_template_kwargs");
+        let thinking = body.get("thinking");
+        let reasoning_effort = body.get("reasoning_effort").and_then(|r| r.as_str())
+            .or_else(|| kwargs.and_then(|k| k.get("reasoning_effort")).and_then(|r| r.as_str()))
+            .map(|s| s.to_string());
+        let enable_thinking = kwargs.and_then(|k| k.get("enable_thinking")).and_then(|t| t.as_bool())
+            .or_else(|| body.get("enable_thinking").and_then(|t| t.as_bool()))
+            .or_else(|| thinking.and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(|t| t != "disabled"))
+            .or_else(|| (reasoning_effort.as_deref() == Some("none")).then_some(false));
+        let clear_thinking = kwargs.and_then(|k| k.get("clear_thinking")).and_then(|c| c.as_bool())
+            .or_else(|| thinking.and_then(|t| t.get("clear_thinking")).and_then(|c| c.as_bool()));
         let parallel_tool_calls = body.get("parallel_tool_calls").and_then(|p| p.as_bool()).unwrap_or(true);
 
         Ok(ChatRequest {
@@ -358,6 +385,8 @@ impl ChatRequest {
             stream,
             include_usage,
             enable_thinking,
+            reasoning_effort,
+            clear_thinking,
             parallel_tool_calls,
             images: images.out,
         })

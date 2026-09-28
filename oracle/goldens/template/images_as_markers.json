@@ -1,0 +1,62 @@
+{
+ "name": "images_as_markers",
+ "messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Compare "
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,AAAA"
+     }
+    },
+    {
+     "type": "text",
+     "text": " and "
+    },
+    {
+     "type": "image",
+     "image": "data:image/png;base64,BBBB"
+    },
+    {
+     "type": "text",
+     "text": "."
+    }
+   ]
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eCompare \u003c|begin_of_image|\u003e\u003c|image|\u003e\u003c|end_of_image|\u003e and \u003c|begin_of_image|\u003e\u003c|image|\u003e\u003c|end_of_image|\u003e.\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  27283,
+  220,
+  154830,
+  154854,
+  154831,
+  323,
+  220,
+  154830,
+  154854,
+  154831,
+  13,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eCompare \u003c|begin_of_image|\u003e\u003c|image|\u003e\u003c|end_of_image|\u003e and \u003c|begin_of_image|\u003e\u003c|image|\u003e\u003c|end_of_image|\u003e.\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

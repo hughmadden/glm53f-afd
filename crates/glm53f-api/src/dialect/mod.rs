@@ -8,11 +8,13 @@
 //! engine's `render_chat` and the dialect must describe the same template.
 //!
 //! [`mimo::MimoDialect`] is the reference implementation (MiMo-V2.6-Flash, from
-//! mimo26f-afd v1.2.0). GLM-5.3-Flash's dialect is written against this trait
-//! and passed to [`crate::serve`] in its place.
+//! mimo26f-afd v1.2.0). [`glm::GlmDialect`] is GLM-5.3-Flash's, written against
+//! this trait and passed to [`crate::serve`] in its place.
 
+pub mod glm;
 pub mod mimo;
 
+pub use glm::GlmDialect;
 pub use mimo::MimoDialect;
 
 use crate::json::Json;
@@ -71,6 +73,12 @@ pub trait Dialect: Send + Sync {
     /// first closing tag as reasoning too. Default: no.
     fn reasoning_first(&self, thinking: bool) -> bool {
         let _ = thinking;
+        false
+    }
+
+    /// The thinking switch when a request does not set one (its chat template's default).
+    /// Default: off.
+    fn default_thinking(&self) -> bool {
         false
     }
 }

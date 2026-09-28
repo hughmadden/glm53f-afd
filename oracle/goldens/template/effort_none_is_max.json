@@ -1,0 +1,37 @@
+{
+ "name": "effort_none_is_max",
+ "messages": [
+  {
+   "role": "user",
+   "content": "What is the weather in Paris?"
+  }
+ ],
+ "tools": null,
+ "kwargs": {
+  "reasoning_effort": "none"
+ },
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eWhat is the weather in Paris?\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  3838,
+  374,
+  279,
+  9101,
+  304,
+  12089,
+  30,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eWhat is the weather in Paris?\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

@@ -1,0 +1,33 @@
+{
+ "name": "user_whitespace_kept",
+ "messages": [
+  {
+   "role": "user",
+   "content": "  padded\n\n question  \n"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003e  padded\n\n question  \n\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  220,
+  43617,
+  271,
+  3405,
+  2303,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003e  padded\n\n question  \n\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

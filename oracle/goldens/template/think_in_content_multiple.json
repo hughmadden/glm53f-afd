@@ -1,0 +1,45 @@
+{
+ "name": "think_in_content_multiple",
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  },
+  {
+   "role": "assistant",
+   "content": "pre\u003cthink\u003ea\u003cthink\u003eb\u003c/think\u003emid\u003c/think\u003etail"
+  },
+  {
+   "role": "user",
+   "content": "q2"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eq\u003c|assistant|\u003e\u003cthink\u003eb\u003c/think\u003etail\u003c|user|\u003eq2\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  80,
+  154828,
+  154841,
+  65,
+  154842,
+  14576,
+  154827,
+  80,
+  17,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eq\u003c|assistant|\u003e\u003cthink\u003eb\u003c/think\u003etail\u003c|user|\u003eq2\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

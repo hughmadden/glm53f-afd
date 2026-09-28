@@ -44,4 +44,18 @@ to mimo26f-afd's design records and are kept verbatim as provenance.
 |---|---|---|
 | src/dialect/mod.rs | The `Dialect` trait and `StreamTags`; `ParsedCall` and `ParseResult`, moved verbatim from mimo26f-afd's `src/parser.rs`. | 2026-09-28 |
 | tests/acceptance.rs (end) | `reasoning_opened_by_the_prompt_streams_as_reasoning`: a test-local dialect whose prompt opens the reasoning block (as GLM-5.3-Flash's template does); streamed reasoning and content match the non-stream parse. | 2026-09-28 |
+| src/dialect/glm.rs | `GlmDialect`, GLM-5.3-Flash's completion markup: reasoning first when the prompt opened the think block (`reasoning_first(thinking) = thinking`), thinking on by default; the tool-call envelope read in the order the streaming splitter walks it; argument values typed by the tool's JSON schema, inverting the chat template (a string property keeps its text exactly; other values are JSON when the schema allows); every loss reported, a nameless call with arguments an error, the tool-call cap. Written here; the tool-call format and the schema-typed values follow the GLM-5.3-Flash chat template (sha256 `0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5`) and were cross-read with tpurtell/glmrt-5.3-1rtx-4spark @ `dc6d9b8` : `rust/crates/glmrt-api/src/tooling.rs` (sha256 `cb657995662cbca79bbb2515f822de2d8d3e14ec11a7987d185a61db38eed93f`), no code copied. Tests in the file: parser cases (reasoning, parallel calls, nested JSON, strings holding tags, malformed calls, cap, schema typing, template round trip), request-field mapping, two server tests (a call split across stream deltas; thinking off end to end) and a source-hygiene check. | 2026-09-28 |
 | PROVENANCE.md | This ledger. | 2026-09-28 |
+
+## Changed here (the GLM dialect and its request fields)
+
+Additive changes to the imported files, so a GLM engine gets the request's thinking switch,
+reasoning effort, `clear_thinking` and the history fields its chat template reads. The MiMo
+dialect's behaviour is unchanged (its default thinking stays off).
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/dialect/mod.rs | Registers `glm` (`GlmDialect` re-exported); new trait method `Dialect::default_thinking` (default off) | glm.rs tests | 2026-09-28 |
+| src/types.rs | `ChatMessage` gains `reasoning_content` (from `reasoning_content`, else `reasoning`; image-marker characters removed as from content) and `tool_call_id`. `ChatRequest::enable_thinking` becomes `Option<bool>`, the first of `chat_template_kwargs.enable_thinking`, top-level `enable_thinking`, `thinking.type` (`disabled` off, any other type on) and `reasoning_effort: "none"` (off); new `reasoning_effort` (top level, else `chat_template_kwargs`) and `clear_thinking` (`chat_template_kwargs`, else `thinking`) | glm.rs `request_fields_map_to_the_template_switches` | 2026-09-28 |
+| src/engine.rs | New `PromptOptions` (thinking, reasoning effort, clear_thinking); new `Engine::render_prompt` and `Engine::tokenize_prompt`, defaulting to `render_chat` and `tokenize` with the thinking switch alone, so existing engines are unchanged | glm.rs server tests; tests/acceptance.rs | 2026-09-28 |
+| src/chat.rs | The thinking switch is the request's, else `Dialect::default_thinking`; the handler calls `render_prompt` and `tokenize_prompt` with the request's options, and passes the resolved switch to generation and parsing | glm.rs server tests; tests/acceptance.rs | 2026-09-28 |

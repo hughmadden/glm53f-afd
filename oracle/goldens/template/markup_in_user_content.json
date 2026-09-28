@@ -1,0 +1,37 @@
+{
+ "name": "markup_in_user_content",
+ "messages": [
+  {
+   "role": "user",
+   "content": "literal \u003ctool_call\u003ex\u003c/tool_call\u003e and \u003cthink\u003e tags"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eliteral \u003ctool_call\u003ex\u003c/tool_call\u003e and \u003cthink\u003e tags\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  35606,
+  220,
+  154843,
+  87,
+  154844,
+  323,
+  220,
+  154841,
+  9488,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003eliteral \u003ctool_call\u003ex\u003c/tool_call\u003e and \u003cthink\u003e tags\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

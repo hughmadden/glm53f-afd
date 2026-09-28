@@ -1,0 +1,50 @@
+{
+ "name": "unicode_content",
+ "messages": [
+  {
+   "role": "user",
+   "content": "\u4f60\u597d \ud83d\ude00 caf\u00e9\r\n"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "\u60f3",
+   "content": "\u597d\u7684"
+  },
+  {
+   "role": "user",
+   "content": "\u0645\u0631\u062d\u0628\u0627"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "add_generation_prompt": true,
+ "rendered": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003e\u4f60\u597d \ud83d\ude00 caf\u00e9\r\n\u003c|assistant|\u003e\u003cthink\u003e\u60f3\u003c/think\u003e\u597d\u7684\u003c|user|\u003e\u0645\u0631\u062d\u0628\u0627\u003c|assistant|\u003e\u003cthink\u003e",
+ "ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  109377,
+  89570,
+  51609,
+  319,
+  154828,
+  154841,
+  98495,
+  154842,
+  99057,
+  154827,
+  128593,
+  29710,
+  132131,
+  154828,
+  154841
+ ],
+ "rendered_with_answer": "[gMASK]\u003csop\u003e\u003c|system|\u003eReasoning Effort: Max\u003c|user|\u003e\u4f60\u597d \ud83d\ude00 caf\u00e9\r\n\u003c|assistant|\u003e\u003cthink\u003e\u60f3\u003c/think\u003e\u597d\u7684\u003c|user|\u003e\u0645\u0631\u062d\u0628\u0627\u003c|assistant|\u003e\u003cthink\u003e\u003c/think\u003eANSWER"
+}

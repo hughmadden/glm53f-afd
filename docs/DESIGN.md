@@ -104,6 +104,7 @@ no deployment-specific details in it.
 | Host RAM tier | **M** K3 (the DS41RT on-evict design) with least-recently-used eviction | Snapshots include the 141 MiB KDA state | — |
 | API | **M** (OpenAI chat, SSE, tools, reasoning, stop strings in the engine, bounded queue with 429) + **G** (GLM chat template; tool-call format; reasoning split on think tokens) | — | — |
 | Constrained output | **D** (XGrammar masks on the native path) | GLM tool-call grammar | — |
+| Tokenizer and chat template | **M**'s BPE tokenizer, adapted; a hand-written renderer of the checkpoint's `chat_template.jinja` | Exact against the reference tokenizer and 48 rendered template cases; the renderer refuses any other template revision | — |
 | Vision | **M** (image decode crate) + **R** `glm5_next` vision tower (24 layers, 1,024 hidden, patch 14, merge 2) | New encoder kernels, as MiMo's were | Later phase |
 | Console and statistics | **D** v15 (`/` console over a WebSocket, `/v1/stats`) | — | Optional |
 | Test and benchmark harness | **M** (API contract rows, needle ladder, sampling checks, cache-pressure test) | GLM prompts and tool markup | Oracle and goldens (§9) |
@@ -221,6 +222,17 @@ to about C1 throughput. This design rules that out.
    - reasoning lost on a later turn;
    - UTF-8 split across tokens;
    - stop strings ending inside a draft block.
+
+### Thinking switch and reasoning history
+
+- **Thinking is on by default**, as the checkpoint's template renders it: the prompt ends with
+  `<|assistant|>` followed by an opened think tag.
+- **The template has no off switch.** A request that turns thinking off (`enable_thinking` false,
+  `thinking.type` "disabled", or `reasoning_effort` "none") ends the prompt with an empty think
+  block instead. That is the form the template itself writes for an assistant turn without
+  reasoning.
+- **Earlier turns keep their reasoning** unless the request sets `clear_thinking`. Re-rendering the
+  history unchanged is what lets a follow-up turn resume from the previous turn's snapshot.
 
 ## 10. Configuration and deployment
 

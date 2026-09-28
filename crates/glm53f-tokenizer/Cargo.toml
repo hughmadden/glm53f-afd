@@ -1,0 +1,25 @@
+# glm53f-tokenizer: GLM-5.3-Flash's tokenizer and chat template, std-only.
+#
+# - Tokenizer: the checkpoint's tokenizer.json (byte-level BPE: 154,820 vocabulary
+#   tokens, 321,649 merges, 36 added tokens), reproduced exactly: the pre-tokenizer regex with
+#   character classes probed from the reference, `ignore_merges`, the reference's
+#   merge order, added-token splitting, decode and a UTF-8-safe streaming decoder.
+# - Chat template: a hand-written renderer of chat_template.jinja.
+#
+# Both are checked against goldens recorded from the reference `tokenizers` and
+# `transformers` (oracle/tokenizer_goldens.py, oracle/template_goldens.py). The
+# tests that need tokenizer.json read its path from GLM53F_TOKENIZER and skip
+# while it is unset. Adapted from mimo26f-afd v1.2.0 (PROVENANCE.md).
+
+[package]
+name = "glm53f-tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "GLM-5.3-Flash tokenizer (exact tokenizer.json BPE, streaming decode) and chat-template renderer"
+publish = false
+
+[lib]
+name = "glm53f_tokenizer"
+path = "src/lib.rs"
+
+[dependencies]
