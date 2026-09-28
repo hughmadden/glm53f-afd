@@ -85,10 +85,11 @@ alone. Their figures are as they report them; they were not re-run here.
 | | [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark) | [mmastrac](https://github.com/mmastrac/glm-5.3-flash-4x-gx10) (branch `perf-2026-09-27`) | This engine |
 |---|---|---|---|
 | Single stream (tok/s) | ~55 | 167.2 / 118.7 / 64.4 (structured / code / prose) | 186.1 / 142.3 / 78.3 in the same mode |
-| Aggregate (tok/s) | 530 at 48 streams | 253 at 16 streams | 316–326 at 16; 601 at 48 (48 slots) |
+| Aggregate (tok/s) | 530 at 48 streams | 253 at 16 streams | 316–326 at 16; 601 at 48 (48 slots), with one prompt topic on every stream (see below) |
 | Prefill (tok/s) | 3.5–4.1K short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | 4.1K at 4K–79K; 5.2K with an opt-in pair |
 | Context | 1M | 512K | 1M (16 slots); 851K at 48 slots |
 
+- **The aggregate row is not like for like yet.** This engine's concurrency probe sends the same prompt topic on every stream, and streams that route to the same experts read fewer expert weights per step: at 41 rows a step read 103 of the experts, where independent routing would touch about 197. The other recipes' figures use a different prompt per stream. Expect lower aggregates on mixed traffic, by an unmeasured margin: a re-measurement with per-stream prompts is pending.
 - **The single-stream row is like for like.** This engine ran mmastrac's own `dev/repro/decode.py`
   prompts and method: 512 tokens, temperature 0, the median of three runs after a warm-up, tok/s
   including the time to the first token.

@@ -50,6 +50,8 @@ In the matched mode this engine is 11% / 20% / 22% faster, with 4-bit experts th
 
 **Concurrency, aggregate** (tok/s; 400-token streams, DFlash2 τ 0.7):
 
+**Caveat:** every stream here asks about the same topic. Streams that route alike share expert reads: 103 experts per exchange at 41 rows, against about 197 under independent routing. So these aggregates are optimistic for mixed traffic by an unmeasured margin (an estimate from routing diversity puts C48 20–31% high). The public recipes' concurrency figures use a prompt per stream; a like-for-like re-measurement is pending.
+
 | Streams | 16 slots, 29 Sep (copy windows off) | 16 slots, `--decode-lanes 2-16` (now the default) | 48 slots, D8, four prefill lanes, 29 Sep | 16 slots, 28 Sep | 48 slots, 28 Sep |
 |---|---:|---:|---:|---:|---:|
 | C2 | 107.7 | **116.2** | — | — | — |
