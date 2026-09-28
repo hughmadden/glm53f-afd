@@ -52,6 +52,15 @@ themselves instead, and each returns a quarter of the rows
     untested without a fabric; the receive slots that queue the prefill
     lanes' requests are tested on the CPU against a model of the receive
     queue).
+- **Update (29 September 2026).** Both items above have since run on the
+  target hardware, except the peer mesh over RDMA:
+  - the kernels run on four Sparks, the kernel test passes there unchanged,
+    and the split kernels' options were swept there; `l2=2,pf=2,pdl=2` is now
+    the default of GB10 builds ([Measured on GB10](#measured-on-gb10));
+  - the coordinator's link runs over RDMA, with the whole model served by four
+    ranks (`docs/PERFORMANCE.md` §0);
+  - the peer mesh over RDMA is still built but untested (the reduce-scatter
+    stays off; [Open issues](#open-issues), item 5).
 
 Contents:
 
@@ -658,8 +667,10 @@ GLM53F_RANK_SMALL=pf=4,l2=2,pdl=2 GLM53F_RANK_MID=nt=1,l2=2 GLM53F_RANK_LARGE=mt
 
 # Once per rank: cut its share and serve it. --peers lists the four ranks' peer-mesh
 # addresses in rank order (the same list on every rank) for the prefill reduce-scatter.
-target/release/glm53f-rank slice --checkpoint <exl3-checkpoint> --rank R --out <rank-dir> --source "<repo>@<revision>"
-GLM53F_RDMA=1 target/release/glm53f-rank serve --rank R --dir <rank-dir> --listen <fabric-address>:8600 \
+# GLM53F_WIRE_NOCRC=1 as on the coordinator (its RDMA transport requires it); GLM53F_RDMA=1
+# here would also put the peer mesh on RDMA (built, untested).
+target-rank/release/glm53f-rank slice --checkpoint <exl3-checkpoint> --rank R --out <rank-dir> --source "<repo>@<revision>"
+GLM53F_WIRE_NOCRC=1 target-rank/release/glm53f-rank serve --rank R --dir <rank-dir> --listen <fabric-address>:8600 \
   --peers <fabric-0>:8601,<fabric-1>:8601,<fabric-2>:8601,<fabric-3>:8601
 ```
 
@@ -725,7 +736,8 @@ changes a bit.
   decode and verify window, reach 68–75% of it and the large-M kernel 86%.
 
 **What the table says about the split kernels** (arithmetic on the table;
-the conclusions are inferences until the options are swept on a Spark):
+the conclusions are inferences until the options are swept on a Spark, which
+the next table does):
 
 - **Their cost is per expert, not per call.** One row reads 8 expert blocks
   in 0.134 ms and two or three rows 15 in 0.254 ms: 17.1 µs an expert and no
@@ -1072,9 +1084,14 @@ bandwidth turns out to be the limit and the KL gate allows it.
    plan in the gate/up blocks and the split kernels' options (`pf`, `l2`,
    `ord`, `pdl`) are measured on the 4090 only, and `pdl`'s overlap not at
    all; the kernel test, the sweep and the defaults on GB10 are listed in
-   [On a Spark](#on-a-spark). The 4090 is a proxy.
+   [On a Spark](#on-a-spark). The 4090 is a proxy. *(29 September 2026: the
+   kernels have since run on GB10 and the split kernels' options were swept
+   there, `pdl` included in the timings though not measured apart: see
+   [Measured on GB10](#measured-on-gb10).)*
 2. **KL gates.** Three numerics choices need them:
-   - the wire's FP8 rows, where BF16 would be a protocol change;
+   - the wire's FP8 rows, where BF16 would be a protocol change (the engine's
+     gate runs on the target hardware include them and pass,
+     `docs/KL-GATE.md` §6a; no paired run against BF16 rows exists);
    - the BF16-rounded SwiGLU versus FP32 (`fp32_swiglu`);
    - the reduce-scatter's exchange dtype.
 3. **Channel order.** The EXL3 checkpoint reorders each expert's intermediate

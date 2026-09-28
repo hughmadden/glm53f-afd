@@ -475,4 +475,7 @@ kernel 2.2 µs).
 - **Precondition:** `index_select`'s `max_pools` must cover every row's visible
   pools; the host knows the positions, the kernel does not check them.
 - **sm_120 numbers** are not measured yet (the kernels use only sm_80/sm_89
-  instructions and build for `sm_120` unchanged).
+  instructions and build for `sm_120` unchanged). *(29 September 2026: the
+  kernels run on the RTX 5090 in the served model; a DSA layer's attention per
+  2,048-row prefill lane there, 9.66 ms, is in `docs/PERFORMANCE.md` §0. The
+  kernels' own benches have not been recorded there.)*

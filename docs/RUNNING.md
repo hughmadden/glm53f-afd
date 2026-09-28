@@ -16,9 +16,10 @@ weights, connects the same ranks and writes teacher-forced logits instead of ser
 The expert exchange runs over RoCE v2 RDMA, on a port of at least 100 Gb/s; both sides refuse
 other networks. The API can use any network.
 
-**Status.** The coordinator has run end to end against four rank daemons on one development GPU
-(an RTX 4090, `sm_89`) over TCP loopback. Its `sm_120` build compiles but has not yet run on an
-RTX 5090, and its RDMA path has not yet run on a fabric.
+**Status (29 September 2026).** The whole engine runs on its target hardware: the coordinator on
+an RTX 5090 and four ranks on DGX Sparks, over RDMA at 200 Gb/s ([PERFORMANCE.md](PERFORMANCE.md)
+§0). The development setup below (one GPU, four rank daemons over TCP loopback) still runs every
+model-path test.
 
 ## Build
 
@@ -55,7 +56,7 @@ Each binary runs only on the architecture it was built for; the rank checks this
   The whole checkpoint works too. To fetch only the coordinator's tensors:
 
   ```sh
-  scripts/fetch_tensors.py --repo zai-org/GLM-5.3-Flash --revision <sha> --out <coordinator-dir> --select nonexpert
+  python3 scripts/fetch_tensors.py --repo zai-org/GLM-5.3-Flash --revision <sha> --out <coordinator-dir> --select nonexpert
   ```
 
 - **Ranks:** each rank's share, cut from the EXL3 checkpoint into a rank directory (one image
@@ -66,7 +67,11 @@ Each binary runs only on the architecture it was built for; the rank checks this
   ```
 
   A rank directory holds about 38 GB (layers 3 to 44). All four ranks must be cut from the same
-  checkpoint.
+  checkpoint. The EXL3 K4 checkpoint is `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (mirrored at
+  `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`).
+
+- **Drafter** (optional, `--drafter`): the DFlash2 checkpoint `incoai/GLM-5.3-Flash-DFlash2`
+  (`config.json`, `model.safetensors`), on the coordinator.
 
 ## Start
 
@@ -112,8 +117,8 @@ describes each.
 
 ### Prefill lanes and device memory
 
-- **Lanes.** A prefill pass of `--prefill-rows` rows (4,096 by default) runs in
-  `--prefill-lanes` lanes (2 by default, up to 4): while the ranks compute one lane's routed
+- **Lanes.** A prefill pass of `--prefill-rows` rows (8,192 by default) runs in
+  `--prefill-lanes` lanes (4 by default, so lanes of 2,048 rows; 1 to 4): while the ranks compute one lane's routed
   experts, the GPU runs the next lanes' attention, the lanes in turn. Over RDMA one exchange per
   lane is in flight (the ranks queue the requests in their receive slots and compute them in
   order; a rank queues four by default, `--recv-slots`, and says so in the RDMA handshake); over
@@ -126,9 +131,9 @@ describes each.
   one-lane passes of the same rows would give them.
 - **Memory.** Nothing a pass, a draft or an append to the drafter's context uses is allocated
   after start-up. Snapshot marks (the KDA states
-  of a prompt or turn end, 141 MiB) take pages of the KV pool, which admission counts, so a
-  short pool evicts snapshots ([KV snapshots and the RAM tier](#kv-snapshots-and-the-ram-tier)),
-  skips a snapshot or refuses a request; it never runs the
+  of a prompt or turn end: 73 MiB with the default BF16 states, 141 MiB with `--kda-state-f32`) take
+  pages of the KV pool, which admission counts, so a short pool evicts snapshots ([KV snapshots and
+  the RAM tier](#kv-snapshots-and-the-ram-tier)), skips a snapshot or refuses a request; it never runs the
   device out of memory in a pass. The start-up log's `device memory` lines list the weights, the
   forward's buffers (each lane, verify, workspaces, GEMM), the drafter's weights, tap buffer,
   working memory and per-slot ring, the expert exchange, the slots' state, the pool (with the
@@ -140,7 +145,8 @@ describes each.
   so it changes timing only. It overlaps one lane's coordinator work with the other's routed
   experts, but each lane reads the coordinator's weights and the ranks read the experts each
   lane's rows name, so two lanes of many rows read most experts twice: measure it.
-- **Slots.** `--slots` (16 by default) sizes each slot's fixed state (181 MiB with the drafter)
+- **Slots.** `--slots` (16 by default) sizes each slot's fixed state (about 113 MiB with the
+  drafter and the default BF16 KDA states; 181 MiB with `--kda-state-f32`)
   and, with the drafter, the verify pass: every slot's window of 8 rows, capped by the step's row
   budget `GLM53F_SPEC_MAX_ROWS` (256 by default; the most likely drafts first), about 4.9 MiB a
   row. Both come out of the KV pool. The start-up log states the largest request the pool admits
@@ -255,9 +261,12 @@ GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 glm53f-score --checkpoint <coordinator-dir> \
 
 The gate runs both pass sizes (the prefill path, and 8 rows or fewer: the decode path);
 [KL-GATE.md](KL-GATE.md) section 4.3 has the whole sequence, from `klgate.py plan` to `compare`.
-The numerics under test (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
-`--kda-prefill-w8a8`, as `glm53f-serve` takes them) are scored the same way into their own directories and compared with the baseline at
-`--margin 0.002`; the engine line in every output names them.
+`glm53f-score` cuts a prefill pass into two lanes unless `--prefill-lanes` says otherwise (the
+coordinator's default is four). The numerics options (`--kda-fp8`, `--kda-state-bf16` or
+`--kda-state-f32`, `--prefill-w8a16`, `--kda-prefill-w8a8`, `--kda-chunked-prefill`, as
+`glm53f-serve` takes them; BF16 KDA states are the default in both binaries) are scored the same
+way into their own directories and compared with the baseline at `--margin 0.002`; the engine line
+in every output names them.
 `--experts local` runs the official FP8 experts on the coordinator's GPU instead of the ranks;
 `--dev-layers`, `--dev-load-layers` and `--experts zero` make a development run on one GPU, whose
 logits are meaningless.

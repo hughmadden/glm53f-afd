@@ -2,7 +2,9 @@
 
 **Status (28 September 2026): the gate has run on the target hardware, and both engine paths
 pass** (section 6a). The decode path scores 0.0245 nats against the BF16 teacher, equal within its
-standard error to the published figure for the same 4-bit experts.
+standard error to the published figure for the same 4-bit experts. On 29 September the numerics
+options were gated (section 6b): BF16 KDA states (D8) passed and are now the default; FP8 KDA
+projections (D2) failed.
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -113,7 +115,7 @@ Full digests are in [`harness/PROVENANCE-klgate.md`](../harness/PROVENANCE-klgat
 | EXL3 K6 experts | **0.013723** | 0.9656 (streaming lane) | 25 windows | third party |
 | BF16 replayed on a different stack (the floor) | 0.012712 | 0.9665 | 25 windows | third party, cross-stack |
 | BF16 through the streaming harness (that lane's floor) | 0.011506 | — | 25 windows | third party |
-| K4 on the author's production TP4 runtime, padded columns dropped | 0.030480, BCa 95% [0.024965, 0.037419] | 0.9467 | 25 windows | the author's `kld_eval` |
+| K4 on the author's TP4 serving runtime, padded columns dropped | 0.030480, BCa 95% [0.024965, 0.037419] | 0.9467 | 25 windows | the author's `kld_eval` |
 
 What this means for the gate:
 
@@ -268,7 +270,7 @@ routed experts as `glm53f-serve` does, and builds the forward as `glm53f-serve -
 
 ```text
 glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir>
-             [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1|2]
+             [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1-4]
              [--kda-chunked-prefill] [--fp8-act bf16|dynamic] [--no-promote-k32]
              [--kda-fp8] [--kda-state-bf16] [--prefill-w8a16] [--kda-prefill-w8a8]
 ```
@@ -291,9 +293,11 @@ ascending rows below the window's last token.
 2. The ids as they are: no BOS, no template.
 3. `score_each` with the plan's positions, in passes of `--pass-rows`: row r is the output at
    input position r, predicting token r + 1. No sampling, no drafting (DFlash and MTP off), no
-   grammar. At `--pass-rows 4096` a 2,048-token window is one pass in two lanes of 1,024 rows (the
-   forward of `glm53f-serve`'s default `--prefill-rows 4096 --prefill-lanes 2` cuts a 2,048-row
-   pass the same way); at `--pass-rows 8` it is 256 passes.
+   grammar. At `--pass-rows 4096` a 2,048-token window is one pass in two lanes of 1,024 rows
+   (`glm53f-score`'s default `--prefill-lanes 2`; until 29 September `glm53f-serve`'s default
+   `--prefill-rows 4096 --prefill-lanes 2` cut a 2,048-row pass the same way, and its default
+   since, `--prefill-rows 8192 --prefill-lanes 4`, cuts it into four lanes of 512); at
+   `--pass-rows 8` it is 256 passes.
 4. The rows streamed to the window's file as they come, then the slot released.
 
 **Output**, `<out>/<window_id>.safetensors` (written as `<window_id>.safetensors.partial` and
@@ -395,7 +399,9 @@ line.
   the target hardware; not measured there). On the development GPU (an RTX 4090; all 45 layers
   on repeats of layers 0-4, routed outputs of zeros, so no expert exchange), the whole plan ran
   in 20.4 s at `--pass-rows 4096` (0.7-0.9 s a window) and 136.8 s at `--pass-rows 8` (5.4 s a
-  window, about 21 ms a pass), model load included, each writing 2.93 GB.
+  window, about 21 ms a pass), model load included, each writing 2.93 GB. *Measured on the target
+  hardware since (section 6a): 23.8 s for the whole plan at 4,096 rows per pass and 279 s at 8,
+  after 4.3 s of loading.*
 - **Harness** (measured on the fetched subset with a stand-in engine): 37 ms per row per core
   (pure Python, float64), so **30 s** for the first gate's 4,725 rows with 8 processes (175 s of
   CPU); the teacher canary, twice the rows, 54 s. The full panel, 51,175 rows, is about 32 CPU

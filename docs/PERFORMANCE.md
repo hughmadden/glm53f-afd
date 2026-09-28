@@ -1,6 +1,6 @@
 # Expected performance
 
-**Status: measured and modelled (28 September 2026).** §0 gives the first
+**Status: measured and modelled (29 September 2026).** §0 gives the first
 measurements of the whole engine on its target hardware. The other sections are
 the model it was designed against, derived from published or measured numbers of
 related engines; they are kept so each derivation can be checked against §0.
@@ -121,7 +121,9 @@ Copied windows averaged 7.8 tokens with 97.1% of copied tokens kept.
 
 The restore itself took 21.4 ms. A 36K-token snapshot's store to RAM took 9.3 ms.
 
-**Against the public four-Spark recipes** (their READMEs' figures; this engine as above):
+**Against the public four-Spark recipes** (their reported figures; this engine as above). Both
+recipes run on four GB10 systems alone, with no RTX 5090, so the differences belong to the added
+GPU and this engine together:
 
 | Metric | [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark) (vLLM TP4, NVFP4) | mmastrac `perf-2026-09-27` (vLLM TP4, NVFP4) | This engine |
 |---|---|---|---|
@@ -132,6 +134,7 @@ The restore itself took 21.4 ms. A 36K-token snapshot's store to RAM took 9.3 ms
 
 - mmastrac's prefill takes 4-bit activations in its experts, which its own test puts 13–62% away from BF16 activations at the MoE output.
 - This engine's experts keep BF16 activations. Its KL against the BF16 teacher equals the published figure for its 4-bit expert checkpoint.
+- Sources, pinned: tonyd2wild's README at `2ac4e8d` (its 1M fp8 lane for the aggregate, the 114K prefill and the context). For mmastrac, the single-stream and 16-stream figures are those in the message of commit `3e03894` on `perf-2026-09-27`, and the prefill figures those of its `experimental/README.md` from `889a456`. That branch has moved on since: at `74faf89` the same file reports 170.3 / 120.8 / 65.8, 251.3 at 16 streams and 4,946 / 4,750 prefill.
 
 **Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
 in 44–49 s (§6).

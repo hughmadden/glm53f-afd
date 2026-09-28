@@ -1,5 +1,10 @@
 # Plan
 
+> **Note (29 September 2026).** This is the build plan as written before the code, kept as a
+> record. Phases 0 to 3 are built, except constrained output and a needle ladder beyond 79K
+> tokens; phase 4 is in part; phase 5 has not started. Current state: [README](../README.md) and
+> [PERFORMANCE.md](PERFORMANCE.md) §0.
+
 **Status: draft for discussion (28 September 2026).** Each phase ends at a gate
 with a measured receipt. Effort figures are rough, for a builder working with
 parallel helpers; the long pole is the new model kernels (KDA prefill, the k-pool

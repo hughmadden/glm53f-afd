@@ -295,9 +295,12 @@ measured acceptance.
 
 - The goldens use synthetic taps (the target is not run: its experts for layers beyond 4 are not
   in the oracle's subsets). The tap definition (step 1) comes from reading S, not from a numeric
-  comparison with a running target.
+  comparison with a running target. *(29 September 2026: on the whole model the drafter keeps
+  51–71% of its verified drafts; `docs/PERFORMANCE.md` §0.)*
 - One CUDA stream (its own, or the target forward's), no graphs, no fused kernels; the GEMMs are
   cuBLAS. Built and measured for
-  sm_89 only; sm_120 is untested.
+  sm_89 only; sm_120 is untested. *(29 September 2026: it also runs on the RTX 5090, `sm_120`, in
+  every drafted measurement of `docs/PERFORMANCE.md` §0; its kernels' own benches there are not
+  recorded.)*
 - The attention kernel supports up to 4 query heads per KV head; the kernels fix head size 128,
   block 8, 16 candidates and rank at most 1,024.

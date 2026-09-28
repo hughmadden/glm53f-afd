@@ -6,6 +6,13 @@ checkpoint byte counts are exact: they come from `config.json`, the
 safetensors headers of each checkpoint and the reference modeling code. Runtime
 and workspace figures are estimates, labelled as such.
 
+> **Note (29 September 2026).** Written before the engine; §10 was added as the options were
+> built. Since then the engine has run on its target hardware ([PERFORMANCE.md](PERFORMANCE.md)
+> §0), and the KL gate has decided two of the decisions below ([KL-GATE.md](KL-GATE.md) §6b):
+> D8 (BF16 KDA states) passed and is on by default, halving the per-slot KDA state of §3 to
+> 68 MiB; D2 (FP8 KDA projections) failed and stays off. The measured pools and largest requests
+> are in PERFORMANCE.md §0, and the coordinator's start-up log prints its own plan.
+
 Target: **GLM-5.3-Flash** (`zai-org/GLM-5.3-Flash`, architecture
 `glm5_next`) on **one RTX 5090 (32 GB)** coordinator and **four DGX Spark (GB10,
 128 GB unified memory)** expert ranks.
@@ -163,13 +170,13 @@ Each rank holds a quarter of every routed expert, split over the expert's
 | # | Decision | Options | Proposal |
 |---|---|---|---|
 | D1 | KV precision | FP8 528-B record · BF16 · (NVFP4) | **FP8.** 1M on every layout and twice the capacity. Published, on one window: 4-bit experts with an FP8 MLA cache score a KLD of 0.0246; with an NVFP4 cache 0.0548, a configuration that failed the card's task-level test, so NVFP4 is out. Gate: the engine's own 25-window KL against BF16 ([KL-GATE.md](KL-GATE.md)), plus a needle ladder to 1M. |
-| D2 | KDA projection weights | BF16 as shipped · our own FP8 | **Start BF16.** Measure FP8: +4.4 GiB of pool and about −2.7 ms per decode step, but the official checkpoint deliberately keeps these in BF16. *Built, off by default (`--kda-fp8`, §10): 4.26 GiB of weights less; awaits the KL gate.* |
+| D2 | KDA projection weights | BF16 as shipped · our own FP8 | **Start BF16.** Measure FP8: +4.4 GiB of pool and about −2.7 ms per decode step, but the official checkpoint deliberately keeps these in BF16. *Built, off by default (`--kda-fp8`, §10): 4.26 GiB of weights less. Failed the KL gate on 29 September (KL-GATE.md §6b); stays off.* |
 | D3 | Slots | 16 (2 lanes × 8) · 8 | **16**, as in the engines this borrows from. |
 | D4 | KDA snapshot cadence | prompt and turn only · plus every 32K | **Prompt and turn first.** Add periodic checkpoints if branch reuse shows up in real traffic. |
 | D5 | Request cap on the API | 1,048,576 · lower default | **1M,** with admission reserving prompt plus output allowance. |
 | D6 | Expert format on the Sparks | EXL3 K4 · EXL3 K6 · NVFP4 · FP8 | **EXL3 K4.** Published KLD is 0.0246 against 0.0206 for official FP8 (25 windows, offline, no KV-cache quantization), at half the bytes. K6 (0.0137) is the upgrade path; see [DESIGN.md](DESIGN.md) §5. |
 | D7 | Embedding table | GPU · host RAM | **Host RAM** (+1.18 GiB of pool). It costs a gather of M rows × 8 KB per step. |
-| D8 | KDA state precision | FP32 (reference) · BF16 | **FP32.** BF16 saves only 68 MiB per slot. *Built, off by default (`--kda-state-bf16`, §10): 3.19 GiB at 48 slots; measured drift in §10; awaits the KL gate.* |
+| D8 | KDA state precision | FP32 (reference) · BF16 | **FP32.** BF16 saves only 68 MiB per slot. *Built (`--kda-state-bf16`, §10): 3.19 GiB at 48 slots; measured drift in §10. Passed the KL gate on 29 September (KL-GATE.md §6b) and is **on by default** since; `--kda-state-f32` restores FP32.* |
 
 ## 10. D2, D8 and the prefill activations as built (28 September 2026)
 
@@ -177,6 +184,9 @@ Three numerics options (and a variant of the third), each **off by default** and
 `glm53f-serve` and `glm53f-score` (with an environment fallback). Each becomes a default only after the KL gate
 ([KL-GATE.md](KL-GATE.md) §6, `compare --margin 0.002` against the same engine without it) and
 speed runs on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
+*Outcome (29 September 2026, KL-GATE.md §6b): D8 passed and is now on by default; D2 failed;
+W8A16, alone or with the chunked KDA prefill, lowered the mean KL but could not yet be shown
+non-inferior on 25 windows, so it stays opt-in.*
 
 **D2, FP8 KDA projections** (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
 - At load, the fused q|k|v|b projection and `o_proj` of the 34 KDA layers are quantized on the

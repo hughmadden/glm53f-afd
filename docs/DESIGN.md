@@ -5,6 +5,25 @@ agree on before any engine code is written. Sizing is in
 [SIZING.md](SIZING.md), expected performance in [PERFORMANCE.md](PERFORMANCE.md),
 and the build order in [PLAN.md](PLAN.md).
 
+> **Note (29 September 2026).** The engine has since been built and measured on its target
+> hardware ([PERFORMANCE.md](PERFORMANCE.md) §0). This document is kept as the design; where
+> the build differs:
+> - **Lanes.** Prefill runs in up to four lanes, four of 2,048 rows by default. Decode and verify
+>   passes of 2 to 16 rows run in two lanes of whole requests (`--decode-lanes`), not in two
+>   fixed lanes of 8 slots.
+> - **KDA state precision (D8).** BF16 states passed the KL gate and are the default; FP32 is
+>   `--kda-state-f32`. FP8 KDA projections (D2) failed the gate.
+> - **Copy windows.** Greedy requests with the drafter verify spans copied from their own
+>   context in place of drafts (after mimo26f-afd v1.3.0, the idea TensorFold's).
+> - **Prefill return.** The ranks' reduce-scatter (§3, §4) is built, with a BF16 exchange, but
+>   off by default: over the ranks' TCP mesh it was slower than the four-plane return, and the
+>   RDMA mesh is untested.
+> - **Not built yet:** vision, the MTP drafter, constrained output (grammar masks exist in the
+>   sampler, but the API refuses a constrained `tool_choice`), and the console and `/v1/stats`.
+> - **Binaries** are `glm53f-serve` (the coordinator) and `glm53f-rank`. Their kernels are built
+>   for the architecture named by `GLM53F_CUDA_ARCH` ([RUNNING.md](RUNNING.md)), not the device
+>   found at build time.
+
 ## 1. Goal
 
 Serve **GLM-5.3-Flash** over an OpenAI-compatible API on **one RTX 5090 and four
@@ -173,7 +192,8 @@ four ranks must therefore always load the same checkpoint.
     reference, and the chunked kernel's KL is gated like any numerics change.
 - **Batching.** Rows from different requests share the projections. The recurrent
   part is per request: one block per (request, head).
-- **State precision.** FP32, as the reference keeps it (D8).
+- **State precision.** FP32, as the reference keeps it (D8). *(29 September 2026: BF16 states
+  passed the KL gate and are now the default.)*
 
 ## 7. Scheduling and batching
 

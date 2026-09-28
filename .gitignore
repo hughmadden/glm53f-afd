@@ -1,5 +1,6 @@
-# build outputs
+# build outputs (target-*: the per-feature target directories crates/glm53f-rank/README.md uses)
 /target/
+/target-*/
 /build*/
 /dist/
 *.o
@@ -12,9 +13,10 @@
 /scratch/
 *.log
 
-# weights and large fixtures never belong here
+# weights and large fixtures never belong here (*.exl3: a rank directory's layer images)
 *.safetensors
 *.gguf
+*.exl3
 
 # environment
 .env

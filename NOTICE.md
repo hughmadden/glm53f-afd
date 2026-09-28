@@ -56,8 +56,8 @@ authors under their own terms.
 
 ## glmrt: MIT
 
-- **Source:** <https://github.com/tpurtell/glmrt-5.3-1rtx-4spark> @ `dc6d9b8`.
-- **What was taken:** nothing is copied. The rank's TP4 EXL3 split and the prefill reduce-scatter (balanced row partition, rank-to-rank exchange, FP8 row-scaled option) follow its designs (`crates/glm53f-rank`, `crates/glm53f-wire/src/row_shard.rs`).
+- **Source:** <https://github.com/tpurtell/glmrt-5.3-1rtx-4spark> @ `dc6d9b8`. Copyright (c) 2026 T.J. Purtell.
+- **What was taken:** nothing is copied. The rank's TP4 EXL3 split and the prefill reduce-scatter (balanced row partition, rank-to-rank exchange, FP8 row-scaled option) follow its designs (`crates/glm53f-rank`, `crates/glm53f-wire/src/row_shard.rs`), and the FP8 decode GEMM follows the structure of its INT8 W8A16 decode kernel, rewritten for E4M3 with 128 × 128 block scales (`crates/glm53f-layers/kernels/fp8_gemm.cu`).
 
 ## z-lab/dflash: MIT
 
@@ -68,6 +68,24 @@ authors under their own terms.
 
 - **Source:** <https://github.com/sgl-project/sglang> (the heads of pull requests 36708, `2d4b6ac`, and 36507, `926968b`).
 - **What was taken:** nothing is copied. The GLM-5.3-Flash DFlash serving semantics (which hidden states the drafter taps, which rows become its context, its window and the sampled walk) are reimplemented in `crates/glm53f-dflash` and, for the taps, in `crates/glm53f-forward` (`src/draft.rs`, `kernels/glue.cu`).
+
+## transformers: Apache License 2.0
+
+- **Source:** <https://github.com/huggingface/transformers> @ `7cd73d9df0` (`models/glm5_next`; the oracle runs the pinned 5.17.0 wheel).
+- **What was taken:** nothing is copied. Its `glm5_next` code is the reference every layer is written from and tested against: the CPU references in `crates/glm53f-kda`, `crates/glm53f-layers`, `crates/glm53f-dsa` and `crates/glm53f-forward` reimplement its semantics, and `oracle/golden_layers.py` runs it unmodified to record the goldens. The drafter's RMSNorm and RoPE follow `models/qwen3` (`crates/glm53f-dflash`).
+
+## The KL gate's method and published figures
+
+- **Sources:** the `brandonmusic/GLM-5.3-Flash-tr3-4bpw` model repository @ `a5fee929` (model card, `scripts/measure_glm53_*_kld.py`, `eval/kld/`), <https://github.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw> @ `24784d71` (the report), and the `malaiwah/quant-fidelity-registry` dataset @ `394b6475`.
+- **What was taken:** nothing is copied. `harness/klgate.py` reimplements the method (KL per position in float64, the token mean, the window bootstrap, top-1 agreement), and `docs/KL-GATE.md` quotes the published figures with their pinned sources (`harness/PROVENANCE-klgate.md`).
+
+## Published model configurations (test data)
+
+- `crates/glm53f-model/tests/data/` holds verbatim copies of four `config.json` files from their Hugging Face repositories: `zai-org/GLM-5.3-Flash`, `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, `LibertAIDAI/GLM-5.3-Flash-NVFP4` and `incoai/GLM-5.3-Flash-DFlash2` (revisions and digests in `crates/glm53f-model/PROVENANCE.md`). They belong to their publishers and are included only as test data.
+
+## Cephes Math Library
+
+- **What was taken:** numeric constants only: the six polynomial coefficients of `expf` and the two parts of ln 2 of its Cody-Waite reduction (S. L. Moshier's Cephes), in `crates/glm53f-layers/src/math.rs` and `kernels/common.cuh`. The evaluation is written here.
 
 ## NVIDIA CUDA toolkit
 

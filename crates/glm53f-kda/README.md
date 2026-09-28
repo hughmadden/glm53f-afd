@@ -430,7 +430,11 @@ latency-bound blocks. The next steps below would put its idle SMs to use.
 - **Still to check at the model level** (DESIGN §6). The kernel-level checks above cover
   per-layer agreement with the chain, long prompts and the handoff to decode. Still to run:
   greedy tokens after a chunked prefill against an all-chain prefill over a prompt corpus,
-  and the KL gate against the oracle (PLAN.md).
+  and the KL gate against the oracle (PLAN.md). *(29 September 2026: the KL gate has run on
+  the target hardware. The chunked prefill alone raised the mean KL by 0.0021 nats and failed
+  the gate's margin; with W8A16 projections the pair lowered it, but 25 windows could not yet
+  show it non-inferior. It stays opt-in, `glm53f-serve --kda-chunked-prefill`;
+  `docs/KL-GATE.md` §6b.)*
 
 ### Open, and possible next steps
 
@@ -457,7 +461,8 @@ They are the f32 kernels' own code, instantiated for a second state type (`State
 parity test against the source kernels still passes bit for bit). Checked wrappers:
 `ChainBatch::launch_bf16_state`, `replay_batch_bf16_state`, `PrefillBatch::launch_bf16_state`;
 CPU models: `cpu::chain_bf16_state`, `cpu::replay_bf16_state`. The engine turns them on with
-`glm53f-serve --kda-state-bf16` (off by default).
+`glm53f-serve --kda-state-bf16`, the default since 29 September 2026, when they passed the KL
+gate (`docs/KL-GATE.md` §6b); `--kda-state-f32` turns them off.
 
 **Where the state is rounded** (round to nearest even):
 
