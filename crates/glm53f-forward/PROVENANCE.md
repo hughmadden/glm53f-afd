@@ -1,8 +1,6 @@
 # Provenance: glm53f-forward
 
 Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). Dates are 28 and 29 September 2026.
-Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). All dates are 28 September 2026 unless
-a row says otherwise.
 No code is copied from outside this repository. The forward is assembled from this repository's
 kernel crates (called through their C ABIs, not copied) and written from the reference's
 semantics; the units below record what each part was written from. The remote expert backend
