@@ -544,15 +544,15 @@ fn streaming_multibyte_text_does_not_panic_in_holdback() {
     let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), body);
     assert_eq!(status, 200, "panic in the holdback should not drop the stream: {resp}");
 
-    // Content is exactly the concatenation of the pre-tool deltas, each emitted
-    // as its own content event. Assert every fragment arrives verbatim, in
-    // order (the raw stream body is UTF-8-decoded by read_to_string).
-    let fragments = ["Hello ", "\u{2019}", "\u{4e16}\u{754c}", "\u{1f600}", " \u{6d4b}\u{8bd5}"];
-    let mut cursor = 0usize;
-    for f in fragments {
-        let pos = resp[cursor..].find(f).unwrap_or_else(|| panic!("missing fragment {f:?}: {resp}"));
-        cursor += pos + f.len();
-    }
+    // Content is exactly the concatenation of the pre-tool deltas, every fragment verbatim and in
+    // order (the raw stream body is UTF-8-decoded by read_to_string). The space that ends the
+    // first fragment is held until the next text arrives, and goes out with it.
+    let content: String = sse_events(&resp)
+        .iter()
+        .flat_map(|ev| ev.get("choices").and_then(|c| c.as_array()).unwrap_or(&[]).iter())
+        .filter_map(|ch| ch.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()))
+        .collect();
+    assert_eq!(content, "Hello \u{2019}\u{4e16}\u{754c}\u{1f600} \u{6d4b}\u{8bd5}", "{resp}");
 
     // The tool path still works: name + finish_reason (ASCII) come back parsed.
     let mut name: Option<String> = None;
@@ -1372,6 +1372,7 @@ fn glm_thinking_off_is_low_effort() {
     let srv = start_engine_with(OptionsStub(seen.clone()), Arc::new(GlmDialect));
     let cases = [
         (r#""chat_template_kwargs":{"enable_thinking":false}"#, (true, Some("low")), true),
+        (r#""chat_template_kwargs":{"thinking":false}"#, (true, Some("low")), true),
         (r#""enable_thinking":false"#, (true, Some("low")), true),
         (r#""thinking":{"type":"disabled"}"#, (true, Some("low")), true),
         (r#""chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high""#, (true, Some("low")), true),
@@ -1390,5 +1391,475 @@ fn glm_thinking_off_is_low_effort() {
         assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("OK"), "{extra}: {resp}");
         let reasoning = msg.get("reasoning_content").and_then(|c| c.as_str()).unwrap_or("");
         assert_eq!(reasoning.is_empty(), !reasons, "{extra}: {resp}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool calls as GLM-5.3-Flash writes them, well formed or not (added in glm53f-afd): what the
+// client receives, whole and streamed delta by delta, and what the server logs.
+// ---------------------------------------------------------------------------
+
+const GLM_TC: &str = concat!("<", "tool_call", ">");
+const GLM_TC_END: &str = concat!("<", "/tool_call", ">");
+const GLM_AK: &str = concat!("<", "arg_key", ">");
+const GLM_AK_END: &str = concat!("<", "/arg_key", ">");
+const GLM_AV: &str = concat!("<", "arg_value", ">");
+const GLM_AV_END: &str = concat!("<", "/arg_value", ">");
+
+/// A tool call in GLM-5.3-Flash's markup, its values written as the chat template writes them (a
+/// string as is, anything else as JSON).
+fn glm_tool_call(name: &str, args: &[(&str, &str)]) -> String {
+    let mut s = format!("{GLM_TC}{name}");
+    for (k, v) in args {
+        s.push_str(&format!("{GLM_AK}{k}{GLM_AK_END}{GLM_AV}{v}{GLM_AV_END}"));
+    }
+    s + GLM_TC_END
+}
+
+/// The tools each request below offers: a shell whose `timeout` is an integer, and a file reader.
+const AGENT_TOOLS: &str = r#"[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}}},{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]"#;
+
+/// The reasoning each completion below starts with (thinking is on: the prompt opened the block).
+const AGENT_REASONING: &str = "The user wants the files listed.";
+
+/// A completion and what the client must receive for it.
+struct ToolCase {
+    name: &'static str,
+    /// The completion after the reasoning and its closing tag.
+    text: String,
+    /// `message.content` (`None`: null); streamed, the content deltas joined (`None`: none sent).
+    content: Option<String>,
+    /// Each call's name and arguments (a JSON object's text), in order.
+    calls: Vec<(&'static str, &'static str)>,
+    finish: &'static str,
+    /// How each report of the parse, one logged line each, begins.
+    reports: Vec<&'static str>,
+}
+
+fn tool_cases() -> Vec<ToolCase> {
+    let unclosed = format!("{GLM_TC}bash{GLM_AK}command{GLM_AK_END}{GLM_AV}ls{GLM_AV_END}");
+    let nameless = format!("{GLM_TC}{GLM_AK}command{GLM_AK_END}{GLM_AV}ls{GLM_AV_END}{GLM_TC_END}");
+    let after_name = |name: &str, key: &str, value: &str| {
+        format!("{GLM_TC}{name}{GLM_AK_END}{GLM_AK}{key}{GLM_AK_END}{GLM_AV}{value}{GLM_AV_END}{GLM_TC_END}")
+    };
+    vec![
+        ToolCase {
+            name: "good",
+            text: glm_tool_call("bash", &[("command", "ls -la")]),
+            content: None,
+            calls: vec![("bash", r#"{"command":"ls -la"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "two args",
+            text: glm_tool_call("bash", &[("command", "sleep 2 && echo done"), ("timeout", "30")]),
+            content: None,
+            calls: vec![("bash", r#"{"command":"sleep 2 && echo done","timeout":30}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        // The second call has a key outside its schema. Calls are not validated: both pass, and
+        // nothing is reported.
+        ToolCase {
+            name: "good then bad",
+            text: format!("{}\n{}", glm_tool_call("read", &[("file_path", "src/main.rs")]),
+                glm_tool_call("bash", &[("command", "cargo test"), ("cwd", "crates/api")])),
+            content: None,
+            calls: vec![("read", r#"{"file_path":"src/main.rs"}"#), ("bash", r#"{"command":"cargo test","cwd":"crates/api"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        // The name runs into a stray closing tag: recovered as the offered tool, and reported.
+        ToolCase {
+            name: "markup after the name",
+            text: after_name("bash", "command", "git status"),
+            content: None,
+            calls: vec![("bash", r#"{"command":"git status"}"#)],
+            finish: "tool_calls",
+            reports: vec![r#"recovered call "bash" (markup after the name)"#],
+        },
+        ToolCase {
+            name: "key not in schema",
+            text: glm_tool_call("read", &[("path", "README.md")]),
+            content: None,
+            calls: vec![("read", r#"{"path":"README.md"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "tool not offered",
+            text: glm_tool_call("grep", &[("pattern", "TODO"), ("max_count", "5")]),
+            content: None,
+            calls: vec![("grep", r#"{"pattern":"TODO","max_count":5}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        // Lost calls: the text reaches the client as content, after the text before it and
+        // beside a call that parsed.
+        ToolCase {
+            name: "closing tag missing",
+            text: format!("Let me look.{unclosed}"),
+            content: Some(format!("Let me look.{unclosed}")),
+            calls: vec![],
+            finish: "stop",
+            reports: vec![r#"lost call "bash" (closing tag missing)"#],
+        },
+        ToolCase {
+            name: "a call opened inside a call",
+            text: format!("{unclosed}{}", glm_tool_call("read", &[("file_path", "Cargo.toml")])),
+            content: Some(unclosed.clone()),
+            calls: vec![("read", r#"{"file_path":"Cargo.toml"}"#)],
+            finish: "tool_calls",
+            reports: vec![r#"lost call "bash" (closing tag missing before the next call)"#],
+        },
+        ToolCase {
+            name: "markup after the name of a tool not offered",
+            text: after_name("grep", "pattern", "TODO"),
+            content: Some(after_name("grep", "pattern", "TODO")),
+            calls: vec![],
+            finish: "stop",
+            reports: vec!["lost call (markup in the name)"],
+        },
+        // Arguments without a name are a lost call like the others: no error, no other finish
+        // reason.
+        ToolCase {
+            name: "arguments without a name",
+            text: nameless.clone(),
+            content: Some(nameless.clone()),
+            calls: vec![],
+            finish: "stop",
+            reports: vec!["lost call (arguments without a name)"],
+        },
+        ToolCase {
+            name: "arguments without a name, then a call",
+            text: format!("Let me look.\n{nameless}{}", glm_tool_call("read", &[("file_path", "Cargo.toml")])),
+            content: Some(format!("Let me look.\n{nameless}")),
+            calls: vec![("read", r#"{"file_path":"Cargo.toml"}"#)],
+            finish: "tool_calls",
+            reports: vec!["lost call (arguments without a name)"],
+        },
+        // The text before the first call is the reply's content (the whitespace that ends it is
+        // dropped, none is null), and the text after it is not.
+        ToolCase {
+            name: "text before a call",
+            text: format!("Let me look.\n{}", glm_tool_call("read", &[("file_path", "src/main.rs")])),
+            content: Some("Let me look.".into()),
+            calls: vec![("read", r#"{"file_path":"src/main.rs"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "whitespace before a call",
+            text: format!("\n\n {}", glm_tool_call("read", &[("file_path", "src/main.rs")])),
+            content: None,
+            calls: vec![("read", r#"{"file_path":"src/main.rs"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "text before a call, whitespace in front of it kept",
+            text: format!("\n\nLet me look. \n{}", glm_tool_call("read", &[("file_path", "src/main.rs")])),
+            content: Some("\n\nLet me look.".into()),
+            calls: vec![("read", r#"{"file_path":"src/main.rs"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "text between and after calls",
+            text: format!(
+                "First.\n{}\nThen this.\n{}\nDone.",
+                glm_tool_call("read", &[("file_path", "a.rs")]),
+                glm_tool_call("bash", &[("command", "cargo test")])
+            ),
+            content: Some("First.".into()),
+            calls: vec![("read", r#"{"file_path":"a.rs"}"#), ("bash", r#"{"command":"cargo test"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        ToolCase {
+            name: "multi-byte text before a call",
+            text: format!("\u{6771}\u{4eac}\u{306f}\u{6674}\u{308c}\u{3002} caf\u{e9}\n{}", glm_tool_call("read", &[("file_path", "a.rs")])),
+            content: Some("\u{6771}\u{4eac}\u{306f}\u{6674}\u{308c}\u{3002} caf\u{e9}".into()),
+            calls: vec![("read", r#"{"file_path":"a.rs"}"#)],
+            finish: "tool_calls",
+            reports: vec![],
+        },
+        // A reply without calls is untouched: its whitespace stays, streamed as it is written.
+        ToolCase {
+            name: "a plain reply",
+            text: "  Nothing to call.\n\n".into(),
+            content: Some("  Nothing to call.\n\n".into()),
+            calls: vec![],
+            finish: "stop",
+            reports: vec![],
+        },
+        // Multi-byte characters before and inside a lost call.
+        ToolCase {
+            name: "multi-byte text around a lost call",
+            text: format!("caf\u{e9} \u{6771}\u{4eac}\u{3002}{GLM_TC}bash{GLM_AK}command{GLM_AK_END}{GLM_AV}echo \u{6771}\u{4eac} caf\u{e9}{GLM_AV_END}"),
+            content: Some(format!("caf\u{e9} \u{6771}\u{4eac}\u{3002}{GLM_TC}bash{GLM_AK}command{GLM_AK_END}{GLM_AV}echo \u{6771}\u{4eac} caf\u{e9}{GLM_AV_END}")),
+            calls: vec![],
+            finish: "stop",
+            reports: vec![r#"lost call "bash" (closing tag missing)"#],
+        },
+    ]
+}
+
+/// One delta per character: every tag split across deltas.
+fn by_char(text: &str) -> Vec<String> {
+    text.chars().map(String::from).collect()
+}
+
+/// One delta per token, roughly as GLM-5.3-Flash's tokenizer splits the text: each tag one token
+/// (they are added tokens of its vocabulary), other text in pieces of up to three characters.
+fn by_token(text: &str) -> Vec<String> {
+    const TAGS: [&str; 8] = [GLM_THINK, GLM_THINK_END, GLM_TC, GLM_TC_END, GLM_AK, GLM_AK_END, GLM_AV, GLM_AV_END];
+    let (mut out, mut rest) = (Vec::new(), text);
+    while !rest.is_empty() {
+        let end = match TAGS.iter().find(|t| rest.starts_with(**t)) {
+            Some(t) => t.len(),
+            None => {
+                let next_tag = TAGS.iter().filter_map(|t| rest.find(t)).min().unwrap_or(rest.len());
+                rest.char_indices().nth(3).map_or(rest.len(), |(i, _)| i).min(next_tag)
+            }
+        };
+        out.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// GLM-5.3-Flash replaying fixed completions: the last user message names a [`ToolCase`], whose
+/// completion (the reasoning, its closing tag, the case's text) goes out in the deltas `split`
+/// makes.
+struct ToolReplay {
+    split: fn(&str) -> Vec<String>,
+}
+
+impl Engine for ToolReplay {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4 + 1
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        last_content(messages)
+    }
+    fn generate(
+        &self,
+        prompt: &str,
+        _params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let case = tool_cases().into_iter().find(|c| c.name == prompt).ok_or("no such case")?;
+        let deltas = (self.split)(&format!("{AGENT_REASONING}{GLM_THINK_END}{}", case.text));
+        for d in &deltas {
+            on_delta(d);
+        }
+        Ok(GenerateOutcome { text: deltas.concat(), finish_reason: "stop".into(), completion_tokens: deltas.len() })
+    }
+}
+
+fn tool_case_body(case: &str, stream: bool) -> String {
+    format!(r#"{{"model":"glm-5.3-flash","messages":[{{"role":"user","content":"{case}"}}],"tools":{AGENT_TOOLS},"stream":{stream}}}"#)
+}
+
+/// A streamed reply as a client gathers it: reasoning joined, the content deltas, and tool calls
+/// assembled by index (the name from the first delta, the arguments joined).
+struct Gathered {
+    reasoning: String,
+    content: Vec<String>,
+    calls: Vec<(String, String)>,
+    finish: Option<String>,
+}
+
+fn gather(raw: &str) -> Gathered {
+    let mut g = Gathered { reasoning: String::new(), content: Vec::new(), calls: Vec::new(), finish: None };
+    for ev in sse_events(raw) {
+        for ch in ev.get("choices").and_then(|c| c.as_array()).unwrap_or(&[]) {
+            if let Some(f) = ch.get("finish_reason").and_then(|f| f.as_str()) {
+                g.finish = Some(f.to_string());
+            }
+            let Some(d) = ch.get("delta") else { continue };
+            if let Some(r) = d.get("reasoning_content").and_then(|r| r.as_str()) {
+                g.reasoning.push_str(r);
+            }
+            if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
+                g.content.push(c.to_string());
+            }
+            for tc in d.get("tool_calls").and_then(|t| t.as_array()).unwrap_or(&[]) {
+                let i = tc.get("index").and_then(|i| i.as_f64()).expect("a tool-call index") as usize;
+                if i == g.calls.len() {
+                    g.calls.push((String::new(), String::new()));
+                }
+                let f = tc.get("function").expect("a function");
+                g.calls[i].0.push_str(f.get("name").and_then(|n| n.as_str()).unwrap_or(""));
+                g.calls[i].1.push_str(f.get("arguments").and_then(|a| a.as_str()).unwrap_or(""));
+            }
+        }
+    }
+    g
+}
+
+/// Six tool calls as GLM-5.3-Flash writes them, lost calls (never closed, opened inside another,
+/// markup in the name, arguments without a name) and the text around calls, each whole and
+/// streamed a character and a token at a time. Either way the client gets the same content,
+/// calls, finish reason and reasoning:
+/// - a lost call's text comes back as content, after the text before it and beside a call that
+///   parsed, never as an empty turn or an error; finish_reason stays `stop` unless a call parsed;
+/// - the text before the first call is the content, without the whitespace that ends it (null
+///   when nothing is left); the text after it is dropped; a reply without calls is untouched;
+/// - "markup after the name" is recovered as the offered tool;
+/// - a key outside the schema and a tool not offered pass as written (calls are not validated).
+///
+/// The parse's reports, one logged line each, are checked here too.
+#[test]
+fn glm_tool_calls_as_the_model_writes_them() {
+    let body = tool_case_body("", false);
+    let tools = glm53f_api::types::ChatRequest::parse(&glm53f_api::json::parse(&body).unwrap(), &|_: &str| Err("no images".into()))
+        .unwrap()
+        .tools;
+    let whole = start_engine_with(ToolReplay { split: |t| vec![t.to_string()] }, Arc::new(GlmDialect));
+    let streamed = [
+        ("by char", start_engine_with(ToolReplay { split: by_char }, Arc::new(GlmDialect))),
+        ("by token", start_engine_with(ToolReplay { split: by_token }, Arc::new(GlmDialect))),
+    ];
+    for case in tool_cases() {
+        let name = case.name;
+        let want_calls: Vec<(String, String)> = case.calls.iter().map(|(n, a)| (n.to_string(), a.to_string())).collect();
+        let parsed = glm53f_api::dialect::glm::parse(&format!("{AGENT_REASONING}{GLM_THINK_END}{}", case.text), &tools, true, 0);
+        assert_eq!(parsed.reports.len(), case.reports.len(), "{name}: {:?}", parsed.reports);
+        for (got, want) in parsed.reports.iter().zip(&case.reports) {
+            assert!(got.starts_with(want), "{name}: report {got:?}");
+        }
+
+        let (status, resp) = http_post(&format!("{}/v1/chat/completions", whole.base), &tool_case_body(name, false));
+        assert_eq!(status, 200, "{name}: {resp}");
+        let v = glm53f_api::json::parse(&resp).unwrap();
+        let choice = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).unwrap();
+        let msg = choice.get("message").unwrap();
+        assert_eq!(msg.get("content").and_then(|c| c.as_str()), case.content.as_deref(), "{name}: {resp}");
+        let calls: Vec<(String, String)> = msg.get("tool_calls").and_then(|t| t.as_array()).unwrap_or(&[]).iter()
+            .map(|t| {
+                let f = t.get("function").unwrap();
+                (f.get("name").and_then(|n| n.as_str()).unwrap().to_string(), f.get("arguments").and_then(|a| a.as_str()).unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(calls, want_calls, "{name}: {resp}");
+        assert_eq!(choice.get("finish_reason").and_then(|f| f.as_str()), Some(case.finish), "{name}: {resp}");
+        assert_eq!(msg.get("reasoning_content").and_then(|r| r.as_str()), Some(AGENT_REASONING), "{name}: {resp}");
+        let whole_reply = (msg.get("content").and_then(|c| c.as_str()).map(String::from), calls.clone(), case.finish, AGENT_REASONING);
+
+        for (how, srv) in &streamed {
+            let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &tool_case_body(name, true));
+            assert_eq!(status, 200, "{name} {how}: {resp}");
+            let g = gather(&resp);
+            let content = (!g.content.is_empty()).then(|| g.content.concat());
+            assert_eq!(content, case.content, "{name} {how}: {resp}");
+            // Markup reaches content only as a lost call's text, sent once after generation.
+            let live = g.content.len() - usize::from(case.content.as_deref().is_some_and(|c| c.contains('<')));
+            assert!(g.content[..live].iter().all(|c| !c.contains('<')), "{name} {how}: markup in a live delta: {resp}");
+            assert_eq!(g.calls, want_calls, "{name} {how}: {resp}");
+            assert_eq!(g.finish.as_deref(), Some(case.finish), "{name} {how}: {resp}");
+            assert_eq!(g.reasoning, AGENT_REASONING, "{name} {how}: {resp}");
+            // The streamed reply is the whole one.
+            let finish = g.finish.as_deref().unwrap_or("");
+            assert_eq!((content, g.calls.clone(), finish, g.reasoning.as_str()), whole_reply, "{name} {how}: streamed and whole replies differ");
+        }
+    }
+}
+
+/// GLM-5.3-Flash replaying one fixed completion (after the reasoning the prompt opened), in the
+/// deltas `split` makes.
+struct FixedCompletion {
+    text: String,
+    split: fn(&str) -> Vec<String>,
+}
+
+impl Engine for FixedCompletion {
+    fn tokenize(&self, _messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        4
+    }
+    fn render_chat(&self, _messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        String::new()
+    }
+    fn generate(
+        &self,
+        _prompt: &str,
+        _params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let deltas = (self.split)(&format!("{AGENT_REASONING}{GLM_THINK_END}{}", self.text));
+        for d in &deltas {
+            on_delta(d);
+        }
+        Ok(GenerateOutcome { text: deltas.concat(), finish_reason: "stop".into(), completion_tokens: deltas.len() })
+    }
+}
+
+/// A think block inside the text before a call is reasoning, not content, and the whitespace
+/// around it is content as written; only the whitespace that ends the text goes. Whole and
+/// streamed a character and a token at a time, the client gets the same content and reasoning.
+#[test]
+fn a_think_block_inside_the_text_before_a_call_leaves_whole_and_streamed_alike() {
+    let text = format!("First. {GLM_THINK}hmm{GLM_THINK_END} Second. \n{}", glm_tool_call("read", &[("file_path", "a.rs")]));
+    let body = |stream: bool| tool_case_body("", stream);
+    let reasoning = format!("{AGENT_REASONING}hmm");
+    let hows: [(&str, fn(&str) -> Vec<String>); 3] = [("whole", |t| vec![t.to_string()]), ("by char", by_char), ("by token", by_token)];
+    for (how, split) in hows {
+        let srv = start_engine_with(FixedCompletion { text: text.clone(), split }, Arc::new(GlmDialect));
+        let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body(how != "whole"));
+        assert_eq!(status, 200, "{how}: {resp}");
+        let (content, calls, reasoning_got) = if how == "whole" {
+            let v = glm53f_api::json::parse(&resp).unwrap();
+            let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
+            let calls = msg.get("tool_calls").and_then(|t| t.as_array()).map_or(0, |t| t.len());
+            (msg.get("content").and_then(|c| c.as_str()).map(String::from), calls, msg.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("").to_string())
+        } else {
+            let g = gather(&resp);
+            ((!g.content.is_empty()).then(|| g.content.concat()), g.calls.len(), g.reasoning)
+        };
+        assert_eq!(content.as_deref(), Some("First.  Second."), "{how}: {resp}");
+        assert_eq!((calls, reasoning_got.as_str()), (1, reasoning.as_str()), "{how}: {resp}");
+    }
+}
+
+/// Each report of the parse is logged on stderr, one line, under the completion's id, whole and
+/// streamed. The server logs from its own threads, so `lost_call_log_child` serves the requests
+/// in a child process of this test binary, and this test reads the child's output.
+#[test]
+fn parse_reports_are_logged_under_the_completion_id() {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["lost_call_log_child", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("GLM53F_API_LOG_CHILD", "1")
+        .output()
+        .expect("run the child");
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    // The first id shares its line with the test runner's "test ... " prefix.
+    let ids: Vec<&str> = stdout.lines().filter_map(|l| l.split_once("completion id: ").map(|(_, id)| id)).collect();
+    assert_eq!(ids.len(), 4, "{stdout}");
+    for (i, id) in ids.iter().enumerate() {
+        let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with(&format!("[api] {id}: "))).collect();
+        let want = if i < 2 { r#"lost call "bash" (closing tag missing before the next call)"# } else { r#"recovered call "bash""# };
+        assert_eq!(lines.len(), 1, "{id}: {stderr}");
+        assert!(lines[0].contains(want), "{}", lines[0]);
+    }
+}
+
+/// Serves a lost call and a recovered one, whole and streamed, printing each reply's completion
+/// id (for `parse_reports_are_logged_under_the_completion_id`).
+#[test]
+#[ignore = "run by parse_reports_are_logged_under_the_completion_id"]
+fn lost_call_log_child() {
+    if std::env::var_os("GLM53F_API_LOG_CHILD").is_none() {
+        return;
+    }
+    let srv = start_engine_with(ToolReplay { split: by_token }, Arc::new(GlmDialect));
+    for (case, stream) in [("a call opened inside a call", false), ("a call opened inside a call", true),
+        ("markup after the name", false), ("markup after the name", true)] {
+        let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &tool_case_body(case, stream));
+        assert_eq!(status, 200, "{resp}");
+        let head = if stream { sse_events(&resp).remove(0) } else { glm53f_api::json::parse(&resp).unwrap() };
+        println!("completion id: {}", head.get("id").and_then(|i| i.as_str()).unwrap());
     }
 }

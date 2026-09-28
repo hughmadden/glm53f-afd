@@ -79,6 +79,11 @@ authors under their own terms.
 - **Sources:** the `brandonmusic/GLM-5.3-Flash-tr3-4bpw` model repository @ `a5fee929` (model card, `scripts/measure_glm53_*_kld.py`, `eval/kld/`), <https://github.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw> @ `24784d71` (the report), and the `malaiwah/quant-fidelity-registry` dataset @ `394b6475`.
 - **What was taken:** nothing is copied. `harness/klgate.py` reimplements the method (KL per position in float64, the token mean, the window bootstrap, top-1 agreement), and `docs/KL-GATE.md` quotes the published figures with their pinned sources (`harness/PROVENANCE-klgate.md`).
 
+## glm-5.3-flash-4x-gx10, a public serving recipe (no licence file)
+
+- **Source:** <https://github.com/mmastrac/glm-5.3-flash-4x-gx10> @ `5ea4121`. The repository carries no licence file.
+- **What was taken:** nothing is copied. Its real-output tool-call cases and the two spellings of the thinking switch in its chat template are read as shapes and reimplemented with other tool names and values (`crates/glm53f-api/src/dialect/glm.rs`, `src/types.rs`, `tests/acceptance.rs`); the idea of giving a model's cached file pages back before a start is reimplemented in Rust over libc (`crates/glm53f-rank/src/pagecache.rs`). [docs/REUSE.md](docs/REUSE.md) has the rows.
+
 ## Published model configurations (test data)
 
 - `crates/glm53f-model/tests/data/` holds verbatim copies of four `config.json` files from their Hugging Face repositories: `zai-org/GLM-5.3-Flash`, `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, `LibertAIDAI/GLM-5.3-Flash-NVFP4` and `incoai/GLM-5.3-Flash-DFlash2` (revisions and digests in `crates/glm53f-model/PROVENANCE.md`). They belong to their publishers and are included only as test data.

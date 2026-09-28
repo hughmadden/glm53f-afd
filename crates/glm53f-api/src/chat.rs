@@ -98,6 +98,7 @@ pub fn handle<E: Engine + Send + Sync + 'static>(
         // legitimately call more than the storm cap, e.g. the 7-tool replay_exact).
         let cap = 0;
         let parsed = dialect.parse(&outcome.text, &req.tools, thinking, cap);
+        log_reports(&id, &parsed);
         if let Some(e) = parsed.error {
             return Err(ApiError::bad_request(format!("tool call parse error: {e}")));
         }
@@ -119,13 +120,32 @@ fn now_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
-/// The assistant message content for a response: `None` for a tool-call turn,
-/// else the non-tool text.
-fn message_content(parsed: &ParseResult) -> Json {
+/// Every parse report goes to the log, one line each, under the completion's id: a lost or
+/// recovered tool call is visible on the server as well as to the client.
+fn log_reports(id: &str, parsed: &ParseResult) {
+    for r in &parsed.reports {
+        eprintln!("[api] {id}: {r}");
+    }
+}
+
+/// The text of a reply, whole or streamed: the parsed content as it is, but for a reply with tool
+/// calls, without the whitespace that ends it (it only separated the text from the first call).
+fn reply_content(parsed: &ParseResult) -> &str {
     if parsed.calls.is_empty() {
-        Json::Str(parsed.content.clone())
+        &parsed.content
     } else {
+        parsed.content.trim_end()
+    }
+}
+
+/// The assistant message content for a response: the reply's text, and `None` for a tool-call
+/// turn that has none.
+fn message_content(parsed: &ParseResult) -> Json {
+    let text = reply_content(parsed);
+    if text.is_empty() && !parsed.calls.is_empty() {
         Json::Null
+    } else {
+        Json::Str(text.to_string())
     }
 }
 
@@ -264,10 +284,13 @@ enum Span {
 /// Split the streamed completion the way the dialect's `parse` splits the whole
 /// text: content deltas outside blocks, reasoning deltas inside a `<think>` block
 /// (reasoning up to the first `</think>`), and everything from a `<tool_call>`
-/// on held back (re-emitted as parsed `tool_calls` deltas after generation). A
-/// tag split across deltas is held until it resolves, so no markup reaches a
-/// content or reasoning delta. Before this, think blocks streamed as content and
-/// were then repeated as reasoning after generation. The tags are the dialect's
+/// on held back (re-emitted as parsed `tool_calls` deltas after generation, and a
+/// lost call as one content delta). A tag split across deltas is held until it
+/// resolves, so no markup reaches a live content or reasoning delta. Whitespace
+/// that ends the text so far is held too: a tool call that follows drops it (a
+/// reply with calls carries its text without it, see [`reply_content`]), any other
+/// text sends it first. Before this, think blocks streamed as content and were
+/// then repeated as reasoning after generation. The tags are the dialect's
 /// ([`StreamTags`]); a dialect whose prompt opens the reasoning block starts the
 /// split inside it.
 struct StreamSplit {
@@ -275,6 +298,8 @@ struct StreamSplit {
     span: Span,
     /// Think blocks already streamed live; the post-parse pass sends the rest.
     think_blocks: usize,
+    /// Bytes of content streamed live: the start of the parsed content not yet sent.
+    content_bytes: usize,
     tags: StreamTags,
     head: ChunkHead,
 }
@@ -282,9 +307,9 @@ struct StreamSplit {
 impl StreamSplit {
     fn new(tags: StreamTags, reasoning_first: bool, head: ChunkHead) -> Self {
         if reasoning_first {
-            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, tags, head }
+            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, content_bytes: 0, tags, head }
         } else {
-            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, tags, head }
+            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, content_bytes: 0, tags, head }
         }
     }
 
@@ -317,25 +342,33 @@ impl StreamSplit {
                         (Some(p), t) if t.is_none_or(|t| p < t) => {
                             if p > 0 {
                                 http::write_chunk(stream, self.head.content_event(&self.hold[..p]).as_bytes())?;
+                                self.content_bytes += p;
                             }
                             self.hold.drain(..p + think_open.len());
                             self.span = Span::Think;
                             self.think_blocks += 1;
                         }
                         (_, Some(p)) => {
-                            // A tool call starts here: stream the content before it,
-                            // then hold the markup (and anything after) back.
-                            if p > 0 {
-                                http::write_chunk(stream, self.head.content_event(&self.hold[..p]).as_bytes())?;
+                            // A tool call starts here: stream the content before it, less the
+                            // whitespace that ends it, then hold the markup (and anything after)
+                            // back.
+                            let text = self.hold[..p].trim_end();
+                            if !text.is_empty() {
+                                http::write_chunk(stream, self.head.content_event(text).as_bytes())?;
+                                self.content_bytes += text.len();
                             }
                             self.hold.drain(..p);
                             self.span = Span::Tool;
                         }
                         _ => {
-                            // No tag yet (the first arm takes a think tag with no tool tag).
-                            let flush = self.hold.len() - held_suffix(&self.hold, &[think_open, tool_open]);
+                            // No tag yet (the first arm takes a think tag with no tool tag). Hold
+                            // what may still become a tag, and the whitespace before it: a tool
+                            // call may follow.
+                            let unheld = self.hold.len() - held_suffix(&self.hold, &[think_open, tool_open]);
+                            let flush = self.hold[..unheld].trim_end().len();
                             if flush > 0 {
                                 http::write_chunk(stream, self.head.content_event(&self.hold[..flush]).as_bytes())?;
+                                self.content_bytes += flush;
                                 self.hold.drain(..flush);
                             }
                             return Ok(());
@@ -352,7 +385,10 @@ impl StreamSplit {
     fn finish(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
         if !self.hold.is_empty() {
             match self.span {
-                Span::Content => http::write_chunk(stream, self.head.content_event(&self.hold).as_bytes())?,
+                Span::Content => {
+                    http::write_chunk(stream, self.head.content_event(&self.hold).as_bytes())?;
+                    self.content_bytes += self.hold.len();
+                }
                 Span::Think => http::write_chunk(stream, self.head.reasoning_event(&self.hold).as_bytes())?,
                 Span::Tool => {}
             }
@@ -383,9 +419,10 @@ fn held_suffix(hold: &str, tags: &[&str]) -> usize {
 
 /// Stream the SSE response directly to the socket: the role first, then each
 /// content or reasoning delta as the engine produces it (flushed per event, with
-/// the markup held back), then the post-parse tool-call/finish/usage events and
-/// `data: [DONE]`. Every chunk carries the completion's id, `created` and model
-/// ([`ChunkHead`]).
+/// the markup held back), then the post-parse events (reasoning behind a tool
+/// call, a lost call's text, tool calls, finish, usage) and `data: [DONE]`. The
+/// parse reports are logged under the completion's id. Every chunk carries the
+/// completion's id, `created` and model ([`ChunkHead`]).
 #[allow(clippy::too_many_arguments)]
 fn stream_events<E: Engine>(
     engine: &E,
@@ -435,6 +472,7 @@ fn stream_events<E: Engine>(
     // 3. parse the full completion for think blocks and tool calls.
     let cap = 0;
     let parsed = dialect.parse(&outcome.text, tools, params.thinking, cap);
+    log_reports(id, &parsed);
     if parsed.error.is_some() {
         http::write_chunk(stream, head.finish_event("error").as_bytes())?;
         http::write_chunk(stream, b"data: [DONE]\n\n")?;
@@ -451,21 +489,28 @@ fn stream_events<E: Engine>(
         http::write_chunk(stream, head.reasoning_event(r).as_bytes())?;
     }
 
-    // 5. tool-call deltas (header then arguments).
+    // 5. the reply's text not streamed live: what was held back from a lost call's opening tag
+    //    on, and the whitespace before it. With what went out live it adds up to the
+    //    non-streamed reply's content.
+    if let Some(rest) = reply_content(&parsed).get(split.content_bytes..).filter(|r| !r.is_empty()) {
+        http::write_chunk(stream, head.content_event(rest).as_bytes())?;
+    }
+
+    // 6. tool-call deltas (header then arguments).
     for (i, c) in parsed.calls.iter().enumerate() {
         http::write_chunk(stream, head.tool_call_header_event(i, c).as_bytes())?;
         http::write_chunk(stream, head.tool_call_args_event(i, c).as_bytes())?;
     }
 
-    // 6. finish.
+    // 7. finish.
     http::write_chunk(stream, head.finish_event(&finish_reason).as_bytes())?;
 
-    // 7. usage (only when requested).
+    // 8. usage (only when requested).
     if include_usage {
         http::write_chunk(stream, head.usage_event(prompt_tokens, outcome.completion_tokens).as_bytes())?;
     }
 
-    // 8. done.
+    // 9. done.
     http::write_chunk(stream, b"data: [DONE]\n\n")?;
     Ok(())
 }

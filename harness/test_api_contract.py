@@ -34,7 +34,7 @@ def thinking_of(body, mode):
     if mode == "think-ignored":
         return True
     kw = body.get("chat_template_kwargs") or {}
-    for v in (kw.get("enable_thinking"), body.get("enable_thinking")):
+    for v in (kw.get("enable_thinking"), kw.get("thinking"), body.get("enable_thinking")):
         if isinstance(v, bool):
             return v
     t = body.get("thinking")

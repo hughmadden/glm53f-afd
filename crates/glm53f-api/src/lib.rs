@@ -19,9 +19,11 @@
 //! A request sets thinking with the first of these it carries:
 //!
 //! 1. `chat_template_kwargs.enable_thinking` (vLLM and SGLang);
-//! 2. a top-level `enable_thinking`;
-//! 3. `thinking.type` (GLM and Anthropic): `"disabled"` is off, any other type on;
-//! 4. `reasoning_effort: "none"` (top level, else in `chat_template_kwargs`): off.
+//! 2. `chat_template_kwargs.thinking`, a boolean (the spelling some clients and chat templates
+//!    use);
+//! 3. a top-level `enable_thinking`;
+//! 4. `thinking.type` (GLM and Anthropic): `"disabled"` is off, any other type on;
+//! 5. `reasoning_effort: "none"` (top level, else in `chat_template_kwargs`): off.
 //!
 //! Otherwise the dialect's default applies ([`Dialect::default_thinking`]; on for
 //! GLM-5.3-Flash). A dialect whose chat template has no off mode maps "off" to its lowest
@@ -33,6 +35,23 @@
 //! message. An assistant turn's reasoning in the history is read from
 //! `reasoning_content`, else `reasoning`. `harness/api_contract.py` checks all of
 //! this against a running server.
+//!
+//! # Tool calls
+//!
+//! A reply with tool calls carries the text the model wrote before them as `content`, streamed
+//! or not (`null`, or no content delta, when there is none). The whitespace that ends that text
+//! is dropped; text after the first call is dropped.
+//!
+//! A call the GLM dialect cannot parse is never dropped: its text goes to the client as
+//! `content`, beside any calls that did parse, streamed or not, and `finish_reason` is
+//! `tool_calls` only when a call parsed. That includes a call with arguments but no name: a
+//! reply never fails, or ends with another finish reason, for what the model wrote. (The MiMo
+//! reference dialect reports its lost calls without keeping their text, and fails the request
+//! on a nameless one.) One malformed shape is recovered: a name followed by a stray closing tag,
+//! when what is left is a tool the request offered. A call that parses is passed on as written:
+//! its name is not checked against the request's tools, nor its arguments against their schema
+//! (which only types them). Every report of the parse (a lost call, a dropped argument, a
+//! recovered name) is logged to stderr, one line each, under the completion's id.
 
 pub mod chat;
 pub mod dialect;

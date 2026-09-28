@@ -34,11 +34,19 @@
 //!   - a new call opening inside one loses the first call, and parsing resumes at the new call;
 //!   - stray text inside a call, and an argument without a value, are dropped from that call;
 //!   - of two values for one key, the first is dropped;
-//!   - a call with markup in its name is lost;
+//!   - a call with markup in its name is lost, except the "markup after the name" shape below;
+//!   - a call with arguments but no name is lost;
 //!   - an empty call is noted.
 //!
-//!   A call with arguments but no name is an `error`, never a nameless call, as in the MiMo
-//!   reference dialect.
+//!   A lost call's text, from its opening tag, stays in `content` where it stood (an empty call's
+//!   text too), so the client receives what the model wrote instead of an empty turn.
+//! - **Markup after the name.** The model sometimes closes the name with a stray closing tag
+//!   before the first argument: &lt;tool_call&gt;bash&lt;/arg_key&gt;&lt;arg_key&gt;command...
+//!   When stripping closing tags and whitespace from the end of the name leaves exactly the name
+//!   of a tool the request offered, the call is recovered under that name, and reported;
+//!   otherwise it is lost.
+//! - **Content.** The text before the first parsed call and the text of every lost call, in
+//!   order. Text after the first parsed call (between calls, or after the last) is dropped.
 //! - **The tool-call cap:** with `cap` > 0, parsing stops before call `cap + 1` and sets `capped`.
 //!
 //! Every tag literal here is assembled from pieces, so tools that scan sources for markup do not
@@ -102,11 +110,11 @@ pub fn parse(text: &str, tools: &[Tool], thinking: bool, cap: usize) -> ParseRes
     while !rest.is_empty() {
         match (rest.find(TH), rest.find(TC)) {
             (Some(p), c) if c.is_none_or(|c| p < c) => {
-                r.content.push_str(&rest[..p]);
+                keep_text(&mut r, &rest[..p]);
                 rest = take_reasoning(&rest[p + TH.len()..], &mut r);
             }
             (_, Some(p)) => {
-                r.content.push_str(&rest[..p]);
+                keep_text(&mut r, &rest[..p]);
                 if cap != 0 && r.calls.len() >= cap {
                     r.capped = true;
                     break;
@@ -117,21 +125,28 @@ pub fn parse(text: &str, tools: &[Tool], thinking: bool, cap: usize) -> ParseRes
                         r.calls.push(call);
                         rest = &body[used..];
                     }
-                    Call::Lost(used) => rest = &body[used..],
-                    Call::Nameless => {
-                        r.error = Some("nameless tool call".to_string());
-                        r.calls.clear();
-                        return r;
+                    Call::Lost(used) => {
+                        // Not dropped: the call's text, opening tag included, is content.
+                        r.content.push_str(&rest[p..p + TC.len() + used]);
+                        rest = &body[used..];
                     }
                 }
             }
             _ => {
-                r.content.push_str(rest);
+                keep_text(&mut r, rest);
                 break;
             }
         }
     }
     r
+}
+
+/// Text outside blocks goes to `content` until the first call has parsed: what the model says
+/// before a call, not after it.
+fn keep_text(r: &mut ParseResult, text: &str) {
+    if r.calls.is_empty() {
+        r.content.push_str(text);
+    }
 }
 
 /// One reasoning block from `s` (after its opening): up to the first closing tag, or all of it.
@@ -154,8 +169,6 @@ enum Call {
     Parsed(ParsedCall, usize),
     /// No call (reported); resume after the bytes used.
     Lost(usize),
-    /// Arguments without a name: a fatal error.
-    Nameless,
 }
 
 /// The earliest of `tags` in `s`: (position, tag).
@@ -182,6 +195,18 @@ fn skip_call(s: &str, from: usize) -> usize {
     }
 }
 
+/// `name` without the closing tags (`</...>`) and whitespace at its end.
+fn without_closing_tags(name: &str) -> &str {
+    let mut s = name.trim_end();
+    while let Some(head) = s.strip_suffix('>') {
+        match head.rfind("</") {
+            Some(p) if !head[p + 2..].contains(['<', '>']) => s = head[..p].trim_end(),
+            _ => break,
+        }
+    }
+    s
+}
+
 /// Parse one call from `s`, the text after its opening tag.
 fn parse_call(s: &str, tools: &[Tool], reports: &mut Vec<String>) -> Call {
     // The name runs to the first argument or the closing tag; a new call first means this one
@@ -194,18 +219,27 @@ fn parse_call(s: &str, tools: &[Tool], reports: &mut Vec<String>) -> Call {
         reports.push(format!("lost call (closing tag missing before the next call): {}", excerpt(&s[..end])));
         return Call::Lost(end);
     }
-    let name = s[..end].trim();
+    let mut name = s[..end].trim();
     if name.is_empty() {
         if tag == AK {
-            return Call::Nameless;
+            let used = skip_call(s, end);
+            reports.push(format!("lost call (arguments without a name): {}", excerpt(&s[..used])));
+            return Call::Lost(used);
         }
         reports.push("empty tool call".to_string());
         return Call::Lost(end + TC_END.len());
     }
     if name.contains(['<', '>']) {
-        let used = skip_call(s, end);
-        reports.push(format!("lost call (markup in the name): {}", excerpt(&s[..used])));
-        return Call::Lost(used);
+        // Markup after the name (see the module doc): recovered only as an offered tool.
+        let bare = without_closing_tags(name);
+        if !bare.is_empty() && tools.iter().any(|t| t.function.name == bare) {
+            reports.push(format!("recovered call {bare:?} (markup after the name): {}", excerpt(name)));
+            name = bare;
+        } else {
+            let used = skip_call(s, end);
+            reports.push(format!("lost call (markup in the name): {}", excerpt(&s[..used])));
+            return Call::Lost(used);
+        }
     }
     let tool = tools.iter().find(|t| t.function.name == name);
     let mut args: Vec<(String, Json)> = Vec::new();
@@ -478,7 +512,8 @@ mod tests {
                     ("lookup".into(), "{}".into())],
                 "{sep:?}"
             );
-            assert_eq!(r.content.trim(), "Checking.");
+            // The text before the first call; what follows a call (here only whitespace) is dropped.
+            assert_eq!(r.content, format!("Checking.{sep}"));
             assert!(r.reports.is_empty() && r.error.is_none());
         }
         // Reasoning, then parallel calls: one reasoning block, then the calls.
@@ -534,10 +569,76 @@ mod tests {
         // An empty call is noted.
         let r = parse(&format!("{TC}{TC_END}"), &[], false, 0);
         assert!(r.calls.is_empty() && r.reports == ["empty tool call"]);
-        // Arguments without a name are an error, never a nameless call.
+        // Arguments without a name are a lost call, never a nameless one.
         let r = parse(&format!("{TC}{AK}k{AK_END}{AV}v{AV_END}{TC_END}"), &[], false, 0);
-        assert_eq!(r.error.as_deref(), Some("nameless tool call"));
-        assert!(r.calls.is_empty());
+        assert!(r.calls.is_empty() && r.error.is_none());
+        assert!(r.reports.len() == 1 && r.reports[0].starts_with("lost call (arguments without a name)"), "{:?}", r.reports);
+    }
+
+    /// A lost call is not dropped: its text, from the opening tag, stays in the content where it
+    /// stood, beside the text before the first parsed call. Text after the first parsed call is
+    /// dropped; a lost call's own text is kept wherever it stands.
+    #[test]
+    fn a_lost_calls_text_stays_in_the_content() {
+        let ok = call_text("g", &[("k", "1")]);
+        let open = format!("{TC}f{AK}k{AK_END}{AV}v{AV_END}");
+        let nameless = format!("{TC}{AK}k{AK_END}{AV}v{AV_END}{TC_END}");
+        for (text, content, calls, reports) in [
+            // The value, or the call, never closes.
+            (format!("Checking.{TC}f{AK}k{AK_END}{AV}v"), format!("Checking.{TC}f{AK}k{AK_END}{AV}v"), 0, 1),
+            (open.clone(), open.clone(), 0, 1),
+            // A new call opens inside one: the first is text, the second parses.
+            (format!("{open}{ok}"), open.clone(), 1, 1),
+            (format!("A{open}{ok}B"), format!("A{open}"), 1, 1),
+            // Text between the last argument and the next call is stray text of the lost call.
+            (format!("A{open}B{ok}"), format!("A{open}B"), 1, 2),
+            // Markup in the name of a tool not offered, an empty call, arguments without a name.
+            (format!("a{TC}f{AV}1{AV_END}{TC_END}b"), format!("a{TC}f{AV}1{AV_END}{TC_END}b"), 0, 1),
+            (format!("{TC}{TC_END}"), format!("{TC}{TC_END}"), 0, 1),
+            (format!("a{nameless}b"), format!("a{nameless}b"), 0, 1),
+            (format!("A{nameless}{ok}"), format!("A{nameless}"), 1, 1),
+            // Two lost calls in a row.
+            (format!("A{open}{open}{ok}"), format!("A{open}{open}"), 1, 2),
+            // After the first parsed call, a lost call is still kept, and the text around it is not.
+            (format!("{ok}B{open}"), open.clone(), 1, 1),
+            (format!("A{ok}B{nameless}C"), format!("A{nameless}"), 1, 1),
+        ] {
+            let r = parse(&text, &[], false, 0);
+            assert_eq!((r.content.as_str(), r.calls.len(), r.reports.len()), (content.as_str(), calls, reports), "{text:?}: {:?}", r.reports);
+            assert!(r.error.is_none());
+        }
+        // Nothing lost: only the text before the first call.
+        let r = parse(&format!("a{ok}b{ok}c"), &[], false, 0);
+        assert_eq!((r.content.as_str(), r.calls.len(), r.reports.len()), ("a", 2, 0));
+    }
+
+    /// "Markup after the name" (`bash`, a stray closing tag, then the first argument) is recovered
+    /// as the offered tool and reported; any other markup in a name, or a name no offered tool
+    /// has, stays a lost call.
+    #[test]
+    fn markup_after_the_name_is_recovered_only_as_an_offered_tool() {
+        let bash = tool("bash", r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}}}"#);
+        let args = format!("{AK}command{AK_END}{AV}ls -la{AV_END}{AK}timeout{AK_END}{AV}30{AV_END}{TC_END}");
+        for head in [format!("{TC}bash{AK_END}"), format!("{TC}bash {AV_END}\n{AK_END} ")] {
+            let text = format!("{head}{args}");
+            let r = parse(&text, std::slice::from_ref(&bash), false, 0);
+            assert_eq!(calls(&r), [("bash".to_string(), r#"{"command":"ls -la","timeout":30}"#.to_string())], "{text:?}");
+            assert_eq!(r.content, "");
+            assert_eq!(r.reports.len(), 1);
+            assert!(r.reports[0].starts_with("recovered call \"bash\" (markup after the name)"), "{:?}", r.reports);
+            // Not offered: lost, and its text kept.
+            for tools in [vec![], vec![tool("read", "{}")]] {
+                let r = parse(&text, &tools, false, 0);
+                assert_eq!((r.calls.len(), r.content.as_str()), (0, text.as_str()));
+                assert!(r.reports[0].contains("markup in the name"), "{:?}", r.reports);
+            }
+        }
+        // An opening tag after the name, or nothing left once the closing tags go: lost, never a
+        // call under an empty name, even with a tool of an empty name offered.
+        for text in [format!("{TC}bash{AV}{args}"), format!("{TC}{AK_END}{args}")] {
+            let r = parse(&text, &[bash.clone(), tool("", "{}")], false, 0);
+            assert_eq!((r.calls.len(), r.content.as_str(), r.reports.len()), (0, text.as_str(), 1), "{text:?}");
+        }
     }
 
     #[test]
@@ -601,6 +702,11 @@ mod tests {
         // The template's own switch wins over the others.
         let r = parse_req(r#","chat_template_kwargs":{"enable_thinking":true},"enable_thinking":false,"reasoning_effort":"none""#);
         assert_eq!(r.enable_thinking, Some(true));
+        // `thinking` in chat_template_kwargs, a boolean, is its alias: after it, before the rest.
+        assert_eq!(parse_req(r#","chat_template_kwargs":{"thinking":false}"#).enable_thinking, Some(false));
+        assert_eq!(parse_req(r#","chat_template_kwargs":{"thinking":true},"enable_thinking":false"#).enable_thinking, Some(true));
+        assert_eq!(parse_req(r#","chat_template_kwargs":{"enable_thinking":true,"thinking":false}"#).enable_thinking, Some(true));
+        assert_eq!(parse_req(r#","chat_template_kwargs":{"thinking":{"type":"disabled"}}"#).enable_thinking, None);
         // History fields for the template.
         let body = r#"{"messages":[{"role":"assistant","content":"a","reasoning_content":"r1"},{"role":"assistant","content":"b","reasoning":"r2"},{"role":"tool","tool_call_id":"c1","content":"x"}]}"#;
         let req = ChatRequest::parse(&json::parse(body).unwrap(), &|_: &str| Err("no images".to_string())).unwrap();
@@ -801,6 +907,9 @@ mod tests {
             // vLLM and SGLang. The template has no off mode: "off" is its Low effort.
             (r#""chat_template_kwargs":{"enable_thinking":false}"#, opts(true, Some("low"), None)),
             (r#""chat_template_kwargs":{"enable_thinking":true}"#, opts(true, None, None)),
+            // The `thinking` spelling in chat_template_kwargs (a boolean): the same switch.
+            (r#""chat_template_kwargs":{"thinking":false}"#, opts(true, Some("low"), None)),
+            (r#""chat_template_kwargs":{"thinking":true}"#, opts(true, None, None)),
             (r#""enable_thinking":false"#, opts(true, Some("low"), None)),
             // GLM and Anthropic.
             (r#""thinking":{"type":"disabled"}"#, opts(true, Some("low"), None)),
@@ -811,9 +920,13 @@ mod tests {
             (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(false, Some("none"), None)),
             (r#""reasoning_effort":"low""#, opts(true, Some("low"), None)),
             (r#""reasoning_effort":"low","chat_template_kwargs":{"reasoning_effort":"high"}"#, opts(true, Some("low"), None)),
-            // Precedence: chat_template_kwargs, top-level enable_thinking, thinking.type, effort "none".
+            // Precedence: chat_template_kwargs (enable_thinking, then thinking), top-level
+            // enable_thinking, thinking.type, effort "none".
             (r#""chat_template_kwargs":{"enable_thinking":true},"thinking":{"type":"disabled"},"reasoning_effort":"none""#,
                 opts(true, Some("none"), None)),
+            (r#""chat_template_kwargs":{"enable_thinking":true,"thinking":false}"#, opts(true, None, None)),
+            (r#""chat_template_kwargs":{"thinking":false},"enable_thinking":true,"thinking":{"type":"enabled"}"#,
+                opts(true, Some("low"), None)),
             (r#""enable_thinking":true,"thinking":{"type":"disabled"}"#, opts(true, None, None)),
             (r#""thinking":{"type":"enabled"},"reasoning_effort":"none""#, opts(true, Some("none"), None)),
             (r#""thinking":{"type":"disabled"},"reasoning_effort":"high""#, opts(true, Some("low"), None)),

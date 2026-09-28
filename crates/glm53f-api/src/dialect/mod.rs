@@ -28,7 +28,11 @@ pub struct ParsedCall {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParseResult {
-    /// Text outside `<think>` and `<tool_call>` blocks.
+    /// Text outside `<think>` and `<tool_call>` blocks: the reply's text (the API drops the
+    /// whitespace that ends it when there are calls). A dialect may keep a call that did not
+    /// parse in here as text, where it stood (each one also reported), so a malformed call
+    /// reaches the client instead of vanishing. The GLM dialect does, and keeps no text after
+    /// its first parsed call; the MiMo reference keeps all text outside calls and drops lost calls.
     pub content: String,
     /// Reasoning blocks, in order.
     pub reasoning: Vec<String>,
@@ -36,7 +40,7 @@ pub struct ParseResult {
     pub calls: Vec<ParsedCall>,
     /// Losses that must be surfaced (never silently dropped).
     pub reports: Vec<String>,
-    /// A fatal parse error (e.g. a nameless call).
+    /// A fatal parse error (the MiMo dialect's nameless call).
     pub error: Option<String>,
     /// True when the tool-call cap fired (finish_reason `tool_calls`).
     pub capped: bool,

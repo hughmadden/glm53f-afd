@@ -75,3 +75,29 @@ STREAM-MARKUP and TOOLS-stream).
 | src/lib.rs | Crate doc: the reasoning field, the chunk head, and the thinking switch's sources in precedence order | — | 2026-09-28 |
 | src/dialect/glm.rs (tests) | The server stub records `tokenize_prompt`'s options as well as `render_prompt`'s. Streamed reasoning is read from `reasoning_content` and a `reasoning` key fails the test. New: `the_thinking_switch_forms_and_their_precedence_reach_the_engine` (17 request forms), `reasoning_after_a_tool_call_streams_under_the_same_field`; `thinking_off_reaches_the_engine_and_the_parse` also streams | the tests themselves | 2026-09-28 |
 | tests/acceptance.rs | `streaming_think_block_is_reasoning_only_and_matches_non_stream` and `reasoning_opened_by_the_prompt_streams_as_reasoning` read streamed reasoning from `reasoning_content` and fail on a `reasoning` key | the tests themselves | 2026-09-28 |
+
+## Changed here (tool calls that do not parse, the text before a call, the `thinking` spelling of the switch)
+
+A call the GLM dialect could not parse left nothing at the client (an empty `stop` turn), a nameless
+one failed the request (a 400, or `finish_reason` "error" streamed), its reports were never read, the
+text before a call reached a streaming client but not a whole reply, one malformed shape the model
+writes ("markup after the name": a stray closing tag between the name and the first argument) was
+lost, and `chat_template_kwargs.thinking` was ignored. Found by reading the API against the
+real-output parser cases and the chat template of a public recipe (mmastrac/glm-5.3-flash-4x-gx10
+@ `5ea4121`: `dev/patch-tests/_glm47_failclosed_stream_test.py`, sha256
+`c39fee31c28b47ed91ef3ad3269a9d5498ae4fb7aea39194b524ae2548db7594`, and `image/chat-template.jinja`
+line 3, sha256 `f02c2c536ac51deeb2675125064f56578d4ca729389511a782a8ccdc6721e95e`). The cases are
+reimplemented as shapes (own tool names and values, no code or text copied); the recipe's parser
+refuses such calls with a sentinel argument, this one returns their text as `content` and refuses
+nothing. Each of the first three items below is a separate hunk.
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/dialect/glm.rs | **Lost calls kept.** A lost call's text, opening tag included, stays in `content` where it stood; "markup after the name" is recovered, and reported, when what is left of the name (`without_closing_tags`) is a tool the request offered; module doc | glm.rs `a_lost_calls_text_stays_in_the_content`, `markup_after_the_name_is_recovered_only_as_an_offered_tool` | 2026-09-29 |
+| src/dialect/glm.rs | **Nameless calls lost.** A call with arguments but no name is a lost call (was `error`, so a 400 or `finish_reason` "error"); `Call::Nameless` removed. The MiMo dialect keeps its error | glm.rs `malformed_calls_are_reported_not_dropped`, `a_lost_calls_text_stays_in_the_content`; tests/acceptance.rs cases "arguments without a name" | 2026-09-29 |
+| src/dialect/glm.rs, src/chat.rs, src/dialect/mod.rs | **The text before a call.** `parse` keeps text only until the first call has parsed (`keep_text`); `reply_content` is the content of a reply, whole and streamed: as parsed, but without the whitespace that ends it when there are calls; `message_content` returns it (null when empty beside calls). The stream holds back whitespace that ends the text so far (a call that follows drops it) and, after generation, sends the rest of `reply_content` beyond what it sent live (`StreamSplit::content_bytes`): a lost call's text | tests/acceptance.rs `glm_tool_calls_as_the_model_writes_them` (cases "text before a call", "whitespace before a call", "text between and after calls", "a plain reply", and the lost calls), `a_think_block_inside_the_text_before_a_call_leaves_whole_and_streamed_alike`, `streaming_multibyte_text_does_not_panic_in_holdback` (now reads the joined content: the space ending the first fragment goes out with the next text) | 2026-09-29 |
+| src/chat.rs | `log_reports`: every parse report to stderr under the completion's id, whole and streamed | tests/acceptance.rs `parse_reports_are_logged_under_the_completion_id` | 2026-09-29 |
+| src/types.rs | `chat_template_kwargs.thinking` (a boolean) is an alias of `enable_thinking`: read after it and before the top-level one | glm.rs `request_fields_map_to_the_template_switches`, `the_thinking_switch_forms_and_their_precedence_reach_the_engine`; tests/acceptance.rs `glm_thinking_off_is_low_effort` | 2026-09-29 |
+| src/lib.rs | Crate doc: the switch's sources, tool calls | — | 2026-09-29 |
+| tests/acceptance.rs | `glm_tool_calls_as_the_model_writes_them` (the recipe's six shapes, lost calls, the text around calls: each whole and streamed a character and a token at a time), the think-block test, `parse_reports_are_logged_under_the_completion_id` (the server logs from its own threads, so a child process serves the requests and the test reads its stderr) | the tests themselves | 2026-09-29 |
+| harness/test_api_contract.py | The fake server reads `chat_template_kwargs.thinking` as the API does | the self-test | 2026-09-29 |

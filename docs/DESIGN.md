@@ -276,8 +276,9 @@ to about C1 throughput. This design rules that out.
   `<|assistant|>` followed by an opened think tag.
 - **The template has no off switch.** It renders a reasoning effort of Low, High or Max (the
   default) and always opens the think block.
-  - A request that turns thinking off (`enable_thinking` false, or `thinking.type` "disabled") gets
-    the template's **Low** effort, as other hosts of this model do. The model writes a short plan,
+  - A request that turns thinking off (`chat_template_kwargs.enable_thinking` false or its alias
+    `chat_template_kwargs.thinking` false, a top-level `enable_thinking` false, or `thinking.type`
+    "disabled") gets the template's **Low** effort, as other hosts of this model do. The model writes a short plan,
     returned under `reasoning_content`, then answers.
   - `reasoning_effort: "none"` asks for no reasoning at all. The prompt then ends with an empty
     think block, the form the template writes for an assistant turn without reasoning.
@@ -287,6 +288,27 @@ to about C1 throughput. This design rules that out.
     faster (docs/PERFORMANCE.md §0).
 - **Earlier turns keep their reasoning** unless the request sets `clear_thinking`. Re-rendering the
   history unchanged is what lets a follow-up turn resume from the previous turn's snapshot.
+
+### Tool calls
+
+- **The text before the first call is the reply's `content`**, whole or streamed: the whitespace that
+  ends it is dropped, and it is `null` (no content delta) when nothing is left. Whitespace at its
+  start stays as written: a stream cannot tell that a call will follow. Text after the first call is
+  dropped. The streamed text holds back whitespace until it knows a call does not follow, so the two
+  forms agree. Until 29 September 2026 a whole reply carried no content beside its calls.
+- **A call the parser cannot read is returned as text.** Its text, from the opening tag, goes to the
+  client as `content` (streamed after generation, so no markup reaches a live delta), beside any
+  calls that did parse; `finish_reason` is `tool_calls` only when one did. A call with arguments and
+  no name is one of them: no reply fails, or ends with another finish reason, for what the model
+  wrote. Until 29 September 2026 a lost call left an empty `stop` turn, and a nameless one a 400
+  (or `finish_reason` "error" when streamed).
+- **Every parse report is logged**, one line per report under the completion's id: a lost call, an
+  argument dropped from a call, a recovered name.
+- **One shape is recovered:** a name followed by a stray closing tag of an argument key, before the
+  first argument, when what is left of the name is a tool the request offered.
+- **Calls are not checked against the request.** A tool that was not offered, or a key outside its
+  schema, is passed on as written; the schema only types the values. Refusing them (with an argument
+  the client can retry on) would change the API contract, so it is not done.
 
 ## 10. Configuration and deployment
 

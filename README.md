@@ -177,12 +177,18 @@ and reasoning (`reasoning_content`). Thinking is on by default, as the model's c
 it.
 - The template has no thinking-off mode; it renders a reasoning effort of Low, High or Max, Max by
   default.
-- A request that turns thinking off (`chat_template_kwargs.enable_thinking: false`, or
-  `thinking.type: "disabled"`) gets the template's Low effort: a short plan under
-  `reasoning_content`, then the answer.
+- A request that turns thinking off (`chat_template_kwargs.enable_thinking: false` or its alias
+  `chat_template_kwargs.thinking: false`, or `thinking.type: "disabled"`) gets the template's Low
+  effort: a short plan under `reasoning_content`, then the answer.
 - `reasoning_effort: "none"` asks for no reasoning at all (an empty think block), for callers with
   tiny token budgets.
 - `reasoning_effort: "low"` / `"high"` / `"max"` choose the effort directly.
+- A reply with tool calls carries the text the model wrote before them as `content` (its ending
+  whitespace dropped; `null` when there is none), streamed or not.
+- A tool call the model writes badly (its closing tag missing, markup in its name, arguments but no
+  name) is not dropped and never fails the request: its text comes back as `content`, streamed or
+  not, and the server logs why. One shape is recovered: a name followed by a stray closing tag,
+  when the rest is a tool the request offered.
 
 ## Status and limitations
 

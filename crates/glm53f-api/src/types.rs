@@ -131,8 +131,9 @@ pub struct ChatRequest {
     pub stream: bool,
     pub include_usage: bool,
     /// The request's thinking switch, the first of: `chat_template_kwargs.enable_thinking`,
-    /// top-level `enable_thinking`, `thinking.type` (`disabled` is off, any other type on), and
-    /// `reasoning_effort: "none"` (off). `None` when the request says nothing: the dialect's
+    /// `chat_template_kwargs.thinking` (a boolean: the spelling some clients and chat templates
+    /// use), top-level `enable_thinking`, `thinking.type` (`disabled` is off, any other type on),
+    /// and `reasoning_effort: "none"` (off). `None` when the request says nothing: the dialect's
     /// default applies ([`crate::Dialect::default_thinking`]).
     pub enable_thinking: Option<bool>,
     /// `reasoning_effort` (top level, else `chat_template_kwargs`), as sent: the chat template
@@ -364,6 +365,7 @@ impl ChatRequest {
             .or_else(|| kwargs.and_then(|k| k.get("reasoning_effort")).and_then(|r| r.as_str()))
             .map(|s| s.to_string());
         let enable_thinking = kwargs.and_then(|k| k.get("enable_thinking")).and_then(|t| t.as_bool())
+            .or_else(|| kwargs.and_then(|k| k.get("thinking")).and_then(|t| t.as_bool()))
             .or_else(|| body.get("enable_thinking").and_then(|t| t.as_bool()))
             .or_else(|| thinking.and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(|t| t != "disabled"))
             .or_else(|| (reasoning_effort.as_deref() == Some("none")).then_some(false));
