@@ -7,10 +7,10 @@
 //! |---|---|
 //! | mHC (both sites) | `fn` BF16 `[24][16,384]`, `base` and `scale` f32 |
 //! | `input_layernorm`, `post_attention_layernorm` | BF16 `[4096]` |
-//! | KDA q, k, v, b projections | one BF16 `[24,640][4096]` (q, k, v, beta rows stacked) |
+//! | KDA q, k, v, b projections | one BF16 `[24,640][4096]` (q, k, v, beta rows stacked), or FP8 with [`WeightOptions::kda_fp8`] |
 //! | KDA f_a, g_a | one BF16 `[256][4096]` |
 //! | KDA f_b, g_b | one BF16 `[2][8192][128]` (two GEMV groups) |
-//! | KDA o_proj | BF16 `[4096][8192]` |
+//! | KDA o_proj | BF16 `[4096][8192]`, or FP8 with [`WeightOptions::kda_fp8`] |
 //! | KDA conv, `A_log`, `dt_bias`, `o_norm` | BF16 `[24,576][4]` (q, k, v concatenated), f32, f32, BF16 |
 //! | DSA q_a, kv_a, q_b, o | FP8 E4M3 with f32 `weight_scale_inv` per 128 x 128 block |
 //! | DSA `kv_b_proj` | BF16 `[32,768][512]` |
@@ -24,6 +24,19 @@
 //!
 //! The embedding is not here: it stays in page-locked host memory ([`crate::embed`]).
 //! Routed experts are the expert backend's ([`crate::experts`]).
+//!
+//! **FP8 KDA projections (decision D2, [`WeightOptions::kda_fp8`], off by default).** The official
+//! checkpoint ships the 34 KDA layers' projections in BF16 (9.37 GB, 61% of the coordinator's
+//! weights). With the option, the fused q|k|v|b projection and `o_proj` are quantized at load
+//! time to FP8 E4M3 with 128 x 128 block scales, the checkpoint's own scheme for its other FP8
+//! weights (`glm53f-layers`' `glm53f_fp8_quantize_weight`: per block `scale = amax / 448`,
+//! `q = e4m3(w / scale)`). They then run the FP8 GEMMs the DSA projections run. q|k|v|b has
+//! 24,640 rows = 192 blocks of 128 and a 64-row block for beta, which has scales of its own (the
+//! FP8 kernels take a partial last block of rows). The gate projections (`f_a`, `g_a`, `f_b`,
+//! `g_b`: 6 MB a layer, 2% of the KDA bytes, and the forget gate's decays compound over the
+//! sequence), the conv, the norms, `A_log` and `dt_bias` stay as shipped. Resident KDA bytes:
+//! 275.5 MB a layer in BF16, 141.0 MB with the option (9.37 GB and 4.80 GB over 34 layers: 4.26
+//! GiB less).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,10 +46,18 @@ use glm53f_model::config::{AttnKind, ModelConfig};
 use glm53f_model::dtype::DType;
 use glm53f_model::safetensors::Checkpoint;
 
-use crate::device::DeviceBuffer;
+use crate::device::{launched, DeviceBuffer, Stream};
 use crate::error::{invalid, Result};
 use crate::gemm::{Bf16Mat, Fp8Mat};
 use crate::shape::*;
+
+/// Load-time choices for the coordinator's weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightOptions {
+    /// Decision D2: the KDA layers' q|k|v|b and `o_proj` quantized at load to FP8 E4M3 with
+    /// 128 x 128 block scales (module documentation). Off: BF16 as the checkpoint ships them.
+    pub kda_fp8: bool,
+}
 
 /// An FP8 block-128 weight on the device.
 pub struct Fp8W {
@@ -78,6 +99,23 @@ impl Bf16W {
     }
 }
 
+/// A projection the checkpoint ships in BF16: as shipped, or quantized to FP8 block-128 at load
+/// ([`WeightOptions::kda_fp8`]).
+pub enum ProjW {
+    Bf16(Bf16W),
+    Fp8(Fp8W),
+}
+
+impl ProjW {
+    /// Device bytes of the weight (and its scales).
+    pub fn bytes(&self) -> usize {
+        match self {
+            ProjW::Bf16(w) => w.mat().bytes(),
+            ProjW::Fp8(w) => w.mat().bytes(),
+        }
+    }
+}
+
 /// One mHC site: `fn` BF16 `[24][4 * hidden]`, `base` f32 `[24]`, `scale` f32 `[3]`.
 pub struct HcW {
     pub fn_: DeviceBuffer,
@@ -87,12 +125,13 @@ pub struct HcW {
 
 pub struct KdaW {
     /// q | k | v | beta-logit projections, `[24,640][4096]`.
-    pub qkvb: Bf16W,
+    pub qkvb: ProjW,
     /// f_a | g_a, `[256][4096]`.
     pub fga: Bf16W,
     /// f_b and g_b as two groups, `[2][8192][128]`.
     pub fgb: Bf16W,
-    pub o: Bf16W,
+    /// `[4096][8192]`.
+    pub o: ProjW,
     /// BF16 `[24,576][4]`.
     pub conv_w: DeviceBuffer,
     /// f32 `[64]`.
@@ -171,17 +210,80 @@ pub struct DeviceModel {
     pub head: HeadW,
     /// Device bytes held.
     pub bytes: usize,
+    /// The load-time choices it was loaded with.
+    pub opts: WeightOptions,
 }
 
 /// Reads checked tensors from a checkpoint and uploads them.
 pub struct Loader<'a> {
     pub ckpt: &'a Checkpoint,
     pub bytes: usize,
+    pub opts: WeightOptions,
+    /// The stream the load-time quantization runs on (created on first use).
+    stream: Option<Stream>,
 }
 
 impl<'a> Loader<'a> {
     pub fn new(ckpt: &'a Checkpoint) -> Loader<'a> {
-        Loader { ckpt, bytes: 0 }
+        Self::with_options(ckpt, WeightOptions::default())
+    }
+
+    pub fn with_options(ckpt: &'a Checkpoint, opts: WeightOptions) -> Loader<'a> {
+        Loader {
+            ckpt,
+            bytes: 0,
+            opts,
+            stream: None,
+        }
+    }
+
+    /// A BF16 weight quantized on the device to FP8 E4M3 with 128 x 128 block scales
+    /// (`glm53f_fp8_quantize_weight`); the BF16 copy is freed.
+    pub fn quantize(&mut self, w: Bf16W) -> Result<Fp8W> {
+        if w.groups != 1 || !w.k.is_multiple_of(128) || !w.n.is_multiple_of(8) {
+            return Err(invalid!(
+                "FP8 quantization needs one group, k % 128 == 0 and n % 8 == 0 ({} x {} x {})",
+                w.groups,
+                w.n,
+                w.k
+            ));
+        }
+        if self.stream.is_none() {
+            self.stream = Some(Stream::new()?);
+        }
+        let st = self.stream.as_ref().unwrap();
+        let q = Fp8W {
+            w: DeviceBuffer::alloc(w.n * w.k)?,
+            scales: DeviceBuffer::alloc(w.n.div_ceil(128) * (w.k / 128) * 4)?,
+            n: w.n,
+            k: w.k,
+        };
+        // SAFETY: `w` holds [n][k] BF16, `q` [n][k] codes and [ceil(n/128)][k/128] scales.
+        launched(
+            unsafe {
+                glm53f_layers::ffi::glm53f_fp8_quantize_weight(
+                    w.buf.ptr(0),
+                    w.n as i32,
+                    w.k as i32,
+                    q.w.ptr(0),
+                    q.scales.ptr(0),
+                    st.raw().cast(),
+                )
+            },
+            "glm53f_fp8_quantize_weight",
+        )?;
+        st.synchronize()?;
+        self.bytes = self.bytes - w.buf.bytes() + q.w.bytes() + q.scales.bytes();
+        Ok(q)
+    }
+
+    /// A projection that ships in BF16: as shipped, or quantized when `fp8`.
+    fn proj(&mut self, w: Bf16W, fp8: bool) -> Result<ProjW> {
+        Ok(if fp8 {
+            ProjW::Fp8(self.quantize(w)?)
+        } else {
+            ProjW::Bf16(w)
+        })
     }
 
     /// A tensor's bytes, checked against the dtype and shape the engine expects.
@@ -342,18 +444,23 @@ impl<'a> Loader<'a> {
             .iter()
             .map(|c| (c.as_str(), DType::BF16, &[KDA_WIDTH, 1, 4][..]))
             .collect();
+        let fp8 = self.opts.kda_fp8;
+        let qkvb = self.bf16(
+            &[
+                &n("q_proj.weight"),
+                &n("k_proj.weight"),
+                &n("v_proj.weight"),
+                &n("b_proj.weight"),
+            ],
+            &[KDA_WIDTH, KDA_WIDTH, KDA_WIDTH, KDA_HEADS],
+            HIDDEN,
+            1,
+        )?;
+        let qkvb = self.proj(qkvb, fp8)?;
+        let o = self.bf16(&[&n("o_proj.weight")], &[HIDDEN], KDA_WIDTH, 1)?;
+        let o = self.proj(o, fp8)?;
         Ok(KdaW {
-            qkvb: self.bf16(
-                &[
-                    &n("q_proj.weight"),
-                    &n("k_proj.weight"),
-                    &n("v_proj.weight"),
-                    &n("b_proj.weight"),
-                ],
-                &[KDA_WIDTH, KDA_WIDTH, KDA_WIDTH, KDA_HEADS],
-                HIDDEN,
-                1,
-            )?,
+            qkvb,
             fga: self.bf16(
                 &[&n("f_a_proj.weight"), &n("g_a_proj.weight")],
                 &[KDA_DIM, KDA_DIM],
@@ -366,7 +473,7 @@ impl<'a> Loader<'a> {
                 KDA_DIM,
                 2,
             )?,
-            o: self.bf16(&[&n("o_proj.weight")], &[HIDDEN], KDA_WIDTH, 1)?,
+            o,
             conv_w: self.upload(&conv_parts)?,
             a_log: self.upload(&[(&n("A_log"), DType::F32, &[KDA_HEADS])])?,
             dt_bias: self.upload(&[(&n("dt_bias"), DType::F32, &[KDA_WIDTH])])?,
@@ -499,7 +606,17 @@ impl DeviceModel {
         shape: &ModelShape,
         loaded: usize,
     ) -> Result<DeviceModel> {
-        let mut ld = Loader::new(ckpt);
+        Self::load_with(ckpt, shape, loaded, WeightOptions::default())
+    }
+
+    /// [`DeviceModel::load_repeating`] with load-time choices ([`WeightOptions`]).
+    pub fn load_with(
+        ckpt: &Checkpoint,
+        shape: &ModelShape,
+        loaded: usize,
+        opts: WeightOptions,
+    ) -> Result<DeviceModel> {
+        let mut ld = Loader::with_options(ckpt, opts);
         let mut layers: Vec<Arc<LayerW>> = Vec::with_capacity(shape.layers);
         for l in 0..shape.layers {
             if l < loaded {
@@ -523,6 +640,7 @@ impl DeviceModel {
             layers,
             head,
             bytes: ld.bytes,
+            opts,
         })
     }
 }

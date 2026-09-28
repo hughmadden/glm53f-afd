@@ -189,6 +189,27 @@ pub enum StateOut<'a> {
     To(&'a DeviceBuffer, usize),
 }
 
+/// How a batch launch's states are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateType {
+    /// f32, as the reference keeps it.
+    F32,
+    /// bf16 (the `_bf16state` entry points, decision D8): the arithmetic stays f32, and the
+    /// state is rounded to bf16 after every row (the chain and the replay) or every 16-row
+    /// chunk (the prefill).
+    Bf16,
+}
+
+impl StateType {
+    /// Bytes of one state element.
+    pub fn bytes(self) -> usize {
+        match self {
+            StateType::F32 => 4,
+            StateType::Bf16 => 2,
+        }
+    }
+}
+
 fn same(a: &DeviceBuffer, b: &DeviceBuffer) -> bool {
     a.as_ptr() == b.as_ptr() && a.bytes() > 0
 }
@@ -524,6 +545,17 @@ pub struct ChainBatch<'a> {
 
 impl ChainBatch<'_> {
     pub fn launch(&self, meta: &BatchMeta, stream: &Stream) -> Result<(), Error> {
+        self.launch_as(meta, stream, StateType::F32)
+    }
+
+    /// With bf16 states (`glm53f_kda_chain_batch_bf16state`): `state` and `state_out` hold bf16
+    /// values, and the requests' `state_offset`s count bf16 elements.
+    pub fn launch_bf16_state(&self, meta: &BatchMeta, stream: &Stream) -> Result<(), Error> {
+        self.launch_as(meta, stream, StateType::Bf16)
+    }
+
+    fn launch_as(&self, meta: &BatchMeta, stream: &Stream, st: StateType) -> Result<(), Error> {
+        let es = st.bytes();
         let h = self.weights.heads;
         let batch = meta.batch()?;
         let total = meta.total_rows();
@@ -539,14 +571,14 @@ impl ChainBatch<'_> {
         meta.check_regions("conv", self.conv, 2, 0, WINDOW * channels(h), false, |r| {
             r.conv_offset
         })?;
-        meta.check_regions("state", self.state, 4, 0, state_len(h), true, |r| {
+        meta.check_regions("state", self.state, es, 0, state_len(h), true, |r| {
             r.state_offset
         })?;
         let state_out = match self.state_out {
             StateOut::Skip => core::ptr::null_mut(),
-            StateOut::InPlace => self.state.ptr::<f32>(0),
+            StateOut::InPlace => self.state.ptr::<u8>(0),
             StateOut::To(buf, _) => {
-                meta.check_regions("state_out", buf, 4, 0, state_len(h), true, |r| {
+                meta.check_regions("state_out", buf, es, 0, state_len(h), true, |r| {
                     r.state_offset
                 })?;
                 if same(buf, self.state) {
@@ -554,7 +586,7 @@ impl ChainBatch<'_> {
                         "state_out is the state buffer: use InPlace".into(),
                     ));
                 }
-                buf.ptr::<f32>(0)
+                buf.ptr::<u8>(0)
             }
         };
         let (ks, vs, gs, bs) = match self.saves {
@@ -575,39 +607,72 @@ impl ChainBatch<'_> {
             ),
         };
         let w = self.weights;
+        let heads = to_i32(h, "heads")?;
         // SAFETY: every region was checked above against the metadata's host copy, which
         // matches what `BatchMeta::set` copied to the device.
         let code = unsafe {
-            ffi::glm53f_kda_chain_batch(
-                to_i32(h, "heads")?,
-                batch,
-                meta.cu_rows.ptr(0),
-                self.p.buf.ptr(self.p.offset),
-                self.p.stride as i64,
-                self.b_off,
-                self.a.buf.ptr(self.a.offset),
-                self.a.stride as i64,
-                self.g.buf.ptr(self.g.offset),
-                self.g.stride as i64,
-                self.conv.ptr(0),
-                meta.conv_off.ptr(0),
-                w.conv_w.ptr(0),
-                self.state.ptr(0),
-                state_out,
-                meta.state_off.ptr(0),
-                w.a_log.ptr(0),
-                w.dt_bias.ptr(0),
-                w.norm_w.ptr(0),
-                w.eps,
-                w.lower,
-                self.out.buf.ptr(self.out.offset),
-                self.out.stride as i64,
-                ks,
-                vs,
-                gs,
-                bs,
-                stream.raw(),
-            )
+            match st {
+                StateType::F32 => ffi::glm53f_kda_chain_batch(
+                    heads,
+                    batch,
+                    meta.cu_rows.ptr(0),
+                    self.p.buf.ptr(self.p.offset),
+                    self.p.stride as i64,
+                    self.b_off,
+                    self.a.buf.ptr(self.a.offset),
+                    self.a.stride as i64,
+                    self.g.buf.ptr(self.g.offset),
+                    self.g.stride as i64,
+                    self.conv.ptr(0),
+                    meta.conv_off.ptr(0),
+                    w.conv_w.ptr(0),
+                    self.state.ptr(0),
+                    state_out.cast(),
+                    meta.state_off.ptr(0),
+                    w.a_log.ptr(0),
+                    w.dt_bias.ptr(0),
+                    w.norm_w.ptr(0),
+                    w.eps,
+                    w.lower,
+                    self.out.buf.ptr(self.out.offset),
+                    self.out.stride as i64,
+                    ks,
+                    vs,
+                    gs,
+                    bs,
+                    stream.raw(),
+                ),
+                StateType::Bf16 => ffi::glm53f_kda_chain_batch_bf16state(
+                    heads,
+                    batch,
+                    meta.cu_rows.ptr(0),
+                    self.p.buf.ptr(self.p.offset),
+                    self.p.stride as i64,
+                    self.b_off,
+                    self.a.buf.ptr(self.a.offset),
+                    self.a.stride as i64,
+                    self.g.buf.ptr(self.g.offset),
+                    self.g.stride as i64,
+                    self.conv.ptr(0),
+                    meta.conv_off.ptr(0),
+                    w.conv_w.ptr(0),
+                    self.state.ptr(0),
+                    state_out.cast(),
+                    meta.state_off.ptr(0),
+                    w.a_log.ptr(0),
+                    w.dt_bias.ptr(0),
+                    w.norm_w.ptr(0),
+                    w.eps,
+                    w.lower,
+                    self.out.buf.ptr(self.out.offset),
+                    self.out.stride as i64,
+                    ks,
+                    vs,
+                    gs,
+                    bs,
+                    stream.raw(),
+                ),
+            }
         };
         launched(code, "glm53f_kda_chain_batch")
     }
@@ -722,6 +787,47 @@ pub fn replay_batch(
     saves: &LayerSaves,
     stream: &Stream,
 ) -> Result<(), Error> {
+    replay_batch_as(
+        meta,
+        state,
+        state_out,
+        state_stride,
+        saves,
+        stream,
+        StateType::F32,
+    )
+}
+
+/// [`replay_batch`] with bf16 states (`glm53f_kda_replay_batch_bf16state`): strides and offsets
+/// count bf16 elements.
+pub fn replay_batch_bf16_state(
+    meta: &BatchMeta,
+    state: &DeviceBuffer,
+    state_out: &DeviceBuffer,
+    state_stride: usize,
+    saves: &LayerSaves,
+    stream: &Stream,
+) -> Result<(), Error> {
+    replay_batch_as(
+        meta,
+        state,
+        state_out,
+        state_stride,
+        saves,
+        stream,
+        StateType::Bf16,
+    )
+}
+
+fn replay_batch_as(
+    meta: &BatchMeta,
+    state: &DeviceBuffer,
+    state_out: &DeviceBuffer,
+    state_stride: usize,
+    saves: &LayerSaves,
+    stream: &Stream,
+    st: StateType,
+) -> Result<(), Error> {
     let (h, l) = (saves.heads, saves.layers);
     let batch = meta.batch()?;
     if l == 0 || meta.total_rows() > saves.rows {
@@ -733,7 +839,7 @@ pub fn replay_batch(
         meta.check_regions(
             "state",
             buf,
-            4,
+            st.bytes(),
             (l - 1) * state_stride,
             state_len(h),
             true,
@@ -753,26 +859,47 @@ pub fn replay_batch(
             ));
         }
     }
+    let (heads, layers) = (to_i32(h, "heads")?, to_i32(l, "layers")?);
     // SAFETY: regions checked above against the metadata's host copy.
     let code = unsafe {
-        ffi::glm53f_kda_replay_batch(
-            to_i32(h, "heads")?,
-            to_i32(l, "layers")?,
-            batch,
-            meta.cu_rows.ptr(0),
-            meta.keep_d.ptr(0),
-            state.ptr(0),
-            state_out.ptr(0),
-            state_stride as i64,
-            meta.state_off.ptr(0),
-            saves.k.ptr(0),
-            saves.v.ptr(0),
-            saves.g.ptr(0),
-            saves.b.ptr(0),
-            saves.kv_stride() as i64,
-            saves.b_stride() as i64,
-            stream.raw(),
-        )
+        match st {
+            StateType::F32 => ffi::glm53f_kda_replay_batch(
+                heads,
+                layers,
+                batch,
+                meta.cu_rows.ptr(0),
+                meta.keep_d.ptr(0),
+                state.ptr(0),
+                state_out.ptr(0),
+                state_stride as i64,
+                meta.state_off.ptr(0),
+                saves.k.ptr(0),
+                saves.v.ptr(0),
+                saves.g.ptr(0),
+                saves.b.ptr(0),
+                saves.kv_stride() as i64,
+                saves.b_stride() as i64,
+                stream.raw(),
+            ),
+            StateType::Bf16 => ffi::glm53f_kda_replay_batch_bf16state(
+                heads,
+                layers,
+                batch,
+                meta.cu_rows.ptr(0),
+                meta.keep_d.ptr(0),
+                state.ptr(0),
+                state_out.ptr(0),
+                state_stride as i64,
+                meta.state_off.ptr(0),
+                saves.k.ptr(0),
+                saves.v.ptr(0),
+                saves.g.ptr(0),
+                saves.b.ptr(0),
+                saves.kv_stride() as i64,
+                saves.b_stride() as i64,
+                stream.raw(),
+            ),
+        }
     };
     launched(code, "glm53f_kda_replay_batch")
 }
@@ -1034,6 +1161,17 @@ pub struct PrefillBatch<'a> {
 
 impl PrefillBatch<'_> {
     pub fn launch(&self, meta: &BatchMeta, stream: &Stream) -> Result<(), Error> {
+        self.launch_as(meta, stream, StateType::F32)
+    }
+
+    /// With bf16 states (`glm53f_kda_prefill_batch_bf16state`): `state` and `state_out` hold
+    /// bf16 values, and the requests' `state_offset`s count bf16 elements.
+    pub fn launch_bf16_state(&self, meta: &BatchMeta, stream: &Stream) -> Result<(), Error> {
+        self.launch_as(meta, stream, StateType::Bf16)
+    }
+
+    fn launch_as(&self, meta: &BatchMeta, stream: &Stream, st: StateType) -> Result<(), Error> {
+        let es = st.bytes();
         let h = self.weights.heads;
         let vb = check_value_blocks(self.value_blocks)?;
         check_lower(self.weights.lower)?;
@@ -1052,16 +1190,16 @@ impl PrefillBatch<'_> {
         meta.check_regions("conv", self.conv, 2, 0, WINDOW * channels(h), true, |r| {
             r.conv_offset
         })?;
-        meta.check_regions("state", self.state, 4, 0, state_len(h), true, |r| {
+        meta.check_regions("state", self.state, es, 0, state_len(h), true, |r| {
             r.state_offset
         })?;
         let state_out = match self.state_out {
             StateOut::Skip => {
                 return Err(Error::Invalid("a prefill always writes its state".into()));
             }
-            StateOut::InPlace => self.state.ptr::<f32>(0),
+            StateOut::InPlace => self.state.ptr::<u8>(0),
             StateOut::To(buf, _) => {
-                meta.check_regions("state_out", buf, 4, 0, state_len(h), true, |r| {
+                meta.check_regions("state_out", buf, es, 0, state_len(h), true, |r| {
                     r.state_offset
                 })?;
                 if same(buf, self.state) {
@@ -1069,45 +1207,78 @@ impl PrefillBatch<'_> {
                         "state_out is the state buffer: use InPlace".into(),
                     ));
                 }
-                buf.ptr::<f32>(0)
+                buf.ptr::<u8>(0)
             }
         };
         let (ws, ws_bytes) = self.workspace.args(h, batch as usize)?;
         let max_rows = meta.requests().iter().map(|r| r.rows).max().unwrap_or(0);
         let (cu_rows, _, conv_off, state_off) = meta.device_arrays();
         let w = self.weights;
+        let (heads, max_rows) = (to_i32(h, "heads")?, to_i32(max_rows, "max_rows")?);
         // SAFETY: every region was checked above against the metadata's host copy.
         let code = unsafe {
-            ffi::glm53f_kda_prefill_batch(
-                to_i32(h, "heads")?,
-                batch,
-                cu_rows,
-                to_i32(max_rows, "max_rows")?,
-                self.p.buf.ptr(self.p.offset),
-                self.p.stride as i64,
-                self.b_off,
-                self.a.buf.ptr(self.a.offset),
-                self.a.stride as i64,
-                self.g.buf.ptr(self.g.offset),
-                self.g.stride as i64,
-                self.conv.ptr(0),
-                conv_off,
-                w.conv_w.ptr(0),
-                self.state.ptr(0),
-                state_out,
-                state_off,
-                w.a_log.ptr(0),
-                w.dt_bias.ptr(0),
-                w.norm_w.ptr(0),
-                w.eps,
-                w.lower,
-                self.out.buf.ptr(self.out.offset),
-                self.out.stride as i64,
-                vb,
-                ws,
-                ws_bytes,
-                stream.raw(),
-            )
+            match st {
+                StateType::F32 => ffi::glm53f_kda_prefill_batch(
+                    heads,
+                    batch,
+                    cu_rows,
+                    max_rows,
+                    self.p.buf.ptr(self.p.offset),
+                    self.p.stride as i64,
+                    self.b_off,
+                    self.a.buf.ptr(self.a.offset),
+                    self.a.stride as i64,
+                    self.g.buf.ptr(self.g.offset),
+                    self.g.stride as i64,
+                    self.conv.ptr(0),
+                    conv_off,
+                    w.conv_w.ptr(0),
+                    self.state.ptr(0),
+                    state_out.cast(),
+                    state_off,
+                    w.a_log.ptr(0),
+                    w.dt_bias.ptr(0),
+                    w.norm_w.ptr(0),
+                    w.eps,
+                    w.lower,
+                    self.out.buf.ptr(self.out.offset),
+                    self.out.stride as i64,
+                    vb,
+                    ws,
+                    ws_bytes,
+                    stream.raw(),
+                ),
+                StateType::Bf16 => ffi::glm53f_kda_prefill_batch_bf16state(
+                    heads,
+                    batch,
+                    cu_rows,
+                    max_rows,
+                    self.p.buf.ptr(self.p.offset),
+                    self.p.stride as i64,
+                    self.b_off,
+                    self.a.buf.ptr(self.a.offset),
+                    self.a.stride as i64,
+                    self.g.buf.ptr(self.g.offset),
+                    self.g.stride as i64,
+                    self.conv.ptr(0),
+                    conv_off,
+                    w.conv_w.ptr(0),
+                    self.state.ptr(0),
+                    state_out.cast(),
+                    state_off,
+                    w.a_log.ptr(0),
+                    w.dt_bias.ptr(0),
+                    w.norm_w.ptr(0),
+                    w.eps,
+                    w.lower,
+                    self.out.buf.ptr(self.out.offset),
+                    self.out.stride as i64,
+                    vb,
+                    ws,
+                    ws_bytes,
+                    stream.raw(),
+                ),
+            }
         };
         launched(code, "glm53f_kda_prefill_batch")
     }

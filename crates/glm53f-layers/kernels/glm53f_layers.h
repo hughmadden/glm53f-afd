@@ -149,7 +149,9 @@ int32_t glm53f_swiglu(const uint16_t* gate_up, uint16_t* act, uint8_t* q, float*
 int32_t glm53f_selfcheck_division_free(uint64_t* mismatches, cudaStream_t stream);
 
 // ---- FP8 block-128 projections: out [rows][n] = x [rows][k] . W^T, W [n][k] E4M3 with
-// f32 scales [n/128][k/128]; n % 128 == 0, k % 128 == 0. ------------------------------------
+// f32 scales [ceil(n/128)][k/128]; n % 8 == 0, k % 128 == 0. A partial last block of rows
+// (n % 128 != 0, for example a fused projection of 24,640 rows) has its own row of scales;
+// no row of W past n is read. -----------------------------------------------------------------
 
 // Decode GEMM, 1 <= rows <= 8, bandwidth-bound. a8 = 0: x is BF16 [rows][k]; a8 = 1: x is
 // E4M3 [rows][k] with scales x_scales [rows][k/128] (glm53f_act_quant). ksplit divides
@@ -193,6 +195,23 @@ int32_t glm53f_fp8_gemm_prefill(const uint8_t* xq, const float* x_scales, const 
 
 // Shared memory the prefill GEMM needs (bytes); it opts in on first use.
 int32_t glm53f_fp8_gemm_prefill_smem_bytes(void);
+
+// ---- FP8 block-128 weights: quantization and dequantization -----------------------------------
+
+// Quantize a BF16 weight w [n][k] (k % 128 == 0; any n >= 1) to E4M3 codes q [n][k] with f32
+// scales [ceil(n/128)][k/128], the scheme of the checkpoint's own FP8 weights: per 128 x 128
+// block (a partial last block of rows included), scale = amax / 448 (1 for an all-zero block)
+// and q = e4m3_rn_satfinite(w / scale), with IEEE division. Bit for bit the host's
+// src/fp8.rs quantize_weight_bf16. For weights the checkpoint ships in BF16 (the KDA
+// projections), quantized at load time.
+int32_t glm53f_fp8_quantize_weight(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, float* scales,
+                                   cudaStream_t stream);
+
+// Rows row0 .. row0 + rows - 1 of an FP8 block-128 weight W [n][k] (scales [ceil(n/128)][k/128])
+// as BF16: out [rows][k] = bf16(e4m3(W) * scale), one f32 multiply rounded to nearest even
+// (k % 128 == 0, row0 + rows <= n). The W8A16 prefill path feeds these tiles to a BF16 GEMM.
+int32_t glm53f_fp8_dequant_bf16(const uint8_t* w, const float* w_scales, int32_t n, int32_t k,
+                                int32_t row0, int32_t rows, uint16_t* out, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

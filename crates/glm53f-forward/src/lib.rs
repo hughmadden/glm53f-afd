@@ -65,6 +65,14 @@
 //! tensor-core FP8 kernel). The MLA latent and the pooled index keys are stored in FP8
 //! (decision D1). `tests/goldens_chain.rs` reports every stage against the oracle.
 //!
+//! **Numerics under test**, each off by default (`docs/SIZING.md` §10): the KDA projections
+//! quantized to FP8 block-128 at load (`weights::WeightOptions::kda_fp8`, decision D2); the KDA
+//! states stored in BF16 (`kvplan::KvLayout::with_kda_state_bf16`, decision D8; the state is
+//! rounded after every row, so verify and commit keep the bits of serial steps); FP8 projections
+//! over 8 rows with BF16 activations (`gemm::GemmPolicy::prefill_w8a16`, with
+//! `kda_prefill_w8a8` keeping the FP8 KDA projections at E4M3). The model-path tests run with any
+//! of them on through `GLM53F_TEST_NUMERICS`.
+//!
 //! # The KV
 //!
 //! A pool of pages (64 tokens of every DSA layer: 35,904 B per layer, 394,944 B over 11 layers),

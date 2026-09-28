@@ -52,7 +52,7 @@ mod daemon {
     use glm53f_forward::remote::RemoteExperts;
     use glm53f_forward::serve::{ServedForward, DRAFTS};
     use glm53f_forward::shape::{ModelShape, SAMPLE_VOCAB};
-    use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+    use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
     use glm53f_serve::{admission_line, dev_banner, kv_pages, verify_rows, Experts, Options};
 
     const GIB: f64 = (1u64 << 30) as f64;
@@ -92,14 +92,26 @@ mod daemon {
             eprintln!("{b}");
         }
         let shape = s(ModelShape::new(&cfg.text, layers))?;
+        let num = o.numerics;
+        if num != Default::default() {
+            eprintln!("[coordinator] numerics under test: {}", num.describe());
+        }
         let t0 = Instant::now();
-        let model = s(DeviceModel::load(&ckpt, &shape))?;
+        let wopts = WeightOptions {
+            kda_fp8: num.kda_fp8,
+        };
+        let model = s(DeviceModel::load_with(&ckpt, &shape, layers, wopts))?;
         let embed = s(HostEmbedding::load(&ckpt))?;
         eprintln!(
-            "[coordinator] weights: decoder layers 0-{} and the head, {:.2} GB on the GPU, the \
-             embedding {:.2} GB in host RAM, {:.1} s",
+            "[coordinator] weights: decoder layers 0-{} and the head, {:.2} GB on the GPU (KDA \
+             projections {}), the embedding {:.2} GB in host RAM, {:.1} s",
             layers - 1,
             model.bytes as f64 / 1e9,
+            if num.kda_fp8 {
+                "FP8 block-128, quantized at load"
+            } else {
+                "BF16"
+            },
             embed.bytes() as f64 / 1e9,
             t0.elapsed().as_secs_f64()
         );
@@ -140,6 +152,8 @@ mod daemon {
             max_requests: o.slots,
             ..ForwardConfig::default()
         };
+        fcfg.policy.prefill_w8a16 = num.prefill_w8a16;
+        fcfg.policy.kda_prefill_w8a8 = num.kda_prefill_w8a8;
         if drafter.is_some() {
             fcfg.max_verify_rows =
                 fcfg.max_verify_rows
@@ -186,7 +200,8 @@ mod daemon {
             .max_context
             .unwrap_or(usize::MAX)
             .min(cfg.text.max_position_embeddings as usize);
-        let layout = KvLayout::new(&shape, drafter.as_ref().map(|d| d.config()));
+        let layout = KvLayout::new(&shape, drafter.as_ref().map(|d| d.config()))
+            .with_kda_state_bf16(num.kda_state_bf16);
         let max_pages = KvLayout::pages_for(max_context).div_ceil(4) * 4;
         let bufs = s(ForwardBuffers::new(&fcfg, &shape, max_pages, &stream))?;
         let fb = bufs.bytes();
@@ -284,11 +299,17 @@ mod daemon {
             }
         );
         eprintln!(
-            "[coordinator]   {} {}; {} slots x {} of positional state and page tables = {}",
+            "[coordinator]   {} {}; {} slots x {} of positional state (KDA states {}) and page \
+             tables = {}",
             experts_what,
             mib(experts_bytes),
             o.slots,
             mib(fixed / o.slots),
+            if layout.kda_state_bf16 {
+                "BF16"
+            } else {
+                "FP32"
+            },
             gib(fixed)
         );
         eprintln!(

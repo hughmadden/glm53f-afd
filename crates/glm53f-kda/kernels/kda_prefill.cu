@@ -67,6 +67,24 @@ struct Rows {
     int rows;
 };
 
+// How a state is stored: f32, or bf16 (the `_bf16state` entry point). The kernels compute in f32 either way; a
+// bf16 state is rounded to bf16 at the end of every chunk of 16 rows, so the stores between sub-segments are exact
+// and the results do not depend on the workspace size.
+template <typename S>
+struct StateIO;
+template <>
+struct StateIO<float> {
+    static constexpr bool kRound = false;
+    static __device__ __forceinline__ float load(const float* p) { return *p; }
+    static __device__ __forceinline__ void store(float* p, float v) { *p = v; }
+};
+template <>
+struct StateIO<__nv_bfloat16> {
+    static constexpr bool kRound = true;
+    static __device__ __forceinline__ float load(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+    static __device__ __forceinline__ void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+};
+
 __device__ __forceinline__ Rows request_rows(const int32_t* cu_rows, int b, int rows1) {
     if (cu_rows == nullptr) return {0, rows1};
     const int r0 = cu_rows[b];
@@ -370,10 +388,10 @@ __device__ __forceinline__ void chunk_times_state(const float* x, const float (&
 }
 
 // Pass 2: the chunks of one sub-segment in order, for one (head, value-column block, request).
-template <int KP, int COLS>
+template <int KP, int COLS, typename S>
 __global__ void __launch_bounds__(THREADS) inter_kernel(
         int H, const int32_t* __restrict__ cu_rows, int rows1, int sub0, int chunks,
-        const __nv_bfloat16* __restrict__ G, long long g_stride, const float* state_in, float* state_out,
+        const __nv_bfloat16* __restrict__ G, long long g_stride, const S* state_in, S* state_out,
         const long long* __restrict__ state_off, const __nv_bfloat16* __restrict__ norm_w, float eps,
         __nv_bfloat16* __restrict__ out, long long out_stride, const float* __restrict__ ws) {
     using Gm = Geo<KP, COLS>;
@@ -394,7 +412,8 @@ __global__ void __launch_bounds__(THREADS) inter_kernel(
 #pragma unroll
     for (int c = 0; c < COLS; ++c)
 #pragma unroll
-        for (int j = 0; j < KW; ++j) s[c][j] = state_in[sbase + (long long)(vb0 + vg * COLS + c) * DK + kp * KW + j];
+        for (int j = 0; j < KW; ++j)
+            s[c][j] = StateIO<S>::load(state_in + sbase + (long long)(vb0 + vg * COLS + c) * DK + kp * KW + j);
     const int nch = here > 0 ? (here + CH - 1) / CH : 0;
     const float* wsb = ws + (long long)b * chunks * H * WS_FLOATS + (long long)h * WS_FLOATS;
     float nw[4];
@@ -470,7 +489,10 @@ __global__ void __launch_bounds__(THREADS) inter_kernel(
             }
             const float e = se[k], l = sl[k];
 #pragma unroll
-            for (int cc = 0; cc < COLS; ++cc) s[cc][j] = fmaf(s[cc][j], e, l * t[cc]);
+            for (int cc = 0; cc < COLS; ++cc) {
+                s[cc][j] = fmaf(s[cc][j], e, l * t[cc]);
+                if constexpr (StateIO<S>::kRound) s[cc][j] = bf(s[cc][j]);
+            }
         }
         __syncthreads();
 
@@ -511,7 +533,8 @@ __global__ void __launch_bounds__(THREADS) inter_kernel(
 #pragma unroll
     for (int c = 0; c < COLS; ++c)
 #pragma unroll
-        for (int j = 0; j < KW; ++j) state_out[sbase + (long long)(vb0 + vg * COLS + c) * DK + kp * KW + j] = s[c][j];
+        for (int j = 0; j < KW; ++j)
+            StateIO<S>::store(state_out + sbase + (long long)(vb0 + vg * COLS + c) * DK + kp * KW + j, s[c][j]);
 }
 
 // The gated RMSNorm over the bf16(Y) that value-split blocks left in `out`: warp per (row, head), the chain's
@@ -591,23 +614,24 @@ int sm_count() {
     return n;
 }
 
-template <int KP, int COLS>
+template <int KP, int COLS, typename S>
 int inter_launch(dim3 grid, cudaStream_t st, int H, const int32_t* cu_rows, int rows1, int sub0, int chunks,
-                 const __nv_bfloat16* G, long long g_stride, const float* s_in, float* s_out, const long long* soff,
+                 const __nv_bfloat16* G, long long g_stride, const S* s_in, S* s_out, const long long* soff,
                  const __nv_bfloat16* norm_w, float eps, __nv_bfloat16* out, long long out_stride, const float* ws) {
     const size_t bytes = sizeof(float) * Geo<KP, COLS>::FLOATS;
-    cudaFuncSetAttribute(inter_kernel<KP, COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
-    inter_kernel<KP, COLS><<<grid, THREADS, bytes, st>>>(H, cu_rows, rows1, sub0, chunks, G, g_stride, s_in, s_out, soff,
-                                                   norm_w, eps, out, out_stride, ws);
+    cudaFuncSetAttribute(inter_kernel<KP, COLS, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
+    inter_kernel<KP, COLS, S><<<grid, THREADS, bytes, st>>>(H, cu_rows, rows1, sub0, chunks, G, g_stride, s_in, s_out,
+                                                         soff, norm_w, eps, out, out_stride, ws);
     return (int)cudaGetLastError();
 }
 
 // The passes over every sub-segment, the norm for value-split blocks, and the conv-window advance, in
 // stream order.
+template <typename S>
 int launch(int32_t heads, int32_t batch, const int32_t* cu_rows, int32_t rows1, int32_t max_rows,
            const glm53f_bf16* p, int64_t p_stride, int64_t b_off, const glm53f_bf16* a, int64_t a_stride,
            const glm53f_bf16* g, int64_t g_stride, glm53f_bf16* conv, const int64_t* conv_off,
-           const glm53f_bf16* conv_w, const float* state_in, float* state_out, const int64_t* state_off,
+           const glm53f_bf16* conv_w, const S* state_in, S* state_out, const int64_t* state_off,
            const float* a_log, const float* dt_bias, const glm53f_bf16* norm_w, float eps, float lower,
            glm53f_bf16* out, int64_t out_stride, int32_t value_blocks, float* workspace, int64_t workspace_bytes,
            glm53f_stream_t stream) {
@@ -643,14 +667,14 @@ int launch(int32_t heads, int32_t batch, const int32_t* cu_rows, int32_t rows1, 
             const int rc = (int)cudaGetLastError();
             if (rc != 0) return rc;
         }
-        const float* s_in = sub0 == 0 ? state_in : state_out;
+        const S* s_in = sub0 == 0 ? state_in : state_out;
         const dim3 grid(heads * nb, batch);
-        const int rc = nb == 1   ? inter_launch<2, 1>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
-                                                   s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace)
-                       : nb == 2 ? inter_launch<8, 2>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
-                                                   s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace)
-                                 : inter_launch<8, 1>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
-                                                   s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace);
+        const int rc = nb == 1   ? inter_launch<2, 1, S>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
+                                                      s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace)
+                       : nb == 2 ? inter_launch<8, 2, S>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
+                                                      s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace)
+                                 : inter_launch<8, 1, S>(grid, st, heads, cu_rows, rows1, sub0, (int)chunks, bfp(g), g_stride,
+                                                      s_in, state_out, soff, bfp(norm_w), eps, bfp(out), out_stride, workspace);
         if (rc != 0) return rc;
         if (max_rows == 0) break;
     }
@@ -698,4 +722,21 @@ extern "C" int glm53f_kda_prefill_batch(int32_t heads, int32_t batch, const int3
     return launch(heads, batch, cu_rows, 0, max_rows, p, p_stride, b_off, a, a_stride, g, g_stride, conv, conv_off,
                   conv_w, state_in, state_out, state_off, a_log, dt_bias, norm_w, eps, lower, out, out_stride,
                   value_blocks, workspace, workspace_bytes, stream);
+}
+
+extern "C" int glm53f_kda_prefill_batch_bf16state(int32_t heads, int32_t batch, const int32_t* cu_rows,
+                                                  int32_t max_rows, const glm53f_bf16* p, int64_t p_stride,
+                                                  int64_t b_off, const glm53f_bf16* a, int64_t a_stride,
+                                                  const glm53f_bf16* g, int64_t g_stride, glm53f_bf16* conv,
+                                                  const int64_t* conv_off, const glm53f_bf16* conv_w,
+                                                  const glm53f_bf16* state_in, glm53f_bf16* state_out,
+                                                  const int64_t* state_off, const float* a_log,
+                                                  const float* dt_bias, const glm53f_bf16* norm_w, float eps,
+                                                  float lower, glm53f_bf16* out, int64_t out_stride,
+                                                  int32_t value_blocks, float* workspace, int64_t workspace_bytes,
+                                                  glm53f_stream_t stream) {
+    if (!cu_rows || !conv_off || !state_off) return kInvalid;
+    return launch(heads, batch, cu_rows, 0, max_rows, p, p_stride, b_off, a, a_stride, g, g_stride, conv, conv_off,
+                  conv_w, bfp(state_in), bfp(state_out), state_off, a_log, dt_bias, norm_w, eps, lower, out,
+                  out_stride, value_blocks, workspace, workspace_bytes, stream);
 }

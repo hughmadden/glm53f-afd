@@ -12,7 +12,12 @@
 //!   layer attends over its full 2,051-token selection);
 //! - `GLM53F_BENCH_STEPS`: timed steps per batch size (default 40);
 //! - `GLM53F_BENCH_EXPERTS=local` with `GLM53F_EXPERTS_DIR`: run the routed experts of layers 3
-//!   and 4 on this GPU (default: zeros, the coordinator's own work only).
+//!   and 4 on this GPU (default: zeros, the coordinator's own work only);
+//! - `GLM53F_BENCH_PREFILL_ROWS`: rows of one prefill pass (default 256);
+//! - the numerics under test, as `glm53f-serve` reads them (each off unless set to something
+//!   other than `0`): `GLM53F_KDA_FP8` (FP8 KDA projections), `GLM53F_KDA_STATE_BF16` (BF16 KDA
+//!   states), `GLM53F_PREFILL_W8A16` (FP8 projections over 8 rows with BF16 activations),
+//!   `GLM53F_KDA_PREFILL_W8A8` (with the two above, the FP8 KDA projections keep E4M3).
 //!
 //! The routed experts run on the expert ranks in the engine, so the extrapolation leaves them
 //! out; the router's host copy of the routes (the step's host round trip) stays in.
@@ -29,7 +34,7 @@ use glm53f_forward::gemm::Fp8Act;
 use glm53f_forward::kv::{GlmKv, KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::shape::ModelShape;
-use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
 
 const LAYERS: usize = 5;
 
@@ -91,9 +96,21 @@ fn main() {
     };
     let context = env_usize("GLM53F_BENCH_CONTEXT", 4096);
     let steps = env_usize("GLM53F_BENCH_STEPS", 40);
+    let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
+    let (kda_fp8, state_bf16, w8a16) = (
+        on("GLM53F_KDA_FP8"),
+        on("GLM53F_KDA_STATE_BF16"),
+        on("GLM53F_PREFILL_W8A16"),
+    );
+    println!(
+        "numerics: KDA projections {}, KDA states {}, FP8 projections over 8 rows {}",
+        if kda_fp8 { "FP8" } else { "BF16" },
+        if state_bf16 { "BF16" } else { "FP32" },
+        if w8a16 { "W8A16" } else { "W8A8" }
+    );
     let (cfg, ckpt) = open_checkpoint(&dir).unwrap();
     let shape = ModelShape::new(&cfg.text, LAYERS).unwrap();
-    let model = DeviceModel::load(&ckpt, &shape).unwrap();
+    let model = DeviceModel::load_with(&ckpt, &shape, LAYERS, WeightOptions { kda_fp8 }).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
     let max_req = 8;
@@ -103,7 +120,7 @@ fn main() {
     let pages_per = KvLayout::pages_for(context + extra);
     let kv = KvPool::new(
         KvConfig {
-            layout: KvLayout::new(&shape, None),
+            layout: KvLayout::new(&shape, None).with_kda_state_bf16(state_bf16),
             max_slots: max_req + 1,
             pages: (max_req + 1) * pages_per,
             max_pages: pages_per.div_ceil(4) * 4,
@@ -121,12 +138,14 @@ fn main() {
         } else {
             Box::new(ZeroExperts)
         };
-    let fcfg = ForwardConfig {
-        max_rows: 256,
+    let mut fcfg = ForwardConfig {
+        max_rows: env_usize("GLM53F_BENCH_PREFILL_ROWS", 256),
         max_verify_rows: 64,
         max_requests: max_req,
         ..ForwardConfig::default()
     };
+    fcfg.policy.prefill_w8a16 = w8a16;
+    fcfg.policy.kda_prefill_w8a8 = on("GLM53F_KDA_PREFILL_W8A8");
     let mut fwd = GlmForward::new(model, embed, kv, experts, fcfg).unwrap();
     let (free, total) = device::mem_info().unwrap();
     println!(
@@ -175,6 +194,27 @@ fn main() {
             fwd.cfg.max_rows,
             context as f64 / total * 1e3,
             kda * 1e3 / context as f64 / 4.0
+        );
+        // Per KDA layer (the mean of layers 0, 1, 2 and 4) and pass: the projections (q|k|v|b,
+        // f_a|g_a, f_b and g_b), the recurrence, o_proj; the DSA layer's stages for scale.
+        let m = mean(std::slice::from_ref(t));
+        let passes = context.div_ceil(fwd.cfg.max_rows) as f64;
+        let kda_stage = |s: &str| {
+            [0usize, 1, 2, 4]
+                .iter()
+                .map(|&l| get(&m, l, &[s]))
+                .sum::<f64>()
+                / 4.0
+                / passes
+        };
+        println!(
+            "  per KDA layer and pass of {} rows: projections {:.3} ms, recurrence {:.3} ms, o_proj {:.3} ms; DSA layer 3 per pass {:.3} ms (projections {:.3})",
+            fwd.cfg.max_rows,
+            kda_stage("kda_proj"),
+            kda_stage("kda_core"),
+            kda_stage("kda_o"),
+            get(&m, 3, &DSA) / passes,
+            get(&m, 3, &["dsa_proj"]) / passes
         );
     }
 

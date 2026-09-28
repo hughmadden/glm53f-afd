@@ -5,7 +5,10 @@
 //!   coordinator subset (the non-expert tensors with their original names);
 //! - `GLM53F_EXPERTS_DIR`: the routed experts of the MoE layers run (the official checkpoint,
 //!   or a subset); defaults to the checkpoint directory;
-//! - `GLM53F_GOLDENS`: the oracle's golden sets (default `oracle/goldens` in this repository).
+//! - `GLM53F_GOLDENS`: the oracle's golden sets (default `oracle/goldens` in this repository);
+//! - `GLM53F_TEST_NUMERICS`: numerics under test for every forward these helpers build, a
+//!   comma-separated list of `kda-fp8`, `kda-state-bf16`, `prefill-w8a16` and `kda-prefill-w8a8`
+//!   (default none), so a whole suite can run with an option on ([`numerics`]).
 //!
 //! Anything missing makes the tests print why and pass.
 #![allow(dead_code)]
@@ -22,7 +25,7 @@ use glm53f_forward::gemm::Fp8Act;
 use glm53f_forward::kv::{KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::shape::{ModelShape, TOP_K};
-use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
 use glm53f_forward::Result;
 use glm53f_layers::testkit::goldens::{self, GoldenSet};
 use glm53f_layers::testkit::json;
@@ -41,6 +44,59 @@ pub fn checkpoint_dir() -> Option<PathBuf> {
 
 pub fn experts_dir() -> Option<PathBuf> {
     env_dir(&["GLM53F_EXPERTS_DIR"]).or_else(checkpoint_dir)
+}
+
+/// Numerics under test for the forwards the tests build (`GLM53F_TEST_NUMERICS`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TestNumerics {
+    pub kda_fp8: bool,
+    pub kda_state_bf16: bool,
+    pub prefill_w8a16: bool,
+    pub kda_prefill_w8a8: bool,
+}
+
+impl TestNumerics {
+    /// The weights' load-time options.
+    pub fn weights(&self) -> WeightOptions {
+        WeightOptions {
+            kda_fp8: self.kda_fp8,
+        }
+    }
+
+    /// `l` with the KDA states in BF16 when asked for.
+    pub fn layout(&self, l: KvLayout) -> KvLayout {
+        l.with_kda_state_bf16(self.kda_state_bf16)
+    }
+
+    /// `cfg` with the W8A16 prefill path (and the KDA projections' exception) when asked for.
+    pub fn config(&self, mut cfg: ForwardConfig) -> ForwardConfig {
+        cfg.policy.prefill_w8a16 |= self.prefill_w8a16;
+        cfg.policy.kda_prefill_w8a8 |= self.kda_prefill_w8a8;
+        cfg
+    }
+}
+
+/// `GLM53F_TEST_NUMERICS` (panics on an unknown name, so a typo cannot pass silently).
+pub fn numerics() -> TestNumerics {
+    let mut n = TestNumerics::default();
+    for name in std::env::var("GLM53F_TEST_NUMERICS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
+        match name {
+            "kda-fp8" => n.kda_fp8 = true,
+            "kda-state-bf16" => n.kda_state_bf16 = true,
+            "prefill-w8a16" => n.prefill_w8a16 = true,
+            "kda-prefill-w8a8" => n.kda_prefill_w8a8 = true,
+            other => panic!("GLM53F_TEST_NUMERICS: unknown option {other:?}"),
+        }
+    }
+    if n != TestNumerics::default() {
+        eprintln!("numerics under test: {n:?}");
+    }
+    n
 }
 
 /// Golden routes per MoE layer: (ids, weights) of every row, in order.
@@ -280,7 +336,8 @@ pub fn forward(
     };
     let shape = ModelShape::new(&mcfg.text, layers).unwrap();
     let t0 = std::time::Instant::now();
-    let model = DeviceModel::load(&ckpt, &shape).unwrap();
+    let num = numerics();
+    let model = DeviceModel::load_with(&ckpt, &shape, layers, num.weights()).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     eprintln!(
         "loaded layers 0..{layers} and the head: {:.2} GB on the GPU, embedding {:.2} GB in host RAM, {:.1} s",
@@ -289,7 +346,7 @@ pub fn forward(
         t0.elapsed().as_secs_f64()
     );
     let stream = Arc::new(Stream::new().unwrap());
-    let layout = KvLayout::new(&shape, None);
+    let layout = num.layout(KvLayout::new(&shape, None));
     let kv = KvPool::new(
         KvConfig {
             layout,
@@ -322,7 +379,7 @@ pub fn forward(
         let seen = gr.seen.clone();
         (Box::new(gr), seen)
     };
-    let fwd = GlmForward::new(model, embed, kv, experts, cfg).unwrap();
+    let fwd = GlmForward::new(model, embed, kv, experts, num.config(cfg)).unwrap();
     Some(Setup { fwd, seen })
 }
 
@@ -346,12 +403,13 @@ pub fn forward_with(
         }
     };
     let shape = ModelShape::new(&mcfg.text, layers).unwrap();
-    let model = DeviceModel::load(&ckpt, &shape).unwrap();
+    let num = numerics();
+    let model = DeviceModel::load_with(&ckpt, &shape, layers, num.weights()).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
     let kv = KvPool::new(
         KvConfig {
-            layout: KvLayout::new(&shape, None),
+            layout: num.layout(KvLayout::new(&shape, None)),
             max_slots: slots,
             pages,
             max_pages,
@@ -361,5 +419,5 @@ pub fn forward_with(
     )
     .unwrap();
     let experts = experts(&stream);
-    Some(GlmForward::new(model, embed, kv, experts, cfg).unwrap())
+    Some(GlmForward::new(model, embed, kv, experts, num.config(cfg)).unwrap())
 }

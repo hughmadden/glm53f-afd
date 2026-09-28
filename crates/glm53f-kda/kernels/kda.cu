@@ -52,6 +52,35 @@ __device__ __forceinline__ void update(float (&s)[4][4], const float (&kk)[4], c
     }
 }
 
+// How a state is stored: f32 (the reference's), or bf16 (the `_bf16state` entry points). The kernels compute in
+// f32 either way; a bf16 state is rounded to bf16 after every row (after the row's read-out), so a window of R rows
+// gives the bits of R serial single-row steps, each of which stores its state in bf16.
+template <typename S>
+struct StateIO;
+template <>
+struct StateIO<float> {
+    static constexpr bool kRound = false;
+    static __device__ __forceinline__ float load(const float* p) { return *p; }
+    static __device__ __forceinline__ void store(float* p, float v) { *p = v; }
+};
+template <>
+struct StateIO<__nv_bfloat16> {
+    static constexpr bool kRound = true;
+    static __device__ __forceinline__ float load(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+    static __device__ __forceinline__ void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+};
+
+// A bf16 state's rounding after a row (nothing for an f32 state).
+template <typename S>
+__device__ __forceinline__ void round_state(float (&s)[4][4]) {
+    if constexpr (StateIO<S>::kRound) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s[j][i] = bf(s[j][i]);
+    }
+}
+
 // Request b's rows: [row0, row0 + rows) of the shared row buffers. Without cu_rows: one request, `rows` rows.
 struct Rows {
     long long row0;
@@ -66,12 +95,13 @@ __device__ __forceinline__ Rows request_rows(const int32_t* cu_rows, int b, int 
 
 // The state pointers are not __restrict__: a chain or replay may run in place (state_out == state_in). Each
 // thread reads its 16 state values before the first row and writes the same 16 after the last.
+template <typename S>
 __global__ void __launch_bounds__(1024) chain_kernel(
         int H, const int32_t* __restrict__ cu_rows, int rows1,
         const __nv_bfloat16* __restrict__ P, long long p_stride, long long b_off,
         const __nv_bfloat16* __restrict__ A, long long a_stride, const __nv_bfloat16* __restrict__ G,
         long long g_stride, const __nv_bfloat16* __restrict__ conv, const long long* __restrict__ conv_off,
-        const __nv_bfloat16* __restrict__ cw, const float* state_in, float* state_out,
+        const __nv_bfloat16* __restrict__ cw, const S* state_in, S* state_out,
         const long long* __restrict__ state_off, const float* __restrict__ a_log,
         const float* __restrict__ dt_bias, const __nv_bfloat16* __restrict__ norm_w, float eps, float lower,
         __nv_bfloat16* __restrict__ out, long long out_stride, float* __restrict__ k_save,
@@ -92,7 +122,7 @@ __global__ void __launch_bounds__(1024) chain_kernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i];
+        for (int i = 0; i < 4; ++i) s[j][i] = StateIO<S>::load(state_in + sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i);
     const float decay_rate = expf(a_log[h]);
     for (int r = 0; r < rows; ++r) {
         const long long gr = rr.row0 + r;             // this row in the shared row buffers
@@ -147,6 +177,7 @@ __global__ void __launch_bounds__(1024) chain_kernel(
             o = warp_sum(o);
             if (lane == 0) ys[warp * 4 + j] = bf(o);
         }
+        round_state<S>(s);
         if (k_save != nullptr) {
             const long long base = (gr * H + h) * DK;
             if (t < DK) { k_save[base + t] = ks[t]; g_save[base + t] = gs[t]; }
@@ -174,15 +205,16 @@ __global__ void __launch_bounds__(1024) chain_kernel(
 #pragma unroll
         for (int j = 0; j < 4; ++j)
 #pragma unroll
-            for (int i = 0; i < 4; ++i) state_out[sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
+            for (int i = 0; i < 4; ++i) StateIO<S>::store(state_out + sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i, s[j][i]);
     }
 }
 
 // The source's replay and replay_layers in one kernel: block (layer * H + h, b) replays `rows` saved rows of
 // request b (keep[b] with a batch) from its row cu_rows[b] on; per-layer strides of the states and the saves.
+template <typename S>
 __global__ void __launch_bounds__(1024) replay_kernel(
         int H, const int32_t* __restrict__ cu_rows, const int32_t* __restrict__ keep, int rows1,
-        const float* state_in, float* state_out, long long state_stride, const long long* __restrict__ state_off,
+        const S* state_in, S* state_out, long long state_stride, const long long* __restrict__ state_off,
         const float* __restrict__ k_save, const __nv_bfloat16* __restrict__ v_save,
         const float* __restrict__ g_save, const float* __restrict__ b_save, long long kv_stride,
         long long b_stride) {
@@ -201,7 +233,7 @@ __global__ void __launch_bounds__(1024) replay_kernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i];
+        for (int i = 0; i < 4; ++i) s[j][i] = StateIO<S>::load(state_in + sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i);
     for (int r = 0; r < rows; ++r) {
         const long long gr = row0 + r;
         const long long base = (gr * H + h) * DK;
@@ -211,12 +243,13 @@ __global__ void __launch_bounds__(1024) replay_kernel(
 #pragma unroll
         for (int i = 0; i < 4; ++i) { kk[i] = ksv[base + lane * 4 + i]; gg[i] = gsv[base + lane * 4 + i]; }
         update(s, kk, gg, vs, warp, bsv[gr * H + h]);
+        round_state<S>(s);
         __syncthreads();
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) state_out[sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
+        for (int i = 0; i < 4; ++i) StateIO<S>::store(state_out + sbase + (long long)(warp * 4 + j) * DK + lane * 4 + i, s[j][i]);
 }
 
 // The source's commit-time conv shift (a Triton kernel there): thread (channel c, layer, request) sets the 3
@@ -255,7 +288,7 @@ inline __nv_bfloat16* bfp(T* x) { return reinterpret_cast<__nv_bfloat16*>(x); }
 
 // Host-side checks shared by the chain entry points.
 inline bool chain_args_ok(int32_t heads, const glm53f_bf16* p, const glm53f_bf16* a, const glm53f_bf16* g,
-                          const glm53f_bf16* conv, const glm53f_bf16* conv_w, const float* state_in,
+                          const glm53f_bf16* conv, const glm53f_bf16* conv_w, const void* state_in,
                           const float* a_log, const float* dt_bias, const glm53f_bf16* norm_w,
                           const glm53f_bf16* out, const float* k_save, const glm53f_bf16* v_save,
                           const float* g_save, const float* b_save) {
@@ -277,12 +310,35 @@ extern "C" int glm53f_kda_chain(int32_t heads, int32_t rows, const glm53f_bf16* 
     if (rows < 1 || !chain_args_ok(heads, p, a, g, conv, conv_w, state_in, a_log, dt_bias, norm_w, out, k_save,
                                    v_save, g_save, b_save))
         return kInvalid;
-    chain_kernel<<<dim3(heads, 1), 1024, 0, (cudaStream_t)stream>>>(
+    chain_kernel<float><<<dim3(heads, 1), 1024, 0, (cudaStream_t)stream>>>(
         heads, nullptr, rows, bfp(p), p_stride, b_off, bfp(a), a_stride, bfp(g), g_stride, bfp(conv), nullptr,
         bfp(conv_w), state_in, state_out, nullptr, a_log, dt_bias, bfp(norm_w), eps, lower, bfp(out), out_stride,
         k_save, bfp(v_save), g_save, b_save);
     return launched();
 }
+
+namespace {
+
+template <typename S>
+int chain_batch_launch(int32_t heads, int32_t batch, const int32_t* cu_rows, const glm53f_bf16* p, int64_t p_stride,
+                       int64_t b_off, const glm53f_bf16* a, int64_t a_stride, const glm53f_bf16* g, int64_t g_stride,
+                       const glm53f_bf16* conv, const int64_t* conv_off, const glm53f_bf16* conv_w, const S* state_in,
+                       S* state_out, const int64_t* state_off, const float* a_log, const float* dt_bias,
+                       const glm53f_bf16* norm_w, float eps, float lower, glm53f_bf16* out, int64_t out_stride,
+                       float* k_save, glm53f_bf16* v_save, float* g_save, float* b_save, glm53f_stream_t stream) {
+    if (batch < 1 || batch > 65535 || !cu_rows || !conv_off || !state_off ||
+        !chain_args_ok(heads, p, a, g, conv, conv_w, state_in, a_log, dt_bias, norm_w, out, k_save, v_save, g_save,
+                       b_save))
+        return kInvalid;
+    chain_kernel<S><<<dim3(heads, batch), 1024, 0, (cudaStream_t)stream>>>(
+        heads, cu_rows, 0, bfp(p), p_stride, b_off, bfp(a), a_stride, bfp(g), g_stride, bfp(conv),
+        reinterpret_cast<const long long*>(conv_off), bfp(conv_w), state_in, state_out,
+        reinterpret_cast<const long long*>(state_off), a_log, dt_bias, bfp(norm_w), eps, lower, bfp(out),
+        out_stride, k_save, bfp(v_save), g_save, b_save);
+    return launched();
+}
+
+}  // namespace
 
 extern "C" int glm53f_kda_chain_batch(int32_t heads, int32_t batch, const int32_t* cu_rows, const glm53f_bf16* p,
                                       int64_t p_stride, int64_t b_off, const glm53f_bf16* a, int64_t a_stride,
@@ -292,29 +348,40 @@ extern "C" int glm53f_kda_chain_batch(int32_t heads, int32_t batch, const int32_
                                       const float* dt_bias, const glm53f_bf16* norm_w, float eps, float lower,
                                       glm53f_bf16* out, int64_t out_stride, float* k_save, glm53f_bf16* v_save,
                                       float* g_save, float* b_save, glm53f_stream_t stream) {
-    if (batch < 1 || batch > 65535 || !cu_rows || !conv_off || !state_off ||
-        !chain_args_ok(heads, p, a, g, conv, conv_w, state_in, a_log, dt_bias, norm_w, out, k_save, v_save, g_save,
-                       b_save))
-        return kInvalid;
-    chain_kernel<<<dim3(heads, batch), 1024, 0, (cudaStream_t)stream>>>(
-        heads, cu_rows, 0, bfp(p), p_stride, b_off, bfp(a), a_stride, bfp(g), g_stride, bfp(conv),
-        reinterpret_cast<const long long*>(conv_off), bfp(conv_w), state_in, state_out,
-        reinterpret_cast<const long long*>(state_off), a_log, dt_bias, bfp(norm_w), eps, lower, bfp(out),
-        out_stride, k_save, bfp(v_save), g_save, b_save);
-    return launched();
+    return chain_batch_launch<float>(heads, batch, cu_rows, p, p_stride, b_off, a, a_stride, g, g_stride, conv,
+                                     conv_off, conv_w, state_in, state_out, state_off, a_log, dt_bias, norm_w, eps,
+                                     lower, out, out_stride, k_save, v_save, g_save, b_save, stream);
+}
+
+extern "C" int glm53f_kda_chain_batch_bf16state(int32_t heads, int32_t batch, const int32_t* cu_rows,
+                                                const glm53f_bf16* p, int64_t p_stride, int64_t b_off,
+                                                const glm53f_bf16* a, int64_t a_stride, const glm53f_bf16* g,
+                                                int64_t g_stride, const glm53f_bf16* conv, const int64_t* conv_off,
+                                                const glm53f_bf16* conv_w, const glm53f_bf16* state_in,
+                                                glm53f_bf16* state_out, const int64_t* state_off,
+                                                const float* a_log, const float* dt_bias,
+                                                const glm53f_bf16* norm_w, float eps, float lower,
+                                                glm53f_bf16* out, int64_t out_stride, float* k_save,
+                                                glm53f_bf16* v_save, float* g_save, float* b_save,
+                                                glm53f_stream_t stream) {
+    return chain_batch_launch<__nv_bfloat16>(heads, batch, cu_rows, p, p_stride, b_off, a, a_stride, g, g_stride,
+                                             conv, conv_off, conv_w, bfp(state_in), bfp(state_out), state_off,
+                                             a_log, dt_bias, norm_w, eps, lower, out, out_stride, k_save, v_save,
+                                             g_save, b_save, stream);
 }
 
 namespace {
 
+template <typename S>
 inline int replay_launch(int32_t heads, int32_t layers, int32_t batch, const int32_t* cu_rows, const int32_t* keep,
-                         int32_t rows, const float* state_in, float* state_out, int64_t state_stride,
+                         int32_t rows, const S* state_in, S* state_out, int64_t state_stride,
                          const int64_t* state_off, const float* k_save, const glm53f_bf16* v_save,
                          const float* g_save, const float* b_save, int64_t kv_stride, int64_t b_stride,
                          glm53f_stream_t stream) {
     if (heads < 1 || layers < 1 || batch < 1 || batch > 65535 || (long long)heads * layers > 0x7fffffffLL ||
         !state_in || !state_out || !k_save || !v_save || !g_save || !b_save || rows < 0)
         return kInvalid;
-    replay_kernel<<<dim3(heads * layers, batch), 1024, 0, (cudaStream_t)stream>>>(
+    replay_kernel<S><<<dim3(heads * layers, batch), 1024, 0, (cudaStream_t)stream>>>(
         heads, cu_rows, keep, rows, state_in, state_out, state_stride,
         reinterpret_cast<const long long*>(state_off), k_save, bfp(v_save), g_save, b_save, kv_stride, b_stride);
     return launched();
@@ -345,6 +412,18 @@ extern "C" int glm53f_kda_replay_batch(int32_t heads, int32_t layers, int32_t ba
     if (!cu_rows || !keep || !state_off) return kInvalid;
     return replay_launch(heads, layers, batch, cu_rows, keep, 0, state_in, state_out, state_stride, state_off,
                          k_save, v_save, g_save, b_save, kv_stride, b_stride, stream);
+}
+
+extern "C" int glm53f_kda_replay_batch_bf16state(int32_t heads, int32_t layers, int32_t batch,
+                                                 const int32_t* cu_rows, const int32_t* keep,
+                                                 const glm53f_bf16* state_in, glm53f_bf16* state_out,
+                                                 int64_t state_stride, const int64_t* state_off,
+                                                 const float* k_save, const glm53f_bf16* v_save,
+                                                 const float* g_save, const float* b_save, int64_t kv_stride,
+                                                 int64_t b_stride, glm53f_stream_t stream) {
+    if (!cu_rows || !keep || !state_off) return kInvalid;
+    return replay_launch(heads, layers, batch, cu_rows, keep, 0, bfp(state_in), bfp(state_out), state_stride,
+                         state_off, k_save, v_save, g_save, b_save, kv_stride, b_stride, stream);
 }
 
 namespace {

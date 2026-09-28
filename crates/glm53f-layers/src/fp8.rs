@@ -156,6 +156,57 @@ impl Fp8Matrix {
     }
 }
 
+/// Quantize a BF16 weight `[rows][cols]` (`cols` a multiple of 128) to E4M3 with one f32 scale
+/// per 128 x 128 block: the scheme of the checkpoint's own FP8 weights (`weight_scale_inv =
+/// block amax / 448`, 1 for an all-zero block; `q = e4m3(w / scale)` with IEEE division, round
+/// to nearest even, saturating). A partial last block of rows has a scale of its own. For the
+/// weights the checkpoint ships in BF16 (the KDA projections); `glm53f_fp8_quantize_weight`
+/// computes the same bits on the GPU.
+pub fn quantize_weight_bf16(w: &[u16], rows: usize, cols: usize) -> Fp8Matrix {
+    assert_eq!(w.len(), rows * cols, "the weight must be rows x cols");
+    assert_eq!(
+        cols % BLOCK,
+        0,
+        "the weight's width must be a multiple of 128"
+    );
+    let (sr, sc) = (rows.div_ceil(BLOCK), cols / BLOCK);
+    let mut data = vec![0u8; rows * cols];
+    let mut scale_inv = vec![0f32; sr * sc];
+    for br in 0..sr {
+        let rs = br * BLOCK..((br + 1) * BLOCK).min(rows);
+        for bc in 0..sc {
+            let cs = bc * BLOCK..(bc + 1) * BLOCK;
+            let mut amax = 0.0f32;
+            for r in rs.clone() {
+                for &b in &w[r * cols + cs.start..r * cols + cs.end] {
+                    amax = amax.max(crate::bf16::to_f32(b).abs());
+                }
+            }
+            let s = if amax > 0.0 { amax / E4M3_MAX } else { 1.0 };
+            scale_inv[br * sc + bc] = s;
+            for r in rs.clone() {
+                for c in cs.clone() {
+                    data[r * cols + c] = f32_to_e4m3(crate::bf16::to_f32(w[r * cols + c]) / s);
+                }
+            }
+        }
+    }
+    Fp8Matrix::new(rows, cols, data, scale_inv)
+}
+
+/// Rows `row0 .. row0 + rows` of `m` as BF16: `bf16(e4m3(w) * scale)`, one f32 multiply
+/// rounded to nearest even (`glm53f_fp8_dequant_bf16`).
+pub fn dequant_bf16(m: &Fp8Matrix, row0: usize, rows: usize) -> Vec<u16> {
+    assert!(row0 + rows <= m.rows, "rows past the weight");
+    let mut out = Vec::with_capacity(rows * m.cols);
+    for r in row0..row0 + rows {
+        for c in 0..m.cols {
+            out.push(crate::bf16::from_f32(m.value(r, c) * m.scale(r, c)));
+        }
+    }
+    out
+}
+
 /// Activation rows quantized per 128-group: E4M3 codes `[rows][cols]` and f32 scales
 /// `[rows][cols / 128]`.
 #[derive(Clone, Debug)]
@@ -239,6 +290,62 @@ mod tests {
         assert_eq!(e4m3_to_f32(0xFE), -448.0);
         assert!(e4m3_to_f32(0x7F).is_nan());
         assert!(e4m3_to_f32(0xFF).is_nan());
+    }
+
+    #[test]
+    fn weight_quantization_is_the_checkpoint_scheme() {
+        use crate::bf16;
+        // 200 x 256: two blocks of columns, a whole and a partial (72-row) block of rows. Block
+        // (0, 1) is all zero; block (1, 0) holds an exact power-of-two maximum.
+        let (rows, cols) = (200, 256);
+        let mut w = vec![0u16; rows * cols];
+        let mut s = 7u64;
+        for r in 0..rows {
+            for c in 0..cols {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let v = ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.08;
+                if !(r < 128 && c >= 128) {
+                    w[r * cols + c] = bf16::from_f32(v);
+                }
+            }
+        }
+        w[150 * cols + 3] = bf16::from_f32(0.25);
+        let m = quantize_weight_bf16(&w, rows, cols);
+        assert_eq!(m.scale_inv.len(), 2 * 2);
+        assert_eq!(m.scale_inv[1], 1.0, "an all-zero block has scale 1");
+        assert!(m.data[..128 * cols]
+            .chunks(cols)
+            .all(|row| row[128..].iter().all(|&q| q == 0)));
+        assert_eq!(m.scale_inv[2], 0.25 / 448.0);
+        assert_eq!(
+            m.data[150 * cols + 3],
+            0x7E,
+            "the block maximum codes to 448"
+        );
+        // Every value within half an E4M3 step of its weight (relative 2^-4 in the normal
+        // range, 2^-10 of the scale below it), and the codes equal a plain re-quantization.
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = bf16::to_f32(w[r * cols + c]);
+                let sc = m.scale(r, c);
+                let back = m.value(r, c) * sc;
+                assert!(
+                    (back - x).abs() <= x.abs() / 16.0 + sc / 1024.0,
+                    "({r}, {c}): {x} -> {back}"
+                );
+                assert_eq!(m.data[r * cols + c], f32_to_e4m3(x / sc));
+            }
+        }
+        // Dequantization: one rounded product.
+        let d = dequant_bf16(&m, 128, 72);
+        assert_eq!(d.len(), 72 * cols);
+        assert_eq!(
+            d[22 * cols + 3],
+            bf16::from_f32(e4m3_to_f32(0x7E) * m.scale(150, 3))
+        );
+        assert_eq!(bf16::to_f32(d[22 * cols + 3]), bf16::round(0.25));
     }
 
     #[test]

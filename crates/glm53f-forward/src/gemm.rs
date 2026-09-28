@@ -5,10 +5,14 @@
 //!   bandwidth-bound, and row-independent, so a verify window of R rows gives the bits of R
 //!   serial decode steps. More rows run cuBLAS (`cublasGemmEx`, BF16 tensor cores, f32
 //!   accumulation, f32 split-K reductions).
-//! - **FP8 block-128** (the DSA projections, shared experts, dense MLPs, local routed experts):
-//!   `glm53f-layers`' kernels. Up to 8 rows: the decode GEMM with its K splits fused
-//!   (BF16 activations by default, or the checkpoint's dynamic per-128 E4M3 activations);
-//!   more rows: the FP8 tensor-core GEMM, which takes E4M3 activations.
+//! - **FP8 block-128** (the DSA projections, shared experts, dense MLPs, local routed experts,
+//!   and the KDA projections when they are loaded in FP8): `glm53f-layers`' kernels. Up to 8
+//!   rows: the decode GEMM with its K splits fused (BF16 activations by default, or the
+//!   checkpoint's dynamic per-128 E4M3 activations); more rows: the FP8 tensor-core GEMM, which
+//!   takes E4M3 activations (W8A8), or, with [`GemmPolicy::prefill_w8a16`], BF16 activations
+//!   (W8A16): the weight dequantized to BF16 tiles of rows (`glm53f_fp8_dequant_bf16`, one
+//!   rounded product per weight) in [`DEQUANT_BYTES`] of scratch, each multiplied by cuBLAS as
+//!   the BF16 GEMMs are.
 
 use core::ffi::c_void;
 
@@ -82,6 +86,14 @@ pub struct GemmPolicy {
     /// The FP8 tensor-core GEMM adds every k32 partial sum in f32 (more accurate, about 9%
     /// slower) instead of accumulating whole 128-blocks in the tensor core.
     pub prefill_promote_k32: bool,
+    /// FP8 GEMMs over more than 8 rows take BF16 activations (W8A16) through BF16 tiles of the
+    /// weight and cuBLAS, instead of E4M3 activations (W8A8) on the FP8 tensor cores. Needs
+    /// [`DEQUANT_BYTES`] of scratch, allocated with the engine.
+    pub prefill_w8a16: bool,
+    /// With `prefill_w8a16`: the FP8 KDA projections ([`Gemm::fp8_kda`], decision D2) keep E4M3
+    /// activations over 8 rows, so they keep D2's prefill speed while the other projections take
+    /// W8A16. Nothing without `prefill_w8a16`.
+    pub kda_prefill_w8a8: bool,
 }
 
 impl Default for GemmPolicy {
@@ -90,14 +102,31 @@ impl Default for GemmPolicy {
             gemv_max_rows: 8,
             fp8_act: Fp8Act::Bf16,
             prefill_promote_k32: true,
+            prefill_w8a16: false,
+            kda_prefill_w8a8: false,
         }
     }
 }
 
 impl GemmPolicy {
+    /// Whether FP8 GEMMs over more than 8 rows take BF16 activations (for the KDA projections
+    /// when `kda`).
+    pub fn w8a16(&self, kda: bool) -> bool {
+        self.prefill_w8a16 && !(kda && self.kda_prefill_w8a8)
+    }
+
     /// Whether an FP8 GEMM over `rows` rows needs E4M3 activations.
     pub fn fp8_needs_quant(&self, rows: usize) -> bool {
-        rows > 8 || self.fp8_act == Fp8Act::Dynamic128
+        self.needs_quant(rows, false)
+    }
+
+    /// The same for an FP8 KDA projection (`kda`) or another one.
+    pub fn needs_quant(&self, rows: usize, kda: bool) -> bool {
+        if rows > 8 {
+            !self.w8a16(kda)
+        } else {
+            self.fp8_act == Fp8Act::Dynamic128
+        }
     }
 }
 
@@ -106,6 +135,9 @@ const PARTIAL_FLOATS: usize = 1 << 20;
 const SYNC_COUNTERS: usize = 1 << 16;
 /// The cuBLAS workspace.
 const BLAS_WORKSPACE: usize = 32 << 20;
+/// The BF16 weight tiles of the W8A16 prefill path ([`GemmPolicy::prefill_w8a16`]): 8,192 rows
+/// of a 4,096-wide weight, 2,048 of the widest (16,384).
+pub const DEQUANT_BYTES: usize = 64 << 20;
 
 /// The GEMM engine: a cuBLAS handle and the split-K scratch the fused kernels share (one
 /// stream: launches run one after another, and the kernels leave the counters zeroed).
@@ -113,6 +145,8 @@ pub struct Gemm {
     blas: Blas,
     partials: DeviceBuffer,
     sync: DeviceBuffer,
+    /// BF16 weight tiles for the W8A16 prefill path (allocated when the policy has it).
+    dequant: Option<DeviceBuffer>,
     pub policy: GemmPolicy,
 }
 
@@ -125,13 +159,30 @@ impl Gemm {
             blas: Blas::new(stream, BLAS_WORKSPACE)?,
             partials: DeviceBuffer::alloc(PARTIAL_FLOATS * 4)?,
             sync: DeviceBuffer::zeroed(SYNC_COUNTERS * 4)?,
+            dequant: if policy.prefill_w8a16 {
+                Some(DeviceBuffer::alloc(DEQUANT_BYTES)?)
+            } else {
+                None
+            },
             policy,
         })
     }
 
-    /// Device bytes of its scratch (the cuBLAS workspace and the split-K buffers).
+    /// Device bytes of its scratch (the cuBLAS workspace, the split-K buffers and the W8A16
+    /// path's weight tiles).
     pub fn bytes(&self) -> usize {
-        BLAS_WORKSPACE + self.partials.bytes() + self.sync.bytes()
+        BLAS_WORKSPACE
+            + self.partials.bytes()
+            + self.sync.bytes()
+            + self.dequant.as_ref().map_or(0, |d| d.bytes())
+    }
+
+    /// Rows of the W8A16 path's weight tiles for an `[n][k]` weight: tiles of equal size (a
+    /// multiple of 128 rows, the last one shorter), as few as [`DEQUANT_BYTES`] allows.
+    pub fn w8a16_tile_rows(n: usize, k: usize) -> usize {
+        let max = (DEQUANT_BYTES / (2 * k)) / 128 * 128;
+        let tiles = n.div_ceil(max.max(128));
+        n.div_ceil(tiles).div_ceil(128) * 128
     }
 
     /// The GEMV's K splits for `w` (shape only).
@@ -277,10 +328,41 @@ impl Gemm {
         out: *mut u16,
         stream: &Stream,
     ) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.fp8_as(x, w, rows, out, stream, false) }
+    }
+
+    /// [`Gemm::fp8`] for an FP8 KDA projection (decision D2), which
+    /// [`GemmPolicy::kda_prefill_w8a8`] keeps at W8A8 over 8 rows.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Gemm::fp8`].
+    pub unsafe fn fp8_kda(
+        &self,
+        x: &Fp8Input,
+        w: &Fp8Mat,
+        rows: usize,
+        out: *mut u16,
+        stream: &Stream,
+    ) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.fp8_as(x, w, rows, out, stream, true) }
+    }
+
+    unsafe fn fp8_as(
+        &self,
+        x: &Fp8Input,
+        w: &Fp8Mat,
+        rows: usize,
+        out: *mut u16,
+        stream: &Stream,
+        kda: bool,
+    ) -> Result<()> {
         if rows == 0 {
             return Ok(());
         }
-        let quant = self.policy.fp8_needs_quant(rows);
+        let quant = self.policy.needs_quant(rows, kda);
         if quant && (x.q.is_null() || x.scales.is_null()) {
             return Err(invalid!(
                 "an FP8 GEMM over {rows} rows needs E4M3 activations"
@@ -315,6 +397,9 @@ impl Gemm {
                 )
             };
             launched(code, "glm53f_fp8_gemm_decode_fused")
+        } else if self.policy.w8a16(kda) {
+            // SAFETY: as documented; the tiles' scratch is the engine's.
+            unsafe { self.fp8_w8a16(x.bf16, w, rows, out, stream) }
         } else {
             let flags = if self.policy.prefill_promote_k32 {
                 lffi::PREFILL_PROMOTE_K32
@@ -339,6 +424,75 @@ impl Gemm {
             };
             launched(code, "glm53f_fp8_gemm_prefill")
         }
+    }
+}
+
+impl Gemm {
+    /// `out [rows][n] = x . w^T` with BF16 activations for an FP8 block-128 weight: tiles of the
+    /// weight's rows dequantized to BF16 (`glm53f_fp8_dequant_bf16`), each multiplied by cuBLAS
+    /// into its columns of `out`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Gemm::fp8`] (the BF16 activations `[rows][k]`).
+    pub unsafe fn fp8_w8a16(
+        &self,
+        x: *const u16,
+        w: &Fp8Mat,
+        rows: usize,
+        out: *mut u16,
+        stream: &Stream,
+    ) -> Result<()> {
+        let tiles = self
+            .dequant
+            .as_ref()
+            .ok_or_else(|| invalid!("the W8A16 prefill path needs an engine built for it"))?;
+        let tile = Self::w8a16_tile_rows(w.n, w.k);
+        if tile * w.k * 2 > tiles.bytes() {
+            return Err(invalid!("W8A16 tiles too small for {w:?}"));
+        }
+        let mut n0 = 0;
+        while n0 < w.n {
+            let nt = tile.min(w.n - n0);
+            // SAFETY: rows n0 .. n0 + nt of the weight; the tile buffer holds nt x k BF16.
+            let code = unsafe {
+                lffi::glm53f_fp8_dequant_bf16(
+                    w.w,
+                    w.scales,
+                    w.n as i32,
+                    w.k as i32,
+                    n0 as i32,
+                    nt as i32,
+                    tiles.ptr(0),
+                    stream.raw().cast(),
+                )
+            };
+            launched(code, "glm53f_fp8_dequant_bf16")?;
+            let t = Bf16Mat {
+                ptr: tiles.ptr(0),
+                n: nt,
+                k: w.k,
+                ld: w.k,
+                groups: 1,
+                gstride: 0,
+            };
+            // SAFETY: x [rows][k]; out's columns n0 .. n0 + nt of rows of n.
+            unsafe {
+                self.cublas(
+                    x,
+                    w.k,
+                    0,
+                    &t,
+                    rows,
+                    out.wrapping_add(n0).cast(),
+                    w.n,
+                    0,
+                    false,
+                )
+            }?;
+            n0 += nt;
+        }
+        Ok(())
     }
 }
 

@@ -1,8 +1,11 @@
 //! Throughput of the KDA kernels at the model's geometry (64 heads).
 //!
 //! ```text
-//! cargo run --release -p glm53f-kda --features cuda --example kda_bench [-- --quick]
+//! cargo run --release -p glm53f-kda --features cuda --example kda_bench [-- --quick] [--bf16-state]
 //! ```
+//!
+//! `--bf16-state` runs sections 1b and 2 with the states in bf16 (the `_bf16state` entry points,
+//! decision D8).
 //!
 //! 1. Long windows (the prefill question): one request, one layer, 1K / 4K / 16K rows, then
 //!    2 and 3 requests of 4K rows in one launch (more blocks than one request's 64). 1b runs
@@ -91,6 +94,8 @@ struct ChainLaunch<'a> {
     k_off: usize,
     b_off_saves: usize,
     saves: Option<&'a LayerSaves>,
+    /// The states in bf16 (`glm53f_kda_chain_batch_bf16state`).
+    bf16: bool,
 }
 
 impl ChainLaunch<'_> {
@@ -102,6 +107,10 @@ impl ChainLaunch<'_> {
             StateOut::InPlace => c.state.ptr(0),
             StateOut::To(b, _) => b.ptr(0),
         };
+        if self.bf16 {
+            self.raw_bf16(stream, state_out.cast());
+            return;
+        }
         let (ks, vs, gs, bs) = match self.saves {
             Some(s) => (
                 s.k.ptr::<f32>(self.k_off),
@@ -151,10 +160,66 @@ impl ChainLaunch<'_> {
             )
         });
     }
+
+    fn raw_bf16(&self, stream: &Stream, state_out: *mut u16) {
+        let c = &self.checked;
+        let w = c.weights;
+        let (ks, vs, gs, bs) = match self.saves {
+            Some(s) => (
+                s.k.ptr::<f32>(self.k_off),
+                s.v.ptr::<u16>(self.k_off),
+                s.g.ptr::<f32>(self.k_off),
+                s.b.ptr::<f32>(self.b_off_saves),
+            ),
+            None => (
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ),
+        };
+        let (cu_rows, _, conv_off, state_off) = self.meta.device_arrays();
+        // SAFETY: the same arguments passed the checked launch before timing.
+        ok(unsafe {
+            ffi::glm53f_kda_chain_batch_bf16state(
+                H as i32,
+                self.meta.requests().len() as i32,
+                cu_rows,
+                c.p.buf.ptr(c.p.offset),
+                c.p.stride as i64,
+                c.b_off,
+                c.a.buf.ptr(c.a.offset),
+                c.a.stride as i64,
+                c.g.buf.ptr(c.g.offset),
+                c.g.stride as i64,
+                c.conv.ptr(0),
+                conv_off,
+                w.conv_w.ptr(0),
+                c.state.ptr(0),
+                state_out,
+                state_off,
+                w.a_log.ptr(0),
+                w.dt_bias.ptr(0),
+                w.norm_w.ptr(0),
+                w.eps,
+                w.lower,
+                c.out.buf.ptr(c.out.offset),
+                c.out.stride as i64,
+                ks,
+                vs,
+                gs,
+                bs,
+                stream.raw(),
+            )
+        });
+    }
 }
 
 fn main() {
     let quick = std::env::args().any(|a| a == "--quick");
+    let bf16_state = std::env::args().any(|a| a == "--bf16-state");
+    // Bytes of a state element in sections 1b and 2.
+    let es = if bf16_state { 2 } else { 4 };
     if device::device_count() == 0 {
         eprintln!("no CUDA device");
         std::process::exit(1);
@@ -222,6 +287,7 @@ fn main() {
             k_off: 0,
             b_off_saves: 0,
             saves: None,
+            bf16: false,
         };
         launch.checked.launch(&meta, &stream).unwrap();
         let ms = time(&stream, if n >= 16384 { 2 } else { 3 }, || {
@@ -252,7 +318,10 @@ fn main() {
     drop((saves, state));
 
     // 1b. The chunked prefill over the same windows.
-    println!("\n1b. chunked prefill: {H} heads, one layer, state in place, conv window advanced");
+    println!(
+        "\n1b. chunked prefill: {H} heads, one layer, state ({}) in place, conv window advanced",
+        if bf16_state { "bf16" } else { "f32" }
+    );
     println!(
         "{:>9} {:>8} {:>7} {:>9} {:>9} {:>10} {:>10} {:>18}",
         "requests", "rows", "blocks", "rows/pass", "ws MB", "ms", "us/row", "x34 layers us/tok"
@@ -286,7 +355,7 @@ fn main() {
         let total_rows = batch * n;
         let r = rows(total_rows, 3);
         let conv = DeviceBuffer::zeroed(batch * WINDOW * c * 2).unwrap();
-        let state = DeviceBuffer::zeroed(batch * slot * 4).unwrap();
+        let state = DeviceBuffer::zeroed(batch * slot * es).unwrap();
         let requests: Vec<Request> = (0..batch)
             .map(|b| Request {
                 rows: n,
@@ -299,7 +368,7 @@ fn main() {
         for &(vb, per_pass) in configs {
             let ws = kernel::PrefillWorkspace::new(H, batch, per_pass).unwrap();
             let launch = || {
-                kernel::PrefillBatch {
+                let pf = kernel::PrefillBatch {
                     weights: &w,
                     p: RowView::new(&r.p, 0, r.p_stride),
                     b_off: r.b_off,
@@ -311,9 +380,12 @@ fn main() {
                     out: RowView::dense(&r.out, H * DV),
                     value_blocks: vb,
                     workspace: &ws,
+                };
+                if bf16_state {
+                    pf.launch_bf16_state(&meta, &stream).unwrap()
+                } else {
+                    pf.launch(&meta, &stream).unwrap()
                 }
-                .launch(&meta, &stream)
-                .unwrap()
             };
             let ms = time(&stream, 3, launch);
             let per_row = ms * 1e3 / total_rows as f64;
@@ -326,7 +398,10 @@ fn main() {
     }
 
     // 2. Decode and verify steps.
-    println!("\n2. one step's recurrent part, {LAYERS} layers x {H} heads, each layer its own states (ms per step)");
+    println!(
+        "\n2. one step's recurrent part, {LAYERS} layers x {H} heads, each layer its own {} states (ms per step)",
+        if bf16_state { "bf16" } else { "f32" }
+    );
     println!(
         "{:>9} {:>5} {:>14} {:>14} {:>15} {:>11} {:>16}",
         "requests",
@@ -357,7 +432,7 @@ fn main() {
             .map(|l| rows(total_rows, 10 + l as u64))
             .collect();
         // Layer l's states and windows at l * batch slots.
-        let pool = DeviceBuffer::zeroed(LAYERS * batch * slot * 4).unwrap();
+        let pool = DeviceBuffer::zeroed(LAYERS * batch * slot * es).unwrap();
         let convs = DeviceBuffer::zeroed(LAYERS * batch * WINDOW * c * 2).unwrap();
         let saves = LayerSaves::alloc(LAYERS, H, total_rows).unwrap();
         let metas: Vec<BatchMeta> = (0..LAYERS)
@@ -395,13 +470,18 @@ fn main() {
                         out: RowView::dense(&r.out, H * DV),
                         saves: None,
                     };
-                    checked.launch(&metas[l], &stream).unwrap();
+                    if bf16_state {
+                        checked.launch_bf16_state(&metas[l], &stream).unwrap();
+                    } else {
+                        checked.launch(&metas[l], &stream).unwrap();
+                    }
                     ChainLaunch {
                         checked,
                         meta: &metas[l],
                         k_off: l * saves.kv_stride(),
                         b_off_saves: l * saves.b_stride(),
                         saves: if with_saves { Some(&saves) } else { None },
+                        bf16: bf16_state,
                     }
                 })
                 .collect()
@@ -427,10 +507,16 @@ fn main() {
         let mut meta = BatchMeta::new(batch).unwrap();
         meta.set(&requests, None).unwrap();
         let stride = batch * slot;
-        kernel::replay_batch(&meta, &pool, &pool, stride, &saves, &stream).unwrap();
-        let t_replay = time(&stream, iters, || {
-            kernel::replay_batch(&meta, &pool, &pool, stride, &saves, &stream).unwrap()
-        });
+        let replay = || {
+            if bf16_state {
+                kernel::replay_batch_bf16_state(&meta, &pool, &pool, stride, &saves, &stream)
+                    .unwrap()
+            } else {
+                kernel::replay_batch(&meta, &pool, &pool, stride, &saves, &stream).unwrap()
+            }
+        };
+        replay();
+        let t_replay = time(&stream, iters, replay);
         // All layers' rows in one buffer for the shift: layer l's rows at l * total_rows rows.
         let p_all = DeviceBuffer::zeroed(LAYERS * total_rows * rs[0].p_stride * 2).unwrap();
         let t_shift = time(&stream, iters, || {
@@ -447,7 +533,7 @@ fn main() {
             .unwrap()
         });
         // State bytes: the decode chain reads and writes every state once.
-        let bytes = 2.0 * (LAYERS * batch * slot * 4) as f64;
+        let bytes = 2.0 * (LAYERS * batch * slot * es) as f64;
         println!(
             "{batch:>9} {r_n:>5} {t_verify:>14.3} {t_decode:>14.3} {t_replay:>15.3} {t_shift:>11.3} {:>11.0} GB/s",
             bytes / (t_decode * 1e-3) / 1e9

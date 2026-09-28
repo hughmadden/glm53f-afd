@@ -270,6 +270,7 @@ routed experts as `glm53f-serve` does, and builds the forward as `glm53f-serve -
 glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir>
              [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1|2]
              [--kda-chunked-prefill] [--fp8-act bf16|dynamic] [--no-promote-k32]
+             [--kda-fp8] [--kda-state-bf16] [--prefill-w8a16] [--kda-prefill-w8a8]
 ```
 
 `--pass-rows` is 4096 by default (at most 4,096 per lane). `--experts local` runs the official
@@ -380,7 +381,9 @@ python3 harness/klgate.py compare decode.json prefill.json
 Each run prints its engine line and, per window, the tokens, passes, rows and times; `run.json`
 keeps them next to the windows' files. A numerics change is scored the same way into its own
 directory and compared with `compare <candidate>.json <baseline>.json --margin 0.002`
-(section 3).
+(section 3). The numerics options under test (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
+`--kda-prefill-w8a8`; [SIZING.md](SIZING.md) §10) are flags of both binaries, named in the engine
+line.
 
 ## 5. Cost
 

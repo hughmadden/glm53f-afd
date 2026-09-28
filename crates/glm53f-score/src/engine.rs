@@ -16,7 +16,7 @@ use glm53f_forward::kv::{KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::remote::RemoteExperts;
 use glm53f_forward::shape::{ModelShape, EXPERTS, VOCAB};
-use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
 use glm53f_model::catalog::LAYERS;
 use glm53f_model::safetensors::Checkpoint;
 
@@ -42,6 +42,8 @@ pub fn forward_config(o: &Options) -> ForwardConfig {
         policy: GemmPolicy {
             fp8_act: fp8_act(o.fp8_act),
             prefill_promote_k32: o.promote_k32,
+            prefill_w8a16: o.numerics.prefill_w8a16,
+            kda_prefill_w8a8: o.numerics.kda_prefill_w8a8,
             ..GemmPolicy::default()
         },
         ..ForwardConfig::default()
@@ -136,7 +138,10 @@ pub fn load(o: &Options, max_tokens: usize) -> Result<Engine, String> {
     let shape = s(ModelShape::new(&cfg.text, layers))?;
     let loaded = o.dev_load_layers.unwrap_or(layers).min(layers);
     let t0 = Instant::now();
-    let model = s(DeviceModel::load_repeating(&ckpt, &shape, loaded))?;
+    let wopts = WeightOptions {
+        kda_fp8: o.numerics.kda_fp8,
+    };
+    let model = s(DeviceModel::load_with(&ckpt, &shape, loaded, wopts))?;
     let embed = s(HostEmbedding::load(&ckpt))?;
     eprintln!(
         "[score] weights: decoder layers 0-{} ({} loaded), the head: {:.2} GB on the GPU, the \
@@ -195,7 +200,7 @@ pub fn load(o: &Options, max_tokens: usize) -> Result<Engine, String> {
     let fb = bufs.bytes();
     let kv = s(KvPool::new(
         KvConfig {
-            layout: KvLayout::new(&shape, None),
+            layout: KvLayout::new(&shape, None).with_kda_state_bf16(o.numerics.kda_state_bf16),
             max_slots: 1,
             pages: max_pages,
             max_pages,

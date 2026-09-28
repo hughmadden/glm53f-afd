@@ -47,6 +47,10 @@
 //! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass: 2 overlaps one lane's attention with the other's experts on the ranks, 1 runs the pass serially |
 //! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (needs `--prefill-lanes 2`); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
+//! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
+//! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 (68 MiB less per slot and per snapshot) |
+//! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (64 MiB of GEMM scratch) |
+//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
@@ -61,6 +65,11 @@
 //! `GLM53F_WIRE_INFLIGHT` (1 holds RDMA to one exchange in flight), `GLM53F_TIMELINE`,
 //! `GLM53F_PROFILE` (the forward's lane trace: a `PIPE` line per prefill pass, a `STEP` line per
 //! decode step, see `glm53f-forward`'s `LaneTrace::step_summary`).
+//!
+//! **Numerics under test.** The `Numerics` options change the engine's arithmetic and are
+//! off by default: each becomes a default only after the KL gate (`docs/KL-GATE.md`) and speed
+//! runs on the target hardware. `glm53f-score` takes the same flags. The start-up log names the
+//! ones on.
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
 //! reached through an address without a RoCE v2 device at the floor rate. `GLM53F_WIRE_ALLOW_LAN=1`
@@ -94,7 +103,8 @@
 //!
 //! Everything but the KV pool is allocated first, and the pool takes what is left less
 //! `--reserve-gib`; a pass allocates nothing. Snapshot marks (the KDA states and conv windows of
-//! a prompt or turn end, 141 MiB each) take pages of the pool (376 each), so admission, which
+//! a prompt or turn end, 141 MiB each; 73 MiB with `--kda-state-bf16`) take pages of the pool (376
+//! each; 195), so admission, which
 //! counts free pages, counts them too: under pressure it evicts retained snapshots to the host
 //! tier, and a mark the pool has no room for is refused (that snapshot is skipped) instead of
 //! running the device out of memory. The start-up log lists what was allocated for what, and
@@ -153,6 +163,11 @@ options:
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
   --prefill-rows <r>  --prefill-lanes 1|2  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
+numerics under test (off by default):
+  --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
+  --kda-state-bf16    KDA recurrent states stored in BF16 (D8)
+  --prefill-w8a16     FP8 projections over 8 rows with BF16 activations
+  --kda-prefill-w8a8  with the two above: the FP8 KDA projections keep E4M3 activations
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
 /// Expert ranks.
@@ -168,6 +183,70 @@ pub enum Experts {
     Remote(Vec<String>),
     /// The official FP8 experts on this GPU, loaded from `dir` into `gib` GiB on demand.
     Local { dir: PathBuf, gib: f64 },
+}
+
+/// Numerics under test, each off by default (the KL gate and speed runs decide).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Numerics {
+    /// D2: the KDA layers' q|k|v|b and o projections quantized at load to FP8 E4M3 with
+    /// 128 x 128 block scales (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
+    pub kda_fp8: bool,
+    /// D8: the KDA recurrent states stored in BF16, computed in f32 (`--kda-state-bf16`,
+    /// `GLM53F_KDA_STATE_BF16=1`).
+    pub kda_state_bf16: bool,
+    /// FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3
+    /// (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`).
+    pub prefill_w8a16: bool,
+    /// With `kda_fp8` and `prefill_w8a16`: the FP8 KDA projections keep E4M3 activations over 8
+    /// rows (`--kda-prefill-w8a8`, `GLM53F_KDA_PREFILL_W8A8=1`).
+    pub kda_prefill_w8a8: bool,
+}
+
+impl Numerics {
+    /// The environment's choices (a variable set to anything but `0` turns its option on).
+    pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Numerics {
+        let on = |k: &str| env(k).is_some_and(|v| v != "0");
+        Numerics {
+            kda_fp8: on("GLM53F_KDA_FP8"),
+            kda_state_bf16: on("GLM53F_KDA_STATE_BF16"),
+            prefill_w8a16: on("GLM53F_PREFILL_W8A16"),
+            kda_prefill_w8a8: on("GLM53F_KDA_PREFILL_W8A8"),
+        }
+    }
+
+    /// Turn on the option `flag` names; false when it names none.
+    pub fn flag(&mut self, flag: &str) -> bool {
+        match flag {
+            "--kda-fp8" => self.kda_fp8 = true,
+            "--kda-state-bf16" => self.kda_state_bf16 = true,
+            "--prefill-w8a16" => self.prefill_w8a16 = true,
+            "--kda-prefill-w8a8" => self.kda_prefill_w8a8 = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// The options on, for logs and engine lines (`none` when all are off).
+    pub fn describe(&self) -> String {
+        let on: Vec<&str> = [
+            (self.kda_fp8, "FP8 KDA projections (D2)"),
+            (self.kda_state_bf16, "BF16 KDA states (D8)"),
+            (self.prefill_w8a16, "W8A16 prefill projections"),
+            (
+                self.kda_prefill_w8a8,
+                "the FP8 KDA projections W8A8 at prefill",
+            ),
+        ]
+        .iter()
+        .filter(|x| x.0)
+        .map(|x| x.1)
+        .collect();
+        if on.is_empty() {
+            "none".to_string()
+        } else {
+            on.join(", ")
+        }
+    }
 }
 
 /// The daemon's options.
@@ -193,6 +272,8 @@ pub struct Options {
     pub drafter: Option<PathBuf>,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
     pub dev_layers: Option<usize>,
+    /// Numerics under test.
+    pub numerics: Numerics,
 }
 
 /// `0-N`: the first N + 1 decoder layers.
@@ -292,8 +373,12 @@ impl Options {
         };
         let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
+        let mut numerics = Numerics::from_env(env);
         let mut it = args.iter();
         while let Some(k) = it.next() {
+            if numerics.flag(k) {
+                continue;
+            }
             let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
             match k.as_str() {
                 "--checkpoint" => checkpoint = Some(PathBuf::from(val()?)),
@@ -374,6 +459,7 @@ impl Options {
             decode_lanes,
             drafter,
             dev_layers,
+            numerics,
         })
     }
 }
@@ -574,6 +660,60 @@ mod tests {
             "{short}"
         );
         assert!(short.contains("256000 tokens"), "{short}");
+    }
+
+    #[test]
+    fn numerics_under_test_are_off_unless_asked_for() {
+        let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        let o = Options::parse(&args("--checkpoint /c"), &env).unwrap();
+        assert_eq!(o.numerics, Numerics::default());
+        assert_eq!(o.numerics.describe(), "none");
+        let o = Options::parse(
+            &args("--checkpoint /c --kda-fp8 --kda-state-bf16 --prefill-w8a16"),
+            &env,
+        )
+        .unwrap();
+        let all = Numerics {
+            kda_fp8: true,
+            kda_state_bf16: true,
+            prefill_w8a16: true,
+            kda_prefill_w8a8: false,
+        };
+        assert_eq!(o.numerics, all);
+        assert_eq!(
+            o.numerics.describe(),
+            "FP8 KDA projections (D2), BF16 KDA states (D8), W8A16 prefill projections"
+        );
+        // The environment: anything but 0.
+        let env2 = |k: &str| match k {
+            "GLM53F_KDA_FP8" => Some("1".to_string()),
+            "GLM53F_KDA_STATE_BF16" => Some("0".to_string()),
+            "GLM53F_PREFILL_W8A16" => Some("yes".to_string()),
+            other => env(other),
+        };
+        let o = Options::parse(&args("--checkpoint /c"), &env2).unwrap();
+        assert_eq!(
+            o.numerics,
+            Numerics {
+                kda_fp8: true,
+                kda_state_bf16: false,
+                prefill_w8a16: true,
+                kda_prefill_w8a8: false,
+            }
+        );
+        let o = Options::parse(
+            &args("--checkpoint /c --kda-fp8 --prefill-w8a16 --kda-prefill-w8a8"),
+            &env,
+        )
+        .unwrap();
+        assert!(o.numerics.kda_prefill_w8a8);
+        assert!(o
+            .numerics
+            .describe()
+            .ends_with("the FP8 KDA projections W8A8 at prefill"));
+        // The flags take no value.
+        let o = Options::parse(&args("--kda-state-bf16 --checkpoint /c"), &env).unwrap();
+        assert!(o.numerics.kda_state_bf16 && o.checkpoint == PathBuf::from("/c"));
     }
 
     #[test]

@@ -172,10 +172,14 @@ fn gpu_decode(
 fn decode_gemm_is_bitwise_and_row_independent() {
     let s = Stream::new().unwrap();
     let mut rng = Rng::new(104);
+    // 320 and 136 rows end in a partial 128-row block (64 and 8 rows) with its own scales, as
+    // the fused KDA q|k|v|b projection (24,640 rows) does.
     for (n, k, ksplits) in [
         (256, 1024, vec![1, 2, 4, 8]),
         (512, 4096, vec![1, 4]),
         (128, 1536, vec![1, 3]),
+        (320, 2048, vec![1, 2]),
+        (136, 512, vec![1]),
     ] {
         let w = rng.fp8_matrix(n, k);
         let dw = dev_weight(&w);
@@ -212,6 +216,9 @@ fn prefill_gemm_is_within_bound_of_exact() {
         (100, 256, 512),
         (300, 384, 1024),
         (256, 128, 4096),
+        // A partial last block of rows (64 and 8 rows past the last whole block).
+        (100, 320, 512),
+        (130, 136, 1024),
     ] {
         let w = rng.fp8_matrix(n, k);
         let dw = dev_weight(&w);
@@ -287,14 +294,21 @@ fn prefill_gemm_is_exact_on_integer_data() {
         .iter()
         .map(|&v| fp8::f32_to_e4m3(v))
         .collect();
-    for (rows, n, k) in [(1, 128, 128), (77, 256, 384), (130, 384, 1024)] {
+    for (rows, n, k) in [
+        (1usize, 128usize, 128usize),
+        (77, 256, 384),
+        (130, 384, 1024),
+        (77, 200, 384),
+    ] {
         let pick = |rng: &mut Rng| codes[(rng.next_u64() % codes.len() as u64) as usize];
         let xq: Vec<u8> = (0..rows * k).map(|_| pick(&mut rng)).collect();
         let wq: Vec<u8> = (0..n * k).map(|_| pick(&mut rng)).collect();
         // Scales 2^-2 .. 2^2 keep every sum within 24 significant bits.
         let pow2 = |rng: &mut Rng| 2f32.powi((rng.next_u64() % 5) as i32 - 2);
         let xs: Vec<f32> = (0..rows * k / 128).map(|_| pow2(&mut rng)).collect();
-        let ws: Vec<f32> = (0..(n / 128) * (k / 128)).map(|_| pow2(&mut rng)).collect();
+        let ws: Vec<f32> = (0..n.div_ceil(128) * (k / 128))
+            .map(|_| pow2(&mut rng))
+            .collect();
         let (dq, dxs, dwq, dws) = (up(&xq), up(&xs), up(&wq), up(&ws));
         for promotion in [ops::Promotion::Block128, ops::Promotion::K32] {
             let (out, out32) = (zeros(rows * n * 2), zeros(rows * n * 4));
@@ -330,6 +344,43 @@ fn prefill_gemm_is_exact_on_integer_data() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn weight_quantization_and_dequantization_match_the_host() {
+    // The load-time quantizer of BF16 weights and the W8A16 prefill's BF16 tiles, bit for bit
+    // against src/fp8.rs, on shapes with a partial last block of rows (the fused KDA
+    // q|k|v|b projection is 24,640 = 192 x 128 + 64 rows).
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(111);
+    for (n, k) in [(128usize, 128usize), (320, 1024), (200, 384), (24640, 256)] {
+        let mut w = rng.bf16_vec(n * k, 0.02);
+        // An all-zero block, a lone outlier, and a signed zero.
+        for r in 0..n.min(128) {
+            for c in 0..128 {
+                w[r * k + c] = 0;
+            }
+        }
+        w[(n - 1) * k + k - 1] = bf16::from_f32(-3.0);
+        w[k + 1] = 0x8000;
+        let host = fp8::quantize_weight_bf16(&w, n, k);
+        let (dw, q, sc) = (up(&w), zeros(n * k), zeros(n.div_ceil(128) * (k / 128) * 4));
+        ops::quantize_weight(&dw, n, k, &q, &sc, &s).unwrap();
+        let (gq, gs): (Vec<u8>, Vec<f32>) =
+            (down(&q, n * k), down(&sc, n.div_ceil(128) * (k / 128)));
+        assert_eq!(gq, host.data, "codes n={n} k={k}");
+        assert_bits_f32(&gs, &host.scale_inv, "scales");
+        for (row0, rows) in [(0usize, n), (n / 2, n - n / 2), (n - 1, 1)] {
+            let out = zeros(rows * k * 2);
+            ops::dequant_bf16(&q, &sc, n, k, row0, rows, &out, &s).unwrap();
+            let got: Vec<u16> = down(&out, rows * k);
+            assert_eq!(
+                got,
+                fp8::dequant_bf16(&host, row0, rows),
+                "dequant n={n} k={k} rows {row0}+{rows}"
+            );
         }
     }
 }

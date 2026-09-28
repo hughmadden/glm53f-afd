@@ -381,8 +381,14 @@ fn run_per_layer(su: &mut Setup, g: &Goldens, chunk: usize) -> Run {
 struct Summary {
     out_streams: Vec<(usize, f64)>,
     routing_gap: Vec<(usize, f32)>,
-    logits: Option<(f64, f64, usize, usize)>,
+    /// Logits against the golden (prefill row, decode rows), argmax agreement, device picks equal
+    /// to the host argmax, and agreement on the rows whose golden top-2 gap is at least 0.25 (of
+    /// how many).
+    logits: Option<(f64, f64, usize, usize, usize, usize)>,
 }
+
+/// Rows of the head whose golden top-2 logits are at least this far apart: a clear winner.
+const CLEAR_GAP: f32 = 0.25;
 
 fn report(g: &Goldens, run: &Run, title: &str) -> Summary {
     let rec = &run.rec;
@@ -768,6 +774,7 @@ fn report(g: &Goldens, run: &Run, title: &str) -> Summary {
         );
         sum.out_streams.push((l, ep.rel_rms.max(ed.rel_rms)));
     }
+    let mut differ: Vec<String> = Vec::new();
     if let Some((logits, picks)) = &run.logits {
         let gl = g.f32("head", "head.logits");
         let nl = g.f32("native", "head.logits");
@@ -793,20 +800,46 @@ fn report(g: &Goldens, run: &Run, title: &str) -> Summary {
             }
             b
         };
-        let agree = (0..=STEPS)
-            .filter(|&r| {
-                argmax(&logits[r * VOCAB..(r + 1) * VOCAB])
-                    == argmax(&gl[r * VOCAB..(r + 1) * VOCAB])
-            })
-            .count();
+        let same = |r: usize| {
+            argmax(&logits[r * VOCAB..(r + 1) * VOCAB]) == argmax(&gl[r * VOCAB..(r + 1) * VOCAB])
+        };
+        // The golden's gap between its best two logits, per row.
+        let gap = |r: usize| -> f32 {
+            let row = &gl[r * VOCAB..r * VOCAB + SAMPLE_VOCAB];
+            let b = argmax(&gl[r * VOCAB..(r + 1) * VOCAB]);
+            let second = row
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != b)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            row[b] - second
+        };
+        let agree = (0..=STEPS).filter(|&r| same(r)).count();
+        let clear: Vec<usize> = (0..=STEPS).filter(|&r| gap(r) >= CLEAR_GAP).collect();
+        let clear_agree = clear.iter().filter(|&&r| same(r)).count();
+        differ = (0..=STEPS)
+            .filter(|&r| !same(r))
+            .map(|r| format!("row {r} (golden top-2 gap {:.3})", gap(r)))
+            .collect();
         let picks_ok = (0..=STEPS)
             .filter(|&r| picks[r] as usize == argmax(&logits[r * VOCAB..(r + 1) * VOCAB]))
             .count();
-        sum.logits = Some((lp.rel_rms, ld.rel_rms, agree, picks_ok));
+        sum.logits = Some((
+            lp.rel_rms,
+            ld.rel_rms,
+            agree,
+            picks_ok,
+            clear_agree,
+            clear.len(),
+        ));
     }
     table.print(title);
-    if let Some((_, _, agree, picks_ok)) = sum.logits {
-        eprintln!("  head: argmax equal to the FP32 golden's on {agree}/9 rows; device picks equal the host argmax on {picks_ok}/9");
+    if let Some((_, _, agree, picks_ok, ca, cn)) = sum.logits {
+        eprintln!("  head: argmax equal to the FP32 golden's on {agree}/9 rows ({ca}/{cn} of the rows whose golden top-2 gap is at least {CLEAR_GAP}); device picks equal the host argmax on {picks_ok}/9");
+        if !differ.is_empty() {
+            eprintln!("  head: argmax differs on {}", differ.join(", "));
+        }
     }
     sum
 }
@@ -884,22 +917,47 @@ fn layers_0_to_4_against_the_goldens() {
         "  chunked vs chain, layer 0 after the prompt: state relative RMS {st_diff:.2e}; {flips} of {} gated-norm outputs differ (BF16)",
         nc.len()
     );
+    // With BF16 states (GLM53F_TEST_NUMERICS=kda-state-bf16) the chain rounds the state every
+    // row and the chunked kernel every 16 rows: they agree to BF16 rounding, not f32.
+    let chunk_bound = if numerics().kda_state_bf16 {
+        2e-2
+    } else {
+        1e-4
+    };
     assert!(
-        st_diff > 0.0 && st_diff < 1e-4,
+        st_diff > 0.0 && st_diff < chunk_bound,
         "chunked KDA prefill against the chain: {st_diff:.3e}"
     );
 
+    // Bounds. With numerics under test (GLM53F_TEST_NUMERICS) the argmax must agree on every row
+    // whose golden top-2 gap is at least 0.25 (the golden's rows 0 and 2 are near-ties, 0.042 and
+    // 0.006). FP8 KDA projections (D2) move the projections by 1.4e-2 to 1.9e-2 (relative RMS;
+    // the reference in BF16: 2.2e-3), which the KDA layers' outputs carry: the 8-row bounds are
+    // then 3e-2.
+    let num = numerics();
+    let (chain8, layer8) = if num.kda_fp8 {
+        (3e-2, 3e-2)
+    } else {
+        (2e-2, 1e-2)
+    };
     for (s, what, bound) in [
         (&s1, "chain", 5e-2),
-        (&s2, "chain, 8-row passes", 2e-2),
+        (&s2, "chain, 8-row passes", chain8),
         (&s5, "chain, chunked KDA prefill", 5e-2),
     ] {
-        let (lp, ld, agree, picks_ok) = s.logits.unwrap();
+        let (lp, ld, agree, picks_ok, clear_agree, clear) = s.logits.unwrap();
         assert_eq!(
             picks_ok, 9,
             "{what}: the device argmax disagrees with the host"
         );
-        assert!(agree >= 8, "{what}: argmax agrees on only {agree}/9 rows");
+        if num == TestNumerics::default() {
+            assert!(agree >= 8, "{what}: argmax agrees on only {agree}/9 rows");
+        } else {
+            assert_eq!(
+                clear_agree, clear,
+                "{what}: argmax differs on a row with a clear winner"
+            );
+        }
         assert!(
             lp.max(ld) < bound,
             "{what}: logits relative RMS {lp:.3e} / {ld:.3e}"
@@ -909,7 +967,7 @@ fn layers_0_to_4_against_the_goldens() {
         }
     }
     for (s, what, bound) in [
-        (&s3, "per layer, 8-row passes", 1e-2),
+        (&s3, "per layer, 8-row passes", layer8),
         (&s4, "per layer, one pass", 5e-2),
     ] {
         for (l, e) in &s.out_streams {

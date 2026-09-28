@@ -9,11 +9,12 @@
 //!   `j`'s 35,904-byte block (64 latent records of 528 B, 16 pooled keys of 128 B, 16 f32
 //!   scales; `glm53f_dsa::cache`) at byte `35,904 j`. Over the model's 11 DSA layers a page is
 //!   394,944 B = 64 x 6,171 B, the planner's `KvGeometry::page_bytes`.
-//! - **Positional state**, per slot: the FP32 KDA states `[kda_layers][64][128 (v)][128 (k)]`,
-//!   the BF16 conv windows `[kda_layers][3][24,576]`, and the DSA tails `[dsa_layers][1,552 B]`
-//!   (the raw index keys and gates of the incomplete pool). A mark saves all three: the tail
-//!   belongs to a position, like the KDA state, because the keys it holds are dropped once
-//!   their pool completes.
+//! - **Positional state**, per slot: the FP32 KDA states `[kda_layers][64][128 (v)][128 (k)]`
+//!   (136 MiB), or BF16 with [`KvLayout::with_kda_state_bf16`] (68 MiB; decision D8), the BF16
+//!   conv windows `[kda_layers][3][24,576]`, and the DSA tails `[dsa_layers][1,552 B]` (the raw
+//!   index keys and gates of the incomplete pool). A mark saves all three: the tail belongs to a
+//!   position, like the KDA state, because the keys it holds are dropped once their pool
+//!   completes.
 //! - **Draft KV** (DFlash2): the drafter's context ring, reserved per slot when a drafter is
 //!   configured (`crate::kv` keeps it at the committed length).
 //!
@@ -47,6 +48,9 @@ pub struct KvLayout {
     pub page_bytes: usize,
     /// Bytes of the DFlash2 draft KV reserved per slot (0 without a drafter).
     pub draft_kv_bytes: usize,
+    /// The KDA states are stored in BF16 instead of FP32 (decision D8; the kernels' `_bf16state`
+    /// variants): half the bytes of every state, mark and host image.
+    pub kda_state_bf16: bool,
 }
 
 impl KvLayout {
@@ -56,12 +60,28 @@ impl KvLayout {
             dsa_layers: shape.dsa_layers,
             page_bytes: shape.dsa_layers.max(1) * LAYER_PAGE_BYTES,
             draft_kv_bytes: draft.map_or(0, |d| d.kv_bytes_per_slot() as usize),
+            kda_state_bf16: false,
         }
     }
 
-    /// f32 elements of one layer's KDA state.
+    /// The same layout with the KDA states in BF16 (`true`) or FP32.
+    pub fn with_kda_state_bf16(mut self, bf16: bool) -> KvLayout {
+        self.kda_state_bf16 = bf16;
+        self
+    }
+
+    /// Elements of one layer's KDA state.
     pub const fn state_elems_per_layer() -> usize {
         KDA_HEADS * KDA_DIM * KDA_DIM
+    }
+
+    /// Bytes of one KDA state element: 4, or 2 in BF16.
+    pub fn kda_state_elem_bytes(&self) -> usize {
+        if self.kda_state_bf16 {
+            2
+        } else {
+            4
+        }
     }
 
     /// BF16 elements of one layer's conv window.
@@ -70,7 +90,7 @@ impl KvLayout {
     }
 
     pub fn kda_state_bytes(&self) -> usize {
-        self.kda_layers * Self::state_elems_per_layer() * 4
+        self.kda_layers * Self::state_elems_per_layer() * self.kda_state_elem_bytes()
     }
 
     pub fn conv_bytes(&self) -> usize {
@@ -104,7 +124,8 @@ impl KvLayout {
         ]
     }
 
-    /// Pool pages one mark takes (GLM-5.3-Flash: 376 pages, 141 MiB).
+    /// Pool pages one mark takes (GLM-5.3-Flash: 376 pages, 141 MiB; with BF16 KDA states 195
+    /// pages, 73 MiB).
     pub fn mark_pages(&self) -> usize {
         self.mark_regions().iter().map(|r| r.2).sum()
     }

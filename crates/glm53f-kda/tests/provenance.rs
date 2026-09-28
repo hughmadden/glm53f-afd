@@ -64,6 +64,6 @@ fn bindings_cover_the_header() {
         .into_iter()
         .filter(|n| !n.starts_with("parity_"))
         .collect();
-    assert_eq!(declared.len(), 10, "{declared:?}");
+    assert_eq!(declared.len(), 13, "{declared:?}");
     assert_eq!(declared, bound);
 }

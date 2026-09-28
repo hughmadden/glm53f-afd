@@ -583,6 +583,67 @@ pub fn fp8_gemm_prefill(
     )
 }
 
+/// Quantize a BF16 weight `w` `[n][k]` to E4M3 `q` `[n][k]` with block scales
+/// `[ceil(n/128)][k/128]` (the host's `fp8::quantize_weight_bf16`, bit for bit).
+pub fn quantize_weight(
+    w: &DeviceBuffer,
+    n: usize,
+    k: usize,
+    q: &DeviceBuffer,
+    scales: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    need(w, n * k * 2, "w")?;
+    need(q, n * k, "q")?;
+    need(scales, n.div_ceil(128) * k.div_ceil(128) * 4, "scales")?;
+    check(
+        unsafe {
+            ffi::glm53f_fp8_quantize_weight(
+                w.ptr(),
+                i(n, "n")?,
+                i(k, "k")?,
+                q.mut_ptr(),
+                scales.mut_ptr(),
+                s.0,
+            )
+        },
+        "glm53f_fp8_quantize_weight",
+    )
+}
+
+/// Rows `row0 .. row0 + rows` of an FP8 weight `[n][k]` as BF16 `out` `[rows][k]`
+/// (`fp8::dequant_bf16`, bit for bit).
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_bf16(
+    w: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    n: usize,
+    k: usize,
+    row0: usize,
+    rows: usize,
+    out: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    need(w, n * k, "w")?;
+    need(w_scales, n.div_ceil(128) * k.div_ceil(128) * 4, "w_scales")?;
+    need(out, rows * k * 2, "out")?;
+    check(
+        unsafe {
+            ffi::glm53f_fp8_dequant_bf16(
+                w.ptr(),
+                w_scales.ptr(),
+                i(n, "n")?,
+                i(k, "k")?,
+                i(row0, "row0")?,
+                i(rows, "rows")?,
+                out.mut_ptr(),
+                s.0,
+            )
+        },
+        "glm53f_fp8_dequant_bf16",
+    )
+}
+
 // ---- Second revision: single-launch variants ------------------------------------------------
 
 /// Counters for the single-launch kernels (`sync` in the C ABI): `count` zeroed `u32`s. The

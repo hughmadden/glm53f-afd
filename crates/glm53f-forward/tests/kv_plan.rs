@@ -74,6 +74,38 @@ fn accounting_matches_the_planner() {
     assert_eq!(KvLayout::new(&s5, None).mark_pages(), 468 + 17 + 1);
 }
 
+/// BF16 KDA states (decision D8): half the state's bytes in every slot, mark and host image;
+/// the conv windows, tails and draft KV unchanged.
+#[test]
+fn bf16_kda_states_halve_the_state() {
+    let (cfg, draft) = configs();
+    let shape = ModelShape::full(&cfg.text).unwrap();
+    let f = KvLayout::new(&shape, Some(&draft));
+    let b = f.with_kda_state_bf16(true);
+    assert!(!f.kda_state_bf16 && b.kda_state_bf16);
+    assert_eq!((f.kda_state_elem_bytes(), b.kda_state_elem_bytes()), (4, 2));
+    // 34 x 64 x 128 x 128 x 2 B = 68 MiB.
+    assert_eq!(b.kda_state_bytes(), 68 << 20);
+    assert_eq!(f.kda_state_bytes() - b.kda_state_bytes(), 68 << 20);
+    assert_eq!(b.conv_bytes(), f.conv_bytes());
+    assert_eq!(b.draft_kv_bytes, f.draft_kv_bytes);
+    assert_eq!(b.mark_bytes(), f.mark_bytes() - (68 << 20));
+    assert_eq!(b.slot_fixed_bytes(), f.slot_fixed_bytes() - (68 << 20));
+    // A mark: 181 + 13 + 1 = 195 pages (73.4 MiB) instead of 376.
+    assert_eq!(b.mark_regions().map(|r| r.2), [181, 13, 1]);
+    assert_eq!(b.mark_pages(), 195);
+    assert!(b.mark_pages() * b.page_bytes >= b.mark_bytes());
+    eprintln!(
+        "BF16 KDA states: slot {:.1} MiB (f32 {:.1}); mark {} pages, {:.1} MiB (f32 {} pages); 48 slots save {:.2} GiB",
+        b.slot_fixed_bytes() as f64 / 1048576.0,
+        f.slot_fixed_bytes() as f64 / 1048576.0,
+        b.mark_pages(),
+        (b.mark_pages() * b.page_bytes) as f64 / 1048576.0,
+        f.mark_pages(),
+        48.0 * (f.slot_fixed_bytes() - b.slot_fixed_bytes()) as f64 / (1u64 << 30) as f64
+    );
+}
+
 fn check_refs(alloc: &PageAlloc, slots: &[&SlotPages]) {
     let mut refs = vec![0u32; alloc.total()];
     for s in slots {

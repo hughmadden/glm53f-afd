@@ -7,7 +7,8 @@
 //!   layer (layer `j`'s block of physical page `p` at `p * page_bytes + 35,904 j`, which is the
 //!   `glm53f_dsa_cache_t` view with `page_stride = page_bytes`);
 //! - `table`: the page tables, `[max_slots][max_pages]` i32, one row per slot;
-//! - `state`: FP32 KDA states `[max_slots][kda_layers][64][128][128]`;
+//! - `state`: KDA states `[max_slots][kda_layers][64][128][128]`, FP32, or BF16 when the layout
+//!   says so ([`KvLayout::kda_state_bf16`], decision D8);
 //! - `conv`: BF16 conv windows `[max_slots][kda_layers][3][24,576]`;
 //! - `tails`: DSA tails `[max_slots][dsa_layers][1,552 B]`;
 //! - `draft`: the DFlash2 drafter's context rings, `[max_slots][draft_kv_bytes]` (when the layout
@@ -733,9 +734,10 @@ impl GlmKv {
 
     // ---- Views for the forward and for tests ---------------------------------------------
 
-    /// Element offset of this slot's KDA state (all its layers) in the pool's state arena.
+    /// Element offset of this slot's KDA state (all its layers) in the pool's state arena (f32
+    /// or BF16 elements, as the layout stores them).
     pub(crate) fn state_elem_offset(&self) -> usize {
-        self.state_at() / 4
+        self.state_at() / self.layout().kda_state_elem_bytes()
     }
 
     /// Element offset of this slot's conv windows in the pool's conv arena.
@@ -748,13 +750,19 @@ impl GlmKv {
         self.tails_at() / TAIL + dsa_layer
     }
 
-    /// Download KDA layer `j`'s state, f32 `[64][128 (v)][128 (k)]`.
+    /// Download KDA layer `j`'s state, f32 `[64][128 (v)][128 (k)]` (a BF16 state widened).
     pub fn download_state(&self, j: usize) -> Result<Vec<f32>> {
         self.stream().synchronize()?;
         let n = KvLayout::state_elems_per_layer();
-        self.pool
-            .state
-            .download_at(self.state_elem_offset() + j * n, n)
+        let at = self.state_elem_offset() + j * n;
+        if self.layout().kda_state_bf16 {
+            let b: Vec<u16> = self.pool.state.download_at(at, n)?;
+            Ok(b.iter()
+                .map(|&x| f32::from_bits((x as u32) << 16))
+                .collect())
+        } else {
+            self.pool.state.download_at(at, n)
+        }
     }
 
     /// Download KDA layer `j`'s conv window, BF16 `[3][24,576]`.

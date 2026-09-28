@@ -55,8 +55,10 @@ fn admission_refuses_and_snapshots_skip_instead_of_running_out() {
         ..ForwardConfig::default()
     };
     // A 600-token prompt with 8 new tokens reserves 600 + 1,024 + 64 tokens (the shell's output
-    // allowance): 27 pages. One mark: 486 pages for these five layers. Three to spare.
-    let (request, mark) = (27, 486);
+    // allowance): 27 pages. One mark: 486 pages for these five layers (252 with BF16 KDA states,
+    // GLM53F_TEST_NUMERICS=kda-state-bf16). Three to spare.
+    let mark = if numerics().kda_state_bf16 { 252 } else { 486 };
+    let request = 27;
     let Some(fwd) = forward_with(
         5,
         cfg,

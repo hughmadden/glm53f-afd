@@ -52,6 +52,10 @@
 //! | `--kda-chunked-prefill` | | off | KDA of passes over 8 rows through the chunked kernel (a numerics change under test) |
 //! | `--fp8-act bf16\|dynamic` | | `bf16` | FP8 projections of up to 8 rows: BF16 activations (W8A16) or the checkpoint's dynamic E4M3 (W8A8) |
 //! | `--no-promote-k32` | | off | The FP8 tensor-core GEMM accumulates whole 128-blocks in the tensor core |
+//! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (as `glm53f-serve`) |
+//! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 |
+//! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows with BF16 activations (W8A16) |
+//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows |
 //! | `--dev-layers 0-N` | | off | Development: decoder layers 0 to N only, then the head (as `glm53f-serve`) |
 //! | `--dev-load-layers N` | | off | Development: load decoder layers 0 to N - 1 and run all 45 on repeats of them |
 //!
@@ -72,7 +76,7 @@ pub mod engine;
 
 use std::path::PathBuf;
 
-use glm53f_serve::{parse_dev_layers, MAX_LANE_ROWS, RANKS};
+use glm53f_serve::{parse_dev_layers, Numerics, MAX_LANE_ROWS, RANKS};
 
 /// Usage, for `--help` and errors.
 pub const USAGE: &str = "usage:
@@ -84,6 +88,11 @@ options:
   --windows <id,...>     score these windows of the plan only
   --experts remote|local|zero  --local-experts-gib <g>  --prefill-lanes 1|2
   --kda-chunked-prefill  --fp8-act bf16|dynamic  --no-promote-k32
+numerics under test (off by default, as glm53f-serve):
+  --kda-fp8              KDA projections quantized to FP8 block-128 at load (D2)
+  --kda-state-bf16       KDA recurrent states stored in BF16 (D8)
+  --prefill-w8a16        FP8 projections over 8 rows with BF16 activations
+  --kda-prefill-w8a8     with the two above: the FP8 KDA projections keep E4M3 activations
 development (the logits are meaningless):
   --dev-layers 0-N       decoder layers 0..=N only
   --dev-load-layers N    load decoder layers 0..N-1, run all 45 on repeats of them
@@ -124,6 +133,8 @@ pub struct Options {
     pub kda_chunked_prefill: bool,
     pub fp8_act: Fp8Act,
     pub promote_k32: bool,
+    /// Numerics under test (`glm53f-serve`'s flags).
+    pub numerics: Numerics,
     /// Development: the decoder layers run (a prefix), or the layers loaded (all run on repeats
     /// of them).
     pub dev_layers: Option<usize>,
@@ -170,8 +181,12 @@ impl Options {
         let (mut pass_rows, mut lanes) = (4096usize, 2usize);
         let (mut chunked, mut fp8_act, mut promote_k32) = (false, Fp8Act::Bf16, true);
         let (mut dev_layers, mut dev_load_layers) = (None, None);
+        let mut numerics = Numerics::from_env(env);
         let mut it = args.iter();
         while let Some(k) = it.next() {
+            if numerics.flag(k) {
+                continue;
+            }
             let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
             match k.as_str() {
                 "--checkpoint" => checkpoint = Some(PathBuf::from(val()?)),
@@ -256,6 +271,7 @@ impl Options {
             kda_chunked_prefill: chunked,
             fp8_act,
             promote_k32,
+            numerics,
             dev_layers,
             dev_load_layers,
         })
@@ -316,14 +332,37 @@ pub fn engine_line(o: &Options, b: &Build) -> String {
         Fp8Act::Bf16 => ("W8A16", "BF16"),
         Fp8Act::Dynamic => ("W8A8", "dynamic E4M3"),
     };
+    let n = &o.numerics;
+    let beyond = if n.prefill_w8a16 && n.kda_fp8 && n.kda_prefill_w8a8 {
+        format!(
+            "W8A16 beyond (BF16 tiles of the FP8 weights, cuBLAS), but W8A8 for the KDA \
+             projections with {} accumulation",
+            if o.promote_k32 {
+                "k32-promoted"
+            } else {
+                "whole-block tensor-core"
+            }
+        )
+    } else if n.prefill_w8a16 {
+        "W8A16 beyond (BF16 tiles of the FP8 weights, cuBLAS)".to_string()
+    } else {
+        format!(
+            "W8A8 beyond with {} accumulation",
+            if o.promote_k32 {
+                "k32-promoted"
+            } else {
+                "whole-block tensor-core"
+            }
+        )
+    };
     parts.push(format!(
         "non-expert weights: the official FP8 checkpoint (FP8 block-128 projections {small} up to \
-         8 rows ({act} activations), W8A8 beyond with {} accumulation; BF16 KDA and indexer \
-         projections: GEMV up to 8 rows, cuBLAS beyond)",
-        if o.promote_k32 {
-            "k32-promoted"
+         8 rows ({act} activations), {beyond}; {} KDA projections; BF16 indexer projections: \
+         GEMV up to 8 rows, cuBLAS beyond)",
+        if n.kda_fp8 {
+            "FP8 block-128 (quantized at load)"
         } else {
-            "whole-block tensor-core"
+            "BF16"
         }
     ));
     let local = b.moe_layers - b.zero_moe_layers;
@@ -342,10 +381,10 @@ pub fn engine_line(o: &Options, b: &Build) -> String {
         ),
         Experts::Zero => "routed experts: zeros".to_string(),
     });
-    parts.push(
-        "KV: MLA latent FP8 E4M3 (528-byte records), pooled index keys FP8, KDA states F32"
-            .to_string(),
-    );
+    parts.push(format!(
+        "KV: MLA latent FP8 E4M3 (528-byte records), pooled index keys FP8, KDA states {}",
+        if n.kda_state_bf16 { "BF16" } else { "F32" }
+    ));
     parts.push(if o.kda_chunked_prefill {
         "KDA over 8 rows: the chunked prefill kernel".to_string()
     } else {
@@ -397,6 +436,7 @@ mod tests {
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
             (false, Fp8Act::Bf16, true)
         );
+        assert_eq!(o.numerics, Numerics::default());
         assert!(!o.development());
         let o = Options::parse(
             &args(
@@ -419,6 +459,37 @@ mod tests {
         assert_eq!(
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
             (true, Fp8Act::Dynamic, false)
+        );
+        // The numerics under test, as glm53f-serve takes them; the engine line names them.
+        let o = Options::parse(
+            &args("--plan p --out o --kda-fp8 --kda-state-bf16 --prefill-w8a16"),
+            &env,
+        )
+        .unwrap();
+        assert!(o.numerics.kda_fp8 && o.numerics.kda_state_bf16 && o.numerics.prefill_w8a16);
+        let b = Build {
+            layers: 45,
+            model_layers: 45,
+            loaded: 45,
+            zero_moe_layers: 0,
+            moe_layers: 42,
+            gpu: "sm_120 (170 SMs)".into(),
+        };
+        let line = engine_line(&o, &b);
+        assert!(
+            line.contains("FP8 block-128 (quantized at load) KDA projections"),
+            "{line}"
+        );
+        assert!(line.contains("W8A16 beyond"), "{line}");
+        assert!(line.contains("KDA states BF16"), "{line}");
+        let plain = engine_line(
+            &Options::parse(&args("--plan p --out o"), &env).unwrap(),
+            &b,
+        );
+        assert!(plain.contains("BF16 KDA projections") && plain.contains("KDA states F32"));
+        assert!(
+            plain.contains("W8A8 beyond with k32-promoted accumulation"),
+            "{plain}"
         );
         // Local experts default to the checkpoint.
         let o = Options::parse(

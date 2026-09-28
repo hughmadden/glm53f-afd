@@ -163,10 +163,97 @@ Each rank holds a quarter of every routed expert, split over the expert's
 | # | Decision | Options | Proposal |
 |---|---|---|---|
 | D1 | KV precision | FP8 528-B record · BF16 · (NVFP4) | **FP8.** 1M on every layout and twice the capacity. Published, on one window: 4-bit experts with an FP8 MLA cache score a KLD of 0.0246; with an NVFP4 cache 0.0548, a configuration that failed the card's task-level test, so NVFP4 is out. Gate: the engine's own 25-window KL against BF16 ([KL-GATE.md](KL-GATE.md)), plus a needle ladder to 1M. |
-| D2 | KDA projection weights | BF16 as shipped · our own FP8 | **Start BF16.** Measure FP8: +4.4 GiB of pool and about −2.7 ms per decode step, but the official checkpoint deliberately keeps these in BF16. |
+| D2 | KDA projection weights | BF16 as shipped · our own FP8 | **Start BF16.** Measure FP8: +4.4 GiB of pool and about −2.7 ms per decode step, but the official checkpoint deliberately keeps these in BF16. *Built, off by default (`--kda-fp8`, §10): 4.26 GiB of weights less; awaits the KL gate.* |
 | D3 | Slots | 16 (2 lanes × 8) · 8 | **16**, as in the engines this borrows from. |
 | D4 | KDA snapshot cadence | prompt and turn only · plus every 32K | **Prompt and turn first.** Add periodic checkpoints if branch reuse shows up in real traffic. |
 | D5 | Request cap on the API | 1,048,576 · lower default | **1M,** with admission reserving prompt plus output allowance. |
 | D6 | Expert format on the Sparks | EXL3 K4 · EXL3 K6 · NVFP4 · FP8 | **EXL3 K4.** Published KLD is 0.0246 against 0.0206 for official FP8 (25 windows, offline, no KV-cache quantization), at half the bytes. K6 (0.0137) is the upgrade path; see [DESIGN.md](DESIGN.md) §5. |
 | D7 | Embedding table | GPU · host RAM | **Host RAM** (+1.18 GiB of pool). It costs a gather of M rows × 8 KB per step. |
-| D8 | KDA state precision | FP32 (reference) · BF16 | **FP32.** BF16 saves only 68 MiB per slot. |
+| D8 | KDA state precision | FP32 (reference) · BF16 | **FP32.** BF16 saves only 68 MiB per slot. *Built, off by default (`--kda-state-bf16`, §10): 3.19 GiB at 48 slots; measured drift in §10; awaits the KL gate.* |
+
+## 10. D2, D8 and the prefill activations as built (28 September 2026)
+
+Three numerics options (and a variant of the third), each **off by default** and each a flag of
+`glm53f-serve` and `glm53f-score` (with an environment fallback). Each becomes a default only after the KL gate
+([KL-GATE.md](KL-GATE.md) §6, `compare --margin 0.002` against the same engine without it) and
+speed runs on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
+
+**D2, FP8 KDA projections** (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
+- At load, the fused q|k|v|b projection and `o_proj` of the 34 KDA layers are quantized on the
+  GPU to FP8 E4M3 with 128 × 128 block scales, the checkpoint's own scheme (`scale = amax / 448`,
+  `q = e4m3(w / scale)`). q|k|v|b has 24,640 rows: 192 whole blocks and a 64-row block for beta
+  with scales of its own (the FP8 GEMMs now take a partial last block of rows). The gate
+  projections (6 MB a layer; the forget gate's decays compound), conv, norms, `A_log` and
+  `dt_bias` stay as shipped.
+- Memory: 275.5 → 141.0 MB a layer, 9.37 → 4.80 GB over 34 layers, **4.26 GiB less**.
+- Decode (layers 0–4, `decode_bench`): per KDA layer `kda_proj` 0.23 → 0.12 ms and `kda_o` 0.077
+  → 0.041 ms at one row, **about −4.9 ms per step over 34 layers** on the 4090 (about −2.8 ms
+  scaled by the 5090's bandwidth: an estimate, not a measurement).
+- Prefill: the KDA projections take the FP8 GEMMs, W8A8 (E4M3 activations) by default and
+  W8A16 with `--prefill-w8a16`. Per KDA layer and pass (`decode_bench`, one lane, the chunked KDA
+  kernel, three runs; the projections are q|k|v|b with the gate GEMMs, then `o_proj`):
+
+  | Rows per pass | BF16 (today) | D2, W8A8 | D2 with `--prefill-w8a16` |
+  |---:|---:|---:|---:|
+  | 2,048 | 3.31–3.63 + 1.04–1.06 ms | 2.31 + 0.70–0.86 ms (−1.3 to −1.5 ms, −30%) | 3.57–3.93 + 1.13–1.24 ms (+0.3 to +0.5 ms) |
+  | 4,096 | 6.60–8.10 + 2.14–2.20 ms | 4.49–4.68 + 1.45–1.78 ms (−2.8 ms) | 6.89–7.57 + 2.18–2.53 ms (+0.3 to +1.0 ms) |
+
+  Over 34 layers D2 saves about 48 ms per 2,048-row pass on the 4090 (23 µs per token); with W8A16
+  as well the KDA projections cost about 14 ms more than BF16 (7 µs per token), on top of the
+  W8A16 cost of the other FP8 projections below. `--kda-prefill-w8a8` (with `--kda-fp8
+  --prefill-w8a16`) keeps the FP8 KDA projections at W8A8 and the others at W8A16: the KDA
+  layers then run at D2's speed (2.26–2.51 + 0.70 ms per 2,048 rows, 4.48–4.95 + 1.45–1.46 per
+  4,096), about −12 µs per token against today over the whole model (an estimate from the parts).
+  The prefill of 8,192 tokens through layers 0–4 in passes of 2,048 rows: 222–230 ms, 195–204
+  with D2, 256–259 with D2 and W8A16, 223–233 with the three.
+- Error against the oracle (layers 0–4, `goldens_chain`): the projections move by 1.4–1.9%
+  relative RMS (0.2% for the reference in BF16); head logits 1.55e-2 (8-row passes) and 2.7e-2
+  (one pass) against 0.97e-2 and 2.4e-2 without it; argmax 7/9, the two rows that differ being the
+  golden's near-ties (top-2 logit gaps 0.042 and 0.006).
+
+**D8, BF16 KDA states** (`--kda-state-bf16`, `GLM53F_KDA_STATE_BF16=1`).
+- The state is stored in BF16 and every kernel computes in f32. The chain and the replay round
+  the state after every row, so a verify round committed at k rows still gives the bits of k
+  serial decode steps (`verify_commit` passes with it). The chunked prefill rounds after every
+  16-row chunk.
+- Memory: 136 → 68 MiB per slot and 376 → 195 pool pages per snapshot mark (141 → 73 MiB, and
+  the host tier's images likewise): **3.19 GiB at 48 slots**.
+- Speed (`kda_bench`, 34 layers, the recurrent part of a step): decode chain 0.60 → 0.34 ms at
+  one request and 3.34 → 2.02 ms at eight; the commit replay of 8 × 8 rows 3.39 → 2.56 ms.
+- **Drift** (`crates/glm53f-kda/tests/gpu_bf16_state.rs`, 8 heads, synthetic inputs): after 8K
+  rows the state is 2.1e-3 (relative RMS) from exact arithmetic with gates across the range and
+  **2.6e-2 when every channel decays slowly** (multipliers ≥ 0.9993: one step's decay is below
+  half a BF16 ulp, so rounding swallows it); the f32 chain is at 5.6e-8 and 6.0e-7. Over 64K rows
+  in eight segments the difference from the f32 state stays flat (2.0e-3 and 2.6e-2 at every
+  segment): it does not grow, but the slow channels carry it. On the oracle's real prompt 5.3–6.1%
+  of the key channels of layers 0 and 4 decay slower than 0.998 per token. The KL gate on 2,048-
+  token windows decides. An FP16 state (same bytes, 3 more mantissa bits) measured 7.7× less drift
+  on the CPU model (not built).
+
+**W8A16 prefill projections** (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`).
+- FP8 projections over 8 rows take BF16 activations instead of E4M3 per 128-group (the likely
+  source of the prefill path's +0.0038 nats, KL-GATE.md §6a): each weight is dequantized to BF16
+  tiles of rows (`bf16(e4m3 × scale)`, one rounding) in 64 MiB of scratch and multiplied by cuBLAS.
+  Decode (8 rows or fewer) is unchanged.
+- Error (`tests/fp8_gemm.rs`, against exact W8A16 products): mean 2e-4 to 3e-5 of Σ|x·w| against
+  2e-3 to 4e-4 for W8A8, about 10× less.
+- Speed (`gemm_bench prefill`, four runs): the FP8 projections of one pass of the model take
+  43–48 → 67–74 ms at 2,048 rows and 91–99 → 144–157 ms at 4,096 rows on the 4090, **+12 to +14 µs
+  per token**. With D2 as well, the KDA projections run at about the speed of today's BF16 ones
+  (133–157 against 120–148 ms per 2,048 rows). A prefill of 8,192 tokens through layers 0–4
+  (`decode_bench`, one lane, the chunked KDA kernel): 222–236 ms, 250–256 with W8A16, 195–208 with
+  D2, 256–275 with both.
+- Error against the oracle (`goldens_chain`, the prompt in one pass): head logits 2.41e-2 → 0.97e-2
+  (relative RMS), the level of the 8-row decode path (0.97e-2); the dense MLP of layer 0 3.3e-2 →
+  0.98e-2. Every FP8 projection contributes to the prefill path's excess (the outputs of q_a,
+  kv_a, q_b, the DSA `o_proj`, the shared and the dense MLPs are each 1.6–5 times further from the
+  oracle with E4M3 activations than in 8-row passes), so the option covers them all.
+
+**A development-model proxy** (not the gate): `glm53f-score --experts zero --dev-load-layers 5`
+(all 45 layers on repeats of layers 0–4, routed outputs of zeros) on 7 panel windows × 189 rows,
+KL in nats against the same engine with every option off. The prefill path against the decode path
+is 3.6e-2 (top-1 0.81); with `--prefill-w8a16` 0.79e-2 (0.90). Against the decode path, D2 is
+4.9e-2 (0.77) in decode, 6.7e-2 in prefill, 5.0e-2 in prefill with W8A16 and 5.7e-2 with
+`--kda-prefill-w8a8`; D8 1.6e-2 (0.85). The development model's sensitivity is not the real
+model's; the KL gate on the target hardware decides.
+

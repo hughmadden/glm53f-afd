@@ -178,6 +178,9 @@ GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 glm53f-score --checkpoint <coordinator-dir> \
 
 The gate runs both pass sizes (the prefill path, and 8 rows or fewer: the decode path);
 [KL-GATE.md](KL-GATE.md) section 4.3 has the whole sequence, from `klgate.py plan` to `compare`.
+The numerics under test (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
+`--kda-prefill-w8a8`, as `glm53f-serve` takes them) are scored the same way into their own directories and compared with the baseline at
+`--margin 0.002`; the engine line in every output names them.
 `--experts local` runs the official FP8 experts on the coordinator's GPU instead of the ranks;
 `--dev-layers`, `--dev-load-layers` and `--experts zero` make a development run on one GPU, whose
 logits are meaningless.
@@ -216,6 +219,12 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
+# Any model-path suite with a numerics option on (a comma-separated list of kda-fp8,
+# kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8), for example verify and commit with BF16
+# KDA states:
+GLM53F_TEST_NUMERICS=kda-state-bf16 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
+  cargo test --release -p glm53f-forward --features coordinator --test verify_commit -- --nocapture
+
 # GlmForward::score against the forward's own passes; glm53f-score in development mode through
 # harness/klgate.py (with the fetched teacher subset, its first window too).
 GLM53F_CHECKPOINT_DIR=... \
@@ -240,6 +249,10 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 or 2 (default 2) |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes 2`) |
+| `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
+| `GLM53F_KDA_STATE_BF16=1` | `--kda-state-bf16` | Numerics under test, off by default (D8): the KDA recurrent states in BF16 |
+| `GLM53F_PREFILL_W8A16=1` | `--prefill-w8a16` | Numerics under test, off by default: FP8 projections over 8 rows with BF16 activations |
+| `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With the two above: the FP8 KDA projections keep E4M3 activations over 8 rows |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the

@@ -13,7 +13,8 @@
  *
  * Layouts (all row-major, elements):
  *   recurrent state  f32 [H][128 (v)][128 (k)]: value row major. This is the transpose,
- *                    per head, of the reference's [H][K][V] (`recurrent_states`).
+ *                    per head, of the reference's [H][K][V] (`recurrent_states`). The
+ *                    `_bf16state` entry points store the same layout in bf16.
  *   conv window      bf16 [3][C]: the q|k|v projection rows of the 3 positions before
  *                    the window's first row, oldest first. The reference caches the last
  *                    4 positions channel-major, [C][4]; the window is its last 3 columns.
@@ -107,6 +108,28 @@ int glm53f_kda_chain_batch(int32_t heads, int32_t batch, const int32_t* cu_rows,
                            glm53f_stream_t stream);
 
 /**
+ * glm53f_kda_chain_batch with the states stored in bf16 (`state_in`, `state_out`, `state_off` in
+ * bf16 elements) instead of f32: decision D8 of the sizing notes, half the state's memory. Every
+ * value is computed in f32 as in glm53f_kda_chain_batch, from the state widened to f32, and the
+ * state is rounded to bf16 after every row, after that row's read-out. So a window of R rows gives
+ * the bits (outputs, state, replay inputs) of R serial single-row calls, each storing its state
+ * in bf16; with a single row the two variants differ only in the state's final rounding.
+ */
+int glm53f_kda_chain_batch_bf16state(int32_t heads, int32_t batch, const int32_t* cu_rows,
+                                     const glm53f_bf16* p, int64_t p_stride, int64_t b_off,
+                                     const glm53f_bf16* a, int64_t a_stride,
+                                     const glm53f_bf16* g, int64_t g_stride,
+                                     const glm53f_bf16* conv, const int64_t* conv_off,
+                                     const glm53f_bf16* conv_w,
+                                     const glm53f_bf16* state_in, glm53f_bf16* state_out,
+                                     const int64_t* state_off,
+                                     const float* a_log, const float* dt_bias,
+                                     const glm53f_bf16* norm_w, float eps, float lower,
+                                     glm53f_bf16* out, int64_t out_stride,
+                                     float* k_save, glm53f_bf16* v_save, float* g_save,
+                                     float* b_save, glm53f_stream_t stream);
+
+/**
  * One layer, one request: the state after the first `rows` saved rows of a chain
  * (rows >= 0; 0 copies the state). state_out may equal state_in.
  */
@@ -138,6 +161,19 @@ int glm53f_kda_replay_batch(int32_t heads, int32_t layers, int32_t batch,
                             const float* k_save, const glm53f_bf16* v_save, const float* g_save,
                             const float* b_save, int64_t kv_stride, int64_t b_stride,
                             glm53f_stream_t stream);
+
+/**
+ * glm53f_kda_replay_batch with bf16 states (as glm53f_kda_chain_batch_bf16state: f32 arithmetic,
+ * the state rounded to bf16 after every replayed row). The commit of a verify round run by
+ * glm53f_kda_chain_batch_bf16state: keeping k rows gives the bits of k serial single-row calls.
+ */
+int glm53f_kda_replay_batch_bf16state(int32_t heads, int32_t layers, int32_t batch,
+                                      const int32_t* cu_rows, const int32_t* keep,
+                                      const glm53f_bf16* state_in, glm53f_bf16* state_out,
+                                      int64_t state_stride, const int64_t* state_off,
+                                      const float* k_save, const glm53f_bf16* v_save,
+                                      const float* g_save, const float* b_save, int64_t kv_stride,
+                                      int64_t b_stride, glm53f_stream_t stream);
 
 /**
  * Advance a conv window past `keep` kept rows, in place: window rows j = 0..2 become rows
@@ -212,6 +248,26 @@ int glm53f_kda_prefill_batch(int32_t heads, int32_t batch, const int32_t* cu_row
                              float eps, float lower,
                              glm53f_bf16* out, int64_t out_stride, int32_t value_blocks,
                              float* workspace, int64_t workspace_bytes, glm53f_stream_t stream);
+
+/**
+ * glm53f_kda_prefill_batch with bf16 states (`state_in`, `state_out`, `state_off` in bf16
+ * elements). The chunked form keeps the state in f32 registers across a chunk of 16 rows and
+ * rounds it to bf16 at the end of every chunk (chunks count from each request's first row), so
+ * the results still do not depend on the workspace size. It rounds 16 times less often than the
+ * chain's bf16 variant, which rounds after every row: the two agree to bf16 rounding, not bit
+ * for bit.
+ */
+int glm53f_kda_prefill_batch_bf16state(int32_t heads, int32_t batch, const int32_t* cu_rows,
+                                       int32_t max_rows, const glm53f_bf16* p, int64_t p_stride,
+                                       int64_t b_off, const glm53f_bf16* a, int64_t a_stride,
+                                       const glm53f_bf16* g, int64_t g_stride, glm53f_bf16* conv,
+                                       const int64_t* conv_off, const glm53f_bf16* conv_w,
+                                       const glm53f_bf16* state_in, glm53f_bf16* state_out,
+                                       const int64_t* state_off, const float* a_log,
+                                       const float* dt_bias, const glm53f_bf16* norm_w, float eps,
+                                       float lower, glm53f_bf16* out, int64_t out_stride,
+                                       int32_t value_blocks, float* workspace,
+                                       int64_t workspace_bytes, glm53f_stream_t stream);
 
 #ifdef __cplusplus
 }

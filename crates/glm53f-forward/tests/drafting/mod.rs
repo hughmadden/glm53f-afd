@@ -29,7 +29,7 @@ use glm53f_forward::shape::ModelShape;
 use glm53f_forward::weights::{open_checkpoint, DeviceModel};
 use glm53f_forward::Result;
 
-use crate::common::{checkpoint_dir, env_dir, experts_dir, gpu_with};
+use crate::common::{checkpoint_dir, env_dir, experts_dir, gpu_with, numerics};
 
 /// The MoE layers whose routed experts run (the others give zeros).
 pub const EXPERT_LAYERS: [usize; 2] = [3, 4];
@@ -113,7 +113,8 @@ pub fn drafted_forward(
     };
     let shape = ModelShape::full(&mcfg.text).unwrap();
     let t0 = std::time::Instant::now();
-    let model = DeviceModel::load_repeating(&ckpt, &shape, loaded).unwrap();
+    let num = numerics();
+    let model = DeviceModel::load_with(&ckpt, &shape, loaded, num.weights()).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
     let d = Dflash::load(&ddir, &model, &embed, &stream).unwrap();
@@ -125,7 +126,7 @@ pub fn drafted_forward(
         d.weight_bytes() as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
-    let layout = KvLayout::new(&shape, Some(d.config()));
+    let layout = num.layout(KvLayout::new(&shape, Some(d.config())));
     let kv = KvPool::new(
         KvConfig {
             layout,
@@ -145,7 +146,14 @@ pub fn drafted_forward(
         Fp8Act::Bf16,
     )
     .unwrap();
-    let mut fwd = GlmForward::new(model, embed, kv, Box::new(SomeExperts { local }), cfg).unwrap();
+    let mut fwd = GlmForward::new(
+        model,
+        embed,
+        kv,
+        Box::new(SomeExperts { local }),
+        num.config(cfg),
+    )
+    .unwrap();
     fwd.attach_drafter(d).unwrap();
     Some(fwd)
 }

@@ -260,9 +260,26 @@ fn the_oracles_prompt_in_two_lanes() {
          least {TIE} apart"
     );
     assert!(exact, "two lanes differ from two passes of the same rows");
-    // The chain test's bounds against the oracle (tests/goldens_chain.rs).
-    for (e, a) in [(e2, a2), (e1, a1)] {
-        assert!(e < 5e-2 && a >= 8, "against the golden: {e:.3e}, {a}/9");
+    // The chain test's bounds against the oracle (tests/goldens_chain.rs); with numerics under
+    // test (GLM53F_TEST_NUMERICS), the argmax on every row whose golden top-2 gap is at least
+    // TIE, as there.
+    let golden_picks: Vec<u32> = (0..=STEPS)
+        .map(|r| argmax(&gl[r * VOCAB..(r + 1) * VOCAB]) as u32)
+        .collect();
+    let clear = [
+        decided(&gl, &golden_picks, &two.1),
+        decided(&gl, &golden_picks, &one.1),
+    ];
+    for ((e, a), (rows, same)) in [(e2, a2), (e1, a1)].into_iter().zip(clear) {
+        assert!(e < 5e-2, "against the golden: {e:.3e}");
+        if numerics() == TestNumerics::default() {
+            assert!(a >= 8, "against the golden: {a}/9");
+        } else {
+            assert_eq!(
+                same, rows,
+                "against the golden, the rows with a clear winner"
+            );
+        }
     }
     // Two lanes against one pass: the same tokens but on near ties, logits within the same
     // bound.

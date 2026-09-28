@@ -8,7 +8,9 @@
 //! - [`mlp`]: SwiGLU clamped at 10, FP8 block-128 projections (W8A16, or W8A8 with the
 //!   checkpoint's dynamic per-128 activation quantization), the dense MLPs of layers 0-2
 //!   and the shared expert.
-//! - [`fp8`]: E4M3 coding, block-scaled weights, activation quantization.
+//! - [`fp8`]: E4M3 coding, block-scaled weights, activation quantization, and the
+//!   quantization of a BF16 weight in the checkpoint's block-128 scheme (with its BF16
+//!   dequantization, for the W8A16 prefill path).
 //! - [`norm`]: the weighted RMSNorm.
 //! - [`layer`]: the decoder layer's stream flow with the sublayers as callbacks, the
 //!   embedding broadcast and the final hidden state.

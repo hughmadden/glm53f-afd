@@ -146,6 +146,25 @@ unsafe extern "C" {
         stream: CudaStream,
     ) -> CudaError;
     pub fn glm53f_fp8_gemm_prefill_smem_bytes() -> i32;
+    pub fn glm53f_fp8_quantize_weight(
+        w: *const u16,
+        n: i32,
+        k: i32,
+        q: *mut u8,
+        scales: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_fp8_dequant_bf16(
+        w: *const u8,
+        w_scales: *const f32,
+        n: i32,
+        k: i32,
+        row0: i32,
+        rows: i32,
+        out: *mut u16,
+        stream: CudaStream,
+    ) -> CudaError;
 
     // Second revision: single-launch variants (see the header's `sync` convention).
     #[allow(clippy::too_many_arguments)]

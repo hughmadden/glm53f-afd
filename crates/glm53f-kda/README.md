@@ -21,8 +21,8 @@ returns the gated RMSNorm's output, which is `o_proj`'s input.
 | `src/kernel.rs`, `src/device.rs` | Checked Rust wrappers and minimal device memory (feature `cuda`) |
 | `src/ffi.rs`, `src/cuda.rs` | Raw bindings to the ABI and the few CUDA runtime calls used (feature `cuda`) |
 | `src/goldens.rs` | Loader and checks for the oracle's golden fixtures |
-| `tests/` | CPU only: `cpu_reference.rs`, `goldens.rs`, `provenance.rs`. Feature `cuda`: `gpu.rs` (decode and verify kernels), `gpu_prefill.rs` (prefill) |
-| `examples/kda_bench.rs` | Throughput at the model's geometry |
+| `tests/` | CPU only: `cpu_reference.rs`, `goldens.rs`, `provenance.rs`. Feature `cuda`: `gpu.rs` (decode and verify kernels), `gpu_prefill.rs` (prefill), `gpu_bf16_state.rs` (the BF16-state variants) |
+| `examples/kda_bench.rs` | Throughput at the model's geometry (`--bf16-state`: the BF16-state variants) |
 
 The ABI:
 
@@ -37,6 +37,7 @@ The ABI:
 | `glm53f_kda_prefill` | per pass: chunks × H, then H × value blocks | One layer, one request, a prompt segment of any length through the chunked form: the chain's outputs and final state, from any committed state and conv window. Advances the conv window past the rows |
 | `glm53f_kda_prefill_batch` | the same × B | The same for B requests of different lengths, each with its own state and conv window |
 | `glm53f_kda_prefill_workspace_bytes` | — | The workspace for a given number of rows per pass |
+| `glm53f_kda_chain_batch_bf16state`, `glm53f_kda_replay_batch_bf16state`, `glm53f_kda_prefill_batch_bf16state` | as above | The batch entry points with the states stored in BF16 ([BF16 state](#bf16-state-decision-d8)) |
 
 The chain and the replays may update states in place (`state_out == state_in`) or not write
 them at all. The prefill always writes its state, in place or not.
@@ -446,6 +447,73 @@ latency-bound blocks. The next steps below would put its idle SMs to use.
 - **Wave quantization on the RTX 5090.** A batch whose block count just exceeds a multiple of
   170 (8 requests: 512 blocks) wastes most of a wave. The engine can group prefill requests
   to avoid it.
+
+## BF16 state (decision D8)
+
+The `_bf16state` entry points store the recurrent state in BF16 (68 MiB per request over 34
+layers instead of 136) and compute exactly as the f32 kernels do, from the state widened to f32.
+They are the f32 kernels' own code, instantiated for a second state type (`StateIO` in
+`kernels/kda.cu` and `kda_prefill.cu`); the f32 instantiation's arithmetic is unchanged (the
+parity test against the source kernels still passes bit for bit). Checked wrappers:
+`ChainBatch::launch_bf16_state`, `replay_batch_bf16_state`, `PrefillBatch::launch_bf16_state`;
+CPU models: `cpu::chain_bf16_state`, `cpu::replay_bf16_state`. The engine turns them on with
+`glm53f-serve --kda-state-bf16` (off by default).
+
+**Where the state is rounded** (round to nearest even):
+
+- **The chain and the replay: after every row**, after that row's read-out. A window of R rows
+  therefore gives the bits of R serial single-row calls, each of which stores its state in BF16,
+  and a verify round committed at k rows gives the bits of k serial decode steps, as with an f32
+  state. With one row the outputs equal the f32 chain's and the state is its state rounded once.
+- **The chunked prefill: after every chunk of 16 rows** (chunks count from each request's first
+  row). The state is never materialized per row there. Stores between sub-segments are then
+  exact, so the results still do not depend on the workspace size. The prefill rounds 16 times
+  less often than the chain: the two agree to BF16 rounding, not bit for bit.
+
+**Verified** (`tests/gpu_bf16_state.rs`, RTX 4090, 64 heads unless stated):
+
+| Check | Result |
+|---|---|
+| A window of R = 1, 2, 5, 8 rows against R serial single-row calls (with the conv shift between them) | outputs, state, replay inputs and conv window bit for bit |
+| A verify window (no state written) | the window's outputs bit for bit; the state untouched |
+| The replay of every prefix k ≤ R | the state after k serial steps bit for bit, and `cpu::replay_bf16_state` bit for bit |
+| One row against the f32-state chain | outputs and replay inputs bit for bit; the state the f32 state rounded once |
+| The chain against `cpu::chain_bf16_state` (1, 8, 40 rows) | state ≤ 9.3e-4 normwise, outputs ≤ 4.7e-4 (≤ 26 of 327,680 BF16 outputs differ): the device's and the host's `expf` |
+| Batched against per request (16 heads; 5 requests of 3, 0, 8, 1, 5 rows in shuffled slots; the replay with a different `keep` each; the prefill with 37, 0, 100, 16, 1 rows) | bit for bit |
+| The prefill with 16, 48 and 160 rows per pass against one pass (1,000 rows; 1, 2 and 4 value blocks) | bit for bit |
+| The prefill against the chain, both BF16 (1,000 rows) | state 3.6e-3, outputs 6.5e-3 normwise |
+
+**Drift.** Rounding the state every row is the risk: when a channel's decay multiplier lies
+within half a BF16 ulp of 1 (above about 0.998), rounding undoes the step's decay unless the
+delta-rule update moves the value, and the state then forgets more slowly than it should. The same
+data as `accuracy_against_exact_arithmetic` and `long_prompt_drift` (8 heads; the f64 replay of
+the replay inputs, which do not depend on the state, is exact arithmetic):
+
+| 8,192 rows, state against exact arithmetic (max normwise, relative RMS) | Gates across the range | Every multiplier ≥ 0.9993 |
+|---|---:|---:|
+| Chain, f32 state | 1.0e-7, 5.6e-8 | 1.4e-6, 6.0e-7 |
+| Chain, BF16 state (every row) | 5.3e-3, 2.1e-3 | **7.8e-2, 2.6e-2** |
+| Prefill, f32 state | 1.2e-7, 6.6e-8 | 3.4e-7, 2.1e-7 |
+| Prefill, BF16 state (every 16 rows) | 2.9e-3, 1.7e-3 | 1.2e-2, 6.8e-3 |
+| Outputs against the f32 chain, relative RMS (BF16 outputs that differ) | chain 1.9e-3 (25%), prefill 6.0e-4 (3.4%) | chain 2.3e-2 (92%), prefill 6.6e-3 (72%) |
+
+Over 64K rows in eight segments of 8K, each continuing from its own state, the BF16 chain's state
+stays 1.8e-3 to 2.1e-3 (relative RMS) from the f32 chain's at every segment with gates across the
+range, and 2.6e-2 with slow decay: bounded, not growing, but the slowly decaying channels carry a
+few percent. On the oracle's real prompt 5.3–6.1% of the (row, key channel) decay multipliers of
+layers 0 and 4 exceed 0.998 and 3.3–3.8% exceed 0.9993. The KL gate on the target hardware
+decides. For comparison, an FP16 state (the same bytes, three more mantissa bits; not built) drifts
+7.7 times less on the same data with the CPU model: 2.7e-4 and 3.3e-3.
+
+**Speed** (`kda_bench --bf16-state`, section 2: 34 layers, 64 heads, ms per step, best of two
+runs on a shared RTX 4090):
+
+| Requests × rows | Verify chain | Decode chain | Commit replay |
+|---|---:|---:|---:|
+| 1 × 1 | 0.350 → 0.237 | 0.598 → 0.343 | 0.346 → 0.139 |
+| 1 × 8 | 1.001 → 0.975 | 1.262 → 1.023 | 0.481 → 0.335 |
+| 8 × 1 | 1.791 → 1.194 | 3.336 → 2.022 | 2.836 → 1.393 |
+| 8 × 8 | 4.839 → 4.151 | 6.322 → 4.850 | 3.394 → 2.561 |
 
 ## Engine notes (decode and verify)
 

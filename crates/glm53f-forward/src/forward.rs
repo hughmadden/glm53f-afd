@@ -128,7 +128,7 @@ use crate::gemm::{act_quant, Fp8Input, Gemm, GemmPolicy};
 use crate::kv::{GlmKv, KvPool};
 use crate::kvplan::{KvLayout, LAYER_PAGE_BYTES, TAIL};
 use crate::shape::*;
-use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW};
+use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW, ProjW};
 
 /// Sizes and kernel choices of a forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1660,24 +1660,45 @@ impl GlmForward {
             // SAFETY (all launches): arenas and saves sized for the shape; offsets from the slots.
             launched(
                 unsafe {
-                    kffi::glm53f_kda_replay_batch(
-                        KDA_HEADS as i32,
-                        shape.kda_layers as i32,
-                        n_req,
-                        meta.cu_rows,
-                        meta.keep,
-                        pool.state.ptr(0),
-                        pool.state.ptr(0),
-                        sn as i64,
-                        meta.state_off,
-                        self.v.k.ptr(0),
-                        self.v.v.ptr(0),
-                        self.v.g.ptr(0),
-                        self.v.b.ptr(0),
-                        (vr * KDA_WIDTH) as i64,
-                        (vr * KDA_HEADS) as i64,
-                        st,
-                    )
+                    if pool.cfg.layout.kda_state_bf16 {
+                        kffi::glm53f_kda_replay_batch_bf16state(
+                            KDA_HEADS as i32,
+                            shape.kda_layers as i32,
+                            n_req,
+                            meta.cu_rows,
+                            meta.keep,
+                            pool.state.ptr(0),
+                            pool.state.ptr(0),
+                            sn as i64,
+                            meta.state_off,
+                            self.v.k.ptr(0),
+                            self.v.v.ptr(0),
+                            self.v.g.ptr(0),
+                            self.v.b.ptr(0),
+                            (vr * KDA_WIDTH) as i64,
+                            (vr * KDA_HEADS) as i64,
+                            st,
+                        )
+                    } else {
+                        kffi::glm53f_kda_replay_batch(
+                            KDA_HEADS as i32,
+                            shape.kda_layers as i32,
+                            n_req,
+                            meta.cu_rows,
+                            meta.keep,
+                            pool.state.ptr(0),
+                            pool.state.ptr(0),
+                            sn as i64,
+                            meta.state_off,
+                            self.v.k.ptr(0),
+                            self.v.v.ptr(0),
+                            self.v.g.ptr(0),
+                            self.v.b.ptr(0),
+                            (vr * KDA_WIDTH) as i64,
+                            (vr * KDA_HEADS) as i64,
+                            st,
+                        )
+                    }
                 },
                 "glm53f_kda_replay_batch",
             )?;
@@ -3070,20 +3091,27 @@ impl GlmForward {
             self.s.p.ptr(0)
         };
         let x: *const u16 = self.s.normed.ptr(0);
-        unsafe {
-            self.gemm.bf16(
-                x,
-                HIDDEN,
-                0,
-                &w.qkvb.mat(),
-                rows,
-                p.cast(),
-                KDA_P_COLS,
-                0,
-                false,
-                &st,
-            )
-        }?;
+        match &w.qkvb {
+            ProjW::Bf16(m) => unsafe {
+                self.gemm.bf16(
+                    x,
+                    HIDDEN,
+                    0,
+                    &m.mat(),
+                    rows,
+                    p.cast(),
+                    KDA_P_COLS,
+                    0,
+                    false,
+                    &st,
+                )
+            }?,
+            // FP8 (D2): the normed rows as the DSA projections take them (BF16, or their E4M3 form).
+            ProjW::Fp8(m) => unsafe {
+                self.gemm
+                    .fp8_kda(&self.normed_input(), &m.mat(), rows, p, &st)
+            }?,
+        }
         unsafe {
             self.gemm.bf16(
                 x,
@@ -3128,7 +3156,10 @@ impl GlmForward {
             KvLayout::state_elems_per_layer(),
             KvLayout::conv_elems_per_layer(),
         );
+        // The layer's states: f32, or bf16 (D8) for the kernels' `_bf16state` variants.
+        let bf16_state = pool.cfg.layout.kda_state_bf16;
         let state: *mut f32 = pool.state.ptr(j * sn);
+        let state16: *mut u16 = pool.state.ptr(j * sn);
         let conv: *mut u16 = pool.conv.ptr(j * cn);
         let (ks, vs, gs, bs): (*mut f32, *mut u16, *mut f32, *mut f32) = if verify {
             (
@@ -3162,11 +3193,121 @@ impl GlmForward {
             // SAFETY: as for the chain below; the workspace was sized above.
             launched(
                 unsafe {
-                    kffi::glm53f_kda_prefill_batch(
+                    if bf16_state {
+                        kffi::glm53f_kda_prefill_batch_bf16state(
+                            KDA_HEADS as i32,
+                            n,
+                            meta.cu_rows,
+                            max_rows,
+                            p,
+                            KDA_P_COLS as i64,
+                            KDA_QKV as i64,
+                            ag,
+                            (2 * KDA_WIDTH) as i64,
+                            ag.wrapping_add(KDA_WIDTH),
+                            (2 * KDA_WIDTH) as i64,
+                            conv,
+                            meta.conv_off,
+                            w.conv_w.ptr(0),
+                            state16,
+                            state16,
+                            meta.state_off,
+                            w.a_log.ptr(0),
+                            w.dt_bias.ptr(0),
+                            w.o_norm.ptr(0),
+                            RMS_EPS,
+                            KDA_LOWER,
+                            self.s.kda_out.ptr(0),
+                            KDA_WIDTH as i64,
+                            self.cfg.kda_prefill_value_blocks,
+                            self.ws.kda.ptr(0),
+                            self.ws.kda.bytes() as i64,
+                            st.raw(),
+                        )
+                    } else {
+                        kffi::glm53f_kda_prefill_batch(
+                            KDA_HEADS as i32,
+                            n,
+                            meta.cu_rows,
+                            max_rows,
+                            p,
+                            KDA_P_COLS as i64,
+                            KDA_QKV as i64,
+                            ag,
+                            (2 * KDA_WIDTH) as i64,
+                            ag.wrapping_add(KDA_WIDTH),
+                            (2 * KDA_WIDTH) as i64,
+                            conv,
+                            meta.conv_off,
+                            w.conv_w.ptr(0),
+                            state,
+                            state,
+                            meta.state_off,
+                            w.a_log.ptr(0),
+                            w.dt_bias.ptr(0),
+                            w.o_norm.ptr(0),
+                            RMS_EPS,
+                            KDA_LOWER,
+                            self.s.kda_out.ptr(0),
+                            KDA_WIDTH as i64,
+                            self.cfg.kda_prefill_value_blocks,
+                            self.ws.kda.ptr(0),
+                            self.ws.kda.bytes() as i64,
+                            st.raw(),
+                        )
+                    }
+                },
+                "glm53f_kda_prefill_batch",
+            )?;
+            self.mark(l, "kda_core")?;
+            self.kda_o(rows, &w.o)?;
+            self.mark(l, "kda_o")?;
+            return Ok(());
+        }
+        // SAFETY: state and conv arenas hold every slot of the batch at its offsets; scratch
+        // sized for `rows`; the saves for up to the verify capacity.
+        launched(
+            unsafe {
+                if bf16_state {
+                    kffi::glm53f_kda_chain_batch_bf16state(
                         KDA_HEADS as i32,
-                        n,
+                        reqs.len() as i32,
                         meta.cu_rows,
-                        max_rows,
+                        p,
+                        KDA_P_COLS as i64,
+                        KDA_QKV as i64,
+                        ag,
+                        (2 * KDA_WIDTH) as i64,
+                        ag.wrapping_add(KDA_WIDTH),
+                        (2 * KDA_WIDTH) as i64,
+                        conv,
+                        meta.conv_off,
+                        w.conv_w.ptr(0),
+                        state16,
+                        if verify {
+                            core::ptr::null_mut()
+                        } else {
+                            state16
+                        },
+                        meta.state_off,
+                        w.a_log.ptr(0),
+                        w.dt_bias.ptr(0),
+                        w.o_norm.ptr(0),
+                        RMS_EPS,
+                        KDA_LOWER,
+                        self.s.kda_out.ptr(0),
+                        KDA_WIDTH as i64,
+                        ks,
+                        vs,
+                        gs,
+                        bs,
+                        st.raw(),
+                    )
+                } else {
+                    kffi::glm53f_kda_chain_batch(
+                        KDA_HEADS as i32,
+                        reqs.len() as i32,
+                        meta.cu_rows,
                         p,
                         KDA_P_COLS as i64,
                         KDA_QKV as i64,
@@ -3178,7 +3319,7 @@ impl GlmForward {
                         meta.conv_off,
                         w.conv_w.ptr(0),
                         state,
-                        state,
+                        if verify { core::ptr::null_mut() } else { state },
                         meta.state_off,
                         w.a_log.ptr(0),
                         w.dt_bias.ptr(0),
@@ -3187,66 +3328,13 @@ impl GlmForward {
                         KDA_LOWER,
                         self.s.kda_out.ptr(0),
                         KDA_WIDTH as i64,
-                        self.cfg.kda_prefill_value_blocks,
-                        self.ws.kda.ptr(0),
-                        self.ws.kda.bytes() as i64,
+                        ks,
+                        vs,
+                        gs,
+                        bs,
                         st.raw(),
                     )
-                },
-                "glm53f_kda_prefill_batch",
-            )?;
-            self.mark(l, "kda_core")?;
-            unsafe {
-                self.gemm.bf16(
-                    self.s.kda_out.ptr(0),
-                    KDA_WIDTH,
-                    0,
-                    &w.o.mat(),
-                    rows,
-                    self.s.attn_out.ptr::<c_void>(0),
-                    HIDDEN,
-                    0,
-                    false,
-                    &st,
-                )
-            }?;
-            self.mark(l, "kda_o")?;
-            return Ok(());
-        }
-        // SAFETY: state and conv arenas hold every slot of the batch at its offsets; scratch
-        // sized for `rows`; the saves for up to the verify capacity.
-        launched(
-            unsafe {
-                kffi::glm53f_kda_chain_batch(
-                    KDA_HEADS as i32,
-                    reqs.len() as i32,
-                    meta.cu_rows,
-                    p,
-                    KDA_P_COLS as i64,
-                    KDA_QKV as i64,
-                    ag,
-                    (2 * KDA_WIDTH) as i64,
-                    ag.wrapping_add(KDA_WIDTH),
-                    (2 * KDA_WIDTH) as i64,
-                    conv,
-                    meta.conv_off,
-                    w.conv_w.ptr(0),
-                    state,
-                    if verify { core::ptr::null_mut() } else { state },
-                    meta.state_off,
-                    w.a_log.ptr(0),
-                    w.dt_bias.ptr(0),
-                    w.o_norm.ptr(0),
-                    RMS_EPS,
-                    KDA_LOWER,
-                    self.s.kda_out.ptr(0),
-                    KDA_WIDTH as i64,
-                    ks,
-                    vs,
-                    gs,
-                    bs,
-                    st.raw(),
-                )
+                }
             },
             "glm53f_kda_chain_batch",
         )?;
@@ -3273,22 +3361,58 @@ impl GlmForward {
             )?;
         }
         self.mark(l, "kda_core")?;
-        unsafe {
-            self.gemm.bf16(
-                self.s.kda_out.ptr(0),
-                KDA_WIDTH,
-                0,
-                &w.o.mat(),
-                rows,
-                self.s.attn_out.ptr::<c_void>(0),
-                HIDDEN,
-                0,
-                false,
-                &st,
-            )
-        }?;
+        self.kda_o(rows, &w.o)?;
         self.mark(l, "kda_o")?;
         Ok(())
+    }
+
+    /// KDA's `o_proj` of the gated norm's output into the attention output: BF16 as shipped, or
+    /// FP8 (D2) with the output's E4M3 form, when the GEMM takes one, in the DSA output's
+    /// buffers (the two attention kinds never share a pass of a lane).
+    fn kda_o(&mut self, rows: usize, o: &ProjW) -> Result<()> {
+        let st = self.stream.clone();
+        let s = &self.s;
+        match o {
+            ProjW::Bf16(m) => unsafe {
+                self.gemm.bf16(
+                    s.kda_out.ptr(0),
+                    KDA_WIDTH,
+                    0,
+                    &m.mat(),
+                    rows,
+                    s.attn_out.ptr::<c_void>(0),
+                    HIDDEN,
+                    0,
+                    false,
+                    &st,
+                )
+            },
+            ProjW::Fp8(m) => {
+                if self.gemm.policy.needs_quant(rows, true) {
+                    // SAFETY: kda_out [rows][8192]; o_q and o_s hold rows of 16,384 codes and 128
+                    // scales.
+                    unsafe {
+                        act_quant(
+                            s.kda_out.ptr(0),
+                            s.o_q.ptr(0),
+                            s.o_s.ptr(0),
+                            rows,
+                            KDA_WIDTH,
+                            &st,
+                        )
+                    }?;
+                }
+                let x = Fp8Input {
+                    bf16: s.kda_out.ptr(0),
+                    q: s.o_q.ptr(0),
+                    scales: s.o_s.ptr(0),
+                };
+                unsafe {
+                    self.gemm
+                        .fp8_kda(&x, &m.mat(), rows, s.attn_out.ptr(0), &st)
+                }
+            }
+        }
     }
 
     /// A DSA layer over `rows` rows. A verify pass keeps each layer's raw index keys and gates for

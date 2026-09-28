@@ -384,6 +384,37 @@ pub fn chain(
     rows: &Rows,
     mode: Rounding,
 ) -> ChainOut {
+    chain_with(p, conv, state, rows, mode, false)
+}
+
+/// [`chain`] with the state stored in bfloat16 (the kernels' `_bf16state` chain, decision D8):
+/// `state` holds bfloat16-exact values, every step is computed in f32, and the state is rounded
+/// to bfloat16 after each row's read-out. A window of rows therefore equals serial single-row
+/// calls, each of which stores its state in bfloat16.
+pub fn chain_bf16_state(
+    p: &LayerParams,
+    conv: &[f32],
+    state: &[f32],
+    rows: &Rows,
+    mode: Rounding,
+) -> ChainOut {
+    chain_with(p, conv, state, rows, mode, true)
+}
+
+fn round_state(s: &mut [f32]) {
+    for x in s.iter_mut() {
+        *x = bf16::round(*x);
+    }
+}
+
+fn chain_with(
+    p: &LayerParams,
+    conv: &[f32],
+    state: &[f32],
+    rows: &Rows,
+    mode: Rounding,
+    bf16_state: bool,
+) -> ChainOut {
     p.check();
     rows.check();
     let (hn, rn) = (p.heads, rows.rows);
@@ -417,6 +448,9 @@ pub fn chain(
             let kn = l2norm(&k, None);
             update(s, &kn, &g, &v, b);
             let y = read_out(s, &qn).map(|x| mode.round(x));
+            if bf16_state {
+                round_state(s);
+            }
             let gate = &rows.gate[(r * hn + h) * DV..(r * hn + h + 1) * DV];
             let o = gated_rmsnorm_as(&y, &p.norm_w, gate, p.eps, mode);
             let at = (r * hn + h) * DV;
@@ -439,6 +473,17 @@ pub fn chain(
 /// The state after the first `keep` saved rows, from `state` (`[H][DV][DK]`): the kernels'
 /// `replay`. Uses [`update`], as [`chain`] does, so a replayed prefix has the chain's bits.
 pub fn replay(state: &[f32], saves: &Saves, keep: usize) -> Vec<f32> {
+    replay_with(state, saves, keep, false)
+}
+
+/// [`replay`] of a bfloat16 state (the kernels' `_bf16state` replay): each row's update in f32,
+/// then the state rounded to bfloat16, as [`chain_bf16_state`] does. The update involves no
+/// transcendental function, so this is a bit-level model of the device.
+pub fn replay_bf16_state(state: &[f32], saves: &Saves, keep: usize) -> Vec<f32> {
+    replay_with(state, saves, keep, true)
+}
+
+fn replay_with(state: &[f32], saves: &Saves, keep: usize, bf16_state: bool) -> Vec<f32> {
     let hn = saves.heads;
     assert!(keep <= saves.rows);
     assert_eq!(state.len(), state_len(hn));
@@ -454,6 +499,9 @@ pub fn replay(state: &[f32], saves: &Saves, keep: usize) -> Vec<f32> {
                 &saves.v[at..at + DV],
                 saves.beta[r * hn + h],
             );
+            if bf16_state {
+                round_state(s);
+            }
         }
     }
     st
