@@ -1,0 +1,53 @@
+# glm53f-forward: the GLM-5.3-Flash model path on the coordinator GPU.
+#
+#   - device weights, loaded from the official FP8 checkpoint (or its coordinator subset):
+#     KDA projections in BF16, DSA / shared / dense projections as FP8 with block scales,
+#     norms, mHC and routers; the embedding stays in page-locked host RAM (gathered by row);
+#   - BF16 weight GEMMs: a row-independent, bandwidth-bound GEMV for 1-8 rows and cuBLAS
+#     beyond;
+#   - the per-request device KV (`GlmKv`): paged MLA latents and pooled index keys, the DSA
+#     tails, FP32 KDA states and conv windows, marks, fork with copy-on-write pages, host
+#     snapshots;
+#   - the forward: embedding -> 4 mHC streams -> KDA / DSA attention and dense / MoE FFN per
+#     layer -> the final mean head -> LM head, for prefill, decode and verify windows, with
+#     routed experts behind the `ExpertBackend` trait (`LocalFp8Experts` runs them here).
+#
+#   cargo test -p glm53f-forward                    CPU only: no CUDA toolkit needed
+#   cargo test -p glm53f-forward --features cuda    plus the kernels, KV and forward on a GPU
+#
+# No external Rust crates. Provenance: PROVENANCE.md.
+[package]
+name = "glm53f-forward"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GLM-5.3-Flash coordinator model path: device weights, BF16 GEMMs, the GLM device KV and the forward (prefill, decode, verify and commit)"
+publish = false
+
+[lib]
+name = "glm53f_forward"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile this crate's kernels, link cudart and cuBLAS, and build the dependency crates'
+# kernels (build.rs; needs nvcc and a GPU to run). Off by default.
+cuda = ["glm53f-kda/cuda", "glm53f-dsa/cuda", "glm53f-layers/cuda"]
+# Implement the serving shell's KvSlot and ModelForward traits (src/serve.rs), with its GPU
+# sampler.
+coordinator = ["cuda", "dep:glm53f-coordinator", "glm53f-coordinator/cuda"]
+
+[dependencies]
+glm53f-model = { path = "../glm53f-model" }
+glm53f-kda = { path = "../glm53f-kda" }
+glm53f-dsa = { path = "../glm53f-dsa" }
+glm53f-layers = { path = "../glm53f-layers" }
+glm53f-coordinator = { path = "../glm53f-coordinator", optional = true }
+
+[[example]]
+name = "gemm_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "decode_bench"
+required-features = ["cuda"]

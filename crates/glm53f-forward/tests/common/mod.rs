@@ -1,0 +1,321 @@
+//! Shared setup for the GPU tests: where the weights and goldens are, a small forward over
+//! the first decoder layers, the golden-routing expert wrapper, and error statistics.
+//!
+//! - `GLM53F_CHECKPOINT_DIR` (or `GLM53F_CHECKPOINT`): the official checkpoint, or its
+//!   coordinator subset (the non-expert tensors with their original names);
+//! - `GLM53F_EXPERTS_DIR`: the routed experts of the MoE layers run (the official checkpoint,
+//!   or a subset); defaults to the checkpoint directory;
+//! - `GLM53F_GOLDENS`: the oracle's golden sets (default `oracle/goldens` in this repository).
+//!
+//! Anything missing makes the tests print why and pass.
+#![allow(dead_code)]
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use glm53f_forward::device::{self, DeviceBuffer, Stream};
+use glm53f_forward::embed::HostEmbedding;
+use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts};
+use glm53f_forward::forward::{ForwardConfig, GlmForward};
+use glm53f_forward::gemm::Fp8Act;
+use glm53f_forward::kv::{KvConfig, KvPool};
+use glm53f_forward::kvplan::KvLayout;
+use glm53f_forward::shape::{ModelShape, TOP_K};
+use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+use glm53f_forward::Result;
+use glm53f_layers::testkit::goldens::{self, GoldenSet};
+use glm53f_layers::testkit::json;
+
+pub fn env_dir(keys: &[&str]) -> Option<PathBuf> {
+    keys.iter().find_map(std::env::var_os).map(PathBuf::from)
+}
+
+pub fn checkpoint_dir() -> Option<PathBuf> {
+    let d = env_dir(&["GLM53F_CHECKPOINT_DIR", "GLM53F_CHECKPOINT"]);
+    if d.is_none() {
+        eprintln!("skip: GLM53F_CHECKPOINT_DIR is not set");
+    }
+    d
+}
+
+pub fn experts_dir() -> Option<PathBuf> {
+    env_dir(&["GLM53F_EXPERTS_DIR"]).or_else(checkpoint_dir)
+}
+
+/// Golden routes per MoE layer: (ids, weights) of every row, in order.
+pub type RouteQueue = HashMap<usize, VecDeque<(Vec<i32>, Vec<f32>)>>;
+/// Each MoE call's own routes: (layer, ids, weights).
+pub type Seen = Arc<Mutex<Vec<(usize, Vec<i32>, Vec<f32>)>>>;
+
+pub fn goldens_root() -> PathBuf {
+    env_dir(&["GLM53F_GOLDENS"])
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../oracle/goldens"))
+}
+
+/// A GPU with at least `gib` GiB free, or None (printed).
+pub fn gpu_with(gib: f64) -> bool {
+    if device::device_count() == 0 {
+        eprintln!("skip: no CUDA device");
+        return false;
+    }
+    let (free, _) = device::mem_info().unwrap();
+    let have = free as f64 / (1u64 << 30) as f64;
+    if have < gib {
+        eprintln!("skip: {have:.1} GiB free on the GPU, the test needs {gib:.1}");
+        return false;
+    }
+    true
+}
+
+/// The oracle's golden sets, by name, when their payloads are present.
+pub struct Goldens {
+    pub sets: HashMap<String, GoldenSet>,
+}
+
+impl Goldens {
+    pub fn load(names: &[&str]) -> Option<Goldens> {
+        let root = goldens_root();
+        let mut sets = HashMap::new();
+        for d in goldens::discover(&root) {
+            let name = d.file_name().unwrap().to_string_lossy().to_string();
+            if !names.contains(&name.as_str()) {
+                continue;
+            }
+            let set = GoldenSet::load(&d).ok()?;
+            // The payloads are not in git: a set without its files is absent.
+            if set.entries.iter().any(|e| !d.join(&e.file).is_file()) {
+                eprintln!("skip: {name}: golden payloads missing (regenerate with the oracle)");
+                return None;
+            }
+            sets.insert(name, set);
+        }
+        for n in names {
+            if !sets.contains_key(*n) {
+                eprintln!("skip: golden set {n} not found under {}", root.display());
+                return None;
+            }
+        }
+        Some(Goldens { sets })
+    }
+
+    fn entry(&self, set: &str, name: &str) -> (&GoldenSet, &goldens::GoldenEntry) {
+        let s = &self.sets[set];
+        let e = s
+            .get(name)
+            .unwrap_or_else(|| panic!("{set}: no tensor {name}"));
+        (s, e)
+    }
+
+    pub fn f32(&self, set: &str, name: &str) -> Vec<f32> {
+        let (s, e) = self.entry(set, name);
+        s.read_f32(e).unwrap()
+    }
+
+    pub fn has(&self, set: &str, name: &str) -> bool {
+        self.sets[set].get(name).is_some()
+    }
+
+    pub fn i64(&self, set: &str, name: &str) -> Vec<i64> {
+        let (s, e) = self.entry(set, name);
+        s.read_i64(e).unwrap()
+    }
+
+    pub fn shape(&self, set: &str, name: &str) -> Vec<usize> {
+        self.entry(set, name).1.shape.clone()
+    }
+
+    /// The prompt and decode token ids from a set's manifest.
+    pub fn token_ids(&self, set: &str) -> (Vec<u32>, Vec<u32>) {
+        let path = self.sets[set].dir.join("manifest.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let j = json::parse(&text).unwrap();
+        let p = j
+            .get("source")
+            .and_then(|s| s.get("prompt"))
+            .expect("manifest source.prompt");
+        let ids = |k: &str| -> Vec<u32> {
+            p.get(k)
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("manifest source.prompt.{k}"))
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect()
+        };
+        (ids("token_ids"), ids("decode_token_ids"))
+    }
+}
+
+/// Error of `got` against `want`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Err {
+    pub rel_rms: f64,
+    pub max_abs: f64,
+}
+
+pub fn err(got: &[f32], want: &[f32]) -> Err {
+    assert_eq!(got.len(), want.len(), "compared tensors differ in size");
+    Err {
+        rel_rms: glm53f_forward::reference::rel_rms(got, want),
+        max_abs: glm53f_forward::reference::max_abs(got, want),
+    }
+}
+
+pub fn widen(v: &[u16]) -> Vec<f32> {
+    glm53f_layers::bf16::widen(v)
+}
+
+pub fn narrow(v: &[f32]) -> Vec<u16> {
+    glm53f_layers::bf16::narrow(v)
+}
+
+/// Columns `[lo, hi)` of rows of `width`.
+pub fn cols<T: Copy>(v: &[T], width: usize, lo: usize, hi: usize) -> Vec<T> {
+    v.chunks_exact(width)
+        .flat_map(|r| r[lo..hi].to_vec())
+        .collect()
+}
+
+/// Rows `[lo, hi)` of rows of `width`.
+pub fn rows<T: Copy>(v: &[T], width: usize, lo: usize, hi: usize) -> Vec<T> {
+    v[lo * width..hi * width].to_vec()
+}
+
+/// The golden-routing wrapper: MoE calls take their routes from a queue of rows per layer (the
+/// oracle README: routing sits on near-ties, so the expert path is checked with the golden
+/// routes), each call the next `rows` rows whatever the passes' sizes, and every call's own
+/// routes are recorded.
+pub struct GoldenRoutes<B: ExpertBackend> {
+    pub inner: B,
+    /// Per layer: (ids, weights) of every row in order.
+    pub queue: RouteQueue,
+    pub seen: Seen,
+    ids: DeviceBuffer,
+    weights: DeviceBuffer,
+}
+
+impl<B: ExpertBackend> GoldenRoutes<B> {
+    /// The next `rows` golden rows of `layer`.
+    fn take(&mut self, layer: usize, rows: usize) -> Option<(Vec<i32>, Vec<f32>)> {
+        let q = self.queue.get_mut(&layer)?;
+        let (mut ids, mut w) = (Vec::new(), Vec::new());
+        while ids.len() < rows * TOP_K {
+            let (mut a, mut b) = q.pop_front().expect("golden routes ran out");
+            let need = rows * TOP_K - ids.len();
+            if a.len() > need {
+                q.push_front((a.split_off(need), b.split_off(need)));
+            }
+            ids.extend(a);
+            w.extend(b);
+        }
+        Some((ids, w))
+    }
+}
+
+impl<B: ExpertBackend> GoldenRoutes<B> {
+    pub fn new(inner: B, max_rows: usize) -> Self {
+        GoldenRoutes {
+            inner,
+            queue: HashMap::new(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            ids: DeviceBuffer::alloc(max_rows * TOP_K * 4).unwrap(),
+            weights: DeviceBuffer::alloc(max_rows * TOP_K * 4).unwrap(),
+        }
+    }
+}
+
+impl<B: ExpertBackend> ExpertBackend for GoldenRoutes<B> {
+    fn submit(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
+        self.seen.lock().unwrap().push((
+            call.layer,
+            call.host_ids.to_vec(),
+            call.host_weights.to_vec(),
+        ));
+        let Some((ids, w)) = self.take(call.layer, call.rows) else {
+            return self.inner.submit(call, stream);
+        };
+        self.ids.upload_async(stream, 0, &ids)?;
+        self.weights.upload_async(stream, 0, &w)?;
+        let c = ExpertCall {
+            ids: self.ids.ptr(0),
+            weights: self.weights.ptr(0),
+            host_ids: &ids,
+            host_weights: &w,
+            ..*call
+        };
+        self.inner.submit(&c, stream)?;
+        // The combine read the device copies; hold the call's routes until the stream passed it.
+        stream.synchronize()
+    }
+
+    fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
+        self.inner.finish(call, stream)
+    }
+}
+
+/// A forward over decoder layers `0 .. layers` with local FP8 experts behind golden routing.
+pub struct Setup {
+    pub fwd: GlmForward,
+    pub seen: Seen,
+}
+
+pub fn forward(
+    layers: usize,
+    cfg: ForwardConfig,
+    golden_routes: RouteQueue,
+    expert_budget: usize,
+) -> Option<Setup> {
+    let dir = checkpoint_dir()?;
+    let edir = experts_dir()?;
+    let (mcfg, ckpt) = match open_checkpoint(&dir) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("skip: cannot open the checkpoint: {e}");
+            return None;
+        }
+    };
+    let shape = ModelShape::new(&mcfg.text, layers).unwrap();
+    let t0 = std::time::Instant::now();
+    let model = DeviceModel::load(&ckpt, &shape).unwrap();
+    let embed = HostEmbedding::load(&ckpt).unwrap();
+    eprintln!(
+        "loaded layers 0..{layers} and the head: {:.2} GB on the GPU, embedding {:.2} GB in host RAM, {:.1} s",
+        model.bytes as f64 / 1e9,
+        embed.bytes() as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+    let stream = Arc::new(Stream::new().unwrap());
+    let kv = KvPool::new(
+        KvConfig {
+            layout: KvLayout::new(&shape, None),
+            max_slots: 6,
+            pages: 64,
+            max_pages: 16,
+            base_pages: 1,
+        },
+        stream.clone(),
+    )
+    .unwrap();
+    // A budget of 0: routed outputs of zeros (tests of the coordinator path alone).
+    let (experts, seen): (Box<dyn ExpertBackend>, _) = if expert_budget == 0 {
+        (
+            Box::new(glm53f_forward::experts::ZeroExperts),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    } else {
+        let local = LocalFp8Experts::new(
+            &edir,
+            expert_budget,
+            cfg.max_rows.max(cfg.max_verify_rows),
+            &stream,
+            Fp8Act::Bf16,
+        )
+        .unwrap();
+        let mut gr = GoldenRoutes::new(local, cfg.max_rows.max(cfg.max_verify_rows));
+        gr.queue = golden_routes;
+        let seen = gr.seen.clone();
+        (Box::new(gr), seen)
+    };
+    let fwd = GlmForward::new(model, embed, kv, experts, cfg).unwrap();
+    Some(Setup { fwd, seen })
+}

@@ -52,3 +52,7 @@ authors under their own terms.
 
 - **Source:** <https://github.com/fla-org/flash-linear-attention> @ `1837094`.
 - **What was taken:** nothing is copied. The chunked KDA prefill (`crates/glm53f-kda/kernels/kda_prefill.cu`) follows its intra-chunk and inter-chunk structure; the algebra is the transformers reference's.
+
+## NVIDIA CUDA toolkit
+
+- The CUDA runtime and cuBLAS are linked from the installed toolkit, not included. `crates/glm53f-forward/src/cuda.rs` and `src/cublas.rs` re-declare the function signatures and enumeration values they call.
