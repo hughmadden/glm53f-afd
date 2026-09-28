@@ -1,0 +1,38 @@
+# glm53f-dflash: the DFlash2 speculative drafter of GLM-5.3-Flash (incoai/GLM-5.3-Flash-DFlash2).
+#
+#   - an f32 CPU reference of the drafter: context features through fc, five Qwen3-style layers
+#     with two-tap dynamic convolutions over a block of 8, the final norm, logits through the
+#     target's LM head, the top-16 candidates and the selector's path;
+#   - a CUDA forward (feature `cuda`): BF16 weights, a batch of requests per block, a per-request
+#     ring of context K/V for the 2,048-token window, cuBLAS GEMMs and this crate's kernels;
+#   - the seam the target forward and the scheduler will call (`Drafter`).
+#
+#   cargo test -p glm53f-dflash                    CPU only: no CUDA toolkit needed
+#   cargo test -p glm53f-dflash --features cuda    plus the kernels and the forward on a GPU
+#
+# Tests that need the checkpoint or the goldens read GLM53F_DFLASH_DIR, GLM53F_CHECKPOINT_DIR and
+# GLM53F_GOLDENS, and skip (with a message) when they are unset. No external Rust crates.
+# Provenance: PROVENANCE.md.
+[package]
+name = "glm53f-dflash"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GLM-5.3-Flash DFlash2 drafter: f32 CPU reference, CUDA forward and the drafting seam"
+publish = false
+
+[lib]
+name = "glm53f_dflash"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile this crate's kernels and link cudart and cuBLAS (build.rs; needs nvcc, and a GPU to run).
+cuda = []
+
+[dependencies]
+glm53f-model = { path = "../glm53f-model" }
+
+[[example]]
+name = "dflash_bench"
+required-features = ["cuda"]

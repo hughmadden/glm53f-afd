@@ -1,0 +1,348 @@
+{
+ "format": 1,
+ "set": "dflash-native",
+ "source": {
+  "reference": {
+   "repo": "z-lab/dflash",
+   "commit": "07ebd93db9f472af339b644bb70221ad8428328a",
+   "path": "dflash/model.py",
+   "sha256": "f55b7fe0a4c0b3073e0f9cdce547cce29f4b8e2168c4d2818760007c43b7651e",
+   "classes": "DFlash2DraftModel, CandidateSelector, GroupedDynamicCausalConv, Qwen3DFlashDecoderLayer, Qwen3DFlashAttention; dflash_generate's drafting step",
+   "transformers": {
+    "version": "5.17.0",
+    "wheel_sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+    "qwen3_modeling_sha256": "cbb7f2dc274c2f5592746c0dc6985ca50353efa07376f92cc922b77680a74f69",
+    "attention": "sdpa (the reference's own choice) with its explicit boolean mask"
+   }
+  },
+  "drafter": {
+   "repo": "incoai/GLM-5.3-Flash-DFlash2",
+   "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+   "config_sha256": "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573",
+   "weights_sha256": "b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac"
+  },
+  "target": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+   "tensors": {
+    "model.language_model.embed_tokens.weight": {
+     "dtype": "bfloat16",
+     "shape": [
+      154880,
+      4096
+     ],
+     "sha256": "4f7aecd51589ce7879d0ae48a5a1ed25750e4e94d2abe2d14c9526e5ce5641d6"
+    },
+    "lm_head.weight": {
+     "dtype": "bfloat16",
+     "shape": [
+      154880,
+      4096
+     ],
+     "sha256": "aa21c427970f64edd82669db3a8fb46613084e8bc271a3728784a52eb3f25ab4"
+    }
+   }
+  },
+  "runtime": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu132",
+   "numpy": "2.5.2",
+   "mkl": "2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+   "device": "cpu",
+   "cpu_capability": "AVX2",
+   "threads": 16,
+   "env": {
+    "ATEN_CPU_CAPABILITY": "avx2",
+    "MKL_CBWR": "AVX2,STRICT",
+    "ONEDNN_MAX_CPU_ISA": "AVX2"
+   },
+   "deterministic_algorithms": true
+  },
+  "script_sha256": "013397029981f9314dd9991c07802cd93c111531887ab19f6350047f3fe9bb2e",
+  "helpers_sha256": {
+   "golden_layers.py": "b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3"
+  },
+  "taps": {
+   "rule": "Tap rows for positions start..start+rows, BF16 [rows, 20480].\n\n    Element (pos, col): h = splitmix64(seed * 2^48 + pos * 20480 + col) (wrapping u64);\n    v = (h >> 40) / 2^23 - 1, uniform in [-1, 1) and exact in f32; rounded to BF16 (nearest even).",
+   "width": 20480
+  }
+ },
+ "notes": {
+  "facts": {
+   "is_causal": false,
+   "sliding_window": 2048,
+   "block_size": 8,
+   "mask_token_id": 154856,
+   "target_layer_ids": [
+    5,
+    14,
+    24,
+    33,
+    42
+   ],
+   "top_k": 16,
+   "draft_config": {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 154856,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": [
+     5,
+     14,
+     24,
+     33,
+     42
+    ]
+   }
+  },
+  "case": {
+   "context": 300,
+   "seed0": 1,
+   "anchor0": 29975,
+   "accept": 3,
+   "seed1": 2,
+   "anchor1": 4145
+  },
+  "diff_vs_fp32": {
+   "s0": {
+    "final": {
+     "max_abs": 0.12537,
+     "rel_rms": 0.0349462
+    },
+    "logits": {
+     "max_abs": 0.0704239,
+     "rel_rms": 0.0313781
+    },
+    "top16_same_set": [
+     false,
+     false,
+     false,
+     false,
+     false,
+     true,
+     false
+    ],
+    "path_same": [
+     true,
+     true,
+     true,
+     true,
+     true,
+     true,
+     true
+    ]
+   },
+   "s1": {
+    "final": {
+     "max_abs": 0.0979278,
+     "rel_rms": 0.0333155
+    },
+    "logits": {
+     "max_abs": 0.0846348,
+     "rel_rms": 0.0285981
+    },
+    "top16_same_set": [
+     true,
+     false,
+     false,
+     false,
+     true,
+     false,
+     false
+    ],
+    "path_same": [
+     true,
+     true,
+     false,
+     true,
+     true,
+     false,
+     false
+    ]
+   }
+  },
+  "dtype": "native: every drafter tensor BF16 as stored; target embedding and lm_head BF16; the reference's Qwen3RMSNorm and rotary upcast internally; compute_logits returns BF16 logits (recorded as FP32)"
+ },
+ "tensors": {
+  "s0.L0.out": {
+   "file": "s0.L0.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "2ac3c9a503db51aa361e04d637b3ed8147c147f81c3b05e0a0ede57278f89e7e",
+   "desc": "layer 0: block hidden state leaving the layer (BF16)"
+  },
+  "s0.L1.out": {
+   "file": "s0.L1.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "788d51bf3d46162292a647a6305af4da32e543943f8c56428516fd4881dd1253",
+   "desc": "layer 1: block hidden state leaving the layer (BF16)"
+  },
+  "s0.L2.out": {
+   "file": "s0.L2.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "7976bfbc08d6a97cf93f8e512334ffc337691541cfbab3f00af19b18a805e461",
+   "desc": "layer 2: block hidden state leaving the layer (BF16)"
+  },
+  "s0.L3.out": {
+   "file": "s0.L3.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "fb27a6e03f99a5d236ed65c382627189d3ccaaa031367a33780213908362055d",
+   "desc": "layer 3: block hidden state leaving the layer (BF16)"
+  },
+  "s0.L4.out": {
+   "file": "s0.L4.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "fffae4f18b934e88d1e7c11385fd2526bce0b8347f47d706280306171954db01",
+   "desc": "layer 4: block hidden state leaving the layer (BF16)"
+  },
+  "s0.final": {
+   "file": "s0.final.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "8c892759d586dbf4a4a00e54a30f865d8b792fb2ef1449d1b792e885bb6475ad",
+   "desc": "model output norm(h), BF16 [8, 4096]"
+  },
+  "s0.logits": {
+   "file": "s0.logits.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    154880
+   ],
+   "sha256": "b876caf6afbc3d72a06a0c7dcab74ca2dea42cd4e6b4d61505558d251defb2b1",
+   "desc": "logits of rows 1..7 (BF16 values) [7, vocab]"
+  },
+  "s0.topk_ids": {
+   "file": "s0.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "27249a78bc9f15513916c09def609e4dbadce8706b970c5faaae565bb6c113da",
+   "desc": "top-16 ids, descending logit"
+  },
+  "s0.path": {
+   "file": "s0.path.bin",
+   "dtype": "i32",
+   "shape": [
+    7
+   ],
+   "sha256": "daa5ba4f6529f9b09d112ee5fd0d3c97dd7d0a811bc53b9830b5b5805f21fa83",
+   "desc": "propose at temperature 0"
+  },
+  "s1.L0.out": {
+   "file": "s1.L0.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c4798f633bdb83f3d7e059c8edfa89d66ca51d006d1a5a801e699a5c648ed995",
+   "desc": "layer 0: block hidden state leaving the layer (BF16)"
+  },
+  "s1.L1.out": {
+   "file": "s1.L1.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "2f4ae5c2680aa06b76ffb0ebec752cf734df6910c3f88337d3c8fb35ec5b7531",
+   "desc": "layer 1: block hidden state leaving the layer (BF16)"
+  },
+  "s1.L2.out": {
+   "file": "s1.L2.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "62c18124a042a386273289da9638c72b01f7bcaae9d4837c78c4020162cd874e",
+   "desc": "layer 2: block hidden state leaving the layer (BF16)"
+  },
+  "s1.L3.out": {
+   "file": "s1.L3.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "e271475572ad195985de80fcbd7e7c5cf90ada6f6617de4952afe6fc2f25b699",
+   "desc": "layer 3: block hidden state leaving the layer (BF16)"
+  },
+  "s1.L4.out": {
+   "file": "s1.L4.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "9738a102c849d8d904a7c69e0224547e7fc40978a15bbb5bb89745af7afbe586",
+   "desc": "layer 4: block hidden state leaving the layer (BF16)"
+  },
+  "s1.final": {
+   "file": "s1.final.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "596294287dfce09fb77346d9cd3e0e90f7b679babaf9dfff7a14fdd5a5630a22",
+   "desc": "model output norm(h), BF16 [8, 4096]"
+  },
+  "s1.logits": {
+   "file": "s1.logits.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    154880
+   ],
+   "sha256": "2717141fd75f81b3eeff357645f2b6bbe0355cad5368c7f46db5a7671b32b65d",
+   "desc": "logits of rows 1..7 (BF16 values) [7, vocab]"
+  },
+  "s1.topk_ids": {
+   "file": "s1.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "a22b422ca059c815ede5a93d14c276214cd51d87ef88560a1f58a6e887d0c94d",
+   "desc": "top-16 ids, descending logit"
+  },
+  "s1.path": {
+   "file": "s1.path.bin",
+   "dtype": "i32",
+   "shape": [
+    7
+   ],
+   "sha256": "19212e201a31d003703f0b86ef0a0a87f16f304376e46c4f894ddbbf4aece8f2",
+   "desc": "propose at temperature 0"
+  }
+ }
+}

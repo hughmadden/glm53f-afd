@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glm53f-dflash"
+version = "0.1.0"
+dependencies = [
+ "glm53f-model",
+]
+
+[[package]]
 name = "glm53f-dsa"
 version = "0.1.0"
 

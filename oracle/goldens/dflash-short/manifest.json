@@ -1,0 +1,1875 @@
+{
+ "format": 1,
+ "set": "dflash-short",
+ "source": {
+  "reference": {
+   "repo": "z-lab/dflash",
+   "commit": "07ebd93db9f472af339b644bb70221ad8428328a",
+   "path": "dflash/model.py",
+   "sha256": "f55b7fe0a4c0b3073e0f9cdce547cce29f4b8e2168c4d2818760007c43b7651e",
+   "classes": "DFlash2DraftModel, CandidateSelector, GroupedDynamicCausalConv, Qwen3DFlashDecoderLayer, Qwen3DFlashAttention; dflash_generate's drafting step",
+   "transformers": {
+    "version": "5.17.0",
+    "wheel_sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+    "qwen3_modeling_sha256": "cbb7f2dc274c2f5592746c0dc6985ca50353efa07376f92cc922b77680a74f69",
+    "attention": "sdpa (the reference's own choice) with its explicit boolean mask"
+   }
+  },
+  "drafter": {
+   "repo": "incoai/GLM-5.3-Flash-DFlash2",
+   "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+   "config_sha256": "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573",
+   "weights_sha256": "b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac"
+  },
+  "target": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+   "tensors": {
+    "model.language_model.embed_tokens.weight": {
+     "dtype": "bfloat16",
+     "shape": [
+      154880,
+      4096
+     ],
+     "sha256": "4f7aecd51589ce7879d0ae48a5a1ed25750e4e94d2abe2d14c9526e5ce5641d6"
+    },
+    "lm_head.weight": {
+     "dtype": "bfloat16",
+     "shape": [
+      154880,
+      4096
+     ],
+     "sha256": "aa21c427970f64edd82669db3a8fb46613084e8bc271a3728784a52eb3f25ab4"
+    }
+   }
+  },
+  "runtime": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu132",
+   "numpy": "2.5.2",
+   "mkl": "2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+   "device": "cpu",
+   "cpu_capability": "AVX2",
+   "threads": 16,
+   "env": {
+    "ATEN_CPU_CAPABILITY": "avx2",
+    "MKL_CBWR": "AVX2,STRICT",
+    "ONEDNN_MAX_CPU_ISA": "AVX2"
+   },
+   "deterministic_algorithms": true
+  },
+  "script_sha256": "013397029981f9314dd9991c07802cd93c111531887ab19f6350047f3fe9bb2e",
+  "helpers_sha256": {
+   "golden_layers.py": "b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3"
+  },
+  "taps": {
+   "rule": "Tap rows for positions start..start+rows, BF16 [rows, 20480].\n\n    Element (pos, col): h = splitmix64(seed * 2^48 + pos * 20480 + col) (wrapping u64);\n    v = (h >> 40) / 2^23 - 1, uniform in [-1, 1) and exact in f32; rounded to BF16 (nearest even).",
+   "width": 20480
+  }
+ },
+ "notes": {
+  "facts": {
+   "is_causal": false,
+   "sliding_window": 2048,
+   "block_size": 8,
+   "mask_token_id": 154856,
+   "target_layer_ids": [
+    5,
+    14,
+    24,
+    33,
+    42
+   ],
+   "top_k": 16,
+   "draft_config": {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 154856,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": [
+     5,
+     14,
+     24,
+     33,
+     42
+    ]
+   }
+  },
+  "case": {
+   "context": 300,
+   "seed0": 1,
+   "anchor0": 29975,
+   "accept": 3,
+   "seed1": 2,
+   "anchor1": 4145
+  },
+  "kept_rows": [
+   29975,
+   46,
+   31746,
+   438
+  ],
+  "taps_sha256": {
+   "s0": "30562cf403f7b8158b685b6dc9f520dc86a7a000284223ae9df2c275534c2182",
+   "s1": "8f50e6ccf2e4c74d281c1ba91a1e1ce88996772ef02202d899212fa0a7d0186d"
+  },
+  "steps": "s0: context rows 0..299 (seed 1), anchor 29975 at 300; s1: rows 300..303 (seed 2: the anchor and 3 accepted drafts), anchor 4145 at 304",
+  "walk_equals_propose": [
+   true,
+   true
+  ],
+  "padding_ids_in_top16": [
+   0,
+   0
+  ],
+  "layout": "row-major little-endian; K/V heads are the draft's 8 KV heads of 128"
+ },
+ "tensors": {
+  "rope.inv_freq": {
+   "file": "rope.inv_freq.bin",
+   "dtype": "f32",
+   "shape": [
+    64
+   ],
+   "sha256": "4b659c349432de9f79dd9cb4ee360c56e20be3809e01d4bbccbf2ebeae925c3d",
+   "desc": "Qwen3RotaryEmbedding.inv_freq of the drafter (64 values, FP32)"
+  },
+  "mask_embed": {
+   "file": "mask_embed.bin",
+   "dtype": "f32",
+   "shape": [
+    4096
+   ],
+   "sha256": "557b5698fd04f990cb16eba109c4e88692ca758b59d993aa3adb1eac27bc0eeb",
+   "desc": "target embedding row of mask_token_id 154856 (FP32 of the BF16 row)"
+  },
+  "s0.positions": {
+   "file": "s0.positions.bin",
+   "dtype": "i32",
+   "shape": [
+    308
+   ],
+   "sha256": "fc063bdfd582bd2c0dcddc56b7c39afb97f569de6b81cef4bd837c9935fc3437",
+   "desc": "draft forward position ids: new context rows, then the block"
+  },
+  "s0.block_embed": {
+   "file": "s0.block_embed.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d92339416ac2ce3328cd175c849b58a1f20bbd20c2d24764f51c07166a1e196d",
+   "desc": "block input: target embedding rows of [anchor, mask x 7] [8, 4096]"
+  },
+  "s0.L0.in": {
+   "file": "s0.L0.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d92339416ac2ce3328cd175c849b58a1f20bbd20c2d24764f51c07166a1e196d",
+   "desc": "layer 0: block hidden state entering the layer [8, 4096]"
+  },
+  "s0.L0.attn_norm": {
+   "file": "s0.L0.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "15b7be303e1bc92c0cb49f8852587a8449a2e6a28fd63f9de8ba4196e8779036",
+   "desc": "layer 0: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s0.L0.attn_dyn": {
+   "file": "s0.L0.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "854aa30c0473b11542c16548f5a8e48fe8dd684672f7858b02c7368c9e8e27a1",
+   "desc": "layer 0: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s0.L0.attn_conv_in": {
+   "file": "s0.L0.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "16548f99da0881a83b9958038ab8485e53d78e835eafa881a99ee4a4a4b121a2",
+   "desc": "layer 0: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s0.L0.attn_raw": {
+   "file": "s0.L0.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "104c37042dd3f9299a86aac1b8d20ffd4c933e1439d6ad67d0ad9ee1aec25fb0",
+   "desc": "layer 0: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s0.L0.attn_conv_out": {
+   "file": "s0.L0.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "73141c4b44137c7e8e8d12179a0c78db405cb3f5c6aac13a19a37ad88aa75363",
+   "desc": "layer 0: attention_conv.finish output, added to the residual"
+  },
+  "s0.L0.mlp_norm": {
+   "file": "s0.L0.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "25af974b90b586a0b83f3d893a9a0d236c3e9e6879b15ecee52ee041dd874655",
+   "desc": "layer 0: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s0.L0.mlp_dyn": {
+   "file": "s0.L0.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "5ff5ccbaeb14280d0ea07a7549d1cc187160991c2ef0c62f05c0ac3eac7791b7",
+   "desc": "layer 0: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s0.L0.mlp_conv_in": {
+   "file": "s0.L0.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "68ecca030447e857494816262cb46173c633d65e72bd504d2579d4ccda59c220",
+   "desc": "layer 0: mlp_conv.prepare output: the MLP input"
+  },
+  "s0.L0.mlp_raw": {
+   "file": "s0.L0.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "b3d0fbe095c959b53b2f1796db3f539f1fceb66f0dc4ce3c59468270c5a62eef",
+   "desc": "layer 0: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s0.L0.mlp_conv_out": {
+   "file": "s0.L0.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "ce6a7ec082608482a4f5905ebbba17557bec021ee5fd70253ce7e02a1ebb88a7",
+   "desc": "layer 0: mlp_conv.finish output, added to the residual"
+  },
+  "s0.L0.out": {
+   "file": "s0.L0.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "9f90c44dc1e5582b388aaa009d1cba976499db0d9aeb177aca6c7f99f1f44945",
+   "desc": "layer 0: block hidden state leaving the layer"
+  },
+  "s0.L0.k_block": {
+   "file": "s0.L0.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "c8d072545b4bc4de56ee3d3e02b4e71b8ec99885ac76bec98f21e58ace389951",
+   "desc": "layer 0: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s0.L0.v_block": {
+   "file": "s0.L0.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "1db31845dd1556bd8223225f4045f9f93a3faa8eed3a8a225817a8df546dac85",
+   "desc": "layer 0: block values [8, kv_heads, 128]"
+  },
+  "s0.L1.in": {
+   "file": "s0.L1.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "9f90c44dc1e5582b388aaa009d1cba976499db0d9aeb177aca6c7f99f1f44945",
+   "desc": "layer 1: block hidden state entering the layer [8, 4096]"
+  },
+  "s0.L1.attn_norm": {
+   "file": "s0.L1.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "cf3838cc28fca39f3675adf207fdd720710fb793242f8b5f5fc01428944c076b",
+   "desc": "layer 1: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s0.L1.attn_dyn": {
+   "file": "s0.L1.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "bc5eb862e88c565006a3b7177221a247c3e208e05d82fdef9d2e5a1aee7e628b",
+   "desc": "layer 1: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s0.L1.attn_conv_in": {
+   "file": "s0.L1.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "688718467073e8ce6c160b18f4b018a9f8f5c4762c6494655e2a921b556c051e",
+   "desc": "layer 1: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s0.L1.attn_raw": {
+   "file": "s0.L1.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "96a5a95c1e053ae14e61b21b3a89e970df11f467baa6b02f34dcf464c36d9a7e",
+   "desc": "layer 1: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s0.L1.attn_conv_out": {
+   "file": "s0.L1.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "88303b5cfabc41d166fac8325e8ff452906cfa12969bc3756305617f26f481c2",
+   "desc": "layer 1: attention_conv.finish output, added to the residual"
+  },
+  "s0.L1.mlp_norm": {
+   "file": "s0.L1.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d0189b3f1e247aa651ed00960b26b623c227bcd76365e90897a29b1600d685dc",
+   "desc": "layer 1: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s0.L1.mlp_dyn": {
+   "file": "s0.L1.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "c99febee52e38e7f49b9ad6670e49ded8c9cd1ee4a0661035ed04472abf53f42",
+   "desc": "layer 1: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s0.L1.mlp_conv_in": {
+   "file": "s0.L1.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "837c821cfed348d3a26c3d1661007d85fa96b3d74e5e4e2504b920103c33c019",
+   "desc": "layer 1: mlp_conv.prepare output: the MLP input"
+  },
+  "s0.L1.mlp_raw": {
+   "file": "s0.L1.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d3d89519a5316a6a6e91eb729964ce22ffa6fb201254ec65801d6509a528cd25",
+   "desc": "layer 1: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s0.L1.mlp_conv_out": {
+   "file": "s0.L1.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "53bdf9e83800454d892113c2a586dc64f889946342e49c5c89cf4e30476e21a6",
+   "desc": "layer 1: mlp_conv.finish output, added to the residual"
+  },
+  "s0.L1.out": {
+   "file": "s0.L1.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "5f491727dde775f09cc9765b482c779bce7dbf891c845829dc2230a71d19cdc2",
+   "desc": "layer 1: block hidden state leaving the layer"
+  },
+  "s0.L1.k_block": {
+   "file": "s0.L1.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "512ba9fafb2b14a8ec9c1eaccfc789fd3b712ed68c54f4c95ed2cd8d2449276c",
+   "desc": "layer 1: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s0.L1.v_block": {
+   "file": "s0.L1.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "6c4460ee2aaa867540d549a8e2693a6540d730d28a3266085fdd630adf6cb663",
+   "desc": "layer 1: block values [8, kv_heads, 128]"
+  },
+  "s0.L2.in": {
+   "file": "s0.L2.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "5f491727dde775f09cc9765b482c779bce7dbf891c845829dc2230a71d19cdc2",
+   "desc": "layer 2: block hidden state entering the layer [8, 4096]"
+  },
+  "s0.L2.attn_norm": {
+   "file": "s0.L2.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "140a109abe9ef67500ec519cb9af15bd9d341c3b0aa11f3d9e47fde960a4c122",
+   "desc": "layer 2: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s0.L2.attn_dyn": {
+   "file": "s0.L2.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "8e290de9cca5e945a8b205b8c89119641a392e5f8c98fbb077d5f83f22471275",
+   "desc": "layer 2: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s0.L2.attn_conv_in": {
+   "file": "s0.L2.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "e5f71cf4e09ccc4de5fdf75cc8047f7945d16db8ed01ef94ea798f4a0039275e",
+   "desc": "layer 2: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s0.L2.attn_raw": {
+   "file": "s0.L2.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c2df590088fa4be61c51fee68e5610612ce5199c2f6173bbc5d54575debe444b",
+   "desc": "layer 2: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s0.L2.attn_conv_out": {
+   "file": "s0.L2.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0e6ac64c0f92a43c5444c4dffabaa09ad909091fedde009d0499b86be68c7899",
+   "desc": "layer 2: attention_conv.finish output, added to the residual"
+  },
+  "s0.L2.mlp_norm": {
+   "file": "s0.L2.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "1292c473f254fac7351176f4f1472f15cf7b14c430cf9343eca23ca9eb5aef04",
+   "desc": "layer 2: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s0.L2.mlp_dyn": {
+   "file": "s0.L2.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "37f581d0c4511590e2d7c73f072c0489af6bea373380d02c17967d95ede1d632",
+   "desc": "layer 2: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s0.L2.mlp_conv_in": {
+   "file": "s0.L2.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "19122073ddd23628a99e8bd369f0345c3c86c541d10d180c216c6ef5ed96adc1",
+   "desc": "layer 2: mlp_conv.prepare output: the MLP input"
+  },
+  "s0.L2.mlp_raw": {
+   "file": "s0.L2.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "43f9458be6ff50c9fe3b59de3a51fe948bb3f07235d3ac5e5e7bce773e4852f8",
+   "desc": "layer 2: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s0.L2.mlp_conv_out": {
+   "file": "s0.L2.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "10be0de0121d6e412b935931cca60dc1c429e4a449c5ea500c342f9170f6de66",
+   "desc": "layer 2: mlp_conv.finish output, added to the residual"
+  },
+  "s0.L2.out": {
+   "file": "s0.L2.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "bcaaf2ca1d12aeb721eea5dc14a5cfcba27eb2060e4310fbc72dc80ab913386c",
+   "desc": "layer 2: block hidden state leaving the layer"
+  },
+  "s0.L2.k_block": {
+   "file": "s0.L2.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "6193f75bf043c95c747356aa226c0aeaf6b4339a5b91896ad34e2ecaee997fbc",
+   "desc": "layer 2: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s0.L2.v_block": {
+   "file": "s0.L2.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "df112da783e773673f6a71d179bbba848fd38804b7b456547695d2598f0aac13",
+   "desc": "layer 2: block values [8, kv_heads, 128]"
+  },
+  "s0.L3.in": {
+   "file": "s0.L3.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "bcaaf2ca1d12aeb721eea5dc14a5cfcba27eb2060e4310fbc72dc80ab913386c",
+   "desc": "layer 3: block hidden state entering the layer [8, 4096]"
+  },
+  "s0.L3.attn_norm": {
+   "file": "s0.L3.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "befb7090c018d1f5a261f4659a72b4e85964f8b157a40851b9b3fe04c8852196",
+   "desc": "layer 3: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s0.L3.attn_dyn": {
+   "file": "s0.L3.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "95e70b94438375e385252a013515f73b8392aadec838f2ac7315c6afc94e7138",
+   "desc": "layer 3: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s0.L3.attn_conv_in": {
+   "file": "s0.L3.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0eb2f12555ce5ff0e1485e3226b79ecef7c5cea2f4a11a99095b05049698a295",
+   "desc": "layer 3: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s0.L3.attn_raw": {
+   "file": "s0.L3.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "ebfc888bf06738ba66d0fe5eb74d7a25c6cd0e550bdc4ff2162c4ce737bf6e06",
+   "desc": "layer 3: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s0.L3.attn_conv_out": {
+   "file": "s0.L3.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "be2ed37298ed51c48cd747224163f702703cd248a2a40ba32d2fe29b1dab3c78",
+   "desc": "layer 3: attention_conv.finish output, added to the residual"
+  },
+  "s0.L3.mlp_norm": {
+   "file": "s0.L3.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "1637e4a923e97f06f1bc67735ca5493401dc425a104755966147b201e2438317",
+   "desc": "layer 3: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s0.L3.mlp_dyn": {
+   "file": "s0.L3.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "52863c6faeffb65d71e2c0b466acc9f9831ba608730532f204c990a448f6e230",
+   "desc": "layer 3: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s0.L3.mlp_conv_in": {
+   "file": "s0.L3.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "684db40d8a0c3a978fe97d88357964d354457539acaf843fb0890e30caecd8d8",
+   "desc": "layer 3: mlp_conv.prepare output: the MLP input"
+  },
+  "s0.L3.mlp_raw": {
+   "file": "s0.L3.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "4df215e9e5a276d692253179926fa7da635787f11515cca68202306a456d5ee6",
+   "desc": "layer 3: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s0.L3.mlp_conv_out": {
+   "file": "s0.L3.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0226c35598d972b5b86685fc2452cd99c061422e37ce8531583ca6c155756b79",
+   "desc": "layer 3: mlp_conv.finish output, added to the residual"
+  },
+  "s0.L3.out": {
+   "file": "s0.L3.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "37240dc5a453402fd9e6b5ba24c7a19843789d12f5401970029e5c359c15bf09",
+   "desc": "layer 3: block hidden state leaving the layer"
+  },
+  "s0.L3.k_block": {
+   "file": "s0.L3.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "6c525249aa373f77be243634858f97035509240241d1b70e8f589d37e5277672",
+   "desc": "layer 3: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s0.L3.v_block": {
+   "file": "s0.L3.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "f4f0b79445416c7b31590edafbd585dfa2e7ea432c71df5bebf7947b937e2c6f",
+   "desc": "layer 3: block values [8, kv_heads, 128]"
+  },
+  "s0.L4.in": {
+   "file": "s0.L4.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "37240dc5a453402fd9e6b5ba24c7a19843789d12f5401970029e5c359c15bf09",
+   "desc": "layer 4: block hidden state entering the layer [8, 4096]"
+  },
+  "s0.L4.attn_norm": {
+   "file": "s0.L4.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "8f311c3c35d17bd29606befe92b3d748cc34ea7c2a8bd1620d4e37c98bbbcf12",
+   "desc": "layer 4: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s0.L4.attn_dyn": {
+   "file": "s0.L4.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "6b181c89219de264e36acbd7ec6af85bcab73bad82133feb7317a85b9743283b",
+   "desc": "layer 4: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s0.L4.attn_conv_in": {
+   "file": "s0.L4.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "7d72e10f98aa1024e683425a7dd3cbe6b4b6fd53f4edb1d29b40bf33062da8df",
+   "desc": "layer 4: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s0.L4.attn_raw": {
+   "file": "s0.L4.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "87856368612b141a77d7d5747e78a26166f84a422024a9636ba8bf760dcdb81e",
+   "desc": "layer 4: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s0.L4.attn_conv_out": {
+   "file": "s0.L4.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "2910724e75557e030a113dcd53d69408f63c6f23cedecfd9e554e7d2d6f68d55",
+   "desc": "layer 4: attention_conv.finish output, added to the residual"
+  },
+  "s0.L4.mlp_norm": {
+   "file": "s0.L4.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c7ed61d6a8839ef2fce83c882dd09d723a9a5820c2edfb8a0101ba6d16ac1d8b",
+   "desc": "layer 4: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s0.L4.mlp_dyn": {
+   "file": "s0.L4.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "50dcdfd8b6a03cc3470813c5138a2d70ff5056201060c7c352b8386fe681eac2",
+   "desc": "layer 4: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s0.L4.mlp_conv_in": {
+   "file": "s0.L4.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "9bf84d3424517f1f0e3ac758afce78b1600570b67c2bf43d327bb1c757d44779",
+   "desc": "layer 4: mlp_conv.prepare output: the MLP input"
+  },
+  "s0.L4.mlp_raw": {
+   "file": "s0.L4.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "2033c97a2e502074918c791dea540f9a70ad62327f3bb5ae276c94158ddebb5b",
+   "desc": "layer 4: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s0.L4.mlp_conv_out": {
+   "file": "s0.L4.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "732db979a8e190fc5a1babf956dae3050ed42cc79e1ee789cfa8d1f4ffd31c18",
+   "desc": "layer 4: mlp_conv.finish output, added to the residual"
+  },
+  "s0.L4.out": {
+   "file": "s0.L4.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "709bccc5e0333a0ab0d80dae9762933444021886552a4f8ec7fdf49335f832bd",
+   "desc": "layer 4: block hidden state leaving the layer"
+  },
+  "s0.L4.k_block": {
+   "file": "s0.L4.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "29b104f815b449802b973ccf22519668b4bcce097bdf1ffcb274733660a9eac0",
+   "desc": "layer 4: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s0.L4.v_block": {
+   "file": "s0.L4.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "0ef9ce6839e1444fa516ee624e2f78b2856a18574079ff907e3b57d66d683a2e",
+   "desc": "layer 4: block values [8, kv_heads, 128]"
+  },
+  "s0.ctx_features": {
+   "file": "s0.ctx_features.bin",
+   "dtype": "f32",
+   "shape": [
+    300,
+    4096
+   ],
+   "sha256": "604368e87a3f60f407ae9998bb97658fbf56e4326a81de1dd3a52496b74aa92a",
+   "desc": "hidden_norm(fc(taps)) for the new context rows [rows, 4096]"
+  },
+  "s0.ctx_k": {
+   "file": "s0.ctx_k.bin",
+   "dtype": "f32",
+   "shape": [
+    5,
+    300,
+    8,
+    128
+   ],
+   "sha256": "ae09e20b9b5dd084171b044b2b6e35d6b1361e9d28178bd63ba928ce32c31ed0",
+   "desc": "draft cache after the crop: keys of the newest 300 context rows [layers, rows, kv_heads, 128], after k_norm and RoPE at their positions"
+  },
+  "s0.ctx_v": {
+   "file": "s0.ctx_v.bin",
+   "dtype": "f32",
+   "shape": [
+    5,
+    300,
+    8,
+    128
+   ],
+   "sha256": "6bb2dbf31197895520b85c8ccbb7d2b803cb3445f4d6714bd1acf37aa23c577c",
+   "desc": "draft cache after the crop: values of the newest 300 context rows"
+  },
+  "s0.final": {
+   "file": "s0.final.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d3c1fb4f4346b97befc8d190737ef698aae0ef96dc25407b7a1a0552a71a5ada",
+   "desc": "model output: norm(h) for the 8 block rows [8, 4096]"
+  },
+  "s0.logits": {
+   "file": "s0.logits.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    154880
+   ],
+   "sha256": "f8fd51d3e07ea5303dcb7c58981c79eb84de21cecace40b32e70cbf6a61fb65e",
+   "desc": "compute_logits of rows 1..7 through the target lm_head [7, vocab], FP32"
+  },
+  "s0.topk_vals": {
+   "file": "s0.topk_vals.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "62cd9755149328808d006d0b737f02d243c1cac6122f5805707d6b63c2402a64",
+   "desc": "top-16 logits per row, descending (torch.topk sorted=True)"
+  },
+  "s0.topk_ids": {
+   "file": "s0.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "d055d7b065d590055fabac5ced5bd6fd27fd7737f854e7c72032557803ccd1bd",
+   "desc": "top-16 token ids in the order of topk_vals"
+  },
+  "s0.ref_candidates": {
+   "file": "s0.ref_candidates.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "d055d7b065d590055fabac5ced5bd6fd27fd7737f854e7c72032557803ccd1bd",
+   "desc": "the reference's candidates in its own order (torch.topk sorted=False)"
+  },
+  "s0.hproj": {
+   "file": "s0.hproj.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    256
+   ],
+   "sha256": "ee24b16399764a605b79577523956210a05a0bdc87af2ce4004b202af15cb8dc",
+   "desc": "candidate_selector.hidden_projection of rows 1..7 [7, 256]"
+  },
+  "s0.lattice": {
+   "file": "s0.lattice.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16,
+    16
+   ],
+   "sha256": "4cdf901954551b1834c5e4e5f12c9e1c6f2af14816de2727756bc13b6f44a682",
+   "desc": "SGLang edge scores [slot, predecessor, candidate] over the sorted candidates (slot 0: every row is the anchor)"
+  },
+  "s0.path": {
+   "file": "s0.path.bin",
+   "dtype": "i32",
+   "shape": [
+    7
+   ],
+   "sha256": "daa5ba4f6529f9b09d112ee5fd0d3c97dd7d0a811bc53b9830b5b5805f21fa83",
+   "desc": "DFlash2DraftModel.propose at temperature 0: the 7 drafts"
+  },
+  "s0.path_scores": {
+   "file": "s0.path_scores.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "73880e0c4b473b80914d2e987bb34004a03a31b1d886708176e43ab91fe02caa",
+   "desc": "the lattice row the greedy walk used at each slot [7, 16]"
+  },
+  "s0.q_t07": {
+   "file": "s0.q_t07.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "fbccd3721fc3069701082116ce53dab888192651bbfb752aba467a915a108e88",
+   "desc": "softmax(path_scores / 0.7) per slot: a sampled walk's q along this path"
+  },
+  "s1.positions": {
+   "file": "s1.positions.bin",
+   "dtype": "i32",
+   "shape": [
+    12
+   ],
+   "sha256": "34f1e5250f07d603d6a6e60d4039161607be61bacbf5d501a09cacdd2d8eb809",
+   "desc": "draft forward position ids: new context rows, then the block"
+  },
+  "s1.block_embed": {
+   "file": "s1.block_embed.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "cec2b651c11b2c4379a8ed973f363648db79d2bd4a185276ba0710429e8f29e3",
+   "desc": "block input: target embedding rows of [anchor, mask x 7] [8, 4096]"
+  },
+  "s1.L0.in": {
+   "file": "s1.L0.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "cec2b651c11b2c4379a8ed973f363648db79d2bd4a185276ba0710429e8f29e3",
+   "desc": "layer 0: block hidden state entering the layer [8, 4096]"
+  },
+  "s1.L0.attn_norm": {
+   "file": "s1.L0.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "fae25ec8b14ce304a5c02beb28ae4f0afeb8be241842a4c25f5c8ede5a91f685",
+   "desc": "layer 0: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s1.L0.attn_dyn": {
+   "file": "s1.L0.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "1211cfd491961bb506080828d0631801e455219591d7be0393d5dfaa83465410",
+   "desc": "layer 0: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s1.L0.attn_conv_in": {
+   "file": "s1.L0.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "54fea9469cb092dedee9e143f695e3635c346595e48ca5eb78711922e6ffba81",
+   "desc": "layer 0: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s1.L0.attn_raw": {
+   "file": "s1.L0.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "543a45a348b6d9fedd1ee4aa3dde21b90a1c2e63d1c80bc52ce2cd42ce72c3bd",
+   "desc": "layer 0: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s1.L0.attn_conv_out": {
+   "file": "s1.L0.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0e5626fd32de32c729ffa4d94d011bb7382ba383606330df3ea79d03a08422b8",
+   "desc": "layer 0: attention_conv.finish output, added to the residual"
+  },
+  "s1.L0.mlp_norm": {
+   "file": "s1.L0.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c6b17e4425021c8867a978e3fb88017f3182426a199f8689ab20f472e57a4f19",
+   "desc": "layer 0: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s1.L0.mlp_dyn": {
+   "file": "s1.L0.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "f997237f40c7d30f29eabeca498a14a0265dfeaab9e9c5f90486bc358d36738e",
+   "desc": "layer 0: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s1.L0.mlp_conv_in": {
+   "file": "s1.L0.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "41db8067dc4564f9b20a4e88040359ed84ff2bc1b5e52f2e99884b5364271396",
+   "desc": "layer 0: mlp_conv.prepare output: the MLP input"
+  },
+  "s1.L0.mlp_raw": {
+   "file": "s1.L0.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "6d2636bfe9e92aa15c3a2d548a41df0085403ef56f5ca60593668278ac3139fb",
+   "desc": "layer 0: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s1.L0.mlp_conv_out": {
+   "file": "s1.L0.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "ee1f84fa61819445bb21ccf8c88199044ba5bf9511001e97075baad3b1812127",
+   "desc": "layer 0: mlp_conv.finish output, added to the residual"
+  },
+  "s1.L0.out": {
+   "file": "s1.L0.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c37216b869fc4a7d89330175d036570e3b0c7aaee980523d38efaba80d717641",
+   "desc": "layer 0: block hidden state leaving the layer"
+  },
+  "s1.L0.k_block": {
+   "file": "s1.L0.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "4a8217743f6d3b286988f95b37bca1b51fe8ad747cf31ad99ff83dc78b82c3ec",
+   "desc": "layer 0: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s1.L0.v_block": {
+   "file": "s1.L0.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "30bcb0d88f7fb040fa3458b402acc6975206c9c1ddfde5c8f55744a6ba96631f",
+   "desc": "layer 0: block values [8, kv_heads, 128]"
+  },
+  "s1.L1.in": {
+   "file": "s1.L1.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "c37216b869fc4a7d89330175d036570e3b0c7aaee980523d38efaba80d717641",
+   "desc": "layer 1: block hidden state entering the layer [8, 4096]"
+  },
+  "s1.L1.attn_norm": {
+   "file": "s1.L1.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "18547b052d0f9f7682e99148498c4f334e819905b1f617ef4b7a95489d21cb5b",
+   "desc": "layer 1: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s1.L1.attn_dyn": {
+   "file": "s1.L1.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "43b306da5f4b1a86c07dd756906afc7705caa57d5f7f7089698b51f15f192f62",
+   "desc": "layer 1: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s1.L1.attn_conv_in": {
+   "file": "s1.L1.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "932d2a48ad00e918f6a0f7e4b0d9184334ee11f44ac18cde093af5d772f78194",
+   "desc": "layer 1: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s1.L1.attn_raw": {
+   "file": "s1.L1.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "1cd20985a65f9ba3a631f1ef13cd2287591c7aa4b8a2ee62f342424f17beedeb",
+   "desc": "layer 1: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s1.L1.attn_conv_out": {
+   "file": "s1.L1.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "6626c3ce005c56562295a2b89307d57f002bdab0fc12b3fc14cd0b4f49f8985c",
+   "desc": "layer 1: attention_conv.finish output, added to the residual"
+  },
+  "s1.L1.mlp_norm": {
+   "file": "s1.L1.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "6a84f8e34eb8d2fc8a364887043cf280d0ae7a910e0996a2a116e6208cf2aab8",
+   "desc": "layer 1: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s1.L1.mlp_dyn": {
+   "file": "s1.L1.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "588e2ab38bfb62fa4ccbb6323ff0a24e6e008c6605395138d3da322f0175646e",
+   "desc": "layer 1: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s1.L1.mlp_conv_in": {
+   "file": "s1.L1.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "75de1d460b4aecc4f0a57ce692bc1d37b5f87aafdee76e9e1e7f8656d8ee4909",
+   "desc": "layer 1: mlp_conv.prepare output: the MLP input"
+  },
+  "s1.L1.mlp_raw": {
+   "file": "s1.L1.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "fe7ea9c8f116f65406d3dda9cd01e3c429837a96b675aa0caec9d69bdb80f923",
+   "desc": "layer 1: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s1.L1.mlp_conv_out": {
+   "file": "s1.L1.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "786fcd463708ec9c155f9617711e956a041a0882202528fa996ba18165851985",
+   "desc": "layer 1: mlp_conv.finish output, added to the residual"
+  },
+  "s1.L1.out": {
+   "file": "s1.L1.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "283b52a85990f1d335623ed8b5f8696ab922e59d1f817bc23efbc70200fb362f",
+   "desc": "layer 1: block hidden state leaving the layer"
+  },
+  "s1.L1.k_block": {
+   "file": "s1.L1.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "6e519813ffa850e31ad5bd516491ea8560db01f89c099a130fe2ad88a00620d1",
+   "desc": "layer 1: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s1.L1.v_block": {
+   "file": "s1.L1.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "dcc02627725a449e464560f35d2faeaa0e02dc1252984eef5ccd2eaf1abf8479",
+   "desc": "layer 1: block values [8, kv_heads, 128]"
+  },
+  "s1.L2.in": {
+   "file": "s1.L2.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "283b52a85990f1d335623ed8b5f8696ab922e59d1f817bc23efbc70200fb362f",
+   "desc": "layer 2: block hidden state entering the layer [8, 4096]"
+  },
+  "s1.L2.attn_norm": {
+   "file": "s1.L2.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "462844c7a5211373d90afb0a7376d9f6eb39ce32f9b1db4d58bb50856ce7f5c1",
+   "desc": "layer 2: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s1.L2.attn_dyn": {
+   "file": "s1.L2.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "f626b136b09b6b9f7738601177cb946eb18dc82d21af97b3e85d7b5aa96d511c",
+   "desc": "layer 2: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s1.L2.attn_conv_in": {
+   "file": "s1.L2.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "a023d1bcc476ae4dc5d91f1f8b8a57b31c142d7239eec809c20c24ee70644599",
+   "desc": "layer 2: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s1.L2.attn_raw": {
+   "file": "s1.L2.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "4755cf981c82e1acaf7ed2c2dc0d6456eb2c9e71ecb6f5b11a94a3068d5b6392",
+   "desc": "layer 2: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s1.L2.attn_conv_out": {
+   "file": "s1.L2.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "5b7a844db1b3a97b167d29cba3d3f3ba958c66ff6fecb1fb3799294229cea941",
+   "desc": "layer 2: attention_conv.finish output, added to the residual"
+  },
+  "s1.L2.mlp_norm": {
+   "file": "s1.L2.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "b40978cff4f2ffea4a95d30e51f623cfb49f2e205037a3d2f42cb4022662ab6b",
+   "desc": "layer 2: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s1.L2.mlp_dyn": {
+   "file": "s1.L2.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "5481107837946ba764e954dad28248bd5c594fc8f5f2eab3698ca9762ff4f67e",
+   "desc": "layer 2: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s1.L2.mlp_conv_in": {
+   "file": "s1.L2.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "e49fea875ce3282f4ade39e5fbf7eafa5924f00fd5ea0b27d6950680a6ad22fc",
+   "desc": "layer 2: mlp_conv.prepare output: the MLP input"
+  },
+  "s1.L2.mlp_raw": {
+   "file": "s1.L2.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "88fdd169bd150ee1dacb818649364538510c3b152c7342b8af04fa2825ba8dd0",
+   "desc": "layer 2: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s1.L2.mlp_conv_out": {
+   "file": "s1.L2.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "403e44e7c19927c77b273d5ba51aa3cc8b9f93558e70c1e43927afe383f508ae",
+   "desc": "layer 2: mlp_conv.finish output, added to the residual"
+  },
+  "s1.L2.out": {
+   "file": "s1.L2.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "ff2f89560f4258f6c8ec72581ff945bec73e16082cc8263aee830307384f1b96",
+   "desc": "layer 2: block hidden state leaving the layer"
+  },
+  "s1.L2.k_block": {
+   "file": "s1.L2.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "927c0e6abeb64c3c8272c93d9c3becee3937aeff082dffc7ac23a6a67ca4ba5b",
+   "desc": "layer 2: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s1.L2.v_block": {
+   "file": "s1.L2.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "be3718d0547834e316280d96569cbd884d293789d1c3d5e0b4c812621d3d27eb",
+   "desc": "layer 2: block values [8, kv_heads, 128]"
+  },
+  "s1.L3.in": {
+   "file": "s1.L3.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "ff2f89560f4258f6c8ec72581ff945bec73e16082cc8263aee830307384f1b96",
+   "desc": "layer 3: block hidden state entering the layer [8, 4096]"
+  },
+  "s1.L3.attn_norm": {
+   "file": "s1.L3.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "e9f6dcbd6749194a28f8c8cd94f1eb2f311da9e0f4d0ec6ae0ed1f87401908b6",
+   "desc": "layer 3: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s1.L3.attn_dyn": {
+   "file": "s1.L3.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "3cb10fd9869b249429860a67f311d7802b1e1815fd3829e60f811ba17ff6fae0",
+   "desc": "layer 3: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s1.L3.attn_conv_in": {
+   "file": "s1.L3.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "122bc62e1340a42d69022769f3c755a7494212f8bab7ae433ae031a3144eedb9",
+   "desc": "layer 3: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s1.L3.attn_raw": {
+   "file": "s1.L3.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "8820ceb5c6c9edf9ced6ef9a53522c6e13cf0f90802c949517792b36d03696a3",
+   "desc": "layer 3: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s1.L3.attn_conv_out": {
+   "file": "s1.L3.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "1de4f31ca0e5e7c9d3f96adcb136fd63e6b58d23b931ce40f578c6b2c604960f",
+   "desc": "layer 3: attention_conv.finish output, added to the residual"
+  },
+  "s1.L3.mlp_norm": {
+   "file": "s1.L3.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "6ca0a7576ec8713dc7617bb95f15e3feb1cac31cef2d0ff020e9304505054ec7",
+   "desc": "layer 3: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s1.L3.mlp_dyn": {
+   "file": "s1.L3.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "64192505d2d6277c6f69b2024fb5b4c6a873b14ff7f1098aaeb9593e2211b33d",
+   "desc": "layer 3: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s1.L3.mlp_conv_in": {
+   "file": "s1.L3.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "78a7bc1eb80c3996830789fe8c3c4d6737468e9eccd9eec3ff9c410070b5557e",
+   "desc": "layer 3: mlp_conv.prepare output: the MLP input"
+  },
+  "s1.L3.mlp_raw": {
+   "file": "s1.L3.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "186cdd4ebefb8b4740c400fe891fbd0349fe4f7e09a128c1a765bf062043e72f",
+   "desc": "layer 3: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s1.L3.mlp_conv_out": {
+   "file": "s1.L3.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "295419b3233ff7ccd860a698e7892ea05c076e0c47189c11a5c59ca0ac1a2769",
+   "desc": "layer 3: mlp_conv.finish output, added to the residual"
+  },
+  "s1.L3.out": {
+   "file": "s1.L3.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0168a12a047de8226e3b10488a5735eb240e5e40d6bd5504550bc4384faf13c3",
+   "desc": "layer 3: block hidden state leaving the layer"
+  },
+  "s1.L3.k_block": {
+   "file": "s1.L3.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "d80c38d249c7e1b01122e387ff52ab2bb8f3ec7e2c7bbb3159d83f574dd90dbe",
+   "desc": "layer 3: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s1.L3.v_block": {
+   "file": "s1.L3.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "2ab8df078f098d55268716795b2b3afaebd26baa867f7189f1ec649e71e8ea93",
+   "desc": "layer 3: block values [8, kv_heads, 128]"
+  },
+  "s1.L4.in": {
+   "file": "s1.L4.in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "0168a12a047de8226e3b10488a5735eb240e5e40d6bd5504550bc4384faf13c3",
+   "desc": "layer 4: block hidden state entering the layer [8, 4096]"
+  },
+  "s1.L4.attn_norm": {
+   "file": "s1.L4.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "cd5d7235e4d429687cec0b21bd48a00fa26b9871c7e697b65a49c948181ffbd6",
+   "desc": "layer 4: input_layernorm output (attention_conv.prepare input)"
+  },
+  "s1.L4.attn_dyn": {
+   "file": "s1.L4.attn_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "70c951d54dc4d348debb29e8c652aaa586d7ab61f7644bb663bf93c1e5d39b8b",
+   "desc": "layer 4: attention_conv.kernel_projection(attn_norm) [8, 1024] = [side 2][tap 2][group 256]; side 0 for prepare, 1 for finish"
+  },
+  "s1.L4.attn_conv_in": {
+   "file": "s1.L4.attn_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "9b153b14f09f9e866b2a1c7f8fd3b89052bdeebfe930a5259d527005c92f34dc",
+   "desc": "layer 4: attention_conv.prepare output: the q/k/v projections' input"
+  },
+  "s1.L4.attn_raw": {
+   "file": "s1.L4.attn_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "f93fffc01fcafdfd9bc7de555d6d1695a7ea90412271ce66850b3dfb24cd5556",
+   "desc": "layer 4: self_attn output after o_proj (attention_conv.finish input)"
+  },
+  "s1.L4.attn_conv_out": {
+   "file": "s1.L4.attn_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "23fac219b82f4fc47a0780452a9344a110c3ded4609cccd5ee8a2d7f8b15aeb2",
+   "desc": "layer 4: attention_conv.finish output, added to the residual"
+  },
+  "s1.L4.mlp_norm": {
+   "file": "s1.L4.mlp_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d805163ad795464457ca6232e319065ade7eefd60bb61013ae2302e76129f12a",
+   "desc": "layer 4: post_attention_layernorm output (mlp_conv.prepare input)"
+  },
+  "s1.L4.mlp_dyn": {
+   "file": "s1.L4.mlp_dyn.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": "67d0c318d76526c79d733f621caf267430273cdcfe5f12d3710a72554e21367e",
+   "desc": "layer 4: mlp_conv.kernel_projection(mlp_norm) [8, 1024]"
+  },
+  "s1.L4.mlp_conv_in": {
+   "file": "s1.L4.mlp_conv_in.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "bead8962ab8a62e7069e5674bec9f9cda114b070af9395604de90f8dbd885a74",
+   "desc": "layer 4: mlp_conv.prepare output: the MLP input"
+  },
+  "s1.L4.mlp_raw": {
+   "file": "s1.L4.mlp_raw.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "8498df4513748c3505951a788b98945a6cf5dad71ddc5c16d98db5bcffa7344b",
+   "desc": "layer 4: MLP output down(silu(gate(x)) * up(x)) (mlp_conv.finish input)"
+  },
+  "s1.L4.mlp_conv_out": {
+   "file": "s1.L4.mlp_conv_out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "d207982c63c9edd4eaef14bf19a6dfdef6f1228973ed00804c570a290c068171",
+   "desc": "layer 4: mlp_conv.finish output, added to the residual"
+  },
+  "s1.L4.out": {
+   "file": "s1.L4.out.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "8d748377135a80c0556ece660ec09e9ce4af9af244705393fb92d5498dc1aab8",
+   "desc": "layer 4: block hidden state leaving the layer"
+  },
+  "s1.L4.k_block": {
+   "file": "s1.L4.k_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "b7fbc9022e082a6ea59da49151fb594799d6cf4211ee2b993ebf704a0aca750b",
+   "desc": "layer 4: block keys after k_norm and RoPE [8, kv_heads, 128]"
+  },
+  "s1.L4.v_block": {
+   "file": "s1.L4.v_block.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    8,
+    128
+   ],
+   "sha256": "45bcabbde45483c90bc5317e1f1c1e0dc61b288d9ad95e82529c456e16bfc5b8",
+   "desc": "layer 4: block values [8, kv_heads, 128]"
+  },
+  "s1.ctx_features": {
+   "file": "s1.ctx_features.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    4096
+   ],
+   "sha256": "9e7615a32d833d1de91e08472ff3d9b1ac2ebe81d61e3c4cb43f3787a0c781d4",
+   "desc": "hidden_norm(fc(taps)) for the new context rows [rows, 4096]"
+  },
+  "s1.ctx_k": {
+   "file": "s1.ctx_k.bin",
+   "dtype": "f32",
+   "shape": [
+    5,
+    4,
+    8,
+    128
+   ],
+   "sha256": "5b9af1484d1f5647da5e6de5d88b00ffb80050d1edd4ecf91b56f5f0fed6b99a",
+   "desc": "draft cache after the crop: keys of the newest 4 context rows [layers, rows, kv_heads, 128], after k_norm and RoPE at their positions"
+  },
+  "s1.ctx_v": {
+   "file": "s1.ctx_v.bin",
+   "dtype": "f32",
+   "shape": [
+    5,
+    4,
+    8,
+    128
+   ],
+   "sha256": "51e12d3526b6e6ee416b61fe59ac530b5635942d932ffe7580d9715b259b2031",
+   "desc": "draft cache after the crop: values of the newest 4 context rows"
+  },
+  "s1.final": {
+   "file": "s1.final.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    4096
+   ],
+   "sha256": "37d65abe8d0f643fdb32e0d952b8716a1502fd5f2211295534b738a39605d321",
+   "desc": "model output: norm(h) for the 8 block rows [8, 4096]"
+  },
+  "s1.logits": {
+   "file": "s1.logits.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    154880
+   ],
+   "sha256": "847a2074005ec101652844a496737b263cf99a82aac69a5422d0dff77b3e0f1a",
+   "desc": "compute_logits of rows 1..7 through the target lm_head [7, vocab], FP32"
+  },
+  "s1.topk_vals": {
+   "file": "s1.topk_vals.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "86c6c73458d2789d5c8704724e965da5707fdf138e24c3caa1945b685fd865c5",
+   "desc": "top-16 logits per row, descending (torch.topk sorted=True)"
+  },
+  "s1.topk_ids": {
+   "file": "s1.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "7f1db7a7f572d803c735785d3463d9cf777b4910cfd13c74c43011ddaf465297",
+   "desc": "top-16 token ids in the order of topk_vals"
+  },
+  "s1.ref_candidates": {
+   "file": "s1.ref_candidates.bin",
+   "dtype": "i32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "7f1db7a7f572d803c735785d3463d9cf777b4910cfd13c74c43011ddaf465297",
+   "desc": "the reference's candidates in its own order (torch.topk sorted=False)"
+  },
+  "s1.hproj": {
+   "file": "s1.hproj.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    256
+   ],
+   "sha256": "a65385ba6cd0154c27900512bd08ec549a04b9dccdf0664f9c66ca339a595795",
+   "desc": "candidate_selector.hidden_projection of rows 1..7 [7, 256]"
+  },
+  "s1.lattice": {
+   "file": "s1.lattice.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16,
+    16
+   ],
+   "sha256": "a765ed0192631c2818b465ea0ac18afda23e0b1369cd47a95e830cb3ff2357ed",
+   "desc": "SGLang edge scores [slot, predecessor, candidate] over the sorted candidates (slot 0: every row is the anchor)"
+  },
+  "s1.path": {
+   "file": "s1.path.bin",
+   "dtype": "i32",
+   "shape": [
+    7
+   ],
+   "sha256": "768038412f217345507e6dee922e318b5f7095e32e18b3789c21df54e187438e",
+   "desc": "DFlash2DraftModel.propose at temperature 0: the 7 drafts"
+  },
+  "s1.path_scores": {
+   "file": "s1.path_scores.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "f1659cb3051480d50bb4d3881f4d43d9a17bdd62d5e3b53461609b8998ebd1c3",
+   "desc": "the lattice row the greedy walk used at each slot [7, 16]"
+  },
+  "s1.q_t07": {
+   "file": "s1.q_t07.bin",
+   "dtype": "f32",
+   "shape": [
+    7,
+    16
+   ],
+   "sha256": "8ac82a5672b63d72b57eadedac3e944462959da15eb5bfb9e9ae8f85e48a91bb",
+   "desc": "softmax(path_scores / 0.7) per slot: a sampled walk's q along this path"
+  }
+ }
+}

@@ -1,0 +1,64 @@
+# Provenance: glm53f-dflash
+
+Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). Commits are full hashes; each digest is
+the sha256 of the whole source file at that commit. All dates are 28 September 2026. No code is
+copied from any external source: the drafter is reimplemented from the reference's semantics, and
+the kernels are new code (the attention's split-K structure follows a design of mimo26f-afd).
+
+Sources:
+
+- **D**: `z-lab/dflash` @ `07ebd93db9f472af339b644bb70221ad8428328a`, MIT. `dflash/model.py`
+  (`f55b7fe0a4c0b3073e0f9cdce547cce29f4b8e2168c4d2818760007c43b7651e`). Run unmodified by
+  `oracle/golden_dflash.py`; not vendored.
+- **S**: `sgl-project/sglang` @ `2d4b6acea720f5eb5a2b2c269f1cc9dcbc8b10c0` (head of PR #36708,
+  "[DFLASH] Support GLM-5.3-Flash hidden-state capture", the build the checkpoint's README serves
+  with), Apache-2.0. Semantics only.
+- **S'**: `sgl-project/sglang` @ `926968b3777df891038aad0072db5ea2695fa3ae` (head of PR #36507,
+  "GLM-5.3-Flash support", merged into main with #36708 in it), Apache-2.0. Semantics only.
+- **T**: `huggingface/transformers` 5.17.0 (the oracle's hash-pinned wheel, `oracle/requirements.lock`),
+  Apache-2.0: `models/qwen3/modeling_qwen3.py` (`cbb7f2dc274c2f5592746c0dc6985ca50353efa07376f92cc922b77680a74f69`),
+  whose `Qwen3RMSNorm`, `Qwen3RotaryEmbedding`, `Qwen3MLP` and `rotate_half` D imports;
+  `cache_utils.py` (`702144bb44553f6339ea1bf23c8205a708bb5f8c7c09cb3a2db484182646743c`), the
+  sliding-window cache D crops. Semantics only.
+- **M**: `hughmadden/mimo26f-afd` v1.2.0 @ `bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79`, MIT.
+  Design only.
+- **R**: this repository.
+- **W**: the checkpoint `incoai/GLM-5.3-Flash-DFlash2` @ `bf582e4eacc1810f76656d1811693ff6c6737d2a`
+  (`config.json` `c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573`,
+  `model.safetensors` `b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac`), CC
+  BY-NC-ND 4.0 as its README states. Read at run time from `GLM53F_DFLASH_DIR`; nothing of it is
+  stored here (the goldens record digests and activations).
+
+Also read, for context only: D `README.md` (`e39074de245d5893f1812b18755fd3a232fedeb38ed2608d9dfd0b5b4db8780b`)
+and `dflash/benchmark.py` (`d19d3c1688768e13783150ce23178fcf2ed4c94d9ad7960e96f50c99d8a9d48f`);
+S `python/sglang/srt/layers/logits_processor.py`
+(`c97dbcfd0f154a29b4ed5a87a19a692aba687598876759b28d8df293e7f4aae6`); T
+`integrations/sdpa_attention.py` (`53c7229daca9ade4c5df874194448938c1edc925abbc71809f9750dd66381e6f`).
+
+| Unit | Source (repo @ commit : path) | sha256 (source file) | Here | Delta | Pinned by | Date |
+|---|---|---|---|---|---|---|
+| Drafter forward: context features `hidden_norm(fc(taps))`; per-layer context keys and values; the decoder layer with `attention_conv` / `mlp_conv` around attention and MLP; non-causal sliding-window attention over context and block; final norm; logits of rows 1..7 | D : `dflash/model.py` (`DFlashDraftModel`, `Qwen3DFlashDecoderLayer`, `Qwen3DFlashAttention`, `_attention_mask`, `apply_rotary_pos_emb`, `compute_logits`) | `f55b7fe0a4c0b3073e0f9cdce547cce29f4b8e2168c4d2818760007c43b7651e` | `src/reference.rs` | **Reimplemented** in Rust f32. The context lives in a ring of `window + block` rows per layer instead of D's growing cache cropped after each draft (the same keys are visible); a `bf16_io` mode reproduces the GPU forward's roundings | `tests/goldens.rs`: `short_case_matches_fp32_goldens`, `window_case_matches_fp32_goldens` (every layer's intermediates, context K/V, final hidden and logits within 1e-5 of D in FP32); `tests/reference.rs` | 2026-09-28 |
+| Grouped dynamic convolution (two sides from one `kernel_projection`, two taps within the block) | D : `dflash/model.py` (`_grouped_dynamic_convolve`, `GroupedDynamicCausalConv`); S : `python/sglang/srt/models/dflash.py` (`_grouped_conv`, `DFlashGroupedConv`) | D: as above; S: `bfdef4b6ebe54f0ed88e04295310102c88b4b85798604f736cdb46320f3929ef` | `src/reference.rs` (`Reference::conv`), `kernels/dflash.cu` (`dyn_conv_kernel`) | **Reimplemented**; D's order of operations per tap (`acc + base * x`, then `acc + dyn * x`) | `tests/goldens.rs`; `tests/gpu.rs`: `dyn_conv_kernel_is_the_cpu_function` (bitwise); `tests/reference.rs`: `the_block_is_non_causal_and_the_convolution_causal` | 2026-09-28 |
+| Candidate selector: top-16, predecessor/successor codebook edge scores, the greedy walk from the anchor | D : `dflash/model.py` (`CandidateSelector.select`, `DFlash2DraftModel.propose`) | D: as above | `src/selector.rs`, `kernels/dflash.cu` (`topk16_*`, `select_kernel`) | **Reimplemented**; candidates ordered by logit (ties to the lower id), sums in a fixed tree order shared by the CPU model and the kernel | `tests/goldens.rs` (paths, scores, `q` along the path); `tests/gpu.rs`: `select_kernel_is_the_cpu_walk`, `topk16_kernel_is_exact` | 2026-09-28 |
+| Sampled walk: inverse CDF with one uniform per position, the lattice of edge scores, one-hot `q` for greedy rows | S : `python/sglang/srt/models/dflash.py` (`_score_edges`, `CandidateSelector.sample_path`); `python/sglang/kernels/ops/speculative/dflash.py` (`_selector_walk_kernel`) | `bfdef4b6ebe54f0ed88e04295310102c88b4b85798604f736cdb46320f3929ef`, `21f11619531f493bbe9f71d465912ca707f2d722991832e446ff65aecb40528c` | `src/selector.rs` (`Pick::Sample`), `kernels/dflash.cu` (`select_kernel`); the lattice in `oracle/golden_dflash.py` (`lattice`) | **Reimplemented** (the golden script evaluates S's formula on D's modules) | `tests/gpu.rs`: `select_kernel_is_the_cpu_walk`, `forward_matches_the_reference_on_a_random_model` (sampled) | 2026-09-28 |
+| The taps: the mean of the four mHC streams at the entry of layer `k + 1` for `k` in 5, 14, 24, 33, 42, concatenated | S : `python/sglang/srt/models/glm5_next.py` (`_prepare_aux_hidden_state`, `set_dflash_layers_to_capture`), `python/sglang/kernels/ops/layernorm/mhc.py` (`hc_contract`), `python/sglang/srt/layers/communicator_mhc.py`, `python/sglang/srt/layers/aux_hidden_states.py`, `test/registered/unit/models/test_glm5_next_dflash_capture.py`; S' : `python/sglang/srt/models/glm5_next.py` | S: `7f024b98543532c6b29ed95614c615abffdb87cce8d13042ca8dbe93326453a8`, `3a3a309dbe23b9b67ed561ff823b1e92b2d69b3c564c7a48fb3c52cc44067281`, `f019296d207cc6316f378a7318858bea56b8cb6ce374a905395d50c577970159`, `a3e5218d5d3dd04703385fa8b9dc52ae753731185925d597b2c2a84f69a18fd2`, `799d65125a73ce535023aa455c49f53a906593b6a502053b095e3c393528e7d8`; S': `b1bcdcb72ce0abbeb4378084954544b3fc3006914937ae0fbb4093bb0fccc557` | `README.md` (step 1, Integration), `src/seam.rs` (`Append::taps`) | Documented for the target forward; not computed here | — (the goldens' taps are synthetic) | 2026-09-28 |
+| Serving flow: prompt rows and committed verify rows become context; the block `[bonus, mask x 7]` at the committed length; draft rows 1..7; the window as `window_left = 2047` on both sides for encoder-only layers; candidates over the LM head's full `org_vocab_size` | S : `python/sglang/srt/speculative/dflash_worker_v2.py`, `dflash_utils.py`, `python/sglang/kernels/ops/speculative/dflash.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`, `python/sglang/srt/layers/vocab_parallel_embedding.py` | `7fa3e6a33037dd1f78ab56c2240b8a7ff6db2b49fd43c4b6104615d0f9132255`, `f82ed7cb2010d65617774962c37f7e2cded8362a728412e29e981103390f4d5a`, `21f11619531f493bbe9f71d465912ca707f2d722991832e446ff65aecb40528c`, `4e5572a73390ef3cdc9293bdb52409d8ecf5b6fe010a03d6a4256240c024fbeb`, `c2c8d349cc9ae84b1c7e8fd1a8de6bc45c495302950b64b145023cb2580215c0` | `README.md`, `src/seam.rs`, `src/gpu.rs` | Reimplemented as a ring per request and the `Drafter` seam; candidates limited to ids below 154,856 by default (a deliberate difference, `README.md`) | `tests/reference.rs`: `the_window_decides_what_a_draft_reads`, `candidates_stay_below_the_limit`, `the_seam_on_the_cpu_reference` | 2026-09-28 |
+| `Qwen3RMSNorm`, default RoPE (`inv_freq` with the power in f64 and the reciprocal in f32; `rotate_half`), SiLU MLP | T : `transformers/models/qwen3/modeling_qwen3.py` | `cbb7f2dc274c2f5592746c0dc6985ca50353efa07376f92cc922b77680a74f69` | `src/cpu.rs`, `kernels/dflash.cu` (`rmsnorm_kernel`, `rope_table_kernel`, `head_norm_rope_kernel`, `silu_mul_kernel`) | **Reimplemented**; the mean of squares in f64, sine and cosine in f64 of the f32 angle | `tests/goldens.rs`: `rope_table_matches_the_reference` (64 of 64 bits); `tests/gpu.rs`: `rmsnorm_kernel_is_the_cpu_function`, `head_norm_rope_kernel_is_the_cpu_function` (bitwise) | 2026-09-28 |
+| Split-K attention of a block of 8 rows over a per-request ring (one block per request, KV head and key range; warps per query head carrying the 8 rows; a merge kernel); the ring of `window + block` rows at `pos % ring` with the block's rows written in place | M : `crates/mimo26-coordinator/kernels/dflash.cu`, `crates/mimo26-coordinator/src/dforward/dflash.rs` | `ecb17cd49a5f1b9e636ab8d051155bae0bc87eee4d3757f0ed3833cd9b8f4caa`, `a17c8f7788ecd61cd42fd62af328d3aa42ea788246a74439d101303ff69e94e2` | `kernels/dflash.cu` (`attn_split_kernel`, `attn_merge_kernel`, `store_kv_kernel`), `src/gpu.rs` | Design only, code new: grouped-query heads, lanes over keys within a tile (one softmax update per tile), no sink or value scale, a per-request lowest position, `rewind` | `tests/gpu.rs`: `forward_matches_the_reference_on_a_random_model`, `forward_matches_the_reference_on_the_checkpoint` | 2026-09-28 |
+| Feature-gated nvcc build (`GLM53F_NVCC`, `GLM53F_CUDA_ARCH`, `GLM53F_CUDA_LIB`, exact-arithmetic flags) | R @ `7cee788a37431c4f86fec36ce4cfa2eb23741c18` : `crates/glm53f-kda/build.rs` | `14518483008cd1d45efa671b03cda318f7c91c76953dd3cf5cc8af0b05f211e0` | `build.rs` | Pattern; one translation unit; links cuBLAS | `cargo test -p glm53f-dflash --features cuda` | 2026-09-28 |
+| cuBLAS declarations and the row-major GEMM mapping (`cublasGemmEx(T, N, ...)`, `COMPUTE_32F`, disallowed reduced-precision reduction) | R @ `3f179ed6d5dc2f1c433d598e342cd48daafa6623` : `crates/glm53f-forward/src/cublas.rs` | `b518c7bf554650857d5b5b0a65c60b3bacbf2527ecd438281e8ba25fca4e5745` | `src/blas.rs` | Pattern; f32 output only, no batched form | `tests/gpu.rs` | 2026-09-28 |
+| Device buffers, stream, events, runtime bindings | R @ `7cee788a37431c4f86fec36ce4cfa2eb23741c18` : `crates/glm53f-kda/src/device.rs`, `src/cuda.rs` | `4a3d38637adfd837b8e9ba95dcba35452d4cd7e1daa0e95bf216487f4020489a`, `8656794baf005ba3411ec7988f56432ff8f545fe98eb794578661beca2ebbb73` | `src/device.rs`, `src/cuda.rs` | Pattern; asynchronous copies on the drafter's stream, a growing scratch buffer | `tests/gpu.rs` | 2026-09-28 |
+| Golden-set writer, manifest and digest conventions, runtime record, `verify` and `compare` | R @ `6e7510759fc9b7915dd4a0c1e6a97ff5de4d92b1` : `oracle/golden_layers.py` | `b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3` | `oracle/golden_dflash.py` | Imported at run time (not copied); its digest is recorded in every manifest | `golden_dflash.py compare` (two runs, identical digests and manifests) | 2026-09-28 |
+
+## Written here
+
+| Unit | Where | Pinned by |
+|---|---|---|
+| The golden capture: loading D by digest, the drafter through D's `from_pretrained`, the target stub (embedding and LM head), recording hooks and wrappers, synthetic taps, two draft steps per case, the native set | `oracle/golden_dflash.py` | three sets (`dflash-short`, `dflash-window`, `dflash-native`), identical over two runs |
+| GPU forward: device weights (fused QKV and gate/up), batched appends from host or device taps, the draft pipeline, rewinds | `src/gpu.rs` | `tests/gpu.rs` |
+| Kernels: RMSNorm, RoPE table, per-head norm + RoPE, ring stores, dynamic convolution, split-K attention, SiLU x up, block embeddings, draft-row gather, two-pass top-16, selector walk | `kernels/dflash.cu`, `kernels/glm53f_dflash.h` | `tests/gpu.rs` |
+| The seam (`Drafter`, `Append`, `DraftRequest`, `Proposal`, `CpuDrafter`) | `src/seam.rs` | `tests/reference.rs`: `the_seam_on_the_cpu_reference` |
+| Weights and target rows (via `glm53f-model`'s safetensors reader and `DraftConfig`); random weights for tests | `src/weights.rs` | `tests/goldens.rs`, `tests/reference.rs` |
+| Synthetic taps (splitmix64, Steele, Lea and Flood 2014) | `src/synth.rs` | `tests/goldens.rs`: `synthetic_taps_match_the_oracle` (digests of the oracle's taps) |
+| SHA-256 (FIPS 180-4), bfloat16 conversion (IEEE 754 round to nearest even), golden-set reader | `src/sha256.rs`, `src/bf16.rs`, `src/goldens.rs` | known-answer unit tests |
+| Benchmark | `examples/dflash_bench.rs` | — |

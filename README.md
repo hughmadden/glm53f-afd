@@ -22,6 +22,7 @@ anything that matters yet.
 | `glm53f-layers` | mHC hyper-connections, router, dense and shared MLPs, FP8 GEMMs |
 | `glm53f-forward` | The model on the coordinator GPU: weights, KV pages, prefill, decode, verify and commit; remote experts |
 | `glm53f-coordinator` | Serving shell: scheduler, slot pool, prefix index, host RAM tier, sampler, expert wire client |
+| `glm53f-dflash` | The DFlash2 speculative drafter (built and tested; not yet wired into the forward) |
 | `glm53f-serve` | The coordinator daemon |
 | `glm53f-rank` | The expert-rank daemon (EXL3 4-bit experts, TP4) |
 | `glm53f-wire`, `glm53f-rdma` | The expert wire protocol and its RDMA transport |
