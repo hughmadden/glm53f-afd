@@ -61,7 +61,7 @@ authors under their own terms.
 ## SGLang: Apache License 2.0
 
 - **Source:** <https://github.com/sgl-project/sglang> (the heads of pull requests 36708, `2d4b6ac`, and 36507, `926968b`).
-- **What was taken:** nothing is copied. The GLM-5.3-Flash DFlash serving semantics (which hidden states the drafter taps, which rows become its context, its window and the sampled walk) are reimplemented in `crates/glm53f-dflash`.
+- **What was taken:** nothing is copied. The GLM-5.3-Flash DFlash serving semantics (which hidden states the drafter taps, which rows become its context, its window and the sampled walk) are reimplemented in `crates/glm53f-dflash` and, for the taps, in `crates/glm53f-forward` (`src/draft.rs`, `kernels/glue.cu`).
 
 ## NVIDIA CUDA toolkit
 
