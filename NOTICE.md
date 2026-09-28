@@ -53,6 +53,11 @@ authors under their own terms.
 - **Source:** <https://github.com/fla-org/flash-linear-attention> @ `1837094`.
 - **What was taken:** nothing is copied. The chunked KDA prefill (`crates/glm53f-kda/kernels/kda_prefill.cu`) follows its intra-chunk and inter-chunk structure; the algebra is the transformers reference's.
 
+## glmrt: MIT
+
+- **Source:** <https://github.com/tpurtell/glmrt-5.3-1rtx-4spark> @ `dc6d9b8`.
+- **What was taken:** nothing is copied. The rank's TP4 EXL3 split and the prefill reduce-scatter (balanced row partition, rank-to-rank exchange, FP8 row-scaled option) follow its designs (`crates/glm53f-rank`, `crates/glm53f-wire/src/row_shard.rs`).
+
 ## z-lab/dflash: MIT
 
 - **Source:** <https://github.com/z-lab/dflash> @ `07ebd93`.
