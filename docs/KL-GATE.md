@@ -1,8 +1,9 @@
 # KL gate
 
-**Status (28 September 2026): the harness and the teacher subset are ready; the engine side is
-specified here and not implemented.** Until the engine can write per-position logits, the
-model's quality has only been spot-checked (arithmetic, needle retrieval, coherent text).
+**Status (28 September 2026): the harness, the teacher subset and the engine side
+(`glm53f-score`, section 4) are ready; the gate has not yet run on the target hardware.** Until it
+does, the model's quality has only been spot-checked (arithmetic, needle retrieval, coherent
+text).
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -16,7 +17,8 @@ same method. It answers two questions:
 Files: [`harness/klgate.py`](../harness/klgate.py) (the gate),
 [`harness/klgate_fetch.py`](../harness/klgate_fetch.py) (the teacher subset),
 [`harness/PROVENANCE-klgate.md`](../harness/PROVENANCE-klgate.md) (sources). Both tools use only the Python
-standard library (tested with Python 3.12).
+standard library (tested with Python 3.12). The engine's logits come from
+[`crates/glm53f-score`](../crates/glm53f-score) and `GlmForward::score` (section 4).
 
 ## 1. The teacher panel
 
@@ -201,13 +203,15 @@ The full panel (all 51,175 positions, 31.7 GB of teacher logits) is the publicat
 measurement and needs no change to either tool: `klgate_fetch.py --rows-per-window 2047
 --head-rows 0`, or the dataset's own files, which `klgate.py` reads directly.
 
-## 4. The engine side (specified, not implemented)
+## 4. The engine side (implemented)
 
-Today the forward returns logits only for its logit rows: each request's last row in prefill,
-every row in decode and verify. Scoring needs the logits of chosen rows of a teacher-forced
-window. Two additive pieces, and no change to serving:
+In serving, the forward computes logits only for its logit rows: each request's last row in
+prefill, every row in decode and verify. Scoring needs the logits of chosen rows of a
+teacher-forced window. Two additive pieces do it, and serving does not change.
 
 ### 4.1 `GlmForward::score`
+
+In `crates/glm53f-forward/src/forward.rs`:
 
 ```rust
 /// Teacher-forced scoring: append `tokens` to `kv` (a fresh slot) in passes of `pass_rows`
@@ -215,55 +219,98 @@ window. Two additive pieces, and no change to serving:
 /// `tokens`), padding columns included.
 pub fn score(&mut self, kv: &mut GlmKv, tokens: &[u32], rows: &[usize], pass_rows: usize)
     -> Result<Vec<f32>>;
+/// The same, handing each row's logits to `sink` (the row, its 154,880 logits) in order as
+/// they are computed.
+pub fn score_each(&mut self, kv: &mut GlmKv, tokens: &[u32], rows: &[usize], pass_rows: usize,
+    sink: impl FnMut(usize, &[f32]) -> Result<()>) -> Result<()>;
 ```
 
-- It runs the same pass as `prefill`, with the pass's logit rows set to the requested rows that
-  fall in the chunk (the pass already takes its logit rows as a list). The first gate asks for at
-  most 28 rows in any 256-row chunk, so the default 64-row logits scratch suffices; scoring every
-  row needs it sized for `pass_rows` (256 × 154,880 × 4 B = 159 MB) or the head run in
-  sub-batches.
-- `pass_rows` above 8 exercises the prefill path (tensor-core GEMMs, E4M3 activations for the FP8
-  projections); 8 or fewer, the row-independent decode and verify kernels, whose bits equal serial
-  decode. The gate runs both: the published figures are prefill-shaped, and generation runs the
-  decode path.
-- It belongs in `glm53f-forward` once the prefill work in progress has landed; nothing else in the
-  crate changes.
+- **The passes** are those `prefill` runs for one segment cut into chunks of `pass_rows` rows
+  (at most the forward's `prefill_rows()`). A pass of 8 rows or fewer runs the row-independent
+  decode and verify kernels in one lane, whose bits equal serial decode steps. A larger pass runs
+  the prefill kernels (tensor-core GEMMs, E4M3 activations for the FP8 projections), in two lanes
+  in a two-lane forward when it has at least twice `min_lane_rows` rows (128 by default) or one
+  lane cannot hold it.
+- **The head.** Each pass runs the head's final norm over every lane's rows, as any pass
+  through the head does, but not the LM head. The requested rows of the pass are then copied from
+  their lane's head output (lane A's scratch holds the pass's first rows, lane B's the rest), and
+  the LM head runs over them alone, in groups of up to 8 rows: the BF16 GEMV a prefill's last row
+  takes. So a row's logits do not depend on which other rows are scored, they equal the forward's
+  own logits for that row, and no buffer beyond the forward's own is needed however many rows are
+  scored. `score_each` hands the rows over group by group: a caller that writes them out holds at
+  most 8.
+- **Nothing else changes.** One field of the forward records where lane B's rows start in the
+  last pass. The existing passes keep their bits: a digest of every logit, pick and slot byte of
+  two-lane and one-lane prefills, chunked and batched prefills, decode, verify and commit on the
+  real weights of layers 0-4 is the same before and after the change, and the forward's existing
+  tests pass.
+
+**Tests** (`crates/glm53f-forward/tests/score.rs`, the real weights of layers 0-4 and the head,
+routed experts returning zeros):
+
+1. A 150-token prompt scored in passes of 64 rows (two lanes each: 32 + 32, 32 + 32, 11 + 11):
+   at rows 63, 127 and 149 the bits of the logits a prefill of the prompt up to that row writes
+   for its last row, and the same argmax as its pick; the same rows scored on their own, the same
+   bits; the slot left as the prefill of the whole prompt leaves it (KDA states, conv windows, DSA
+   tail, latent pages).
+2. 128 rows in one pass of two lanes (64 + 64) against two one-lane passes of 64 rows: every row
+   bit for bit.
+3. 29 tokens in passes of 8 and of 5 rows: every row bit for bit serial decode steps.
+4. 200 tokens, every row, in passes of 8 rows against one pass of 200 rows (two lanes of 100):
+   logits relative RMS 2.1e-2 on average and 3.7e-2 on the worst row (the chain test's bound is
+   5e-2), the same argmax on all 125 rows whose best two logits are at least 0.25 apart, and no
+   row bit for bit.
 
 ### 4.2 `glm53f-score`
 
-A new binary crate, loading the coordinator exactly as `glm53f-serve` does:
+A binary crate, `crates/glm53f-score`. It loads the coordinator's weights and connects the
+routed experts as `glm53f-serve` does, and builds the forward as `glm53f-serve --prefill-rows R
+--prefill-lanes N` would, with one slot and no drafter:
 
 ```text
 glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir>
-             [--pass-rows <r>] [--windows <id,...>] [the forward's numerics options]
+             [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1|2]
+             [--kda-chunked-prefill] [--fp8-act bf16|dynamic] [--no-promote-k32]
 ```
+
+`--pass-rows` is 4096 by default (at most 4,096 per lane). `--experts local` runs the official
+FP8 experts on the coordinator's GPU instead of the ranks. The crate documentation
+(`crates/glm53f-score/src/lib.rs`) lists every option.
 
 **Input.** `klgate.py plan --teacher <teacher-dir> --out plan.json` writes the plan: schema
 `glm53f-kl-plan.v1`, the teacher panel's identity, `vocab` 154880, and per window `window_id`,
 `tokens` (2,048 ids), `tokens_sha256` (sha256 of the ids as little-endian u32) and `positions`
-(the rows to write: the teacher rows available, ascending).
+(the rows to write: the teacher rows available, ascending). The scorer checks the schema, the
+vocabulary, every id (below 154,856), each window's digest, and that the positions are distinct,
+ascending rows below the window's last token.
 
 **Per window:**
 
 1. A fresh slot: empty KV, zero KDA state. No prefix cache, host RAM tier or sharing between
    windows.
-2. Feed the 2,048 ids as they are: no BOS, no template. Check every id is below 154,856 and the
-   sha256 of the ids fed equals `tokens_sha256`.
-3. `score` with the plan's positions: row r is the output at input position r, predicting
-   token r + 1. No sampling, no drafting (DFlash and MTP off), no grammar.
-4. Write the rows and release the slot.
+2. The ids as they are: no BOS, no template.
+3. `score_each` with the plan's positions, in passes of `--pass-rows`: row r is the output at
+   input position r, predicting token r + 1. No sampling, no drafting (DFlash and MTP off), no
+   grammar. At `--pass-rows 4096` a 2,048-token window is one pass in two lanes of 1,024 rows (the
+   forward of `glm53f-serve`'s default `--prefill-rows 4096 --prefill-lanes 2` cuts a 2,048-row
+   pass the same way); at `--pass-rows 8` it is 256 passes.
+4. The rows streamed to the window's file as they come, then the slot released.
 
-**Output**, `<out>/<window_id>.safetensors`:
+**Output**, `<out>/<window_id>.safetensors` (written as `<window_id>.safetensors.partial` and
+renamed when complete):
 
 | Entry | Content |
 |---|---|
-| `__metadata__` | `window_id`; `tokens_sha256` (of the ids actually fed); `plan_sha256` (sha256 of the plan file); `engine`: one line naming the build and every numerics choice (expert format, KV format, pass rows, FP8 options) |
+| `__metadata__` | `window_id`; `tokens_sha256` (of the ids fed); `plan_sha256` (sha256 of the plan file); `engine`: one line naming the build (its commit, `-dirty` when the sources differ from it) and every numerics choice (the GPU and kernel target, the layers run, the FP8 projections' activations, the routed experts, the KV format, the KDA prefill, the pass rows and lanes, the LM head) |
 | `positions` | I32 [k], ascending: the plan's positions for the window |
 | `logits` | F32 [k, 154880]: row i is the logits of `positions[i]`, all LM-head columns, as the head computes them (no softmax, temperature or masking) |
 
 Header as in any safetensors file: an 8-byte little-endian length, the JSON, spaces to an
-8-byte boundary, then the tensors in `data_offsets` order. Also `<out>/run.json`: the build's
-revision, the options, and per-window token counts and wall times.
+8-byte boundary, then `positions` and `logits` in that order. Also `<out>/run.json`, rewritten
+after every window (`complete` is true at the end): the build's revision and engine line, the
+plan's digest and teacher identity, the options (with the expert wire's variables), the forward's
+configuration, the layers run, the load time, and per window the token count, rows, passes, wall
+time, writing time and bytes.
 
 **Full logits, never API log-probabilities.** The teacher stores full logits, so the engine must
 write full rows: a top-k list (the OpenAI API's `logprobs`) biases KL low exactly where the
@@ -272,14 +319,81 @@ distribution is broad. `klgate.py` refuses rows narrower than the scored columns
 
 **Size.** The first gate's output is 4,725 rows × 619,520 B = 2.93 GB; every position, 31.7 GB.
 
+**Development mode.** `--dev-layers 0-N` (a prefix of the layers, as in `glm53f-serve`),
+`--dev-load-layers N` (layers 0 to N - 1 loaded, all 45 run on repeats of them) and `--experts
+zero` (routed outputs of zeros) make a development run on one GPU. Its logits are meaningless; it
+says so at start, and its engine line begins with `DEVELOPMENT`. In a development run `--experts
+local` gives zeros for the MoE layers the experts directory lacks; otherwise the scorer refuses to
+start without every MoE layer's experts.
+
+**Tests** (`crates/glm53f-score`):
+
+- `cargo test -p glm53f-score` (CPU): the options, the plan's checks and the file writer (unit
+  tests), and `tests/format.rs` (needs `python3`): a synthetic teacher panel in the dataset's
+  layout, `klgate.py plan`, the plan read back, and the teacher's own rows written by the
+  scorer's writer and scored by `klgate.py score`: KL exactly 0 at every row; one changed row
+  alone above 0; a wrong token digest and a missing row refused.
+- `tests/plumbing.rs` (`--features cuda`, one GPU with the coordinator's weights and the FP8
+  experts of layers 3 and 4): the binary in development mode (all 45 layers on repeats of layers
+  0-4, local experts for layers 3 and 4, zeros for the other 40 MoE layers) on two 160-token
+  windows, half of whose tokens are the model's own greedy picks, at `--pass-rows 8` and `4096`.
+  A teacher made of the 8-row run's rows gives KL exactly 0 at all 28 rows and top-1 agreement 1
+  through `klgate.py score`. With `GLM53F_KL_TEACHER` (the fetched subset), window `final-0000`
+  of the real panel at both pass sizes: `klgate.py score` reads all 189 rows against the
+  teacher's. The values mean nothing with 5 layers' weights; the formats line up.
+- By hand on the same GPU, the whole plan (25 windows, routed outputs of zeros) at both pass
+  sizes: `klgate.py score` read all 4,725 rows of each run (28 s each with 8 processes) and
+  failed the gate, as a development model must (mean KL 13.05 nats, top-1 agreement 0.0011);
+  `compare` paired the two runs. And the `--ranks` form: `--dev-layers 0-4` against four
+  `glm53f-rank` daemons on loopback (over TCP, serving the EXL3 shares of layers 3 and 4), window
+  `final-0000` at `--pass-rows 2048` and `8`; `klgate.py score` read its 189 rows both times.
+
+### 4.3 On the target hardware
+
+The ranks serve one coordinator at a time: stop `glm53f-serve` before scoring and start it
+again afterwards. The ranks run as for serving ([RUNNING.md](RUNNING.md), `GLM53F_WIRE_NOCRC=1`).
+
+```sh
+# Build (x86-64, CUDA 12.8 or later; no GPU needed to build).
+GLM53F_CUDA_ARCH=sm_120 cargo build --release -p glm53f-score --features cuda,rdma
+
+# The teacher side (once).
+python3 harness/klgate.py selftest
+python3 harness/klgate.py canary --teacher <teacher-dir>
+python3 harness/klgate.py plan --teacher <teacher-dir> --out plan.json
+
+# The engine, twice: the prefill path (the published figures are prefill-shaped) and the
+# decode path (generation runs it).
+RANKS=192.0.2.10:8600,192.0.2.11:8600,192.0.2.12:8600,192.0.2.13:8600
+GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 target/release/glm53f-score --checkpoint <coordinator-dir> \
+    --ranks "$RANKS" --plan plan.json --pass-rows 4096 --out engine-4096
+GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 target/release/glm53f-score --checkpoint <coordinator-dir> \
+    --ranks "$RANKS" --plan plan.json --pass-rows 8 --out engine-8
+
+# The gate on each, then the two paths paired.
+python3 harness/klgate.py score --teacher <teacher-dir> --engine engine-4096 \
+    --json prefill.json --max-mean 0.040 --min-top1 0.93
+python3 harness/klgate.py score --teacher <teacher-dir> --engine engine-8 \
+    --json decode.json --max-mean 0.040 --min-top1 0.93
+python3 harness/klgate.py compare decode.json prefill.json
+```
+
+Each run prints its engine line and, per window, the tokens, passes, rows and times; `run.json`
+keeps them next to the windows' files. A numerics change is scored the same way into its own
+directory and compared with `compare <candidate>.json <baseline>.json --margin 0.002`
+(section 3).
+
 ## 5. Cost
 
 - **Engine:** the 25 windows are 51,200 tokens. At the current prefill rate of about 1.7K tok/s
   that is **about 30 s**, plus 25 fresh slots, the LM head on 4,725 rows (6 TFLOP in BF16, well
   under a second) and writing 2.93 GB: **under a minute** after the model is loaded. Scoring
   every row changes only the output size, not the prefill. The decode-path run (`--pass-rows 8`)
-  is 6,400 passes of 8 rows: a few minutes if a pass takes tens of milliseconds (an estimate;
-  not measured).
+  is 6,400 passes of 8 rows: a few minutes if a pass takes tens of milliseconds (an estimate for
+  the target hardware; not measured there). On the development GPU (an RTX 4090; all 45 layers
+  on repeats of layers 0-4, routed outputs of zeros, so no expert exchange), the whole plan ran
+  in 20.4 s at `--pass-rows 4096` (0.7-0.9 s a window) and 136.8 s at `--pass-rows 8` (5.4 s a
+  window, about 21 ms a pass), model load included, each writing 2.93 GB.
 - **Harness** (measured on the fetched subset with a stand-in engine): 37 ms per row per core
   (pure Python, float64), so **30 s** for the first gate's 4,725 rows with 8 processes (175 s of
   CPU); the teacher canary, twice the rows, 54 s. The full panel, 51,175 rows, is about 32 CPU
@@ -292,7 +406,8 @@ distribution is broad. `klgate.py` refuses rows narrower than the scored columns
 python3 harness/klgate.py selftest
 python3 harness/klgate.py canary --teacher <teacher-dir>
 python3 harness/klgate.py plan --teacher <teacher-dir> --out plan.json
-glm53f-score ... --plan plan.json --out <engine-dir>
+glm53f-score --checkpoint <coordinator-dir> --ranks <a,b,c,d> --plan plan.json \
+    --pass-rows 4096 --out <engine-dir>          # and --pass-rows 8 (section 4.3)
 python3 harness/klgate.py score --teacher <teacher-dir> --engine <engine-dir> \
     --json baseline.json --max-mean 0.040 --min-top1 0.93
 # a numerics change: score it the same way, then

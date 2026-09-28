@@ -9,6 +9,10 @@ Two binaries:
   `sm_121`). Each holds a quarter of every routed expert (EXL3 4-bit) and serves the MoE
   layers.
 
+A third, **`glm53f-score`**, takes the coordinator's place for the KL gate: it loads the same
+weights, connects the same ranks and writes teacher-forced logits instead of serving (below, and
+[KL-GATE.md](KL-GATE.md) section 4).
+
 The expert exchange runs over RoCE v2 RDMA, on a port of at least 100 Gb/s; both sides refuse
 other networks. The API can use any network.
 
@@ -128,6 +132,27 @@ describes each.
   returned to `finish` returned: about the other lane's work when the exchange is hidden). The
   ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
 
+## The KL gate
+
+`glm53f-score` runs the engine's side of the gate against the BF16 teacher panel
+([KL-GATE.md](KL-GATE.md)): for each window of the plan `harness/klgate.py plan` writes, a fresh
+slot, the raw token ids in passes of `--pass-rows` rows, and the plan's rows' full logits written
+to `<out>/<window>.safetensors`, with `<out>/run.json`. The ranks serve one coordinator at a time,
+so stop `glm53f-serve` first:
+
+```sh
+GLM53F_CUDA_ARCH=sm_120 cargo build --release -p glm53f-score --features cuda,rdma
+GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 glm53f-score --checkpoint <coordinator-dir> \
+  --ranks 192.0.2.10:8600,192.0.2.11:8600,192.0.2.12:8600,192.0.2.13:8600 \
+  --plan plan.json --pass-rows 4096 --out engine-4096   # then --pass-rows 8 --out engine-8
+```
+
+The gate runs both pass sizes (the prefill path, and 8 rows or fewer: the decode path);
+[KL-GATE.md](KL-GATE.md) section 4.3 has the whole sequence, from `klgate.py plan` to `compare`.
+`--experts local` runs the official FP8 experts on the coordinator's GPU instead of the ranks;
+`--dev-layers`, `--dev-load-layers` and `--experts zero` make a development run on one GPU, whose
+logits are meaningless.
+
 ## Development on one GPU
 
 - `--experts local` runs the official FP8 experts on the coordinator's GPU, loaded on demand
@@ -155,6 +180,13 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
 # One streamed chat completion through glm53f-serve in development mode.
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
+
+# GlmForward::score against the forward's own passes; glm53f-score in development mode through
+# harness/klgate.py (with the fetched teacher subset, its first window too).
+GLM53F_CHECKPOINT_DIR=... \
+  cargo test --release -p glm53f-forward --features cuda --test score -- --nocapture
+GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir>] \
+  cargo test --release -p glm53f-score --features cuda --test plumbing -- --nocapture
 ```
 
 ## Environment
@@ -193,4 +225,5 @@ with `GLM53F_RANK_DUMP_LAYER` (write one request frame for offline replay).
 
 **Tests:** `GLM53F_CHECKPOINT_DIR`, `GLM53F_EXPERTS_DIR`, `GLM53F_GOLDENS` (default
 `oracle/goldens`), `GLM53F_TOKENIZER`, `GLM53F_EXL3_DIR`, `GLM53F_FP8_DIR`, `GLM53F_RANK_BIN`,
-`GLM53F_RANK_DIRS`. Tests skip, and say why, when theirs are missing.
+`GLM53F_RANK_DIRS`, `GLM53F_KL_TEACHER` (the teacher subset `klgate_fetch.py` writes),
+`GLM53F_PYTHON` (default `python3`). Tests skip, and say why, when theirs are missing.

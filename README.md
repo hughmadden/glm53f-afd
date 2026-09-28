@@ -24,6 +24,7 @@ anything that matters yet.
 | `glm53f-coordinator` | Serving shell: scheduler, slot pool, prefix index, host RAM tier, sampler, expert wire client |
 | `glm53f-dflash` | The DFlash2 speculative drafter (wired into the forward: `glm53f-serve --drafter`) |
 | `glm53f-serve` | The coordinator daemon |
+| `glm53f-score` | The KL gate's engine side: teacher-forced logits for the rows of a `harness/klgate.py` plan ([docs/KL-GATE.md](docs/KL-GATE.md)) |
 | `glm53f-rank` | The expert-rank daemon (EXL3 4-bit experts, TP4) |
 | `glm53f-wire`, `glm53f-rdma` | The expert wire protocol and its RDMA transport |
 | `glm53f-api`, `glm53f-tokenizer` | OpenAI-compatible API, tokenizer, chat template and GLM tool-call dialect |

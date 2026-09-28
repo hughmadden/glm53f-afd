@@ -66,6 +66,17 @@ name = "glm53f-rdma"
 version = "0.1.0"
 
 [[package]]
+name = "glm53f-score"
+version = "0.1.0"
+dependencies = [
+ "glm53f-coordinator",
+ "glm53f-dsa",
+ "glm53f-forward",
+ "glm53f-model",
+ "glm53f-serve",
+]
+
+[[package]]
 name = "glm53f-serve"
 version = "0.1.0"
 dependencies = [

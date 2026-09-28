@@ -73,6 +73,13 @@
 //! lane B's (a request split by the cut gets lane A's part, then lane B's), with the calls two
 //! one-lane passes of the same rows would make, so the rings hold the same bits.
 //!
+//! # Scoring
+//!
+//! [`GlmForward::score`] feeds a teacher-forced sequence through prefill passes of a chosen size
+//! and returns the logits of chosen rows (the KL gate, `docs/KL-GATE.md`): after each pass the
+//! chosen rows' head outputs are gathered from the lanes and the LM head runs over them alone,
+//! in the GEMV's groups of up to 8 rows. Nothing else in a pass changes.
+//!
 //! # Memory
 //!
 //! Every buffer a pass uses is allocated before the forward exists ([`ForwardBuffers`]): the
@@ -1095,6 +1102,9 @@ pub struct GlmForward {
     sms: i32,
     /// The DFlash2 drafter, when attached.
     draft: Option<Dflash>,
+    /// The first row of lane B in the last pass, when it ran in two lanes (where
+    /// [`GlmForward::score`] finds a row's head output).
+    lane_b: Option<usize>,
 }
 
 fn pack<T: Copy>(bytes: &mut Vec<u8>, v: &[T]) -> usize {
@@ -1180,6 +1190,7 @@ impl GlmForward {
             tap: None,
             trace: None,
             draft: None,
+            lane_b: None,
         })
     }
 
@@ -1622,6 +1633,129 @@ impl GlmForward {
         self.s.tap_streams.download::<u16>(total * HC * HIDDEN)
     }
 
+    // ---- Teacher-forced scoring ----------------------------------------------------------------
+
+    /// Teacher-forced scoring: append `tokens` to `kv` (a fresh slot, for the KL gate) in passes
+    /// of `pass_rows` rows and return the f32 logits `[rows.len()][VOCAB]` of `rows` (ascending
+    /// indices into `tokens`: row r is the output at position r, predicting token r + 1),
+    /// padding columns included.
+    ///
+    /// The passes are those [`GlmForward::prefill`] runs for one segment cut into chunks of
+    /// `pass_rows` (at most [`GlmForward::prefill_rows`]): up to 8 rows run the row-independent
+    /// decode kernels in one lane, whose bits equal serial decode steps; more rows the prefill
+    /// kernels, in two lanes when the forward has them. After each pass the requested rows of its
+    /// chunk are gathered from their lanes' head outputs (the head's final norm, as for any logit
+    /// row) and the LM head runs over them alone, in groups of up to the GEMV's 8 rows: the kernel
+    /// a prefill's last row takes, so a row's logits do not depend on which other rows are scored
+    /// and equal the forward's own logits for that row.
+    pub fn score(
+        &mut self,
+        kv: &mut GlmKv,
+        tokens: &[u32],
+        rows: &[usize],
+        pass_rows: usize,
+    ) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(rows.len() * VOCAB);
+        self.score_each(kv, tokens, rows, pass_rows, |_, logits| {
+            out.extend_from_slice(logits);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// [`GlmForward::score`], handing each requested row's logits to `sink` (the row, its `VOCAB`
+    /// logits) in order as soon as they are computed, instead of collecting them: a caller that
+    /// writes them out holds one group of at most 8 rows.
+    pub fn score_each(
+        &mut self,
+        kv: &mut GlmKv,
+        tokens: &[u32],
+        rows: &[usize],
+        pass_rows: usize,
+        mut sink: impl FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        self.check_idle(std::iter::once(&*kv))?;
+        let cap = self.prefill_rows();
+        if tokens.is_empty() || pass_rows == 0 || pass_rows.min(tokens.len()) > cap {
+            return Err(invalid!(
+                "{} tokens in passes of {pass_rows} rows (this forward's prefill passes hold {cap})",
+                tokens.len()
+            ));
+        }
+        if rows.windows(2).any(|w| w[0] >= w[1]) || rows.last().is_some_and(|&r| r >= tokens.len())
+        {
+            return Err(invalid!(
+                "the rows to score must ascend and index the {} tokens",
+                tokens.len()
+            ));
+        }
+        let st = self.stream.clone();
+        let lm = self.model.head.lm_head.mat();
+        let group = self.s.logit_rows.min(self.gemm.policy.gemv_max_rows).max(1);
+        let mut host = vec![0f32; group * VOCAB];
+        let mut next = 0;
+        for (c, chunk) in tokens.chunks(pass_rows).enumerate() {
+            let first = c * pass_rows;
+            self.pass(
+                Mode::Prefill,
+                &mut [&mut *kv],
+                &[chunk.len()],
+                Input::Tokens(chunk),
+                0..self.shape().layers,
+                true,
+                false,
+            )?;
+            let here = rows[next..].partition_point(|&r| r < first + chunk.len());
+            for g in rows[next..next + here].chunks(group) {
+                for (i, &r) in g.iter().enumerate() {
+                    // Lane A's head output holds the pass's first rows, lane B's the rest.
+                    let (src, at) = match self.lane_b {
+                        Some(b) if r - first >= b => (
+                            &self.s2.as_ref().expect("lane B's buffers").head_out,
+                            r - first - b,
+                        ),
+                        _ => (&self.s.head_out, r - first),
+                    };
+                    self.s.head_sel.copy_from(
+                        &st,
+                        i * HIDDEN * 2,
+                        src,
+                        at * HIDDEN * 2,
+                        HIDDEN * 2,
+                    )?;
+                }
+                let n = g.len();
+                // SAFETY: head_sel holds n <= logit_rows rows of the head output; logits holds
+                // n rows of VOCAB f32.
+                unsafe {
+                    self.gemm.bf16(
+                        self.s.head_sel.ptr(0),
+                        HIDDEN,
+                        0,
+                        &lm,
+                        n,
+                        self.s.logits.ptr::<c_void>(0),
+                        VOCAB,
+                        0,
+                        true,
+                        &st,
+                    )
+                }?;
+                // SAFETY: a host vector of at least n rows of VOCAB f32.
+                let b = unsafe {
+                    std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), n * VOCAB * 4)
+                };
+                self.s.logits.download_bytes(&st, 0, b)?;
+                for (i, &r) in g.iter().enumerate() {
+                    sink(r, &host[i * VOCAB..(i + 1) * VOCAB])?;
+                }
+            }
+            next += here;
+            self.mark(usize::MAX, "score_head")?;
+        }
+        Ok(())
+    }
+
     fn check_idle<'a>(&self, kvs: impl Iterator<Item = &'a GlmKv>) -> Result<()> {
         if self.pending.is_some() {
             return Err(invalid!("a verify round is waiting for its commit"));
@@ -1981,6 +2115,7 @@ impl GlmForward {
             });
             logit_base += nl;
         }
+        self.lane_b = lanes.get(1).map(|l| l.base);
         self.mark(usize::MAX, "embed")?;
         // Every pass through the head captures the drafter's taps (`crate::draft`).
         let taps = head && self.draft.is_some();

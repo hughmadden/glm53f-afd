@@ -1,0 +1,40 @@
+# glm53f-score: the engine side of the KL gate (docs/KL-GATE.md, section 4). It loads the
+# coordinator's weights as glm53f-serve does, connects the four expert ranks (or runs the
+# experts on this GPU for development), and for each window of the plan `harness/klgate.py plan`
+# writes, scores the raw token ids in a fresh slot (`GlmForward::score`) and writes the plan's
+# rows' full logits, in the format `harness/klgate.py score` reads.
+#
+#   cargo test -p glm53f-score                                     CPU: options, plan, output format
+#   cargo build --release -p glm53f-score --features cuda[,rdma]   the scorer
+#
+# No external Rust crates. Provenance: PROVENANCE.md.
+[package]
+name = "glm53f-score"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "KL gate scorer: GLM-5.3-Flash's teacher-forced logits for the rows of a klgate plan, written as safetensors"
+publish = false
+
+[lib]
+name = "glm53f_score"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glm53f-score"
+path = "src/main.rs"
+
+[features]
+default = []
+# The scorer: the forward, its kernels and the expert ranks' wire client (build.rs of the kernel
+# crates; needs nvcc, and a GPU to run). Without it the binary only says how to build it.
+cuda = ["glm53f-forward/coordinator"]
+# The RDMA RC transport of the expert exchange (libibverbs), for a coordinator on the fabric.
+rdma = ["glm53f-coordinator/rdma"]
+
+[dependencies]
+glm53f-coordinator = { path = "../glm53f-coordinator" }
+glm53f-dsa = { path = "../glm53f-dsa" }
+glm53f-forward = { path = "../glm53f-forward" }
+glm53f-model = { path = "../glm53f-model" }
+glm53f-serve = { path = "../glm53f-serve" }
