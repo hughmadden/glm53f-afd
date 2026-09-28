@@ -33,7 +33,9 @@
 //!
 //! Environment: `GLM53F_RANK_TRACE=1` (a line per request, and one per
 //! reduce-scattered exchange), `GLM53F_TIMELINE=1` (cross-host timeline
-//! events), `GLM53F_RANK_DUMP_FRAME=<path>` with `GLM53F_RANK_DUMP_LAYER=<id>`
+//! events), `GLM53F_RANK_SMALL`/`_MID`/`_LARGE` and `GLM53F_RANK_SMALL_MAX`/
+//! `_MID_MAX` (the kernel configuration by row count, `exl3_cuda::Policy`;
+//! the boot log prints it), `GLM53F_RANK_DUMP_FRAME=<path>` with `GLM53F_RANK_DUMP_LAYER=<id>`
 //! (default 3): write the first request frame of that layer to `<path>` for
 //! offline replay. `GLM53F_WIRE_ALLOW_LAN=1` admits connections off the RDMA
 //! fabric (tests only), from the coordinator and from peers.
@@ -237,7 +239,10 @@ fn serve(a: &Args) -> i32 {
             }
         }
         match glm53f_rank::exl3_cuda::CudaKernel::new() {
-            Ok(k) => k,
+            Ok(k) => {
+                println!("{}", k.policy.summary());
+                k
+            }
             Err(e) => {
                 eprintln!("kernel scratch failed: {e}");
                 return 7;

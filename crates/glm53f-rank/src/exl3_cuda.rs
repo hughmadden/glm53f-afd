@@ -17,10 +17,32 @@ struct RawScratch {
     _p: [u8; 0],
 }
 
-/// A kernel configuration: 16-row tiles per expert group (`mt`, 1 or 2), gate/up
-/// K splits (`sk`) and down K splits (`skd`), both dividing 32; zero fields
-/// take the defaults for the row count. `fp32_swiglu` = 1 computes the SwiGLU
-/// in FP32 instead of with the reference model's BF16 roundings (the default).
+/// A kernel configuration; zero fields take the defaults for the row count
+/// (README "The kernel"):
+///
+/// - `mt`: 16-row tiles per expert group (1 or 2 with the split kernels, 2
+///   or 4 with the large-M kernels);
+/// - `sk`, `skd`: gate/up and down K splits, dividing 32 (the large-M down
+///   kernel takes 1, 2 or 4);
+/// - `fp32_swiglu` = 1 computes the SwiGLU in FP32 instead of with the
+///   reference model's BF16 roundings (the default);
+/// - `big`: 1 the split kernels, 2 the large-M kernels;
+/// - `nt`: large-M down, 16-column tiles per warp (1, 2 or 4), blocks of
+///   `128 nt` output columns;
+/// - `fuse`: 1 separate epilogue and reduce kernels, 2 fused into gate/up
+///   and down;
+/// - `discard`: 1 keep the partial sums, 2 drop them from L2 once consumed
+///   (fused only; [`CudaKernel::intermediates`] then refuses);
+/// - `gw`: large-M gate/up, MMA warps per block (8 or 16);
+/// - `gp`: large-M gate/up, rotation warps per block (2, with `gw` 8 and `mt`
+///   2; or -1 for none: the MMA warps rotate their own input);
+/// - `plan`: 1 the planning kernel, 2 the split gate/up blocks plan the call
+///   themselves (split kernels, up to 512 routes; the planning kernel above);
+/// - `l2`: large-M kernels, 1 default caching of the trellis words, 2 an L2
+///   evict-first policy for them.
+///
+/// Only `sk`, `skd` and `fp32_swiglu` change a bit of the output (the tests
+/// compare the others bit for bit).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cfg {
@@ -28,12 +50,67 @@ pub struct Cfg {
     pub sk: c_int,
     pub skd: c_int,
     pub fp32_swiglu: c_int,
+    pub big: c_int,
+    pub nt: c_int,
+    pub fuse: c_int,
+    pub discard: c_int,
+    pub gw: c_int,
+    pub gp: c_int,
+    pub plan: c_int,
+    pub l2: c_int,
+}
+
+impl Cfg {
+    /// Parse `key=value` pairs separated by commas (`mt=4,sk=1,nt=2`), over
+    /// `self`. Keys are the field names.
+    pub fn parse_over(mut self, s: &str) -> Result<Self, String> {
+        for kv in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("kernel configuration: {kv:?} is not key=value"))?;
+            let v: c_int = v.trim().parse().map_err(|_| format!("kernel configuration: {kv:?} has no integer value"))?;
+            match k.trim() {
+                "mt" => self.mt = v,
+                "sk" => self.sk = v,
+                "skd" => self.skd = v,
+                "fp32_swiglu" => self.fp32_swiglu = v,
+                "big" => self.big = v,
+                "nt" => self.nt = v,
+                "fuse" => self.fuse = v,
+                "discard" => self.discard = v,
+                "gw" => self.gw = v,
+                "gp" => self.gp = v,
+                "plan" => self.plan = v,
+                "l2" => self.l2 = v,
+                other => return Err(format!("kernel configuration: unknown key {other:?}")),
+            }
+        }
+        Ok(self)
+    }
+
+    /// `mt=.. sk=.. ...` (every field).
+    pub fn text(&self) -> String {
+        format!(
+            "mt={},sk={},skd={},fp32_swiglu={},big={},nt={},gw={},gp={},plan={},fuse={},discard={},l2={}",
+            self.mt,
+            self.sk,
+            self.skd,
+            self.fp32_swiglu,
+            self.big,
+            self.nt,
+            self.gw,
+            self.gp,
+            self.plan,
+            self.fuse,
+            self.discard,
+            self.l2
+        )
+    }
 }
 
 unsafe extern "C" {
     fn g53r_baked_arch() -> c_int;
     fn g53r_device_identity(arch: *mut c_int, sms: *mut c_int, name: *mut c_char, namelen: usize) -> c_int;
     fn g53r_default_cfg(rows: u32, out: *mut Cfg);
+    fn g53r_resolve_cfg(rows: u32, cfg: *const Cfg, out: *mut Cfg) -> c_int;
     fn g53r_layer_new(host: *const u8, bytes: u64, out: *mut *mut RawLayer, err: *mut c_char, errlen: usize) -> c_int;
     fn g53r_layer_free(l: *mut RawLayer);
     fn g53r_scratch_new(out: *mut *mut RawScratch, err: *mut c_char, errlen: usize) -> c_int;
@@ -138,12 +215,116 @@ pub fn check_device() -> Result<String, String> {
     Ok(format!("{name}, sm_{arch}, {sms} SMs, kernels built for {}", env!("GLM53F_RANK_CUDA_ARCH")))
 }
 
-/// The default configuration for `rows` rows.
+/// The kernel's compiled-in default configuration for `rows` rows.
 pub fn default_cfg(rows: usize) -> Cfg {
     let mut c = Cfg::default();
     // SAFETY: c is a valid out-pointer.
     unsafe { g53r_default_cfg(rows as u32, &mut c) };
     c
+}
+
+/// The configuration a call of `rows` rows runs with `cfg` (zero fields
+/// filled from the defaults for the row count), or an error if the kernel
+/// refuses it.
+pub fn resolve_cfg(rows: usize, cfg: Option<Cfg>) -> Result<Cfg, String> {
+    let mut out = Cfg::default();
+    let p = cfg.as_ref().map_or(core::ptr::null(), |c| c as *const Cfg);
+    // SAFETY: p is null or a valid Cfg; out is a valid out-pointer.
+    match unsafe { g53r_resolve_cfg(rows.max(1) as u32, p, &mut out) } {
+        0 => Ok(out),
+        _ => Err(format!("kernel configuration {} is not valid for {rows} rows", out.text())),
+    }
+}
+
+/// Which configuration each call runs when [`CudaKernel::cfg`] is unset, by
+/// row count: `small` up to `small_max` rows (decode and verify windows: one
+/// configuration, so a row's bits do not depend on the window size), `mid` up
+/// to `mid_max` rows and `large` above. `mid` and `large` must share their K
+/// splits and SwiGLU (the only fields that change a bit), so a prefill row's
+/// bits do not depend on the row count either. Built from the compiled-in
+/// defaults and the environment:
+///
+/// - `GLM53F_RANK_SMALL_MAX` (default 64) and `GLM53F_RANK_MID_MAX` (default
+///   2,048): the regimes' largest row counts;
+/// - `GLM53F_RANK_SMALL`, `GLM53F_RANK_MID`, `GLM53F_RANK_LARGE`: `key=value`
+///   pairs over each regime's defaults (`mt=4,nt=1,discard=1`; keys as in
+///   [`Cfg`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub small_max: usize,
+    pub mid_max: usize,
+    pub small: Cfg,
+    pub mid: Cfg,
+    pub large: Cfg,
+}
+
+impl Policy {
+    /// The compiled-in defaults.
+    pub fn defaults() -> Self {
+        Policy {
+            small_max: 64,
+            mid_max: 2048,
+            small: default_cfg(1),
+            mid: default_cfg(2048),
+            large: default_cfg(crate::consts::MAX_ROWS),
+        }
+    }
+
+    /// The defaults with the environment's overrides, each regime checked.
+    pub fn from_env() -> Result<Self, String> {
+        let mut p = Self::defaults();
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        for (key, max) in [("GLM53F_RANK_SMALL_MAX", &mut p.small_max), ("GLM53F_RANK_MID_MAX", &mut p.mid_max)] {
+            if let Some(v) = var(key) {
+                *max = v.trim().parse().map_err(|_| format!("{key}={v:?} is not a row count"))?;
+            }
+        }
+        let regimes = [("GLM53F_RANK_SMALL", &mut p.small), ("GLM53F_RANK_MID", &mut p.mid), ("GLM53F_RANK_LARGE", &mut p.large)];
+        for (key, cfg) in regimes {
+            if let Some(v) = var(key) {
+                *cfg = cfg.parse_over(&v).map_err(|e| format!("{key}: {e}"))?;
+            }
+        }
+        if p.small_max > p.mid_max {
+            return Err(format!("GLM53F_RANK_SMALL_MAX {} is above GLM53F_RANK_MID_MAX {}", p.small_max, p.mid_max));
+        }
+        let small = resolve_cfg(1, Some(p.small)).map_err(|e| format!("GLM53F_RANK_SMALL: {e}"))?;
+        let mid = resolve_cfg(crate::consts::MAX_ROWS, Some(p.mid)).map_err(|e| format!("GLM53F_RANK_MID: {e}"))?;
+        let large = resolve_cfg(crate::consts::MAX_ROWS, Some(p.large)).map_err(|e| format!("GLM53F_RANK_LARGE: {e}"))?;
+        if (mid.sk, mid.skd, mid.fp32_swiglu) != (large.sk, large.skd, large.fp32_swiglu) {
+            return Err(format!(
+                "GLM53F_RANK_MID and GLM53F_RANK_LARGE must share sk, skd and fp32_swiglu \
+                 (a prefill row's bits would depend on the row count): {} vs {}",
+                mid.text(),
+                large.text()
+            ));
+        }
+        (p.small, p.mid, p.large) = (small, mid, large);
+        Ok(p)
+    }
+
+    /// The configuration for a call of `rows` rows.
+    pub fn for_rows(&self, rows: usize) -> Cfg {
+        if rows <= self.small_max {
+            self.small
+        } else if rows <= self.mid_max {
+            self.mid
+        } else {
+            self.large
+        }
+    }
+
+    /// One line for the boot log.
+    pub fn summary(&self) -> String {
+        format!(
+            "kernel: up to {} rows {}; up to {} rows {}; above {}",
+            self.small_max,
+            self.small.text(),
+            self.mid_max,
+            self.mid.text(),
+            self.large.text()
+        )
+    }
 }
 
 /// One layer's image in device memory.
@@ -162,16 +343,20 @@ impl Drop for CudaLayer {
 /// The CUDA backend: a stream with its events and grow-only device scratch.
 pub struct CudaKernel {
     scratch: *mut RawScratch,
-    /// A fixed configuration for every call (tests and benchmarks), or the
-    /// defaults by row count.
+    /// A fixed configuration for every call (tests and benchmarks; zero
+    /// fields take the compiled-in defaults), or `None` for the policy.
     pub cfg: Option<Cfg>,
+    /// The configurations by row count when `cfg` is `None`.
+    pub policy: Policy,
 }
 
 // SAFETY: as for CudaLayer.
 unsafe impl Send for CudaKernel {}
 
 impl CudaKernel {
+    /// A kernel with the environment's policy ([`Policy::from_env`]).
     pub fn new() -> Result<Self, String> {
+        let policy = Policy::from_env()?;
         let mut out = core::ptr::null_mut();
         let mut err = [0u8; 256];
         // SAFETY: out/err valid for writes.
@@ -179,27 +364,24 @@ impl CudaKernel {
         if rc != 0 {
             return Err(err_string(&err));
         }
-        Ok(Self { scratch: out, cfg: None })
+        Ok(Self { scratch: out, cfg: None, policy })
+    }
+
+    /// The configuration a call of `rows` rows runs.
+    pub fn cfg_for(&self, rows: usize) -> Result<Cfg, String> {
+        match self.cfg {
+            Some(c) => resolve_cfg(rows, Some(c)),
+            None => resolve_cfg(rows, Some(self.policy.for_rows(rows))),
+        }
     }
 }
 
 impl CudaKernel {
     /// Copy the intermediates of the last [`ExpertKernel::ffn`] call of `rows`
-    /// rows (a test hook; the configuration must be the one that call used).
+    /// rows (a test hook; the configuration must be the one that call used,
+    /// with `discard` 1).
     pub fn intermediates(&self, rows: usize) -> Result<Intermediates, String> {
-        let mut cfg = default_cfg(rows);
-        if let Some(c) = self.cfg {
-            if c.mt != 0 {
-                cfg.mt = c.mt;
-            }
-            if c.sk != 0 {
-                cfg.sk = c.sk;
-            }
-            if c.skd != 0 {
-                cfg.skd = c.skd;
-            }
-            cfg.fp32_swiglu = c.fp32_swiglu;
-        }
+        let cfg = self.cfg_for(rows)?;
         let routes = rows * TOPK;
         let (sk, skd) = (cfg.sk as usize, cfg.skd as usize);
         let mut out = Intermediates {
@@ -304,9 +486,8 @@ impl CudaKernel {
         }
         let mut ms = [0f32; 9];
         let mut err = [0u8; 256];
-        let cfg = self.cfg;
-        let cfg_ptr = cfg.as_ref().map_or(core::ptr::null(), |c| c as *const Cfg);
-        if ffi(cfg_ptr, ms.as_mut_ptr(), err.as_mut_ptr() as *mut c_char, err.len()) != 0 {
+        let cfg = self.cfg.unwrap_or_else(|| self.policy.for_rows(n));
+        if ffi(&cfg, ms.as_mut_ptr(), err.as_mut_ptr() as *mut c_char, err.len()) != 0 {
             return Err(err_string(&err));
         }
         Ok(FfnStats {

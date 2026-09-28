@@ -53,7 +53,7 @@ All from `crates/mimo26-spark/` unless the path says otherwise.
 | Daemon | `src/main.rs` | `ce90a69f23ffcbf6fdcdf30acbee3435a91c6b13eaebc05ec2d0e376f3303485` | `src/main.rs` | Kept: boot readback; start-up device gate; fabric guard; RDMA-or-TCP accept; page-locked receive ring; zero-copy receive with the slot re-posted before the return; return written in place into the send buffer; error returns that fail the request, not the rank; per-request timing and window stats. Changed: one loop serves both transports through `RequestView` (the source had separate B1/B2 branches); the MXFP4 B2 and B1 paths become the `ExpertKernel`; layers are prepared eagerly by default (`--lazy` for on-demand); `--allow-partial`; `slice` and `verify` commands. The hard-coded frame-dump path is replaced by `GLM53F_RANK_DUMP_FRAME` (and `GLM53F_RANK_DUMP_LAYER`). New: the peer mesh (`--peers`, `--peer-timeout-ms` and their environment fallbacks) and the reduce-scattered requests (FP32 partial, exchange, row-slice return, an `exchange` trace line). | `tests/daemon.rs`, glm53f-coordinator `tests/row_sharded.rs` |
 | Build script | `build.rs` | `158278df8b9b43d53d477fbe24b104883946c5e895503c75cd1f0fe97c7ee214` | `build.rs` | Compiles one kernel file (`kernels/exl3_rank.cu`) instead of the layout-v2 and B1 sets. Keeps: skip without `cuda`, archive, link `cudart` and `stdc++`, bake the target architecture. Env: `GLM53F_NVCC`, `GLM53F_CUDA_ARCH` (default `sm_89`), `GLM53F_CUDA_LIB`. Adds `--fmad=false`, `--ftz=false`, `--prec-div=true`. | builds with `cuda` |
 | Kernel boundary shape | `src/b1.rs`, `kernels/b1_serve.cu` (`m26s_b1_layer_new`, `m26s_b1_ffn`, `Dev`, error strings) | `72624fa81ed4fde5eb65f3a1fcffab960148c1afb1e5332566b0e5dd40e05cda`, `f60ac76f2b8a294e022adbd29f60953eb9669e1cb6ef97e7f9ed52f1830d896b` | `src/kernel.rs`, `src/exl3_cuda.rs`, `kernels/exl3_rank.cu` (C ABI) | Same shape (a prepared layer, a scratch with stream and events, FP8 rows at pitches, top-8 ids and weights, BF16 out, stage timings, an error string); new EXL3 implementation; an FP32 output (`ffn_f32`, `g53r_ffn_f32`) for the reduce-scatter | `tests/cuda_kernel.rs` |
-| One-CTA route planner | `kernels/b1_serve.cu` (`plan_parallel`) | `f60ac76f…` | `kernels/exl3_rank.cu` (`plan_kernel`) | Adapted to 288 experts and to groups of 16·MT pairs. The fault word is kept. The FC1 chunk list is dropped. The serial prefix sum becomes a warp-shuffle scan (16 → 4 µs a call). The host no longer reads the group count back: grids are sized by a bound and surplus blocks exit. | `tests/cuda_kernel.rs`, `route::tests` |
+| One-CTA route planner | `kernels/b1_serve.cu` (`plan_parallel`) | `f60ac76f…` | `kernels/exl3_rank.cu` (`plan_kernel`) | Adapted to 288 experts and to groups of 16·MT pairs. The fault word is kept. The FC1 chunk list is dropped. The serial prefix sum becomes a warp-shuffle scan (16 → 4 µs a call). The host no longer reads the group count back: grids are sized by a bound and surplus blocks exit. (The plan inside the gate/up blocks, `self_plan`, is written here; see below.) | `tests/cuda_kernel.rs`, `route::tests` |
 | Boot tests | `tests/boot.rs` | `edb85d290bd8a7d71277a324b8b240db74feaea2f44454973fd4b2b5d981bd5b` | `tests/boot.rs` | Rewritten for layer images; the same cases (clean, corrupt, unlisted, rank ownership), plus truncated, missing and partial | — |
 | Licence | `LICENSE` | `bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa` | `LICENSE.mimo26f-afd` | Verbatim | — |
 
@@ -68,7 +68,7 @@ All from `src/tensorfold/families/glm5_next/cuda/` unless the path says otherwis
 | Unit | Source path | sha256 (source file) | Here | Delta | Pinned by |
 |---|---|---|---|---|---|
 | Tile decoder (`mcg2`, `decode_tile`), MMA wrapper (`mma16816`), 128-point warp butterfly (`fwht128`) | `exl3.cu` | `959606bd73e32cf60beb665ad30ca6b36834fdbb4e71cb182cdbe60c789e9728` | `kernels/exl3_rank.cu` (marked section) | Verbatim | `tests/cuda_kernel.rs` (stage checks) |
-| Grouped trellis GEMM, gate/up epilogue with GLM's clamped BF16 SwiGLU, down epilogue | `exl3.cu` (`grouped_kernel`, `gateup_epilogue_kernel`, `down_epilogue_kernel`), `exl3_mm.py` (`routed`) | `959606bd…`, `52350fc994fa3398afd82eb98ceabb70e94bdf67a22d9c3437cacad7f0108ba8` | `kernels/exl3_rank.cu` (`gateup_kernel`, `gateup_epilogue`, `down_kernel`, `reduce_kernel`) | Adapted. Shapes: TP4 slices (N = 512 for gate/up, K = 512 for down), 288 experts. The input rotation is computed per block in shared memory straight from the FP8 wire rows; TensorFold used a separate rotation kernel over BF16 inputs into a buffer. Warps split N (the four 128-column Hadamard blocks), not K. Up to two 16-row tiles per block. The next k tile's weights are prefetched. The down epilogue is fused into the weighted slot reduce, which adds BF16 output and fault words. An FP32 SwiGLU option. Groups come from the plan kernel instead of TensorFold's Triton `_group`. | `tests/cuda_kernel.rs` |
+| Grouped trellis GEMM, gate/up epilogue with GLM's clamped BF16 SwiGLU, down epilogue | `exl3.cu` (`grouped_kernel`, `gateup_epilogue_kernel`, `down_epilogue_kernel`), `exl3_mm.py` (`routed`) | `959606bd…`, `52350fc994fa3398afd82eb98ceabb70e94bdf67a22d9c3437cacad7f0108ba8` | `kernels/exl3_rank.cu` (the split kernels `gateup_kernel`, `down_kernel`; the epilogue and reduce arithmetic `epilogue_item`, `reduce_item`, also run by `gateup_epilogue`, `reduce_kernel` and the fused steps) | Adapted. Shapes: TP4 slices (N = 512 for gate/up, K = 512 for down), 288 experts. The input rotation is computed per block in shared memory straight from the FP8 wire rows; TensorFold used a separate rotation kernel over BF16 inputs into a buffer. Warps split N (the four 128-column Hadamard blocks), not K. Up to two 16-row tiles per block. The next k tile's weights are prefetched; a block's rows' rotation inputs are loaded together. The down epilogue is fused into the weighted slot reduce, which adds BF16 output and fault words and loads every slot's inputs before the first is used. An FP32 SwiGLU option. Groups come from the plan kernel or the gate/up blocks instead of TensorFold's Triton `_group`. | `tests/cuda_kernel.rs` |
 | EXL3 format and reference decoder | `exl3.py` | `acdf6f0be5a2af09a92c905e9ba826f3083f752bbd7a7e42aeafc78ded69e077` | `src/exl3.rs` | Ported to Rust from the format description and the numpy code: codebook, tile positions, states, unpack, rotation, dequantize, forward. FP16 handled at the bit level (`src/half.rs`). | `tests/exl3_golden.rs`: bit for bit against `exl3.py` run unmodified (goldens computed from it) |
 | EXL3 TP split rules | `split.py` (`EXL3_RULES`) | `f8d876285405b05f886bf7a7732d102054e649a35d2707d3bc2eaa54ad3df7f0` | through `glm53f_model::slicing` | The rule is implemented in `glm53f-model`; this crate places the pieces (`src/layout.rs`) | `tests/tp4_slicing.rs`, `tests/real_experts.rs` |
 | Reference expert computation (for the epilogue semantics) | `tests/cuda/test_glm_exl3.py` | `050e5edf3f48100f9fb9acafa7700e069c3a5fc25750fbba51788a2313e1b907` | `src/reference.rs` (`gateup_epilogue`, `swiglu` with BF16 roundings) | Read for the rounding order | `tests/cuda_kernel.rs` |
@@ -111,10 +111,28 @@ All from `src/tensorfold/families/glm5_next/cuda/` unless the path says otherwis
   scale magnitudes read from the published checkpoint.
 - **Kernel file:** `kernels/exl3_rank.cu` outside the marked TensorFold
   section: the FP8 row decode, the in-block rotation, the grids and
-  configurations, faults, the layer upload and scale scan, the C ABI.
+  configurations, faults, the layer upload and scale scan, the C ABI; and,
+  written for prefill and for the decode fixed phases (28 September 2026):
+  - the large-M kernels `gateup_big` and `down_big` (64- or 32-row groups,
+    8 or 16 MMA warps with optional rotation warps, double-buffered rotated
+    rows, `cp.async` staging of the down input, a ring of trellis words
+    loaded ahead, `ldmatrix` A fragments, skipped padding tiles) and their
+    persistent scheduling (`launch_persistent`, work items in grid order);
+  - the fused epilogue and reduce (`gateup_tail`, `down_tail`: the last
+    block of a group or of a (row, chunk) runs the shared epilogue or reduce
+    code; self-clearing arrival counters) and the L2 policies
+    (`discard.global.L2` of consumed partial sums, an evict-first policy for
+    trellis loads);
+  - the plan inside the split gate/up blocks (`self_plan`, `block_scan128`),
+    which repeats `plan_kernel`'s checks with each expert's pairs in route
+    order;
+  - the device helpers `ldsm_a`, `cp_async16`, `row_load`/`row_rotate`.
+- **Configuration policy:** `src/exl3_cuda.rs` (`Cfg` and its text form,
+  `resolve_cfg`, `Policy` with the `GLM53F_RANK_*` environment).
 - **Tests:**
   - `tests/tp4_slicing.rs`, `tests/cuda_kernel.rs`, `tests/reduce_scatter.rs`,
     `tests/mesh.rs`, `tests/real_experts.rs` and `tests/daemon.rs`;
   - the goldens in `tests/exl3_golden.rs`, computed by running TensorFold's
     `exl3.py`.
-- **Benchmark:** `examples/exl3_bench.rs`.
+- **Benchmark:** `examples/exl3_bench.rs` (real layer images from a rank
+  directory, configuration lists and sweeps, minimum or median times).

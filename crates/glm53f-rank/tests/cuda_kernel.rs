@@ -6,10 +6,16 @@
 //! GPU is shared. Run with `--features cuda` (and `--release`).
 //!
 //! Cases:
+//! - stage by stage at 1, 3, 8 and 200 rows (the default schedules, partial
+//!   sums kept): products against f64, the epilogue and the reduce bit for bit;
 //! - decode and verify windows, 1 to 8 rows: every row against the
 //!   kernel-order reference (tight) and the dequantized FP32 model reference;
 //! - batch invariance: a row's output is bit-identical alone and in windows of
-//!   8 and 64 rows (the default configuration up to 64 rows);
+//!   8 and 64 rows (the default configuration up to 64 rows), and alone and in
+//!   64 rows under a fixed prefill configuration of either kernel family;
+//! - schedules: both kernel families, their tilings, both plans, fused and
+//!   unfused steps and the L2 discard give the unfused split kernels' output
+//!   bit for bit at the same K splits (8 to 4,096 rows);
 //! - prefill, 512 and 4,096 rows: sampled rows against the kernel-order
 //!   reference;
 //! - the FP32 output of the prefill reduce-scatter (`ffn_f32`), rounded to
@@ -139,7 +145,8 @@ fn run(k: &mut CudaKernel, l: &exl3_cuda::CudaLayer, p: &[u8], s: &[u8], ids: &[
 fn stagewise(k: &mut CudaKernel, layer: &exl3_cuda::CudaLayer, image: &[u8], rows: usize, fp32: bool) {
     let (p, s) = testkit::wire_rows(0x5EED_7000 + rows as u64, rows);
     let (ids, w) = testkit::routes(0x5EED_7100 + rows as u64, rows, 0);
-    k.cfg = fp32.then_some(Cfg { fp32_swiglu: 1, ..Cfg::default() });
+    // The default schedule for the row count, with its partial sums kept for the hook.
+    k.cfg = Some(Cfg { fp32_swiglu: fp32 as i32, discard: 1, ..Cfg::default() });
     let got = run(k, layer, &p, &s, &ids, &w, rows);
     let im = k.intermediates(rows).unwrap();
     k.cfg = None;
@@ -284,10 +291,44 @@ fn kernel_matches_the_references() {
         assert_eq!(&all64[r * HIDDEN..(r + 1) * HIDDEN], &one[..], "row {r}: window of 64 vs alone");
     }
     // A fixed configuration keeps a row's bits at any size, prefill included.
-    k.cfg = Some(Cfg { mt: 2, sk: 1, skd: 1, fp32_swiglu: 0 });
-    let a = run(&mut k, &layer, &p, &s, &ids, &w, 64);
-    let b = run(&mut k, &layer, &p[..HIDDEN], &s[..SCALES_PER_ROW], &ids[..8], &w[..8], 1);
-    assert_eq!(&a[..HIDDEN], &b[..], "prefill configuration: row 0 alone vs in 64");
+    for c in ["mt=2,sk=1,skd=1", "big=2,mt=4,sk=1,skd=1"] {
+        k.cfg = Some(Cfg::default().parse_over(c).unwrap());
+        let a = run(&mut k, &layer, &p, &s, &ids, &w, 64);
+        let b = run(&mut k, &layer, &p[..HIDDEN], &s[..SCALES_PER_ROW], &ids[..8], &w[..8], 1);
+        assert_eq!(&a[..HIDDEN], &b[..], "{c}: row 0 alone vs in 64");
+    }
+    k.cfg = None;
+
+    // Only the K splits change a bit: the kernel family, the rows per group, the tilings, the plan in the gate/up
+    // blocks, the fused epilogue and reduce and the L2 discard are schedules of the same products and sums. Each
+    // against the planning kernel and the unfused split kernels at the same splits (the kernels as they were
+    // before the large-M family).
+    for (rows, sk, skd) in [(8usize, 8, 2), (64, 8, 2), (200, 1, 1), (4096, 1, 1), (512, 2, 2)] {
+        let (p, s) = testkit::wire_rows(0x5EED_9000 + rows as u64, rows);
+        let (ids, w) = testkit::routes(0x5EED_9100 + rows as u64, rows, 0);
+        let base = format!("sk={sk},skd={skd}");
+        k.cfg = Some(Cfg::default().parse_over(&format!("big=1,mt=2,{base},plan=1,fuse=1,discard=1")).unwrap());
+        let want = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+        let mut schedules = vec![
+            format!("big=1,mt=1,{base},plan=2,fuse=2,discard=2"),
+            format!("big=1,mt=2,{base},plan=2,fuse=1,discard=1"),
+            format!("big=1,mt=1,{base},plan=1,fuse=2,discard=1"),
+        ];
+        for mt in [2, 4] {
+            for nt in [1, 2, 4] {
+                schedules.push(format!("big=2,mt={mt},nt={nt},{base},fuse=2,discard=2"));
+            }
+            schedules.push(format!("big=2,mt={mt},nt=2,gw=16,{base},fuse=1,discard=1"));
+            schedules.push(format!("big=2,mt={mt},nt=2,gw=8,gp={},{base}", if mt == 2 { 2 } else { -1 }));
+        }
+        for c in &schedules {
+            k.cfg = Some(Cfg::default().parse_over(c).unwrap());
+            let got = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+            let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            eprintln!("M{rows} {c}: {differ} values differ from the unfused split kernels");
+            assert_eq!(differ, 0, "M{rows} {c}");
+        }
+    }
     k.cfg = None;
 
     // Prefill.
