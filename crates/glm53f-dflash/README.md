@@ -2,7 +2,7 @@
 
 The DFlash2 speculative drafter of GLM-5.3-Flash (`incoai/GLM-5.3-Flash-DFlash2` at
 `bf582e4e`): an f32 CPU reference, a CUDA forward that drafts for a batch of requests on the
-coordinator GPU, and the seam the target forward and the scheduler will call. The drafter proposes
+coordinator GPU, and the seam the target forward and the scheduler call. The drafter proposes
 seven tokens per step; the target verifies them in one window.
 
 ## Contents
@@ -14,7 +14,7 @@ seven tokens per step; the target verifies them in one window.
 | `src/cpu.rs` | Threaded GEMM against BF16 weights, RMSNorm, RoPE (the reference's own `inv_freq` rounding), SiLU |
 | `src/weights.rs` | The drafter's tensors and the target rows it borrows, read with `glm53f-model`'s safetensors reader |
 | `src/seam.rs` | The integration seam: `Drafter`, `Append`, `DraftRequest`, `Proposal`; `CpuDrafter` implements it |
-| `src/gpu.rs` | `GpuDrafter` (feature `cuda`): device weights, per-request context rings, `append_taps`, `launch` / `proposals`, rewinds |
+| `src/gpu.rs` | `GpuDrafter` (feature `cuda`): device weights, per-request context rings (its own, or caller-owned: `GpuSlot::external`), `append_taps`, `launch` / `proposals`, rewinds, forks (`GpuSlot::follow`), cold restarts (`GpuSlot::restart`); its own stream or the target forward's (`with_borrowed_head_on`) |
 | `kernels/glm53f_dflash.h`, `kernels/dflash.cu` | The kernels behind a C ABI: RMSNorm, RoPE table, per-head norm + RoPE, ring stores, the dynamic convolution, split-K attention over the ring, SiLU x up, top-16, the selector walk |
 | `src/blas.rs`, `src/device.rs`, `src/cuda.rs`, `src/ffi.rs` | cuBLAS (BF16 in, f32 accumulate and out), device buffers, runtime and kernel bindings |
 | `src/goldens.rs`, `src/synth.rs`, `src/sha256.rs`, `src/bf16.rs` | Golden-set reader (digests checked), the goldens' synthetic taps, SHA-256, bfloat16 |
@@ -241,6 +241,9 @@ not a measurement: the 5090's 1.8 TB/s would bring the single-request block near
 
 The target forward and the scheduler drive the drafter through `seam::Drafter` (implemented by
 `GpuDrafter` and `CpuDrafter`); `GpuDrafter::append_taps` takes taps already on the device.
+`crates/glm53f-forward` wires it in (`src/draft.rs`, `src/kv.rs`, `src/serve.rs`): the drafter
+runs on the forward's stream, each slot's ring lives in the KV pool (`GpuSlot::external`), and
+the calls below are the ones it makes.
 
 What the **target forward** must provide:
 
@@ -262,9 +265,10 @@ The calls, mapped to `glm53f_coordinator::model`:
 | `draft(rows)` | `Drafter::draft` (or `launch`, then `proposals`) with `anchor = row.last` at `slot.len()`; `Draft { tokens: tokens[..max], probs: conf[..max] }` (see below on `conf`) |
 | `verify(windows)` | nothing (the window's taps are captured) |
 | `commit(slots, keep)` | `append_taps(slot, the window's first keep rows)`: the anchor and the accepted drafts |
-| `KvSlot::rewind` to a mark | `Drafter::rewind(slot, len)` |
-| `KvSlot::reset` / release | `Drafter::reset`; the ring (40.16 MiB) belongs in `need_bytes` |
-| host tier export / import | the ring is positional state: save it with the mark (one 40.16 MiB allocation per slot), or restart the context cold at that length (`len = lo = L`: drafts see only rows appended afterwards). Neither call exists yet |
+| `KvSlot::rewind` to a mark | `GpuSlot::rewind(len)` (`Drafter::rewind`) |
+| `KvSlot::fork` from a mark of another slot | copy the source's ring, then `GpuSlot::follow(src, len)`: the source's state rewound to `len` |
+| `KvSlot::reset` / release | `GpuSlot::reset` (`Drafter::reset`); the ring (40.16 MiB) is the slot's fixed state |
+| host tier export / import | the ring is positional state: save it with the mark (one 40.16 MiB allocation per slot), or restart the context cold at that length (`GpuSlot::restart`: `len = lo = L`, drafts see only rows appended afterwards). The forward restarts cold |
 
 For sampled requests the proposal carries `candidates` and `q` per position, which a
 rejection-sampling verify needs; an exact-match verify (the shell's current one: a draft is
@@ -292,7 +296,8 @@ measured acceptance.
 - The goldens use synthetic taps (the target is not run: its experts for layers beyond 4 are not
   in the oracle's subsets). The tap definition (step 1) comes from reading S, not from a numeric
   comparison with a running target.
-- One CUDA stream, no graphs, no fused kernels; the GEMMs are cuBLAS. Built and measured for
+- One CUDA stream (its own, or the target forward's), no graphs, no fused kernels; the GEMMs are
+  cuBLAS. Built and measured for
   sm_89 only; sm_120 is untested.
 - The attention kernel supports up to 4 query heads per KV head; the kernels fix head size 128,
   block 8, 16 candidates and rank at most 1,024.

@@ -136,12 +136,14 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
 | `GLM53F_EXPERTS_DIR` | `--experts-dir` | `--experts local`: the routed experts' checkpoint |
 | `GLM53F_API_ADDR` | `--listen` | The API's address (default `127.0.0.1:8100`) |
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
+| `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the
 smaller of 32 GiB and 40% of the available RAM), `GLM53F_PREFILL_SEGMENT_MS`,
 `GLM53F_PREFIX_CACHE_ENTRIES`, and `GLM53F_SPEC`, `GLM53F_SPEC_POLICY`, `GLM53F_SPEC_TAU`,
-`GLM53F_SPEC_COST_A`, `GLM53F_SPEC_COST_B` (speculation, once a drafter exists).
+`GLM53F_SPEC_COST_A`, `GLM53F_SPEC_COST_B` (speculation, with `--drafter`); the daemon reads
+`GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft with the greedy walk too).
 
 **Expert wire:** `GLM53F_RDMA=1` (coordinator: RDMA RC, in an `rdma` build; the ranks follow the
 coordinator's handshake), `GLM53F_WIRE_NOCRC=1` (frames without CRC32C; both sides must agree;

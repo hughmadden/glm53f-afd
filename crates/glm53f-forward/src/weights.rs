@@ -26,6 +26,7 @@
 //! Routed experts are the expert backend's ([`crate::experts`]).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use glm53f_model::catalog::{Catalog, CheckpointFormat, Coverage, LAYERS};
 use glm53f_model::config::{AttnKind, ModelConfig};
@@ -165,7 +166,8 @@ pub struct HeadW {
 /// The coordinator's resident weights for decoder layers `0 .. shape.layers` and the head.
 pub struct DeviceModel {
     pub shape: ModelShape,
-    pub layers: Vec<LayerW>,
+    /// Per decoder layer (shared between layers only by [`DeviceModel::load_repeating`]).
+    pub layers: Vec<Arc<LayerW>>,
     pub head: HeadW,
     /// Device bytes held.
     pub bytes: usize,
@@ -484,10 +486,33 @@ pub fn open_checkpoint(dir: &Path) -> Result<(ModelConfig, Checkpoint)> {
 impl DeviceModel {
     /// Load decoder layers `0 .. shape.layers` and the head from the checkpoint.
     pub fn load(ckpt: &Checkpoint, shape: &ModelShape) -> Result<DeviceModel> {
+        Self::load_repeating(ckpt, shape, shape.layers)
+    }
+
+    /// Tests and development only: decoder layers `0 .. loaded` from the checkpoint, and every
+    /// later layer of `shape` on the weights of the last loaded layer of the same kinds
+    /// (attention and MLP), so a forward over all 45 layers runs in the memory of `loaded`
+    /// layers (layers 0-4 cover every kind). The KV and positional state stay per layer; the
+    /// output is meaningless.
+    pub fn load_repeating(
+        ckpt: &Checkpoint,
+        shape: &ModelShape,
+        loaded: usize,
+    ) -> Result<DeviceModel> {
         let mut ld = Loader::new(ckpt);
-        let mut layers = Vec::with_capacity(shape.layers);
+        let mut layers: Vec<Arc<LayerW>> = Vec::with_capacity(shape.layers);
         for l in 0..shape.layers {
-            layers.push(ld.layer(shape, l)?);
+            if l < loaded {
+                layers.push(Arc::new(ld.layer(shape, l)?));
+                continue;
+            }
+            let same = (0..loaded.min(l))
+                .rev()
+                .find(|&k| shape.attn[k] == shape.attn[l] && shape.mlp[k] == shape.mlp[l])
+                .ok_or_else(|| {
+                    invalid!("layer {l}: no layer of its kinds among the {loaded} loaded")
+                })?;
+            layers.push(layers[same].clone());
         }
         let head = HeadW {
             norm: ld.upload(&[(glm53f_model::catalog::FINAL_NORM, DType::BF16, &[HIDDEN])])?,

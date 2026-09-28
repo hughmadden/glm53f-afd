@@ -651,6 +651,90 @@ fn forward_matches_the_reference_on_a_random_model() {
     agree_or_near_tie("after rewind", &p[0].tokens, &cd, d.top_k, 1e-2);
 }
 
+/// A slot over caller-owned memory drafts as an owned slot fed the same rows; a fork (the ring
+/// copied, then `follow`) drafts as its source rewound to the fork's length; a cold restart
+/// drafts as a rewind past what the ring holds: neither reads a row below `lo`.
+#[test]
+fn external_rings_forks_and_cold_restarts() {
+    if !gpu_present() {
+        return;
+    }
+    let d = tiny_dims();
+    let w = Weights::random(d, 31);
+    let head = bf16::encode(
+        &rnd(32, d.vocab * d.hidden)
+            .iter()
+            .map(|v| 0.1 * v)
+            .collect::<Vec<_>>(),
+    );
+    let embed = bf16::encode(
+        &rnd(33, d.vocab * d.hidden)
+            .iter()
+            .map(|v| 0.05 * v)
+            .collect::<Vec<_>>(),
+    );
+    let row = |t: u32| &embed[t as usize * d.hidden..(t as usize + 1) * d.hidden];
+    let mut g = GpuDrafter::new(&w, &head, row(d.mask_token)).unwrap();
+    let tw = d.tap_width();
+    let one = |g: &mut GpuDrafter, s: &GpuSlot, anchor: u32| {
+        g.draft(&[req(s, anchor, row(anchor), 0.0, &[])]).unwrap()
+    };
+
+    // Owned and external rings fed the same 30 rows.
+    let arena = DeviceBuffer::alloc(2 * d.ring_bytes()).unwrap();
+    let mut a = g.new_slot().unwrap();
+    // SAFETY: two rings' worth of device memory, alive until the end of the test.
+    let mut b = unsafe { GpuSlot::external(arena.ptr::<u8>(0), &d) };
+    let t = synth::taps(40, 0, 30, tw);
+    g.append(&mut [(&mut a, &t[..]), (&mut b, &t[..])]).unwrap();
+    assert_eq!(one(&mut g, &a, 9), one(&mut g, &b, 9), "external ring");
+
+    // A fork of `b` at 20: its ring copied into the second region, then `follow`.
+    // SAFETY: as above.
+    let mut c = unsafe { GpuSlot::external(arena.ptr::<u8>(d.ring_bytes()), &d) };
+    // SAFETY: both regions lie inside the arena.
+    let rc = unsafe {
+        glm53f_dflash::cuda::cudaMemcpyAsync(
+            arena.ptr::<u8>(d.ring_bytes()).cast(),
+            arena.ptr::<u8>(0).cast(),
+            d.ring_bytes(),
+            glm53f_dflash::cuda::MEMCPY_D2D,
+            g.stream().raw(),
+        )
+    };
+    glm53f_dflash::cuda::check(rc, "ring copy").unwrap();
+    c.follow(&b, 20).unwrap();
+    Drafter::rewind(&mut g, &mut a, 20).unwrap();
+    assert_eq!((c.len(), c.lo()), (20, 0));
+    assert_eq!((a.len(), a.lo()), (20, 0));
+    assert_eq!(one(&mut g, &c, 11), one(&mut g, &a, 11), "fork at 20");
+    let t2 = synth::taps(41, 20, 3, tw);
+    g.append(&mut [(&mut a, &t2[..])]).unwrap();
+    g.append(&mut [(&mut c, &t2[..])]).unwrap();
+    assert_eq!(
+        one(&mut g, &c, 12),
+        one(&mut g, &a, 12),
+        "the fork continued"
+    );
+
+    // A cold restart at 63 against a rewind past the ring: 103 rows of another context, back
+    // to 63 (lo = 103 - 40 = 63), then the same 5 rows appended to both.
+    let mut e = g.new_slot().unwrap();
+    e.restart(63);
+    assert_eq!((e.len(), e.lo(), e.context_rows()), (63, 63, 0));
+    let mut f = g.new_slot().unwrap();
+    g.append(&mut [(&mut f, &synth::taps(42, 0, 103, tw)[..])])
+        .unwrap();
+    f.rewind(63).unwrap();
+    assert_eq!((f.len(), f.lo()), (63, 63));
+    let t3 = synth::taps(43, 63, 5, tw);
+    g.append(&mut [(&mut e, &t3[..]), (&mut f, &t3[..])])
+        .unwrap();
+    assert_eq!((e.context_rows(), f.context_rows()), (5, 5));
+    assert_eq!(one(&mut g, &e, 13), one(&mut g, &f, 13), "cold restart");
+    println!("  external ring, fork at 20 and cold restart at 63: identical drafts");
+}
+
 struct RealEnv {
     w: Weights,
     head: Vec<u16>,

@@ -42,6 +42,7 @@ mod daemon {
         CoordinatorEngine, EngineConfig, GlmPrompts, HostCache, Queue, SchedulerConfig,
     };
     use glm53f_forward::device::{self, Stream};
+    use glm53f_forward::draft::{Dflash, LAYERS_NEEDED};
     use glm53f_forward::embed::HostEmbedding;
     use glm53f_forward::experts::{ExpertBackend, LocalFp8Experts};
     use glm53f_forward::forward::{ForwardConfig, GlmForward};
@@ -49,12 +50,13 @@ mod daemon {
     use glm53f_forward::kv::{KvConfig, KvPool};
     use glm53f_forward::kvplan::{KvLayout, PAGE};
     use glm53f_forward::remote::RemoteExperts;
-    use glm53f_forward::serve::ServedForward;
+    use glm53f_forward::serve::{ServedForward, DRAFTS};
     use glm53f_forward::shape::{ModelShape, SAMPLE_VOCAB};
     use glm53f_forward::weights::{open_checkpoint, DeviceModel};
     use glm53f_serve::{dev_banner, kv_pages, Experts, Options};
 
     const GIB: f64 = (1u64 << 30) as f64;
+    const MIB: f64 = (1u64 << 20) as f64;
 
     fn s<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, String> {
         r.map_err(|e| e.to_string())
@@ -82,13 +84,39 @@ mod daemon {
             t0.elapsed().as_secs_f64()
         );
 
-        // 2. The KV: each slot's positional state and page table, and the shared page pool.
+        // 2. The drafter's weights next to the model's, before the KV takes what is left.
         let stream = Arc::new(s(Stream::new())?);
+        let drafter = match &o.drafter {
+            Some(_) if layers < LAYERS_NEEDED => {
+                eprintln!(
+                    "[coordinator] drafter off: its taps are the outputs of layers 5 to 42 and this \
+                     forward runs layers 0-{}",
+                    layers - 1
+                );
+                None
+            }
+            Some(dir) => {
+                let t0 = Instant::now();
+                let d = s(Dflash::load(dir, &model, &embed, &stream))?;
+                eprintln!(
+                    "[coordinator] drafter: DFlash2 from {}, {:.2} GiB of weights on the GPU (the \
+                     LM head is the forward's), {:.1} s",
+                    dir.display(),
+                    d.weight_bytes() as f64 / GIB,
+                    t0.elapsed().as_secs_f64()
+                );
+                Some(d)
+            }
+            None => None,
+        };
+
+        // 3. The KV: each slot's positional state (and drafter ring) and page table, and the
+        // shared page pool.
         let max_context = o
             .max_context
             .unwrap_or(usize::MAX)
             .min(cfg.text.max_position_embeddings as usize);
-        let layout = KvLayout::new(&shape, None);
+        let layout = KvLayout::new(&shape, drafter.as_ref().map(|d| d.config()));
         let max_pages = KvLayout::pages_for(max_context).div_ceil(4) * 4;
         let fixed = o.slots * (max_pages * 4 + layout.slot_fixed_bytes());
         let (free, _) = s(device::mem_info())?;
@@ -104,20 +132,32 @@ mod daemon {
             stream.clone(),
         ))?;
         eprintln!(
-            "[coordinator] KV: {} slots, {:.0} MiB of positional state each; a page pool of {:.2} GiB \
-             ({} tokens); up to {max_context} tokens per request",
+            "[coordinator] KV: {} slots, {:.0} MiB of positional state each{}; a page pool of \
+             {:.2} GiB ({} tokens); up to {max_context} tokens per request",
             o.slots,
-            layout.slot_fixed_bytes() as f64 / (1u64 << 20) as f64,
+            layout.slot_fixed_bytes() as f64 / MIB,
+            if layout.draft_kv_bytes > 0 {
+                format!(
+                    " (the drafter's ring {:.2} MiB of it)",
+                    layout.draft_kv_bytes as f64 / MIB
+                )
+            } else {
+                String::new()
+            },
             (pages * layout.page_bytes) as f64 / GIB,
             pages * PAGE
         );
 
-        // 3. The routed experts, and the forward.
-        let fcfg = ForwardConfig {
+        // 4. The routed experts, and the forward. With a drafter, one verify pass holds every
+        // slot's window.
+        let mut fcfg = ForwardConfig {
             max_rows: o.prefill_rows,
             max_requests: o.slots,
             ..ForwardConfig::default()
         };
+        if drafter.is_some() {
+            fcfg.max_verify_rows = fcfg.max_verify_rows.max(o.slots * (DRAFTS + 1));
+        }
         let rows = fcfg.max_rows.max(fcfg.max_verify_rows);
         let experts: Box<dyn ExpertBackend> = match &o.experts {
             Experts::Remote(addrs) => {
@@ -138,14 +178,25 @@ mod daemon {
                 ))?)
             }
         };
-        let fwd = s(GlmForward::new(model, embed, kv, experts, fcfg))?;
-        let model = ServedForward::new(fwd)?;
+        let mut fwd = s(GlmForward::new(model, embed, kv, experts, fcfg))?;
+        if let Some(d) = drafter {
+            s(fwd.attach_drafter(d))?;
+            eprintln!(
+                "[coordinator] drafter attached: up to {DRAFTS} drafts a step, verify passes of up to \
+                 {} rows; its tap buffer {:.1} MiB, the forward's scratch {:.0} MiB",
+                fcfg.max_verify_rows,
+                fwd.drafter().map_or(0, |d| d.tap_bytes()) as f64 / MIB,
+                fwd.scratch_bytes() as f64 / MIB
+            );
+        }
+        let mut model = ServedForward::new(fwd)?;
+        model.sampled_walk = std::env::var("GLM53F_DFLASH_SAMPLED_WALK").map_or(true, |v| v != "0");
         let slots = (0..o.slots)
             .map(|_| model.fwd.kv.slot())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // 4. The text side, the engine and its scheduler, the API.
+        // 5. The text side, the engine and its scheduler, the API.
         let codec = GlmPrompts::load(&o.tokenizer, &o.chat_template)?;
         if codec.id_bound() != SAMPLE_VOCAB {
             return Err(format!(

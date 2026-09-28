@@ -43,7 +43,7 @@ DS41RT code is copied here.
 
 | File | What | Date |
 |---|---|---|
-| src/model.rs | `KvSlot` and `ModelForward`, the cut between the shell and a model, with `Pick`, `Segment`, `DecodeRow`, `DraftRow`, `Draft`, `Window`, `Limits`, `ImageSpan` | 2026-09-28 |
+| src/model.rs | `KvSlot` and `ModelForward`, the cut between the shell and a model, with `Pick`, `Segment`, `DecodeRow`, `DraftRow` (with the pick of its window's first row, which a drafter may sample with), `Draft`, `Window`, `Limits`, `ImageSpan` | 2026-09-28 |
 | src/radix.rs | `RadixIndex`: a compressed trie over token ids with exact hits and a granular shared-prefix count | 2026-09-28 |
 | src/glm_prompt.rs | `GlmPrompts`: GLM-5.3-Flash's tokenizer and chat template (`glm53f-tokenizer`) behind `PromptCodec`, the official template enforced | 2026-09-28 |
 | src/gpu.rs | FFI to the kernels and the few CUDA runtime calls, `DeviceBuffer`, `Sampler`, page-locking | 2026-09-28 |

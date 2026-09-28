@@ -1,6 +1,7 @@
 // Glue between the kernel crates: the embedding gather (from page-locked host memory into
-// the 4 mHC streams), dtype conversions, the greedy argmax, row gather/scatter and the
-// routed-expert combine of the reference's eager expert loop.
+// the 4 mHC streams), dtype conversions, the greedy argmax, row gather/scatter, the
+// routed-expert combine of the reference's eager expert loop, and the mean of the 4 streams
+// (the DFlash2 drafter's taps).
 #include "glm53f_forward.h"
 #include "common.cuh"
 
@@ -151,6 +152,27 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(const uint16_t* y, con
   }
 }
 
+__global__ void __launch_bounds__(256) stream_mean_kernel(const uint16_t* streams, int hidden, uint16_t* out,
+                                                          int64_t ldo) {
+  const int r = blockIdx.x;
+  const int chunks = hidden / 8;
+  const uint16_t* row = streams + int64_t(r) * 4 * hidden;
+  for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+    float s[4][8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) unpack_bf16x8(*reinterpret_cast<const uint4*>(row + int64_t(j) * hidden + c * 8), s[j]);
+    uint32_t w[4];
+#pragma unroll
+    for (int e = 0; e < 8; e += 2) {
+      const float a = __fmul_rn(__fadd_rn(__fadd_rn(__fadd_rn(s[0][e], s[1][e]), s[2][e]), s[3][e]), 0.25f);
+      const float b =
+          __fmul_rn(__fadd_rn(__fadd_rn(__fadd_rn(s[0][e + 1], s[1][e + 1]), s[2][e + 1]), s[3][e + 1]), 0.25f);
+      w[e / 2] = uint32_t(f32_to_bf16(a)) | (uint32_t(f32_to_bf16(b)) << 16);
+    }
+    *reinterpret_cast<uint4*>(out + int64_t(r) * ldo + c * 8) = make_uint4(w[0], w[1], w[2], w[3]);
+  }
+}
+
 int grid_for(int64_t total, int threads) {
   const int64_t want = (total + threads - 1) / threads;
   return int(want < 65535 ? (want < 1 ? 1 : want) : 65535);
@@ -228,5 +250,14 @@ extern "C" int32_t glm53f_fwd_moe_combine(const uint16_t* y, const int32_t* ids,
     return cudaErrorInvalidValue;
   if (rows == 0) return cudaSuccess;
   moe_combine_kernel<<<rows, 256, 0, stream>>>(y, ids, weights, top_k, hidden, out);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_fwd_stream_mean(const uint16_t* streams, int32_t rows, int32_t hidden, uint16_t* out,
+                                          int64_t ldo, cudaStream_t stream) {
+  if (rows < 0 || hidden < 8 || hidden % 8 || ldo < hidden || ldo % 8 || !aligned16(streams) || !aligned16(out))
+    return cudaErrorInvalidValue;
+  if (rows == 0) return cudaSuccess;
+  stream_mean_kernel<<<rows, 256, 0, stream>>>(streams, hidden, out, ldo);
   return cudaGetLastError();
 }

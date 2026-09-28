@@ -32,6 +32,7 @@ name = "glm53f-forward"
 version = "0.1.0"
 dependencies = [
  "glm53f-coordinator",
+ "glm53f-dflash",
  "glm53f-dsa",
  "glm53f-kda",
  "glm53f-layers",

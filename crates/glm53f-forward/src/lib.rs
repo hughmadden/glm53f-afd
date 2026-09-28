@@ -20,6 +20,7 @@
 //! | `experts` | [`experts::ExpertBackend`], `LocalFp8Experts`, `ZeroExperts` |
 //! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
 //! | `forward` | [`forward::GlmForward`]: the layer loop, the head, prefill / decode / verify / commit, taps and stage timing |
+//! | `draft` | The DFlash2 drafter in the forward (`glm53f-dflash`): its taps (the mean of the four streams after layers 5, 14, 24, 33 and 42), the committed rows appended to each slot's ring, the drafts |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
 //! | `device`, `cuda`, `cublas`, `ffi` | Device memory, streams and events; the runtime, cuBLAS and kernel bindings |
 //!
@@ -73,7 +74,8 @@
 //! `rewind` to a mark, `fork` from a mark of another slot (full pages shared copy-on-write, the
 //! partial page copied), and host images of pages and marks. Byte counts equal the memory
 //! planner's (`glm53f-model`'s `KvGeometry` and `SlotState`) plus the tails, which the planner
-//! does not count (`tests/kv_plan.rs`).
+//! does not count (`tests/kv_plan.rs`). With a drafter, each slot also holds the drafter's context
+//! ring (40.16 MiB), kept at the committed length (`crate::draft`).
 //!
 //! # Tests and tools
 //!
@@ -81,13 +83,17 @@
 //! cargo test -p glm53f-forward                                  # CPU: accounting and pages
 //! cargo test --release -p glm53f-forward --features cuda        # kernels; with the weights below, the model path
 //! cargo test --release -p glm53f-forward --features coordinator --test serve
+//! cargo test --release -p glm53f-forward --features coordinator --test draft           # the drafter's taps and context
+//! cargo test --release -p glm53f-forward --features coordinator --test draft_lossless  # speculation changes no token
 //! cargo run  --release -p glm53f-forward --features cuda --example gemm_bench
 //! cargo run  --release -p glm53f-forward --features cuda --example decode_bench
 //! ```
 //!
 //! The model-path tests read `GLM53F_CHECKPOINT_DIR` (the official checkpoint or its coordinator
 //! subset), `GLM53F_EXPERTS_DIR` (the routed experts of layers 3 and 4, default the checkpoint)
-//! and `GLM53F_GOLDENS` (default `oracle/goldens`), and skip cleanly without them. The build
+//! and `GLM53F_GOLDENS` (default `oracle/goldens`), and skip cleanly without them; the drafter's
+//! tests also `GLM53F_DFLASH_DIR` (the DFlash2 checkpoint) and run all 45 layers on the weights of
+//! the first `GLM53F_DRAFT_TEST_LAYERS` (default 5), repeated. The build
 //! uses `GLM53F_NVCC`, `GLM53F_CUDA_ARCH` (default `sm_89`) and `GLM53F_CUDA_LIB`, as the other
 //! kernel crates do.
 
@@ -102,6 +108,8 @@ pub mod cublas;
 pub mod cuda;
 #[cfg(feature = "cuda")]
 pub mod device;
+#[cfg(feature = "cuda")]
+pub mod draft;
 #[cfg(feature = "cuda")]
 pub mod embed;
 #[cfg(feature = "cuda")]

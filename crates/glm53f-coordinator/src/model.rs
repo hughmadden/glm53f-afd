@@ -162,6 +162,11 @@ pub struct DraftRow<'a, S> {
     pub last: Token,
     /// The most drafts worth proposing (`Limits::block - 1` at most).
     pub max: usize,
+    /// The pick of the verify window's first row, which the first draft is checked against:
+    /// greedy, or the request's draw at the first draft's emitted-token position (draft `j`,
+    /// from 0, stands at that position plus `j`). A drafter may sample its proposals with it; a
+    /// draft is accepted only when it equals the target's own pick either way.
+    pub pick: Pick,
 }
 
 /// A drafter's proposal for one request.

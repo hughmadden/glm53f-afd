@@ -6,7 +6,11 @@
 //! convolutions, attention, logits and the selector are f32.
 //!
 //! Per request a [`GpuSlot`] holds the context ring (`[layers][K, V][window + block][kv_width]`
-//! BF16, 40.16 MiB at the checkpoint's shape) and the committed length.
+//! BF16, 40.16 MiB at the checkpoint's shape) and the committed length. The ring is the slot's own
+//! allocation ([`GpuDrafter::new_slot`]) or memory the caller owns ([`GpuSlot::external`]: the
+//! target's KV pool keeps it with each request's fixed state). A drafter runs on its own stream,
+//! or on the target forward's ([`GpuDrafter::with_borrowed_head_on`]), which orders its work with
+//! the forward's.
 //!
 //! [`GpuDrafter::append`] (committed rows): `fc` over the taps, `hidden_norm`, then per layer the
 //! key/value rows of the fused QKV weight, `k_norm` and RoPE, stored at `pos % ring`.
@@ -53,14 +57,52 @@ enum Head {
     Borrowed(*const u16),
 }
 
+/// Where a slot's ring lives.
+enum Ring {
+    /// Allocated by [`GpuDrafter::new_slot`].
+    Owned(DeviceBuffer),
+    /// Device memory the caller owns ([`GpuSlot::external`]).
+    External(*mut u8),
+}
+
 /// One request's drafter state on the device.
 pub struct GpuSlot {
-    ring: DeviceBuffer,
+    ring: Ring,
+    /// The drafter's window (what [`GpuSlot::rewind`] keeps).
+    window: usize,
     len: usize,
     lo: usize,
 }
 
+// SAFETY: the ring is device memory, usable from any host thread; the slot (or, for an external
+// ring, the caller of `GpuSlot::external`) keeps it alive, and one thread at a time drives it.
+unsafe impl Send for GpuSlot {}
+
 impl GpuSlot {
+    /// A slot with an empty context whose ring is caller-owned device memory: `dims.ring_bytes()`
+    /// bytes at `ring` (the target's KV pool keeps one per request, with the rest of its fixed
+    /// state).
+    ///
+    /// # Safety
+    ///
+    /// `ring` points at `dims.ring_bytes()` bytes on the drafter's device, 16-byte aligned, that
+    /// outlive the slot and that nothing but the drafter this slot is used with writes.
+    pub unsafe fn external(ring: *mut u8, dims: &Dims) -> GpuSlot {
+        GpuSlot {
+            ring: Ring::External(ring),
+            window: dims.window,
+            len: 0,
+            lo: 0,
+        }
+    }
+
+    fn ring_ptr(&self) -> *mut u16 {
+        match &self.ring {
+            Ring::Owned(b) => b.ptr(0),
+            Ring::External(p) => p.cast(),
+        }
+    }
+
     /// Committed rows.
     pub fn len(&self) -> usize {
         self.len
@@ -71,6 +113,54 @@ impl GpuSlot {
     /// The lowest position a draft may read (0 unless a rewind went past what the ring holds).
     pub fn lo(&self) -> usize {
         self.lo
+    }
+
+    /// Context rows a draft at the committed length reads: positions
+    /// `max(lo, len - (window - 1)) .. len`.
+    pub fn context_rows(&self) -> usize {
+        self.len
+            - self
+                .lo
+                .max(self.len.saturating_sub(self.window - 1))
+                .min(self.len)
+    }
+
+    /// Return to an earlier committed length. Positions at or above `old_len - window` are
+    /// intact (see `reference::Context::rewind`); a lower position a later draft would need is
+    /// masked out (`lo`), never read stale.
+    pub fn rewind(&mut self, len: usize) -> Result<(), String> {
+        if len > self.len {
+            return Err(format!("rewind to {len} past the context's {}", self.len));
+        }
+        self.lo = self.lo.max(self.len.saturating_sub(self.window)).min(len);
+        self.len = len;
+        Ok(())
+    }
+
+    /// Empty the context (a new request).
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.lo = 0;
+    }
+
+    /// Continue at committed length `len` with no readable context (`lo = len`): for a request
+    /// whose rows' taps are gone (restored from a host image). Drafts then read only the rows
+    /// appended afterwards.
+    pub fn restart(&mut self, len: usize) {
+        self.len = len;
+        self.lo = len;
+    }
+
+    /// Take `src`'s context at `len <= src.len()`, once the caller has copied `src`'s ring into
+    /// this slot's: `src`'s state rewound to `len` (rows `src`'s ring no longer holds are masked
+    /// out, as for [`GpuSlot::rewind`]).
+    pub fn follow(&mut self, src: &GpuSlot, len: usize) -> Result<(), String> {
+        if self.window != src.window {
+            return Err("follow: slots of drafters with different windows".into());
+        }
+        self.len = src.len;
+        self.lo = src.lo;
+        self.rewind(len)
     }
 }
 
@@ -183,6 +273,10 @@ pub struct GpuDrafter {
     last_nreq: usize,
 }
 
+// SAFETY: the raw pointers a drafter holds are device addresses (a borrowed LM head) and stream
+// handles, usable from any host thread; `&mut self` makes one thread at a time drive it.
+unsafe impl Send for GpuDrafter {}
+
 fn up(data: &[u16], s: &Stream) -> Result<DeviceBuffer, String> {
     DeviceBuffer::from_slice(data, s)
 }
@@ -213,7 +307,7 @@ fn i32c(v: usize, what: &str) -> Result<i32, String> {
 
 impl GpuDrafter {
     /// Upload the drafter's weights and the LM head `head` (`[vocab][hidden]` BF16 bits). `mask_row`
-    /// is the target's embedding row of the mask token.
+    /// is the target's embedding row of the mask token. The drafter gets a stream of its own.
     pub fn new(w: &Weights, head: &[u16], mask_row: &[u16]) -> Result<GpuDrafter, String> {
         let stream = Stream::new()?;
         if head.len() != w.dims.vocab * w.dims.hidden {
@@ -240,6 +334,25 @@ impl GpuDrafter {
         mask_row: &[u16],
     ) -> Result<GpuDrafter, String> {
         let stream = Stream::new()?;
+        Self::build(w, Head::Borrowed(head), mask_row, stream)
+    }
+
+    /// As [`GpuDrafter::with_borrowed_head`], on `stream`, a stream the caller owns (the target
+    /// forward's): the drafter's work is then ordered with the forward's, so taps the forward
+    /// wrote and rings it copied need no synchronization before an append or a draft.
+    ///
+    /// # Safety
+    ///
+    /// As for [`GpuDrafter::with_borrowed_head`]; and `stream` is a live stream that outlives the
+    /// drafter.
+    pub unsafe fn with_borrowed_head_on(
+        w: &Weights,
+        head: *const u16,
+        mask_row: &[u16],
+        stream: crate::cuda::RawStream,
+    ) -> Result<GpuDrafter, String> {
+        // SAFETY: the caller keeps the stream alive for the drafter's life.
+        let stream = unsafe { Stream::borrowed(stream) };
         Self::build(w, Head::Borrowed(head), mask_row, stream)
     }
 
@@ -317,6 +430,56 @@ impl GpuDrafter {
         &self.stream
     }
 
+    pub fn dims(&self) -> Dims {
+        self.dims
+    }
+
+    /// Device bytes of the weights (and of the LM head when it is the drafter's own); the scratch
+    /// grows with the batch on top of it.
+    pub fn weight_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                [
+                    &l.qkv,
+                    &l.o,
+                    &l.gate_up,
+                    &l.down,
+                    &l.attn_kp,
+                    &l.mlp_kp,
+                    &l.attn_base,
+                    &l.mlp_base,
+                    &l.input_ln,
+                    &l.post_ln,
+                    &l.q_norm,
+                    &l.k_norm,
+                ]
+                .iter()
+                .map(|b| b.bytes())
+                .sum::<usize>()
+            })
+            .sum();
+        let own = [
+            &self.fc,
+            &self.hidden_norm,
+            &self.norm,
+            &self.hproj,
+            &self.pred,
+            &self.succ,
+            &self.inv_freq,
+            &self.mask_row,
+        ]
+        .iter()
+        .map(|b| b.bytes())
+        .sum::<usize>();
+        let head = match &self.head {
+            Head::Owned(b) => b.bytes(),
+            Head::Borrowed(_) => 0,
+        };
+        layers + own + head
+    }
+
     fn head_ptr(&self) -> *const u16 {
         match &self.head {
             Head::Owned(b) => b.ptr::<u16>(0),
@@ -327,7 +490,8 @@ impl GpuDrafter {
     /// A slot with an empty context (its ring allocated, not cleared).
     pub fn new_slot(&self) -> Result<GpuSlot, String> {
         Ok(GpuSlot {
-            ring: DeviceBuffer::alloc(self.dims.ring_bytes())?,
+            ring: Ring::Owned(DeviceBuffer::alloc(self.dims.ring_bytes())?),
+            window: self.dims.window,
             len: 0,
             lo: 0,
         })
@@ -341,17 +505,34 @@ impl GpuDrafter {
         pos: usize,
     ) -> Result<(Vec<u16>, Vec<u16>), String> {
         let d = self.dims;
+        if layer >= d.layers {
+            return Err(format!("ring_row: layer {layer} of {}", d.layers));
+        }
         let kvw = d.kv_width();
         let r = pos % d.ring();
-        let k =
-            slot.ring
-                .download_at::<u16>(((layer * 2) * d.ring() + r) * kvw, kvw, &self.stream)?;
-        let v = slot.ring.download_at::<u16>(
-            ((layer * 2 + 1) * d.ring() + r) * kvw,
-            kvw,
-            &self.stream,
-        )?;
-        Ok((k, v))
+        let read = |at: usize| -> Result<Vec<u16>, String> {
+            let mut v = vec![0u16; kvw];
+            // SAFETY: the ring holds [layers][K, V][ring][kv_width] BF16 values and `at + kvw`
+            // lies inside it; v holds kvw values.
+            check(
+                unsafe {
+                    crate::cuda::cudaMemcpyAsync(
+                        v.as_mut_ptr().cast(),
+                        slot.ring_ptr().add(at).cast(),
+                        kvw * 2,
+                        crate::cuda::MEMCPY_D2H,
+                        self.stream.raw(),
+                    )
+                },
+                "ring row",
+            )?;
+            self.stream.synchronize()?;
+            Ok(v)
+        };
+        Ok((
+            read(((layer * 2) * d.ring() + r) * kvw)?,
+            read(((layer * 2 + 1) * d.ring() + r) * kvw)?,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -460,7 +641,7 @@ impl GpuDrafter {
                     )?,
                 }
                 let bi = bases.len() as i32;
-                bases.push(items[i].0.ring.ptr::<u16>(0) as u64);
+                bases.push(items[i].0.ring_ptr() as u64);
                 for r in 0..rows {
                     pos.push((p0 + r) as i64);
                     req.push(bi);
@@ -584,7 +765,7 @@ impl GpuDrafter {
             } else {
                 unif.extend(std::iter::repeat_n(0.0f32, dr));
             }
-            bases.push(slot.ring.ptr::<u16>(0) as u64);
+            bases.push(slot.ring_ptr() as u64);
             for j in 0..bl {
                 pos.push((slot.len + j) as i64);
                 req.push(i as i32);
@@ -1053,20 +1234,10 @@ impl Drafter for GpuDrafter {
     }
 
     fn rewind(&mut self, slot: &mut GpuSlot, len: usize) -> Result<(), String> {
-        if len > slot.len {
-            return Err(format!("rewind to {len} past the context's {}", slot.len));
-        }
-        // Positions >= len_old - window are intact (see reference::Context::rewind).
-        slot.lo = slot
-            .lo
-            .max(slot.len.saturating_sub(self.dims.window))
-            .min(len);
-        slot.len = len;
-        Ok(())
+        slot.rewind(len)
     }
 
     fn reset(&mut self, slot: &mut GpuSlot) {
-        slot.len = 0;
-        slot.lo = 0;
+        slot.reset();
     }
 }

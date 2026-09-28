@@ -14,7 +14,8 @@ wires this repository's crates together.
 
 | File | What | Date |
 |---|---|---|
-| src/lib.rs | The options (flags, environment fallbacks, checks), the KV pool's page count, the development-mode banner, and their tests | 2026-09-28 |
+| src/lib.rs | The options (flags, environment fallbacks, checks, `--drafter`), the KV pool's page count, the development-mode banner, and their tests | 2026-09-28 |
+| src/main.rs (the drafter) | The DFlash2 drafter loaded next to the weights before the KV is sized (its ring in each slot's fixed state), attached to the forward, verify passes sized for every slot's window, its memory logged; off in a development mode of fewer than 44 layers | 2026-09-28 |
 | tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
 | Cargo.toml | The manifest | 2026-09-28 |
 

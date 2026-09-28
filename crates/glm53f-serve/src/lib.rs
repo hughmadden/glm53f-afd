@@ -13,7 +13,10 @@
 //! 2. sizes the KV: a page pool shared by the slots, and each slot's fixed state;
 //! 3. connects the routed experts: the four expert ranks (`--experts remote`, the default), or
 //!    the official FP8 experts on this GPU (`--experts local`, development on one GPU);
-//! 4. starts the engine and the scheduler (`glm53f-coordinator`) over the forward
+//! 4. with `--drafter`, loads the DFlash2 drafter onto the GPU next to the weights (before the KV
+//!    is sized; each slot's fixed state then holds its 40.16 MiB context ring) and attaches it to
+//!    the forward: speculative decoding, up to 7 drafts a step;
+//! 5. starts the engine and the scheduler (`glm53f-coordinator`) over the forward
 //!    (`glm53f-forward`'s `ServedForward`) and serves the OpenAI-compatible API
 //!    (`glm53f-api`, GLM's completion dialect).
 //!
@@ -37,11 +40,15 @@
 //! | `--kv-gib G` | | the free memory less the reserve | The KV page pool |
 //! | `--reserve-gib G` | | 4 | Device memory left free for workspaces and snapshot marks |
 //! | `--prefill-rows R` | | 256 | Rows of one prefill pass (1-4096) |
+//! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
 //! `GLM53F_HOST_CACHE_GB` (the host RAM tier, 0 for none), `GLM53F_PREFILL_SEGMENT_MS`,
-//! `GLM53F_PREFIX_CACHE_ENTRIES`; the wire client `GLM53F_RDMA=1` (an `rdma` build) with
+//! `GLM53F_PREFIX_CACHE_ENTRIES`; with a drafter `GLM53F_SPEC` (0: decode one token a step),
+//! `GLM53F_SPEC_POLICY` (`fixed`, `conf`, else the chain cut at `GLM53F_SPEC_TAU`) and
+//! `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft greedily too); the wire client
+//! `GLM53F_RDMA=1` (an `rdma` build) with
 //! `GLM53F_WIRE_NOCRC=1` (which the ranks must set too), `GLM53F_WIRE_MIN_GBPS`,
 //! `GLM53F_TIMELINE`, `GLM53F_PROFILE`.
 //!
@@ -56,7 +63,9 @@
 //! those layers and the head; the ranks, only the MoE layers among them, served with
 //! `--allow-partial`). **Its output is meaningless text by design.** The daemon says so at
 //! start and again on its serving line. Only a prefix of the layers can run: the forward's
-//! weights and KV are laid out for layers `0 .. N + 1`.
+//! weights and KV are laid out for layers `0 .. N + 1`. A drafter needs N >= 43 (its last tap
+//! is the output of layer 42, read at the entry of layer 43); with fewer layers the daemon says
+//! so and runs without it.
 
 use std::path::PathBuf;
 
@@ -67,6 +76,7 @@ pub const USAGE: &str = "usage:
 options:
   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>  --prefill-rows <r>
+  --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
 /// Expert ranks.
@@ -99,6 +109,8 @@ pub struct Options {
     pub kv_gib: Option<f64>,
     pub reserve_gib: f64,
     pub prefill_rows: usize,
+    /// The DFlash2 drafter's directory (none: no speculative decoding).
+    pub drafter: Option<PathBuf>,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
     pub dev_layers: Option<usize>,
 }
@@ -164,6 +176,7 @@ impl Options {
         };
         let (mut max_context, mut kv_gib, mut reserve_gib) = (None, None, 4.0f64);
         let (mut prefill_rows, mut dev_layers) = (256, None);
+        let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
         let mut it = args.iter();
         while let Some(k) = it.next() {
             let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
@@ -181,6 +194,7 @@ impl Options {
                 "--kv-gib" => kv_gib = Some(number(k, &val()?)?),
                 "--reserve-gib" => reserve_gib = number(k, &val()?)?,
                 "--prefill-rows" => prefill_rows = number(k, &val()?)?,
+                "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -228,6 +242,7 @@ impl Options {
             kv_gib,
             reserve_gib,
             prefill_rows,
+            drafter,
             dev_layers,
         })
     }
@@ -303,7 +318,7 @@ mod tests {
         assert_eq!(o.experts, Experts::Remote(parse_ranks(RANK_LIST).unwrap()));
         assert_eq!((o.listen.as_str(), o.slots), ("127.0.0.1:8100", 8));
         assert_eq!((o.max_context, o.kv_gib, o.reserve_gib), (None, None, 4.0));
-        assert_eq!((o.prefill_rows, o.dev_layers), (256, None));
+        assert_eq!((o.prefill_rows, o.dev_layers, o.drafter), (256, None, None));
         // Flags win over the environment.
         let o = Options::parse(
             &args("--checkpoint /c --slots 2 --listen 0.0.0.0:9000 --tokenizer /t.json"),
@@ -313,6 +328,17 @@ mod tests {
         assert_eq!((o.checkpoint.to_str(), o.slots), (Some("/c"), 2));
         assert_eq!(o.listen, "0.0.0.0:9000");
         assert_eq!(o.tokenizer, PathBuf::from("/t.json"));
+        // The drafter: from its flag, else the environment.
+        let with = |k: &str| match k {
+            "GLM53F_DFLASH_DIR" => Some("/d".to_string()),
+            other => env(other),
+        };
+        assert_eq!(
+            Options::parse(&[], &with).unwrap().drafter,
+            Some(PathBuf::from("/d"))
+        );
+        let o = Options::parse(&args("--drafter /e"), &with).unwrap();
+        assert_eq!(o.drafter, Some(PathBuf::from("/e")));
     }
 
     #[test]
@@ -357,6 +383,7 @@ mod tests {
             "--checkpoint /c --experts local --max-context 0",
             "--checkpoint /c --experts local --frobnicate",
             "--checkpoint", // a flag without its value
+            "--checkpoint /c --experts local --drafter",
         ];
         for b in bad {
             assert!(

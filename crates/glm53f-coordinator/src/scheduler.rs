@@ -621,7 +621,7 @@ impl<M: ModelForward> Scheduler<M> {
                 .active
                 .iter_mut()
                 .zip(&caps)
-                .map(|(a, &k)| DraftRow { slot: &mut a.slot, last: a.last, max: k })
+                .map(|(a, &k)| DraftRow { slot: &mut a.slot, last: a.last, max: k, pick: Pick::at(a.sampling, a.generated as u64) })
                 .collect();
             self.model.draft(&mut rows)
         };

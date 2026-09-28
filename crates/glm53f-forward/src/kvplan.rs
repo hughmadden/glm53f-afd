@@ -14,8 +14,8 @@
 //!   (the raw index keys and gates of the incomplete pool). A mark saves all three: the tail
 //!   belongs to a position, like the KDA state, because the keys it holds are dropped once
 //!   their pool completes.
-//! - **Draft KV** (DFlash2): reserved per slot when a drafter is configured; a later packet
-//!   fills it.
+//! - **Draft KV** (DFlash2): the drafter's context ring, reserved per slot when a drafter is
+//!   configured (`crate::kv` keeps it at the committed length).
 //!
 //! # Pages and copy-on-write
 //!

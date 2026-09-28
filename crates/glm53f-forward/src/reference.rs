@@ -97,6 +97,21 @@ pub fn moe_combine(
     out
 }
 
+/// The mean of the four mHC streams (BF16 `[rows][4][hidden]`) as `glm53f_fwd_stream_mean`
+/// computes it, the drafter's taps: per value `bf16((((s0 + s1) + s2) + s3) * 0.25)` in f32.
+pub fn stream_mean(streams: &[u16], rows: usize, hidden: usize) -> Vec<u16> {
+    assert_eq!(streams.len(), rows * 4 * hidden);
+    let mut out = vec![0u16; rows * hidden];
+    for r in 0..rows {
+        let s = |j: usize, c: usize| bf16::to_f32(streams[(r * 4 + j) * hidden + c]);
+        for c in 0..hidden {
+            out[r * hidden + c] =
+                bf16::from_f32((((s(0, c) + s(1, c)) + s(2, c)) + s(3, c)) * 0.25);
+        }
+    }
+    out
+}
+
 /// Relative RMS difference `||a - b|| / ||b||` (f64 sums).
 pub fn rel_rms(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len());

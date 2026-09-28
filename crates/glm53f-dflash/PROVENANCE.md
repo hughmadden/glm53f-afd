@@ -55,7 +55,7 @@ S `python/sglang/srt/layers/logits_processor.py`
 | Unit | Where | Pinned by |
 |---|---|---|
 | The golden capture: loading D by digest, the drafter through D's `from_pretrained`, the target stub (embedding and LM head), recording hooks and wrappers, synthetic taps, two draft steps per case, the native set | `oracle/golden_dflash.py` | three sets (`dflash-short`, `dflash-window`, `dflash-native`), identical over two runs |
-| GPU forward: device weights (fused QKV and gate/up), batched appends from host or device taps, the draft pipeline, rewinds | `src/gpu.rs` | `tests/gpu.rs` |
+| GPU forward: device weights (fused QKV and gate/up), batched appends from host or device taps, the draft pipeline, rewinds; rings over caller-owned memory (`GpuSlot::external`), forks (`GpuSlot::follow`) and cold restarts (`GpuSlot::restart`), a borrowed stream (`with_borrowed_head_on`, `Stream::borrowed`) | `src/gpu.rs`, `src/device.rs` | `tests/gpu.rs` (`external_rings_forks_and_cold_restarts` for the second half) |
 | Kernels: RMSNorm, RoPE table, per-head norm + RoPE, ring stores, dynamic convolution, split-K attention, SiLU x up, block embeddings, draft-row gather, two-pass top-16, selector walk | `kernels/dflash.cu`, `kernels/glm53f_dflash.h` | `tests/gpu.rs` |
 | The seam (`Drafter`, `Append`, `DraftRequest`, `Proposal`, `CpuDrafter`) | `src/seam.rs` | `tests/reference.rs`: `the_seam_on_the_cpu_reference` |
 | Weights and target rows (via `glm53f-model`'s safetensors reader and `DraftConfig`); random weights for tests | `src/weights.rs` | `tests/goldens.rs`, `tests/reference.rs` |

@@ -29,6 +29,11 @@
 //! single-launch mHC boundary, the router, KDA, the DSA kernels with a fixed split plan), so a
 //! verify window and a short prefill give the bits of serial decode steps. Larger passes use
 //! tensor-core GEMMs (cuBLAS, the FP8 W8A8 GEMM) whose rounding depends on the row count.
+//!
+//! With a drafter attached ([`GlmForward::attach_drafter`], `crate::draft`), every pass through
+//! the head also captures the drafter's taps at the entry of layers 6, 15, 25, 34 and 43, and
+//! the committed rows (a prefill or decode pass's, a commit's kept rows) go to each slot's
+//! drafter context.
 
 use core::ffi::c_void;
 use std::cell::RefCell;
@@ -40,6 +45,7 @@ use glm53f_kda::ffi as kffi;
 use glm53f_layers::ffi as lffi;
 
 use crate::device::{self, launched, DeviceBuffer, Event, Stream};
+use crate::draft::{Dflash, DraftReq, LAYERS_NEEDED};
 use crate::embed::HostEmbedding;
 use crate::error::{invalid, Result};
 use crate::experts::{ExpertBackend, ExpertCall};
@@ -631,6 +637,8 @@ pub struct GlmForward {
     sms: i32,
     host_ids: Vec<i32>,
     host_weights: Vec<f32>,
+    /// The DFlash2 drafter, when attached.
+    draft: Option<Dflash>,
 }
 
 fn pack<T: Copy>(bytes: &mut Vec<u8>, v: &[T]) -> usize {
@@ -701,6 +709,7 @@ impl GlmForward {
             tap: None,
             host_ids: Vec::new(),
             host_weights: Vec::new(),
+            draft: None,
         })
     }
 
@@ -775,6 +784,55 @@ impl GlmForward {
     /// [`GlmForward::logits`]), for a device sampler. Valid until the next pass.
     pub fn device_logits(&self) -> *mut f32 {
         self.s.logits.ptr(0)
+    }
+
+    // ---- The drafter -------------------------------------------------------------------------
+
+    /// Attach the DFlash2 drafter (made for this forward's model and stream: [`Dflash::new`]).
+    /// From then on every pass through the head captures its taps and every committed row
+    /// becomes drafter context. Needs decoder layers `0 ..= 43` and a KV pool with the drafter's
+    /// rings (`KvLayout::new(shape, Some(drafter config))`); attach before the slots hold rows.
+    pub fn attach_drafter(&mut self, mut d: Dflash) -> Result<()> {
+        if !std::ptr::eq(d.head(), self.model.head.lm_head.buf.ptr::<u16>(0)) {
+            return Err(invalid!("the drafter reads another model's LM head"));
+        }
+        if !Arc::ptr_eq(d.stream(), &self.stream) {
+            return Err(invalid!(
+                "the drafter runs on another stream than the forward"
+            ));
+        }
+        if self.shape().layers < LAYERS_NEEDED {
+            return Err(invalid!(
+                "the drafter reads the outputs of layers 5 to 42: the forward runs {} layers, it needs {LAYERS_NEEDED}",
+                self.shape().layers
+            ));
+        }
+        if self.kv.config().layout.draft_kv_bytes == 0 {
+            return Err(invalid!(
+                "the KV pool has no drafter rings (lay it out with the drafter's config)"
+            ));
+        }
+        d.alloc_taps(self.s.rows.max(self.v.rows))?;
+        self.draft = Some(d);
+        Ok(())
+    }
+
+    pub fn has_drafter(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn drafter(&self) -> Option<&Dflash> {
+        self.draft.as_ref()
+    }
+
+    /// The drafter's proposals for `reqs` (each slot at its committed length), `block - 1` per
+    /// request. Slots and the target's state do not change.
+    pub fn draft(&mut self, reqs: &[DraftReq<'_>]) -> Result<Vec<glm53f_dflash::seam::Proposal>> {
+        let d = self
+            .draft
+            .as_mut()
+            .ok_or_else(|| invalid!("no drafter attached"))?;
+        d.draft(reqs, &self.embed)
     }
 
     // ---- Public passes ---------------------------------------------------------------------
@@ -1002,6 +1060,17 @@ impl GlmForward {
             kv.pending = 0;
         }
         self.mark(usize::MAX, "commit")?;
+        // The kept rows (the anchor and the accepted drafts) become drafter context.
+        if let Some(d) = self.draft.as_mut() {
+            let rows: Vec<(usize, usize)> = pending
+                .reqs
+                .iter()
+                .zip(keep)
+                .map(|(r, &k)| (r.row0, k))
+                .collect();
+            d.append(slots, &rows)?;
+            self.mark(usize::MAX, "draft_append")?;
+        }
         Ok(())
     }
 
@@ -1297,6 +1366,8 @@ impl GlmForward {
             Input::Streams(x) => self.s.streams[0].upload_async(&st, 0, x)?,
         }
         self.mark(usize::MAX, "embed")?;
+        // Every pass through the head captures the drafter's taps (`crate::draft`).
+        let taps = head && self.draft.is_some();
         // prev: the previous sublayer's output to expand (block_out, block_out2, post, comb).
         let mut prev: Option<(*const u16, *const u16, *const f32, *const f32)> = None;
         for l in layers.clone() {
@@ -1306,6 +1377,12 @@ impl GlmForward {
             let expanded = self.boundary(total, &lw.attn_hc, &lw.input_norm, cur, prev, true)?;
             if expanded {
                 cur ^= 1;
+            }
+            if let Some(d) = self.draft.as_ref().filter(|_| taps) {
+                // streams[cur]: this layer's input, the previous layer's completed output. At the
+                // entry of layers 6, 15, 25, 34 and 43 their mean is a tap (glm53f-dflash
+                // README step 1: SGLang captures before layer k + 1, contracted by the mean).
+                d.capture(l, total, self.s.streams[cur].ptr(0), &self.stream)?;
             }
             self.mark(l, "attn_hc")?;
             match &lw.attn {
@@ -1453,6 +1530,14 @@ impl GlmForward {
                 Mode::Verify => kv.pending = r,
                 _ => kv.tokens += r,
             }
+        }
+        // Committed rows become drafter context (a verify window's rows wait for its commit).
+        if taps && mode != Mode::Verify {
+            let rows: Vec<(usize, usize)> = reqs.iter().map(|r| (r.row0, r.rows)).collect();
+            if let Some(d) = self.draft.as_mut() {
+                d.append(kvs, &rows)?;
+            }
+            self.mark(usize::MAX, "draft_append")?;
         }
         if mode == Mode::Verify {
             self.pending = Some(Pending { reqs, rows: total });

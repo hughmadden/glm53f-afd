@@ -171,8 +171,11 @@ impl Scratch {
     }
 }
 
-/// A CUDA stream, destroyed on drop.
-pub struct Stream(RawStream);
+/// A CUDA stream, destroyed on drop (unless borrowed).
+pub struct Stream {
+    raw: RawStream,
+    owned: bool,
+}
 
 // SAFETY: a stream handle is usable from any host thread.
 unsafe impl Send for Stream {}
@@ -185,17 +188,30 @@ impl Stream {
             unsafe { cuda::cudaStreamCreate(&mut s) },
             "cudaStreamCreate",
         )?;
-        Ok(Stream(s))
+        Ok(Stream {
+            raw: s,
+            owned: true,
+        })
+    }
+
+    /// A stream another component created and destroys (the target forward's): work queued on
+    /// it is ordered with that component's without events or host waits.
+    ///
+    /// # Safety
+    ///
+    /// `raw` is a live stream that outlives every use of the returned value.
+    pub unsafe fn borrowed(raw: RawStream) -> Stream {
+        Stream { raw, owned: false }
     }
 
     pub fn raw(&self) -> RawStream {
-        self.0
+        self.raw
     }
 
     pub fn synchronize(&self) -> Result<(), String> {
         // SAFETY: a live stream.
         check(
-            unsafe { cuda::cudaStreamSynchronize(self.0) },
+            unsafe { cuda::cudaStreamSynchronize(self.raw) },
             "cudaStreamSynchronize",
         )
     }
@@ -203,8 +219,10 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // SAFETY: created by cudaStreamCreate, destroyed once.
-        unsafe { cuda::cudaStreamDestroy(self.0) };
+        if self.owned {
+            // SAFETY: created by cudaStreamCreate, destroyed once.
+            unsafe { cuda::cudaStreamDestroy(self.raw) };
+        }
     }
 }
 

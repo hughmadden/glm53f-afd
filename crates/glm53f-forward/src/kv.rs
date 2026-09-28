@@ -10,17 +10,36 @@
 //! - `state`: FP32 KDA states `[max_slots][kda_layers][64][128][128]`;
 //! - `conv`: BF16 conv windows `[max_slots][kda_layers][3][24,576]`;
 //! - `tails`: DSA tails `[max_slots][dsa_layers][1,552 B]`;
-//! - `draft`: the DFlash2 draft KV placeholder, `[max_slots][draft_kv_bytes]` (when configured).
+//! - `draft`: the DFlash2 drafter's context rings, `[max_slots][draft_kv_bytes]` (when the layout
+//!   has a drafter): each `[5 layers][K, V][2,056 rows][1,024]` BF16, 40.16 MiB.
 //!
-//! Every device operation is ordered on the pool's stream, which the forward shares.
+//! Every device operation is ordered on the pool's stream, which the forward (and its drafter)
+//! shares.
 //!
 //! [`GlmKv`] mirrors the serving shell's `KvSlot` contract: committed tokens and pending verify
 //! rows; `reserve`; marks of the positional state; `rewind` to a mark; `fork` from another slot
 //! with copy-on-write pages; host images of pages and marks. The DSA tail travels with the
 //! positional state (in a mark and its host image), not in the last page: a 63-token page has
 //! 660 free bytes per layer, and a tail of 3 tokens needs 1,552.
+//!
+//! **The drafter's context** ([`GlmKv::draft_slot`], with a drafter in the layout) is the ring of
+//! the committed rows' keys and values (`glm53f_dflash::gpu::GpuSlot` over the slot's `draft`
+//! region), kept at the committed length: the forward appends every committed row, and the
+//! slot's own moves follow `glm53f_dflash`'s rules. The ring is positional (row `p % 2,056` holds
+//! position `p`, the last 2,048 positions stay intact) and is not saved in marks:
+//!
+//! | `KvSlot` call | The drafter's context |
+//! |---|---|
+//! | `reserve` | unchanged (the ring is fixed state, allocated with the pool) |
+//! | `reset`, `release` | emptied |
+//! | `rewind(to)` | rewound: positions the ring still holds (at or above `len - 2,048`) are kept, lower ones masked out |
+//! | `fork(src, to)` | `src`'s ring copied, then rewound to `to` the same way |
+//! | `import_page`, `import_state(tokens)` | restarted cold at `tokens` (the host image has no taps): drafts read only rows appended afterwards |
 
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use glm53f_dflash::gpu::GpuSlot;
+use glm53f_dflash::Dims;
 
 use crate::device::{DeviceBuffer, Stream};
 use crate::error::{invalid, Error, Result};
@@ -92,6 +111,13 @@ impl KvPool {
             ));
         }
         let l = cfg.layout;
+        if l.draft_kv_bytes != 0 && l.draft_kv_bytes != Dims::GLM53F.ring_bytes() {
+            return Err(invalid!(
+                "a draft region of {} bytes per slot: the DFlash2 ring is {}",
+                l.draft_kv_bytes,
+                Dims::GLM53F.ring_bytes()
+            ));
+        }
         let shared = KvShared {
             pages: DeviceBuffer::zeroed(cfg.pages * l.page_bytes)?,
             table: DeviceBuffer::zeroed(cfg.max_slots * cfg.max_pages * 4)?,
@@ -137,12 +163,21 @@ impl KvPool {
         let slot = s.lock().free_slots.pop().ok_or_else(|| {
             Error::OutOfMemory(format!("all {} KV slots are taken", s.cfg.max_slots))
         })?;
+        let n = s.cfg.layout.draft_kv_bytes;
+        let draft = s.draft.as_ref().map(|d| {
+            // SAFETY: region `slot` of the pool's draft arena holds one ring (checked in `new`),
+            // at a 16-byte multiple; the slot index is this GlmKv's alone while it lives, the
+            // arena lives as long as the pool it holds, and only the forward's drafter writes it,
+            // on the pool's stream.
+            unsafe { GpuSlot::external(d.byte_ptr(slot * n), &Dims::GLM53F) }
+        });
         let mut kv = GlmKv {
             pool: self.shared.clone(),
             slot,
             pages: SlotPages::default(),
             tokens: 0,
             pending: 0,
+            draft,
         };
         kv.clear_state()?;
         let base = s.cfg.base_pages;
@@ -175,6 +210,8 @@ pub struct GlmKv {
     pub(crate) pages: SlotPages,
     pub(crate) tokens: usize,
     pub(crate) pending: usize,
+    /// The drafter's context over this slot's ring, when the pool has rings.
+    pub(crate) draft: Option<GpuSlot>,
 }
 
 impl GlmKv {
@@ -212,7 +249,8 @@ impl GlmKv {
     }
 
     /// Device bytes that holding `tokens` tokens would add (pages only: the positional state
-    /// is fixed per slot, and the forward's working set is its own).
+    /// and the drafter's ring are fixed per slot, allocated with the pool, and the forward's
+    /// working set is its own).
     pub fn need_bytes(&self, tokens: usize) -> usize {
         KvLayout::pages_for(tokens).saturating_sub(self.pages.len()) * self.layout().page_bytes
     }
@@ -222,15 +260,20 @@ impl GlmKv {
         self.grow_pages(KvLayout::pages_for(tokens))
     }
 
-    /// Device bytes held: pages (shared ones included) and the slot's fixed state.
+    /// Device bytes held: pages (shared ones included) and the slot's fixed state (the drafter's
+    /// ring included).
     pub fn bytes(&self) -> usize {
         self.pages.len() * self.layout().page_bytes + self.layout().slot_fixed_bytes()
     }
 
-    /// Drop every token (a fresh request): positional state zeroed, pages kept.
+    /// Drop every token (a fresh request): positional state zeroed, pages kept, the drafter's
+    /// context emptied.
     pub fn reset(&mut self) -> Result<()> {
         self.tokens = 0;
         self.pending = 0;
+        if let Some(d) = self.draft.as_mut() {
+            d.reset();
+        }
         self.clear_state()
     }
 
@@ -383,6 +426,15 @@ impl GlmKv {
         self.copy_state(&mark.buf, false)?;
         self.tokens = to;
         self.pending = 0;
+        if let Some(d) = self.draft.as_mut() {
+            // A context that does not reach `to` (it never lags the committed rows while the
+            // forward has a drafter) restarts cold there.
+            if d.len() >= to {
+                d.rewind(to).map_err(Error::Other)?;
+            } else {
+                d.restart(to);
+            }
+        }
         Ok(())
     }
 
@@ -407,6 +459,18 @@ impl GlmKv {
         self.apply(&ch)?;
         self.copy_state(&mark.buf, false)?;
         self.tokens = to;
+        if let (Some(d), Some(s)) = (self.draft.as_mut(), src.draft.as_ref()) {
+            // The ring is positional, not paged: copy it whole, then keep what it holds of
+            // `src`'s first `to` rows.
+            if s.len() >= to {
+                let n = self.pool.cfg.layout.draft_kv_bytes;
+                let arena = self.pool.draft.as_ref().expect("a pool with rings");
+                arena.copy_from(&self.pool.stream, self.slot * n, arena, src.slot * n, n)?;
+                d.follow(s, to).map_err(Error::Other)?;
+            } else {
+                d.restart(to);
+            }
+        }
         Ok(())
     }
 
@@ -502,7 +566,9 @@ impl GlmKv {
         Ok(())
     }
 
-    /// Finish a restore of `tokens` tokens: load the positional state image.
+    /// Finish a restore of `tokens` tokens: load the positional state image. The drafter's
+    /// context restarts cold at `tokens`: the image holds no taps to rebuild it from, so drafts
+    /// read only the rows committed after the restore.
     pub fn import_state(&mut self, tokens: usize, src: &[u8]) -> Result<()> {
         let l = *self.layout();
         if tokens != self.tokens || src.len() != l.mark_bytes() {
@@ -526,6 +592,9 @@ impl GlmKv {
             self.tails_at(),
             &src[l.kda_state_bytes() + l.conv_bytes()..],
         )?;
+        if let Some(d) = self.draft.as_mut() {
+            d.restart(tokens);
+        }
         Ok(())
     }
 
@@ -534,14 +603,20 @@ impl GlmKv {
         self.stream().synchronize()
     }
 
-    /// The slot's DFlash2 draft-KV region on the device (pointer and bytes), when the pool
-    /// was laid out with a drafter. A placeholder: the drafter packet decides its layout.
+    /// The slot's DFlash2 ring on the device (pointer and bytes), when the pool was laid out
+    /// with a drafter: `[5 layers][K, V][2,056 rows][1,024]` BF16.
     pub fn draft_kv(&self) -> Option<(*mut u8, usize)> {
         let n = self.layout().draft_kv_bytes;
         self.pool
             .draft
             .as_ref()
             .map(|d| (d.byte_ptr(self.slot * n), n))
+    }
+
+    /// The drafter's context (committed length, lowest readable position), when the pool has
+    /// rings.
+    pub fn draft_slot(&self) -> Option<&GpuSlot> {
+        self.draft.as_ref()
     }
 
     // ---- Views for the forward and for tests ---------------------------------------------

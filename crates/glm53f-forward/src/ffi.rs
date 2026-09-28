@@ -94,6 +94,15 @@ unsafe extern "C" {
         stream: RawStream,
     ) -> i32;
 
+    pub fn glm53f_fwd_stream_mean(
+        streams: *const u16,
+        rows: i32,
+        hidden: i32,
+        out: *mut u16,
+        ldo: i64,
+        stream: RawStream,
+    ) -> i32;
+
     pub fn glm53f_fwd_moe_combine(
         y: *const u16,
         ids: *const i32,

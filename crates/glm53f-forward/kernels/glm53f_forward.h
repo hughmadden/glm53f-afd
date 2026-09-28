@@ -93,6 +93,16 @@ int32_t glm53f_fwd_moe_combine(const uint16_t* y, const int32_t* ids, const floa
                                int32_t rows, int32_t top_k, int32_t hidden, uint16_t* out,
                                cudaStream_t stream);
 
+// ---- DFlash2 taps -----------------------------------------------------------------------------
+//
+// out[r][c] = bf16(((s0 + s1 + s2 + s3) summed left to right in f32) * 0.25) for r < rows,
+// c < hidden, where s_j = streams[r][j][c] (the four mHC streams, BF16 [rows][4][hidden]); out
+// rows are `ldo` elements apart. The mean of glm53f-layers' final head (hc_head) with the same
+// order of operations; the drafter's taps are this mean of a layer's output streams.
+// hidden % 8 == 0, ldo % 8 == 0, ldo >= hidden, pointers 16-byte aligned.
+int32_t glm53f_fwd_stream_mean(const uint16_t* streams, int32_t rows, int32_t hidden,
+                               uint16_t* out, int64_t ldo, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

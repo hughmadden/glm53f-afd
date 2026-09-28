@@ -10,7 +10,9 @@
 #     snapshots;
 #   - the forward: embedding -> 4 mHC streams -> KDA / DSA attention and dense / MoE FFN per
 #     layer -> the final mean head -> LM head, for prefill, decode and verify windows, with
-#     routed experts behind the `ExpertBackend` trait (`LocalFp8Experts` runs them here).
+#     routed experts behind the `ExpertBackend` trait (`LocalFp8Experts` runs them here);
+#   - the DFlash2 drafter (glm53f-dflash) wired in: taps captured in the layer loop, every
+#     committed row appended to the request's context ring, drafts for the serving shell.
 #
 #   cargo test -p glm53f-forward                    CPU only: no CUDA toolkit needed
 #   cargo test -p glm53f-forward --features cuda    plus the kernels, KV and forward on a GPU
@@ -32,7 +34,7 @@ path = "src/lib.rs"
 default = []
 # Compile this crate's kernels, link cudart and cuBLAS, and build the dependency crates'
 # kernels (build.rs; needs nvcc and a GPU to run). Off by default.
-cuda = ["glm53f-kda/cuda", "glm53f-dsa/cuda", "glm53f-layers/cuda"]
+cuda = ["glm53f-kda/cuda", "glm53f-dsa/cuda", "glm53f-layers/cuda", "glm53f-dflash/cuda"]
 # Implement the serving shell's KvSlot and ModelForward traits (src/serve.rs), with its GPU
 # sampler.
 coordinator = ["cuda", "dep:glm53f-coordinator", "glm53f-coordinator/cuda"]
@@ -42,6 +44,7 @@ glm53f-model = { path = "../glm53f-model" }
 glm53f-kda = { path = "../glm53f-kda" }
 glm53f-dsa = { path = "../glm53f-dsa" }
 glm53f-layers = { path = "../glm53f-layers" }
+glm53f-dflash = { path = "../glm53f-dflash" }
 glm53f-coordinator = { path = "../glm53f-coordinator", optional = true }
 
 [dev-dependencies]
