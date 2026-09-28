@@ -495,9 +495,18 @@ fn forward_matches_the_reference_on_a_random_model() {
             at += n;
         }
     }
-    // The rings hold the reference's keys and values (BF16): equal but for GEMM rounding, which
-    // moves a value by at most about one BF16 unit at the row's scale.
-    let (mut equal, mut total, mut worst) = (0usize, 0usize, 0f32);
+    // The rings hold the reference's keys and values (BF16): equal but for GEMM rounding. The two
+    // f32 dot products differ by accumulation order, an error on the scale of the row, not of the
+    // value; after rounding to BF16 a value may land on its neighbour (one unit of its own
+    // magnitude), and a value much smaller than the row may move a little more. So the bound is
+    // one BF16 unit of the value plus 1/4096 of the row's RMS. (A bound on the RMS alone is not
+    // the right shape: one unit of a value twice the RMS is 1/64 of the RMS, which sm_120's
+    // cuBLAS kernels reached; one on the value alone fails for tiny values under cancellation.)
+    let bf16_unit = |x: f32| -> f32 {
+        let e = (x.abs().max(f32::MIN_POSITIVE).to_bits() >> 23) as i32 - 127;
+        2f32.powi(e - 7)
+    };
+    let (mut equal, mut total, mut worst, mut beyond) = (0usize, 0usize, 0f32, 0usize);
     for (i, c) in ctxs.iter().enumerate() {
         for l in 0..d.layers {
             for p in c.len().saturating_sub(d.window)..c.len() {
@@ -509,17 +518,17 @@ fn forward_matches_the_reference_on_a_random_model() {
                         equal += (a.to_bits() == b.to_bits()) as usize;
                         total += 1;
                         worst = worst.max((a - b).abs() / rms);
+                        beyond += ((a - b).abs() > bf16_unit(a.abs().max(b.abs())) + rms / 4096.0) as usize;
                     }
                 }
             }
         }
     }
-    println!("  ring vs reference: {equal} of {total} values equal; largest difference {worst:.2e} of the row's RMS");
-    assert!(equal * 100 > total * 99, "too many differences");
-    assert!(
-        worst < 1.0 / 64.0,
-        "a ring value is off by {worst:.2e} of its row's RMS"
+    println!(
+        "  ring vs reference: {equal} of {total} values equal; largest difference {worst:.2e} of the row's RMS; {beyond} beyond the bound"
     );
+    assert!(equal * 100 > total * 99, "too many differences");
+    assert_eq!(beyond, 0, "{beyond} ring values differ by more than one BF16 unit of their magnitude plus 1/4096 of the row RMS");
 
     let anchors = [5u32, 17, 1999];
     let reqs: Vec<DraftRequest<'_, GpuSlot>> = (0..3)
