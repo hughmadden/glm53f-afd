@@ -2,7 +2,7 @@
 //! mimo26f-afd v1.2.0 `crates/mimo26-spark/src/main.rs`).
 //!
 //! ```text
-//! glm53f-rank serve  --rank R --dir DIR [--listen ADDR] [--peers A0,A1,A2,A3] [--peer-timeout-ms MS] [--lazy] [--allow-partial]
+//! glm53f-rank serve  --rank R --dir DIR [--listen ADDR] [--recv-slots N] [--peers A0,A1,A2,A3] [--peer-timeout-ms MS] [--lazy] [--allow-partial]
 //! glm53f-rank slice  --checkpoint CKPT --rank R --out DIR [--layers 3-44] [--mtp] [--source TEXT]
 //! glm53f-rank verify --rank R --dir DIR [--allow-partial]
 //! ```
@@ -19,7 +19,10 @@
 //!    (`glm53f_rdma::fabric_port`), and serves `DS41RTE3` v3 request frames
 //!    with the L4 ladder: over RDMA the rows are read where the NIC landed
 //!    them and the BF16 return is written into the registered send buffer;
-//!    over TCP the frames are owned buffers;
+//!    over TCP the frames are owned buffers. Over RDMA up to `--recv-slots`
+//!    requests (`GLM53F_RANK_RECV_SLOTS`, 4 by default) queue in the receive
+//!    slots it posts, served in order: the coordinator's prefill lanes keep that
+//!    many exchanges in flight, and the handshake tells it how many;
 //! 5. with `--peers` (the four ranks' peer-mesh addresses in rank order,
 //!    `GLM53F_RANK_PEERS`), joins the peer mesh ([`glm53f_rank::mesh`]) and
 //!    serves reduce-scattered requests (`DS41RTE3` v4): the partial is kept in
@@ -50,7 +53,7 @@ use glm53f_rank::manifest::Expect;
 use glm53f_rank::mesh::{self, Mesh, MeshConfig};
 use glm53f_rank::resident::{write_rank_dir, Resident};
 use glm53f_rank::serve::{return_meta_view, serve_view, serve_view_f32, Layers, Timings};
-use glm53f_rank::transport::{ByteTransport, RdmaTransport, TcpTransport};
+use glm53f_rank::transport::{ByteTransport, RdmaTransport, TcpTransport, RECV_SLOTS};
 use glm53f_rank::{boot, timeline};
 use glm53f_wire::frame::{RequestView, ReturnFrame, ReturnRow, FLAG_RETURN_REQUIRED, FLAG_ROW_SLICE};
 use glm53f_wire::l4::{StreamReceiver, StreamSender};
@@ -58,7 +61,7 @@ use glm53f_wire::layout::Status;
 use glm53f_wire::WireNaive;
 
 const USAGE: &str = "usage:
-  glm53f-rank serve  --rank <0..3> --dir <rank-dir> [--listen <addr:port>] [--peers <a0,a1,a2,a3>] [--peer-timeout-ms <ms>] [--lazy] [--allow-partial]
+  glm53f-rank serve  --rank <0..3> --dir <rank-dir> [--listen <addr:port>] [--recv-slots <1..16>] [--peers <a0,a1,a2,a3>] [--peer-timeout-ms <ms>] [--lazy] [--allow-partial]
   glm53f-rank slice  --checkpoint <exl3-checkpoint-dir> --rank <0..3> --out <rank-dir> [--layers 3-44] [--mtp] [--source <text>]
   glm53f-rank verify --rank <0..3> --dir <rank-dir> [--allow-partial]";
 
@@ -67,6 +70,8 @@ struct Args {
     rank: usize,
     dir: Option<PathBuf>,
     listen: String,
+    /// RDMA receive slots per coordinator connection: the requests it may queue.
+    recv_slots: u32,
     lazy: bool,
     expect: Expect,
     checkpoint: Option<PathBuf>,
@@ -102,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         rank: usize::MAX,
         dir: None,
         listen: "0.0.0.0:8600".into(),
+        recv_slots: RECV_SLOTS,
         lazy: false,
         expect: Expect::SERVING,
         checkpoint: None,
@@ -113,12 +119,14 @@ fn parse_args() -> Result<Args, String> {
     let mut mtp = false;
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let (mut peers, mut peer_timeout) = (env("GLM53F_RANK_PEERS"), env("GLM53F_RANK_PEER_TIMEOUT_MS"));
+    let mut recv_slots = env("GLM53F_RANK_RECV_SLOTS");
     while let Some(k) = it.next() {
         let mut val = || it.next().ok_or(format!("{k} needs a value"));
         match k.as_str() {
             "--rank" => a.rank = val()?.parse().map_err(|_| "bad --rank")?,
             "--dir" => a.dir = Some(PathBuf::from(val()?)),
             "--listen" => a.listen = val()?,
+            "--recv-slots" => recv_slots = Some(val()?),
             "--peers" => peers = Some(val()?),
             "--peer-timeout-ms" => peer_timeout = Some(val()?),
             "--lazy" => a.lazy = true,
@@ -133,6 +141,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.rank >= WORLD {
         return Err(format!("--rank must be 0..{WORLD}"));
+    }
+    if let Some(n) = recv_slots {
+        a.recv_slots = n.parse().ok().filter(|n| (1..=16).contains(n)).ok_or(format!("--recv-slots {n}: 1 to 16"))?;
     }
     if let Some(p) = peers {
         let timeout = match peer_timeout {
@@ -404,7 +415,7 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
         }
         // A coordinator that opens with the RDMA handshake gets an RC queue
         // pair; anything else stays on TCP.
-        let rdma = match RdmaTransport::accept(&stream) {
+        let rdma = match RdmaTransport::accept(&stream, a.recv_slots) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("rdma handshake failed: {e}");

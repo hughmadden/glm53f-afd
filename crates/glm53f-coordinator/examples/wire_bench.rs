@@ -5,12 +5,13 @@
 //!
 //! ```text
 //! wire_bench --ranks A,B,C,D [--rows 4096] [--layer 3] [--iters 20] [--min-rows 16]
-//!            [--exchange bf16|fp8] [--mode both|four|sharded] [--inflight 1|2]
+//!            [--exchange bf16|fp8] [--mode both|four|sharded] [--inflight 1..4]
 //! ```
 //!
 //! `--ranks` falls back to `GLM53F_SPARK_ADDRS`. Over RDMA with `GLM53F_RDMA=1` and
-//! `GLM53F_WIRE_NOCRC=1` (an `rdma` build), as the coordinator runs; `--inflight 2` keeps two
-//! exchanges in flight (the two prefill lanes; RDMA only). The ranks need `--peers` for the
+//! `GLM53F_WIRE_NOCRC=1` (an `rdma` build), as the coordinator runs; `--inflight N` keeps N
+//! exchanges in flight (N prefill lanes; RDMA only, at most what the ranks queue: their
+//! `--recv-slots`). The ranks need `--peers` for the
 //! row-sharded mode. With both modes it also prints the RMS difference of the two outputs of
 //! the first exchange (the row-sharded return's error against the four-plane sum).
 
@@ -65,7 +66,7 @@ fn parse() -> Result<Args, String> {
                     _ => return Err("--mode: both, four or sharded".into()),
                 }
             }
-            "--inflight" => a.inflight = num(&v)?.clamp(1, 2),
+            "--inflight" => a.inflight = num(&v)?.clamp(1, glm53f_coordinator::wire::MAX_DEPTH),
             _ => return Err(format!("unknown argument {k}")),
         }
     }
@@ -122,11 +123,12 @@ fn main() {
     let mut first: Vec<Vec<f32>> = Vec::new();
     for &sharded in &a.modes {
         let return_path = if sharded { ReturnPath::RowSharded { min_rows: a.min_rows, exchange: a.exchange } } else { ReturnPath::FourPlaneSum };
-        let mut c = WireClient::connect(&a.ranks, WireConfig { return_path, ..WireConfig::glm53_flash() }).unwrap_or_else(|e| {
+        let cfg = WireConfig { return_path, depth: a.inflight, ..WireConfig::glm53_flash() };
+        let mut c = WireClient::connect(&a.ranks, cfg).unwrap_or_else(|e| {
             eprintln!("wire_bench: {e}");
             std::process::exit(1);
         });
-        let inflight = if c.pipelined() { a.inflight } else { 1 };
+        let inflight = c.depth();
         let name = if sharded && c.config().row_sharded(a.rows).is_some() { format!("row-sharded {}", a.exchange.name()) } else { "four planes".into() };
         // One exchange collected (warms the kernels' scratch and the peer mesh), kept for the comparison.
         c.moe_send_raw(a.layer, &payload, &scales, &routes, TOPK).expect("send");

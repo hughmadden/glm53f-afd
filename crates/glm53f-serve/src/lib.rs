@@ -14,7 +14,7 @@
 //!    the official FP8 experts on this GPU (`--experts local`, development on one GPU);
 //! 3. with `--drafter`, loads the DFlash2 drafter onto the GPU next to the weights (each slot's
 //!    fixed state then holds its 40.16 MiB context ring);
-//! 4. allocates every buffer the forward's passes use (both prefill lanes' scratch for
+//! 4. allocates every buffer the forward's passes use (every prefill lane's scratch for
 //!    `--prefill-rows`, the verify scratch, the attention workspaces for any context), the
 //!    expert exchange's buffers and, with the drafter, its tap buffer and working memory, then
 //!    sizes the KV from the memory left: each slot's fixed state and a page pool shared by the
@@ -43,9 +43,9 @@
 //! | `--max-context T` | | the model's (1,048,576) | Tokens one request can hold |
 //! | `--kv-gib G` | | the free memory less the reserve | The KV page pool |
 //! | `--reserve-gib G` | | 1 | Device memory left free after everything is allocated (kernel modules loaded on first use, the sampler, allocator slack) |
-//! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 4096 | Rows of one prefill pass, both lanes together (at most 4,096 per lane: the wire's request cap) |
-//! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass: 2 overlaps one lane's attention with the other's experts on the ranks, 1 runs the pass serially |
-//! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (needs `--prefill-lanes 2`); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
+//! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 4096 | Rows of one prefill pass, every lane's together (at most 4,096 per lane: the wire's request cap) |
+//! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass, 1 to 4: from 2, each lane's attention overlaps the other lanes' experts on the ranks (N exchanges in flight over RDMA, as many as the ranks queue); 1 runs the pass serially ([Prefill rows and lanes](#prefill-rows-and-lanes)) |
+//! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (the prefill's first two: needs `--prefill-lanes 2` or more); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
@@ -64,7 +64,8 @@
 //! and `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft greedily too); the wire client
 //! `GLM53F_RDMA=1` (an `rdma` build) with
 //! `GLM53F_WIRE_NOCRC=1` (which the ranks must set too), `GLM53F_WIRE_MIN_GBPS`,
-//! `GLM53F_WIRE_INFLIGHT` (1 holds RDMA to one exchange in flight), `GLM53F_TIMELINE`,
+//! `GLM53F_WIRE_INFLIGHT=N` (caps the exchanges in flight over RDMA at N; 1: the lanes take turns
+//! on the wire), `GLM53F_TIMELINE`,
 //! `GLM53F_PROFILE` (the forward's lane trace: a `PIPE` line per prefill pass, a `STEP` line per
 //! decode step, see `glm53f-forward`'s `LaneTrace::step_summary`).
 //!
@@ -103,6 +104,20 @@
 //! flags let a run on the real hardware compare them; `glm53f-forward`'s lane trace
 //! (`GLM53F_PROFILE=1`) shows where each layer's time goes.
 //!
+//! **More lanes** (`--prefill-lanes 3` or 4). With the rank kernel tuned and the exchange's fast
+//! paths, the target hardware measured per MoE layer, lanes of 2,048 rows: 22.2 ms, the GPU busy
+//! 82%, each lane's attention 8.7 ms and its exchange 12.0 ms; lanes of 4,096: 43.4 ms, 84%, 17.6
+//! and 23.0 ms. In two lanes a lane's exchange is longer than the other lane's attention, so each
+//! lane's attention-then-exchange chain sets the pace and the GPU waits. In N lanes the exchange
+//! may take up to N - 1 lanes' attention before the GPU waits, and the ranks (about 7 ms of
+//! compute per 2,048 rows) keep up. Faster attention (`--kda-chunked-prefill`, FP8 KDA
+//! projections) makes the exchange the larger part still, and 3 or 4 lanes the ones to try. The
+//! lanes take the same scratch per row, so `--prefill-lanes 3 --prefill-rows 6144` (lanes of
+//! 2,048) takes 1.5 times the lane buffers of the default; the RDMA receive rings take one return
+//! slot (32 MiB) per lane and rank in page-locked host memory. The ranks queue four requests by
+//! default (`glm53f-rank serve --recv-slots`), and tell the coordinator in the RDMA handshake;
+//! the start-up plan prints the exchanges in flight.
+//!
 //! # Device memory
 //!
 //! Everything but the KV pool is allocated first, and the pool takes what is left less
@@ -140,7 +155,7 @@
 //!
 //! # Decode lanes
 //!
-//! `--decode-lanes` runs a decode or verify pass in the prefill's two lanes, cut between
+//! `--decode-lanes` runs a decode or verify pass in the prefill's first two lanes, cut between
 //! requests (`glm53f-forward`'s `ForwardConfig::decode_lane_rows`): one lane's attention on this
 //! GPU overlaps the other lane's routed experts on the ranks, exactly as the two passes over the
 //! lanes' requests would compute them. It is off by default because it pays only where the
@@ -190,7 +205,7 @@ pub const USAGE: &str = "usage:
 options:
   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
-  --prefill-rows <r>  --prefill-lanes 1|2  --decode-lanes off|<min>[-<max>]
+  --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
 numerics under test (off by default):
@@ -205,6 +220,8 @@ numerics under test (off by default):
 pub const RANKS: usize = 4;
 /// Rows of one prefill lane at most (one exchange: the wire's request cap).
 pub const MAX_LANE_ROWS: usize = 4096;
+/// Lanes of a prefill pass at most (`glm53f-forward`'s `MAX_LANES`).
+pub const MAX_PREFILL_LANES: usize = 4;
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// Where the routed experts run.
@@ -303,7 +320,8 @@ pub struct Options {
     /// Rows of one prefill pass (every lane's together), and its lanes.
     pub prefill_rows: usize,
     pub prefill_lanes: usize,
-    /// Decode and verify passes of `.0 ..= .1` rows run in two lanes (`.0` 0: never).
+    /// Decode and verify passes of `.0 ..= .1` rows run in two lanes (`.0` 0: never), the
+    /// prefill's first two.
     pub decode_lanes: (usize, usize),
     /// The DFlash2 drafter's directory (none: no speculative decoding).
     pub drafter: Option<PathBuf>,
@@ -471,12 +489,15 @@ impl Options {
         if !(1..=64).contains(&slots) {
             return Err(format!("--slots {slots}: 1 to 64"));
         }
-        if !matches!(prefill_lanes, 1 | 2) {
-            return Err(format!("--prefill-lanes {prefill_lanes}: 1 or 2"));
+        if !(1..=MAX_PREFILL_LANES).contains(&prefill_lanes) {
+            return Err(format!(
+                "--prefill-lanes {prefill_lanes}: 1 to {MAX_PREFILL_LANES}"
+            ));
         }
-        if decode_lanes.0 > 0 && prefill_lanes != 2 {
+        if decode_lanes.0 > 0 && prefill_lanes < 2 {
             return Err(
-                "--decode-lanes needs --prefill-lanes 2 (the decode lanes are the prefill's)"
+                "--decode-lanes needs --prefill-lanes 2 or more (the decode lanes are the \
+                 prefill's first two)"
                     .into(),
             );
         }
@@ -664,6 +685,14 @@ mod tests {
         assert_eq!((o.prefill_rows, o.prefill_lanes), (2048, 1));
         let o = Options::parse(&args("--prefill-rows 8192 --prefill-lanes 2"), &env2).unwrap();
         assert_eq!((o.prefill_rows, o.prefill_lanes), (8192, 2));
+        // Up to four lanes of up to 4,096 rows each.
+        for (rows, lanes) in [(6144, 3), (12288, 3), (8192, 4), (16384, 4), (1, 4)] {
+            let a = format!("--prefill-rows {rows} --prefill-lanes {lanes}");
+            let n = Options::parse(&args(&a), &env).unwrap();
+            assert_eq!((n.prefill_rows, n.prefill_lanes), (rows, lanes), "{a}");
+        }
+        let n = Options::parse(&args("--prefill-lanes 4 --decode-lanes 2"), &env).unwrap();
+        assert_eq!((n.prefill_lanes, n.decode_lanes), (4, (2, usize::MAX)));
         // Decode lanes: off by default; from the environment, and the flag over it.
         assert_eq!(o.decode_lanes, (0, usize::MAX));
         let env3 = |k: &str| match k {
@@ -844,7 +873,10 @@ mod tests {
             "--checkpoint /c --experts local --slots 65",          // too many
             "--checkpoint /c --experts local --prefill-rows 8193", // over two lanes of 4,096
             "--checkpoint /c --experts local --prefill-rows 5000 --prefill-lanes 1",
-            "--checkpoint /c --experts local --prefill-lanes 3",
+            "--checkpoint /c --experts local --prefill-rows 12289 --prefill-lanes 3",
+            "--checkpoint /c --experts local --prefill-rows 16385 --prefill-lanes 4",
+            "--checkpoint /c --experts local --prefill-lanes 5",
+            "--checkpoint /c --experts local --prefill-lanes 0",
             "--checkpoint /c --experts local --prefill-rows 0",
             "--checkpoint /c --experts local --kv-gib 0",
             "--checkpoint /c --experts local --reserve-gib -1",

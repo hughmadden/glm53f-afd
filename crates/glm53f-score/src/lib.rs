@@ -16,11 +16,12 @@
 //!    (`--ranks`, over RDMA with `GLM53F_RDMA=1` in an `rdma` build), or the official FP8 experts
 //!    on this GPU (`--experts local`);
 //! 3. builds the forward as `glm53f-serve --prefill-rows R --prefill-lanes N` would (passes of
-//!    `--pass-rows` rows, two lanes by default), one slot, no drafter;
+//!    `--pass-rows` rows, two lanes by default, up to four), one slot, no drafter;
 //! 4. per window: a fresh slot (empty KV, zeroed KDA states; no prefix cache, host tier or
 //!    sharing between windows), the raw ids (no BOS added, no template), `GlmForward::score` in
 //!    passes of `--pass-rows` rows (8 or fewer: the decode path's row-independent kernels; more:
-//!    the prefill path, two lanes above 128 rows), no sampling, no drafting; the plan's rows'
+//!    the prefill path, a lane per 64 rows up to `--prefill-lanes`), no sampling, no drafting;
+//!    the plan's rows'
 //!    logits, every one of the 154,880 LM-head columns, streamed to
 //!    `<out>/<window>.safetensors` as they come (at most 8 rows in memory);
 //! 5. writes `<out>/run.json`: the build, the configuration, the plan, and per window the tokens,
@@ -42,13 +43,13 @@
 //! | `--checkpoint DIR` | `GLM53F_CHECKPOINT_DIR` | required | The official FP8 checkpoint or its coordinator subset, with `config.json` |
 //! | `--plan FILE` | | required | The plan (`klgate.py plan`) |
 //! | `--out DIR` | | required | Where the windows' files and `run.json` go (created) |
-//! | `--pass-rows R` | | 4096 | Rows of one pass, both lanes together (1 to 4,096 per lane); the gate runs 8 or fewer and 4096 |
+//! | `--pass-rows R` | | 4096 | Rows of one pass, every lane's together (1 to 4,096 per lane); the gate runs 8 or fewer and 4096 |
 //! | `--windows ID,...` | | every window | Score these windows of the plan only |
 //! | `--experts remote\|local\|zero` | | `remote` | Where the routed experts run; `zero`: routed outputs of zeros (development) |
 //! | `--ranks A,B,C,D` | `GLM53F_SPARK_ADDRS` | required for `remote` | The four ranks, `host:port` in rank order, on the RDMA fabric |
 //! | `--experts-dir DIR` | `GLM53F_EXPERTS_DIR` | the checkpoint | `local`: a checkpoint holding the routed experts |
 //! | `--local-experts-gib G` | | 4 | `local`: device memory for the experts, loaded on demand |
-//! | `--prefill-lanes N` | | 2 | Lanes of a prefill pass (as `glm53f-serve`) |
+//! | `--prefill-lanes N` | | 2 | Lanes of a prefill pass, 1 to 4 (as `glm53f-serve`) |
 //! | `--kda-chunked-prefill` | | off | KDA of passes over 8 rows through the chunked kernel (a numerics change under test) |
 //! | `--fp8-act bf16\|dynamic` | | `bf16` | FP8 projections of up to 8 rows: BF16 activations (W8A16) or the checkpoint's dynamic E4M3 (W8A8) |
 //! | `--no-promote-k32` | | off | The FP8 tensor-core GEMM accumulates whole 128-blocks in the tensor core |
@@ -76,17 +77,17 @@ pub mod engine;
 
 use std::path::PathBuf;
 
-use glm53f_serve::{parse_dev_layers, Numerics, MAX_LANE_ROWS, RANKS};
+use glm53f_serve::{parse_dev_layers, Numerics, MAX_LANE_ROWS, MAX_PREFILL_LANES, RANKS};
 
 /// Usage, for `--help` and errors.
 pub const USAGE: &str = "usage:
   glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir> [options]
   glm53f-score --checkpoint <dir> --experts local [--experts-dir <dir>] --plan <plan.json> --out <dir> [options]
 options:
-  --pass-rows <r>        rows of one pass, both lanes together (default 4096; 8 or fewer: the
+  --pass-rows <r>        rows of one pass, every lane's together (default 4096; 8 or fewer: the
                          decode path)
   --windows <id,...>     score these windows of the plan only
-  --experts remote|local|zero  --local-experts-gib <g>  --prefill-lanes 1|2
+  --experts remote|local|zero  --local-experts-gib <g>  --prefill-lanes 1-4
   --kda-chunked-prefill  --fp8-act bf16|dynamic  --no-promote-k32
 numerics under test (off by default, as glm53f-serve):
   --kda-fp8              KDA projections quantized to FP8 block-128 at load (D2)
@@ -241,8 +242,8 @@ impl Options {
             "zero" => Experts::Zero,
             other => return Err(format!("--experts {other}: expected remote, local or zero")),
         };
-        if !matches!(lanes, 1 | 2) {
-            return Err(format!("--prefill-lanes {lanes}: 1 or 2"));
+        if !(1..=MAX_PREFILL_LANES).contains(&lanes) {
+            return Err(format!("--prefill-lanes {lanes}: 1 to {MAX_PREFILL_LANES}"));
         }
         if !(1..=lanes * MAX_LANE_ROWS).contains(&pass_rows) {
             return Err(format!(
@@ -456,6 +457,9 @@ mod tests {
             }
         );
         assert_eq!((o.pass_rows, o.lanes), (8, 1));
+        let four = Options::parse(&args("--plan p --out o --pass-rows 16384 --prefill-lanes 4"), &env)
+            .unwrap();
+        assert_eq!((four.pass_rows, four.lanes), (16384, 4));
         assert_eq!(o.windows, Some(vec!["a".to_string(), "b".to_string()]));
         assert_eq!(
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
@@ -553,7 +557,8 @@ mod tests {
             "--checkpoint /c --plan p --out o --experts zero --pass-rows 0",
             "--checkpoint /c --plan p --out o --experts zero --pass-rows 8193",
             "--checkpoint /c --plan p --out o --experts zero --pass-rows 4097 --prefill-lanes 1",
-            "--checkpoint /c --plan p --out o --experts zero --prefill-lanes 3",
+            "--checkpoint /c --plan p --out o --experts zero --prefill-lanes 5",
+            "--checkpoint /c --plan p --out o --experts zero --pass-rows 12289 --prefill-lanes 3",
             "--checkpoint /c --plan p --out o --experts zero --fp8-act e5m2",
             "--checkpoint /c --plan p --out o --experts zero --windows ,",
             "--checkpoint /c --plan p --out o --experts local --local-experts-gib 0",

@@ -57,6 +57,8 @@ mod daemon {
 
     const GIB: f64 = (1u64 << 30) as f64;
     const MIB: f64 = (1u64 << 20) as f64;
+    // The options' lane bound is the forward's.
+    const _: () = assert!(glm53f_serve::MAX_PREFILL_LANES == glm53f_forward::forward::MAX_LANES);
 
     fn s<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, String> {
         r.map_err(|e| e.to_string())
@@ -143,8 +145,9 @@ mod daemon {
             None => None,
         };
 
-        // 3. The routed experts, with their buffers for one lane's exchange. With a drafter, one
-        //    verify pass holds every slot's window, up to the step's row budget.
+        // 3. The routed experts, with their buffers for one lane's exchange and up to a lane's
+        //    exchange in flight each. With a drafter, one verify pass holds every slot's window,
+        //    up to the step's row budget.
         let mut fcfg = ForwardConfig {
             max_rows: o.prefill_rows,
             lanes: o.prefill_lanes,
@@ -166,10 +169,16 @@ mod daemon {
             match &o.experts {
                 Experts::Remote(addrs) => {
                     eprintln!("[coordinator] connecting the expert ranks {addrs:?}");
-                    let r = s(RemoteExperts::connect(addrs, rows))?;
+                    let r = s(RemoteExperts::connect(addrs, rows, o.prefill_lanes))?;
+                    let (recv, body) = r.host_bytes();
                     let what = format!(
-                        "the expert exchange, {rows} rows ({} in flight at most)",
-                        glm53f_forward::experts::ExpertBackend::depth(&r)
+                        "the expert exchange, {rows} rows an exchange, {} in flight at most \
+                         ({} lane(s); page-locked host buffers: receive {}, request body {}), \
+                         device buffers",
+                        glm53f_forward::experts::ExpertBackend::depth(&r),
+                        o.prefill_lanes,
+                        mib(recv),
+                        mib(body)
                     );
                     (Box::new(r), RemoteExperts::device_bytes(rows), what)
                 }

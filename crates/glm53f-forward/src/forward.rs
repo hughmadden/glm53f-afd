@@ -35,61 +35,76 @@
 //! the committed rows (a prefill or decode pass's, a commit's kept rows) go to each slot's
 //! drafter context.
 //!
-//! # Two lanes (prefill)
+//! # Lanes (prefill)
 //!
 //! A layer's routed experts run on the expert ranks while the coordinator waits, so a serial
-//! prefill leaves one side idle at every MoE layer. With [`ForwardConfig::lanes`] 2, a prefill
-//! pass cuts its rows in two halves, lanes A and B (a request that straddles the middle is split:
-//! lane B continues it at the positions after lane A's part), and runs them through each layer
-//! in turn:
+//! prefill leaves one side idle at every MoE layer. With [`ForwardConfig::lanes`] N of 2 to
+//! [`MAX_LANES`], a prefill pass cuts its rows into lanes (a request that straddles a cut is
+//! split: the next lane continues it at the positions after the previous lane's part, and may hand
+//! it on again) and runs them through each layer in turn, in round-robin order on the one stream
+//! (lanes A and B are lanes 0 and 1):
 //!
 //! ```text
-//! layer L:  A: attention, router, submit A's experts, shared expert
-//!           B: attention, router, submit B's experts, shared expert  <- the ranks: A's experts
-//!           A: finish A's experts (L); A: attention (L + 1) ...        <- the ranks: B's experts
+//! layer L:  lane 0: attention, router, submit its experts, shared expert
+//!           lane 1: attention, router, submit its experts, shared expert  <- ranks: lane 0's
+//!           ...
+//!           lane N-1: attention, ...                                      <- ranks: lanes 0, 1..
+//!           lane 0: finish its experts (L); attention (L + 1) ...
 //! ```
 //!
-//! Lane B's attention at layer L needs only what lane A's attention at L left behind: the KDA
-//! states and conv windows (in the pool, updated in place), the MLA latents and pooled keys of
-//! lane A's rows (in the pages), and a split request's DSA tail (copied from lane A's batch tails
-//! before each DSA layer). Within a request, lane A's rows go through each layer before lane
-//! B's, the causal order.
+//! **The cut.** A pass of R rows runs in one lane per [`ForwardConfig::min_lane_rows`] rows, at
+//! most N, and in at least as many as it needs to fit (lane 0 holds a one-lane pass, every lane
+//! `max_rows / N` rows). In k lanes, lane i holds the pass's rows `ceil(i R / k) .. ceil((i + 1) R
+//! / k)`: the lanes differ by a row at most (lane 0 is never the smaller). With N = 2 this is the
+//! rule of the two lanes before: two from twice `min_lane_rows` rows (or more than one lane
+//! holds), cut in the middle.
 //!
-//! At most [`ExpertBackend::depth`] calls are in flight, the oldest finished first: 2 over RDMA,
-//! where the ranks take lane B's request while they compute lane A's; 1 over TCP, where lane A
-//! is collected before lane B is sent (lane B's attention still overlaps lane A's exchange).
+//! Lane i's attention at layer L needs only what the lanes before it left at L: the KDA states
+//! and conv windows (in the pool, updated in place), the MLA latents and pooled keys of their rows
+//! (in the pages), and a split request's DSA tail (copied from lane i - 1's batch tails before
+//! each DSA layer: a request across several lanes goes from one to the next). Within a request, a
+//! lane's rows go through each layer before the next lane's, the causal order.
+//!
+//! **Calls in flight.** At most [`ExpertBackend::depth`] calls are out, the oldest finished
+//! first: a lane's attention at the next layer waits for its own call, and a lane's submit for a
+//! free place. Over RDMA the ranks queue the requests (four by default, one per receive slot they
+//! post) and compute them in order; over TCP one call is out, so each lane's call is collected
+//! before the next lane's is sent (the next lane's attention still overlaps it). The GPU keeps
+//! busy while a lane's exchange takes at most the other N - 1 lanes' attention.
+//!
 //! Each lane has its own buffers (its `Scratch`, swapped in as the active one); the attention
 //! workspaces are shared, since the lanes' kernels run one after another on the one stream.
-//! `run_layers`, passes with a test tap ([`GlmForward::set_tap`]) and prefill passes under two
-//! lanes of [`ForwardConfig::min_lane_rows`] run in one lane. Two lanes change the row counts of
-//! the tensor-core GEMMs, so a prefill's results move within rounding (deterministically: two
-//! lanes give the bits of the same rows run as two passes, lane A's then lane B's); decode's row
-//! independence is untouched. [`GlmForward::set_lane_trace`] times each lane per layer.
+//! `run_layers`, passes with a test tap ([`GlmForward::set_tap`]) and prefill passes too small
+//! for two lanes run in one lane. Lanes change the row counts of the tensor-core GEMMs, so a
+//! prefill's results move within rounding (deterministically: N lanes give the bits of the same
+//! rows run as N passes, lane 0's, then lane 1's, and so on); decode's row independence is
+//! untouched. [`GlmForward::set_lane_trace`] times each lane per layer.
 //!
 //! # Two lanes (decode and verify)
 //!
 //! A decode or verify pass of [`ForwardConfig::decode_lane_rows`] to
-//! [`ForwardConfig::decode_lane_max_rows`] rows, over two requests or more, runs in the same two
-//! lanes, cut between requests (the cut that splits the rows most evenly, lane A the larger on a
-//! tie): a request's rows never straddle the lanes, and requests do not read each other's state,
-//! so a lane is exactly a pass over its own requests. Each lane runs its own head over its own
-//! rows (the final mean and RMSNorm, then the LM head GEMM of the lane's rows alone), into its
-//! rows of lane A's logits, once its last layer is complete: lane A's head runs while lane B's
-//! last routed experts are out. A verify pass keeps each lane's replay inputs, projection rows
-//! and raw index keys at the lane's rows of the verify buffers, so the commit reads the pass's
-//! rows as one pass wrote them; it appends lane A's kept rows to the drafter's contexts, then
-//! lane B's. Two lanes give the bits of the two passes over the lanes' requests (lane A's, then
-//! lane B's) in everything they leave: logits and picks, KDA states, conv windows, pages, tails,
-//! the drafter's taps and rings (`tests/decode_lanes.rs`).
+//! [`ForwardConfig::decode_lane_max_rows`] rows, over two requests or more, runs in the prefill's
+//! first two lanes (whatever [`ForwardConfig::lanes`] is, from 2), cut between requests (the cut
+//! that splits the rows most evenly, lane A the larger on a tie): a request's rows never straddle
+//! the lanes, and requests do not read each other's state, so a lane is exactly a pass over its
+//! own requests. Each lane runs its own head over its own rows (the final mean and RMSNorm, then
+//! the LM head GEMM of the lane's rows alone), into its rows of lane A's logits, once its last
+//! layer is complete: lane A's head runs while lane B's last routed experts are out. A verify
+//! pass keeps each lane's replay inputs, projection rows and raw index keys at the lane's rows of
+//! the verify buffers, so the commit reads the pass's rows as one pass wrote them; it appends
+//! lane A's kept rows to the drafter's contexts, then lane B's. Two lanes give the bits of the two
+//! passes over the lanes' requests (lane A's, then lane B's) in everything they leave: logits and
+//! picks, KDA states, conv windows, pages, tails, the drafter's taps and rings
+//! (`tests/decode_lanes.rs`).
 //!
 //! Whether it pays depends on the load: each lane reads the coordinator's weights once and the
 //! ranks read the routed experts each lane's rows name, so two lanes of many rows read most
 //! experts twice. It is off by default (`decode_lane_rows` 0).
 //!
-//! **The drafter in two lanes.** Each lane captures the drafter's taps for its own rows, into
-//! those rows of the tap buffer (a lane's rows are a contiguous slice of the pass). After the
-//! pass the rows are committed and appended to the drafter's context lane by lane, lane A's then
-//! lane B's (a request split by the cut gets lane A's part, then lane B's), with the calls two
+//! **The drafter in lanes** (prefill, decode and verify). Each lane captures the drafter's taps
+//! for its own rows, into those rows of the tap buffer (a lane's rows are a contiguous slice of
+//! the pass). After the pass the rows are committed and appended to the drafter's context lane by
+//! lane, in lane order (a request split by a cut gets each lane's part in turn), with the calls
 //! one-lane passes of the same rows would make, so the rings hold the same bits.
 //!
 //! # Scoring
@@ -144,21 +159,26 @@ use crate::opprof::{LayerKind, OpProfile, OpTrace, Segment};
 use crate::shape::*;
 use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW, ProjW};
 
+/// Lanes of a prefill pass at most ([`ForwardConfig::lanes`]).
+pub const MAX_LANES: usize = 4;
+
 /// Sizes and kernel choices of a forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForwardConfig {
     /// Rows of one prefill pass, every lane's together (a longer segment runs in chunks of this
     /// many).
     pub max_rows: usize,
-    /// Lanes of a prefill pass: 1, or 2 to pipeline it (module documentation). A lane holds
-    /// `max_rows / lanes` rows (rounded up).
+    /// Lanes of a prefill pass: 1, or 2 to [`MAX_LANES`] to pipeline it (module documentation,
+    /// "Lanes (prefill)"). A lane holds `max_rows / lanes` rows (rounded up). Lowered after
+    /// construction, passes run in fewer of the lanes built.
     pub lanes: usize,
-    /// The fewest rows worth a second lane: a prefill pass under twice this runs in one lane
-    /// (if it fits in one).
+    /// The fewest rows worth a lane of their own: a prefill pass runs in one lane per this many
+    /// rows, at most `lanes`, and in as many as its rows need (a pass under twice this runs in
+    /// one lane if it fits in one).
     pub min_lane_rows: usize,
     /// Decode and verify passes of at least this many rows, and of two requests or more, run in
     /// two lanes cut between requests (module documentation, "Two lanes (decode and verify)");
-    /// 0 keeps them in one lane. Needs lane B's buffers (`lanes` 2).
+    /// 0 keeps them in one lane. Needs lane B's buffers (`lanes` 2 or more).
     pub decode_lane_rows: usize,
     /// Decode and verify passes of more rows than this run in one lane.
     pub decode_lane_max_rows: usize,
@@ -597,7 +617,7 @@ impl Scratch {
         ]
     }
 
-    /// `taps`: the lane that taps read and `run_layers` returns from (lane A); lane B's
+    /// `taps`: the lane that taps read and `run_layers` returns from (lane 0); the other lanes'
     /// scratch has no tap buffer (passes with a tap run in one lane).
     fn new(
         rows: usize,
@@ -889,8 +909,8 @@ impl Workspaces {
 /// Device bytes of a forward's per-pass buffers, by use (for start-up logs).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BufferBytes {
-    /// Each lane's scratch (lane B: 0 in a one-lane forward).
-    pub lanes: [usize; 2],
+    /// Each lane's scratch (0 past the forward's lanes).
+    pub lanes: [usize; MAX_LANES],
     /// The verify round's saved inputs.
     pub verify: usize,
     /// The indexer, sparse MLA (split partials and the core's block buffers) and chunked KDA
@@ -920,10 +940,20 @@ pub struct ForwardBuffers {
     sms: i32,
     stream: Arc<Stream>,
     gemm: Gemm,
+    /// Lane 0's scratch, and the other lanes' in order.
     s: Scratch,
-    s2: Option<Scratch>,
+    rest: Vec<Scratch>,
     v: VerifyScratch,
     ws: Workspaces,
+}
+
+/// Rows the largest pass holds: a prefill's in every lane (as many times the smallest lane's
+/// rows), one lane's, or a verify pass's.
+fn largest_pass(s: &Scratch, rest: &[Scratch], verify: usize) -> usize {
+    let lane = rest.iter().map(|b| b.rows.min(s.rows)).min();
+    lane.map_or(0, |r| (1 + rest.len()) * r)
+        .max(s.rows)
+        .max(verify)
 }
 
 impl ForwardBuffers {
@@ -938,9 +968,9 @@ impl ForwardBuffers {
     ) -> Result<ForwardBuffers> {
         let groups_ok = |g: usize| matches!(g, 1 | 2 | 4);
         if cfg.max_rows == 0
-            || !matches!(cfg.lanes, 1 | 2)
+            || !(1..=MAX_LANES).contains(&cfg.lanes)
             || cfg.min_lane_rows == 0
-            || (cfg.decode_lane_rows > 0 && cfg.lanes != 2)
+            || (cfg.decode_lane_rows > 0 && cfg.lanes < 2)
             || cfg.max_verify_rows == 0
             || cfg.max_requests == 0
             || !(1..=64).contains(&cfg.decode_splits)
@@ -958,19 +988,11 @@ impl ForwardBuffers {
         let logit_rows = cfg.max_requests.max(cfg.max_verify_rows);
         let dl = shape.dsa_layers;
         let s = Scratch::new(rows, logit_rows, cfg.max_requests, max_pages, dl, true)?;
-        let s2 = if cfg.lanes == 2 {
-            // Lane B: prefill rows only; its logit rows go to lane A's head buffers.
-            Some(Scratch::new(
-                lane,
-                0,
-                cfg.max_requests,
-                max_pages,
-                dl,
-                false,
-            )?)
-        } else {
-            None
-        };
+        // The other lanes: prefill rows only (and lane 1 a decode lane's); their logit rows go to
+        // lane 0's head buffers.
+        let rest = (1..cfg.lanes)
+            .map(|_| Scratch::new(lane, 0, cfg.max_requests, max_pages, dl, false))
+            .collect::<Result<Vec<_>>>()?;
         let v = VerifyScratch::new(cfg.max_verify_rows, shape.kda_layers, dl)?;
         let ws = Workspaces::new(
             Workspaces::plan(cfg, rows, sms, dl),
@@ -985,22 +1007,28 @@ impl ForwardBuffers {
             stream: stream.clone(),
             gemm: Gemm::new(stream, cfg.policy)?,
             s,
-            s2,
+            rest,
             v,
             ws,
         })
     }
 
-    /// Rows the largest pass holds: a two-lane prefill's, one lane's, or a verify pass's (a
+    /// Rows the largest pass holds: a prefill's in every lane, one lane's, or a verify pass's (a
     /// drafter's tap buffer holds that many: `crate::draft::Dflash::reserve`).
     pub fn pass_rows(&self) -> usize {
-        let two = self.s2.as_ref().map_or(0, |b| 2 * b.rows.min(self.s.rows));
-        two.max(self.s.rows).max(self.v.rows)
+        largest_pass(&self.s, &self.rest, self.v.rows)
     }
 
     pub fn bytes(&self) -> BufferBytes {
+        let mut lanes = [0; MAX_LANES];
+        for (b, s) in lanes
+            .iter_mut()
+            .zip(std::iter::once(&self.s).chain(&self.rest))
+        {
+            *b = s.bytes();
+        }
         BufferBytes {
-            lanes: [self.s.bytes(), self.s2.as_ref().map_or(0, |s| s.bytes())],
+            lanes,
             verify: self.v.bytes(),
             workspaces: [
                 self.ws.idx.bytes(),
@@ -1020,8 +1048,8 @@ type Prev = (*const u16, *const u16, *const f32, *const f32);
 struct Lane {
     /// The lane's requests; `row0` counts from the lane's first row.
     reqs: Vec<Req>,
-    /// Where they are in the pass: the index of the first among the pass's requests (lane B's
-    /// first is lane A's last when the cut splits it), and the lane's first row.
+    /// Where they are in the pass: the index of the first among the pass's requests (a lane's
+    /// first is the previous lane's last when a cut splits it), and the lane's first row.
     first: usize,
     base: usize,
     rows: usize,
@@ -1029,8 +1057,8 @@ struct Lane {
     /// The stream buffer holding the lane's current streams, and the output to expand next.
     cur: usize,
     prev: Option<Prev>,
-    /// Lane B: `(k, n)` when its first request continues lane A's request `k` of `n` (its DSA
-    /// tails come from lane A before each DSA layer).
+    /// `(k, n)` when its first request continues the previous lane's request `k` of `n` (its DSA
+    /// tails come from that lane before each DSA layer).
     continues: Option<(usize, usize)>,
     /// Logit rows, from the lane's first row, and how many of the pass's logit rows come
     /// before them.
@@ -1072,32 +1100,70 @@ impl Exchange {
     }
 }
 
-/// The pass's requests cut at row `at`: lane A's (the rows before it), lane B's, and, when a
-/// request straddles the cut, its index in lane A (lane B's first request continues it at the
-/// positions after lane A's part).
-fn cut(reqs: &[Req], at: usize) -> (Vec<Req>, Vec<Req>, Option<usize>) {
-    let (mut a, mut b, mut split) = (Vec::new(), Vec::new(), None);
-    for r in reqs {
-        if r.row0 + r.rows <= at {
-            a.push(*r);
-        } else if r.row0 >= at {
-            b.push(Req {
-                row0: r.row0 - at,
-                ..*r
-            });
-        } else {
-            let n = at - r.row0;
-            split = Some(a.len());
-            a.push(Req { rows: n, ..*r });
-            b.push(Req {
-                start: r.start + n,
-                rows: r.rows - n,
-                row0: 0,
+/// One lane's share of a pass ([`cut`]).
+struct Part {
+    /// The lane's requests (`row0` from the lane's first row), the index of its first among the
+    /// pass's requests, and the pass's rows it holds.
+    reqs: Vec<Req>,
+    first: usize,
+    span: Range<usize>,
+    /// `(k, n)`: its first request continues the previous lane's request `k` of `n`.
+    continues: Option<(usize, usize)>,
+    /// Its last request goes on in the next lane: that request's index in this lane.
+    goes_on: Option<usize>,
+}
+
+/// The pass's requests (`total` rows) cut into lanes at rows `at` (ascending, each inside the
+/// pass): lane i holds the rows from `at[i - 1]` (0 for lane 0) to `at[i]` (`total` for the last).
+/// A request across a cut is split: the next lane continues it at the positions after the
+/// previous lane's part, and may hand it on again.
+fn cut(reqs: &[Req], total: usize, at: &[usize]) -> Vec<Part> {
+    let mut parts: Vec<Part> = Vec::with_capacity(at.len() + 1);
+    let mut lo = 0;
+    for hi in at.iter().copied().chain(std::iter::once(total)) {
+        let mut p = Part {
+            reqs: Vec::new(),
+            first: 0,
+            span: lo..hi,
+            continues: None,
+            goes_on: None,
+        };
+        for (i, r) in reqs.iter().enumerate() {
+            let (a, b) = (r.row0.max(lo), (r.row0 + r.rows).min(hi));
+            if a >= b {
+                continue;
+            }
+            if p.reqs.is_empty() {
+                p.first = i;
+                if let Some(before) = parts.last().filter(|_| r.row0 < lo) {
+                    p.continues = Some((before.reqs.len() - 1, before.reqs.len()));
+                }
+            }
+            if r.row0 + r.rows > hi {
+                p.goes_on = Some(p.reqs.len());
+            }
+            p.reqs.push(Req {
+                start: r.start + (a - r.row0),
+                rows: b - a,
+                row0: a - lo,
                 ..*r
             });
         }
+        parts.push(p);
+        lo = hi;
     }
-    (a, b, split)
+    parts
+}
+
+/// The lanes a prefill pass of `total` rows runs in, of `n` it may use: one per `min_rows` rows,
+/// and at least as many as its rows need when one lane holds `first` rows and each lane of
+/// several `rows` (module documentation, "Lanes (prefill)").
+fn lanes_for(total: usize, n: usize, min_rows: usize, first: usize, rows: usize) -> usize {
+    let mut k = (total / min_rows.max(1)).clamp(1, n.max(1));
+    while k < n && total > if k == 1 { first } else { k * rows } {
+        k += 1;
+    }
+    k
 }
 
 /// Pipeline timings of the last traced pass (with [`GlmForward::set_lane_trace`] on): per MoE
@@ -1105,7 +1171,8 @@ fn cut(reqs: &[Req], at: usize) -> (Vec<Req>, Vec<Req>, Option<usize>) {
 #[derive(Clone, Debug)]
 pub struct LaneTrace {
     pub mode: Mode,
-    /// Rows and requests per lane, and the backend's calls in flight at most.
+    /// Rows and requests per lane, and the calls in flight at most (the backend's depth, at most
+    /// one a lane).
     pub rows: Vec<usize>,
     pub requests: Vec<usize>,
     pub depth: usize,
@@ -1138,7 +1205,7 @@ pub struct StepTimes {
 #[derive(Clone, Debug, Default)]
 pub struct LayerTrace {
     pub layer: usize,
-    /// Host time from lane A starting this layer to lane A starting the next (or the loop's end).
+    /// Host time from lane 0 starting this layer to lane 0 starting the next (or the loop's end).
     pub wall_ms: f64,
     /// GPU time of the lane's attention sublayer with both boundaries and the router (its work
     /// before the routes go to the host), and of its shared expert.
@@ -1263,8 +1330,8 @@ struct Tracer {
     events: Vec<Event>,
     used: usize,
     /// `[layer][lane]` records of the current pass.
-    recs: Vec<[TraceRec; 2]>,
-    /// When lane A started each layer, and the layer loop's bounds.
+    recs: Vec<Vec<TraceRec>>,
+    /// When lane 0 started each layer, and the layer loop's bounds.
     starts: Vec<(usize, Instant)>,
     loop_start: Instant,
     loop_end: Instant,
@@ -1319,7 +1386,7 @@ struct Meta {
 struct Pending {
     reqs: Vec<Req>,
     rows: usize,
-    /// Two lanes: lane A's requests (the commit appends each lane's rows to the drafter's
+    /// Two decode lanes: lane A's requests (the commit appends each lane's rows to the drafter's
     /// contexts in a call of its own, as two passes would).
     split: Option<usize>,
 }
@@ -1333,10 +1400,11 @@ pub struct GlmForward {
     gemm: Gemm,
     stream: Arc<Stream>,
     pub cfg: ForwardConfig,
-    /// The active lane's buffers: lane A's outside a pass.
+    /// The active lane's buffers: lane 0's outside a pass.
     s: Scratch,
-    /// The other lane's (a two-lane forward), and which lane `s` is.
-    s2: Option<Scratch>,
+    /// The other lanes' (lane i's at `i - 1`, but lane 0's where the active lane's belong), and
+    /// which lane `s` is ([`GlmForward::use_lane`]).
+    rest: Vec<Scratch>,
     lane: usize,
     v: VerifyScratch,
     ws: Workspaces,
@@ -1349,9 +1417,9 @@ pub struct GlmForward {
     sms: i32,
     /// The DFlash2 drafter, when attached.
     draft: Option<Dflash>,
-    /// The first row of lane B in the last pass, when it ran in two lanes (where
-    /// [`GlmForward::score`] finds a row's head output).
-    lane_b: Option<usize>,
+    /// The first row of each lane of the last pass (where [`GlmForward::score`] finds a row's
+    /// head output).
+    lane_bases: Vec<usize>,
     /// Decode and verify passes run in two lanes so far.
     decode_lane_passes: u64,
 }
@@ -1415,7 +1483,7 @@ impl GlmForward {
             stream,
             gemm,
             s,
-            s2,
+            rest,
             v,
             ws,
             ..
@@ -1430,7 +1498,7 @@ impl GlmForward {
             stream,
             cfg,
             s,
-            s2,
+            rest,
             lane: 0,
             v,
             ws,
@@ -1440,7 +1508,7 @@ impl GlmForward {
             trace: None,
             ops: RefCell::new(None),
             draft: None,
-            lane_b: None,
+            lane_bases: Vec::new(),
             decode_lane_passes: 0,
         };
         if std::env::var("GLM53F_PROFILE_OPS").is_ok_and(|v| !v.is_empty() && v != "0") {
@@ -1462,7 +1530,7 @@ impl GlmForward {
     /// scratch, the verify scratch, the attention workspaces and the GEMM engine's scratch.
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
-            + self.s2.as_ref().map_or(0, |s| s.bytes())
+            + self.rest.iter().map(Scratch::bytes).sum::<usize>()
             + self.v.bytes()
             + self.ws.bytes()
             + self.gemm.bytes()
@@ -1631,11 +1699,10 @@ impl GlmForward {
         Ok(())
     }
 
-    /// Rows the largest pass holds: a two-lane prefill's, one lane's, or a verify pass's (the
-    /// drafter's tap buffer holds that many).
+    /// Rows the largest pass holds: a prefill's in every lane, one lane's, or a verify pass's
+    /// (the drafter's tap buffer holds that many).
     pub fn pass_rows(&self) -> usize {
-        let two = self.s2.as_ref().map_or(0, |b| 2 * b.rows.min(self.s.rows));
-        two.max(self.s.rows).max(self.v.rows)
+        largest_pass(&self.s, &self.rest, self.v.rows)
     }
 
     pub fn has_drafter(&self) -> bool {
@@ -1673,15 +1740,30 @@ impl GlmForward {
 
     // ---- Public passes ---------------------------------------------------------------------
 
-    /// Rows one prefill pass takes now: both lanes' when passes run in two, else one lane's.
+    /// Rows one prefill pass takes now: every lane's when passes run in several, else one
+    /// lane's.
     pub fn prefill_rows(&self) -> usize {
         let one = self.s.rows.min(self.cfg.max_rows);
-        match &self.s2 {
-            Some(b) if self.cfg.lanes == 2 && self.tap.is_none() => {
-                self.cfg.max_rows.min(2 * one.min(b.rows))
-            }
-            _ => one,
+        let n = self.lanes_now();
+        if n > 1 && self.tap.is_none() {
+            self.cfg.max_rows.min(n * one.min(self.lane_rows()))
+        } else {
+            one
         }
+    }
+
+    /// Lanes a prefill pass may run in now: [`ForwardConfig::lanes`], at most the lanes built.
+    fn lanes_now(&self) -> usize {
+        self.cfg.lanes.clamp(1, 1 + self.rest.len())
+    }
+
+    /// Rows the smallest lane holds (lane 0 also holds a verify pass, or every row of a one-lane
+    /// forward).
+    fn lane_rows(&self) -> usize {
+        self.rest
+            .iter()
+            .map(|b| b.rows)
+            .fold(self.s.rows, usize::min)
     }
 
     /// Append and commit each segment's tokens; returns the greedy pick after each segment's
@@ -2001,7 +2083,7 @@ impl GlmForward {
     /// The passes are those [`GlmForward::prefill`] runs for one segment cut into chunks of
     /// `pass_rows` (at most [`GlmForward::prefill_rows`]): up to 8 rows run the row-independent
     /// decode kernels in one lane, whose bits equal serial decode steps; more rows the prefill
-    /// kernels, in two lanes when the forward has them. After each pass the requested rows of its
+    /// kernels, in the forward's lanes. After each pass the requested rows of its
     /// chunk are gathered from their lanes' head outputs (the head's final norm, as for any logit
     /// row) and the LM head runs over them alone, in groups of up to the GEMV's 8 rows: the kernel
     /// a prefill's last row takes, so a row's logits do not depend on which other rows are scored
@@ -2066,14 +2148,9 @@ impl GlmForward {
             let here = rows[next..].partition_point(|&r| r < first + chunk.len());
             for g in rows[next..next + here].chunks(group) {
                 for (i, &r) in g.iter().enumerate() {
-                    // Lane A's head output holds the pass's first rows, lane B's the rest.
-                    let (src, at) = match self.lane_b {
-                        Some(b) if r - first >= b => (
-                            &self.s2.as_ref().expect("lane B's buffers").head_out,
-                            r - first - b,
-                        ),
-                        _ => (&self.s.head_out, r - first),
-                    };
+                    // Each lane's head output holds its rows of the pass.
+                    let x = self.lane_bases.partition_point(|&b| b <= r - first) - 1;
+                    let (src, at) = (&self.scratch(x).head_out, r - first - self.lane_bases[x]);
                     self.s.head_sel.copy_from(
                         &st,
                         i * HIDDEN * 2,
@@ -2298,7 +2375,7 @@ impl GlmForward {
     ) -> Result<Vec<u32>> {
         let t0 = Instant::now();
         let r = self.pass_lanes(mode, kvs, rows, input, layers, head, logits);
-        // Between passes (a failed one too) lane A's buffers are the active ones.
+        // Between passes (a failed one too) lane 0's buffers are the active ones.
         self.use_lane(0);
         if let Some(t) = self.trace.as_mut() {
             t.active = false;
@@ -2330,15 +2407,26 @@ impl GlmForward {
         r
     }
 
-    /// Whether a pass of `total` rows runs in two lanes: a prefill of token ids without a tap,
-    /// in a two-lane forward, of at least two lanes' worth of rows or more than one lane holds.
-    fn two_lanes(&self, mode: Mode, input: &Input<'_>, total: usize) -> bool {
-        mode == Mode::Prefill
-            && self.cfg.lanes == 2
-            && self.s2.is_some()
-            && self.tap.is_none()
-            && matches!(input, Input::Tokens(_))
-            && (total > self.s.rows || total >= 2 * self.cfg.min_lane_rows)
+    /// The lanes a pass of `total` rows runs in (module documentation, "Lanes (prefill)"): a
+    /// prefill of token ids without a tap runs in one lane per [`ForwardConfig::min_lane_rows`]
+    /// rows, at most the lanes it may use now, and in at least as many as its rows need (one lane
+    /// holds lane 0's rows, several the smallest lane's each); anything else in one lane.
+    fn prefill_lanes(&self, mode: Mode, input: &Input<'_>, total: usize) -> usize {
+        let n = self.lanes_now();
+        if mode != Mode::Prefill
+            || n == 1
+            || self.tap.is_some()
+            || !matches!(input, Input::Tokens(_))
+        {
+            return 1;
+        }
+        lanes_for(
+            total,
+            n,
+            self.cfg.min_lane_rows,
+            self.s.rows,
+            self.lane_rows(),
+        )
     }
 
     /// Where a decode or verify pass of `rows[i]` rows per request cuts its two lanes (module
@@ -2349,9 +2437,9 @@ impl GlmForward {
     /// lane B; a tap; input streams; or a lane its buffers do not hold.
     fn decode_cut(&self, mode: Mode, input: &Input<'_>, rows: &[usize]) -> Option<usize> {
         let total: usize = rows.iter().sum();
-        let lane_b = self.s2.as_ref()?;
+        let lane_b = self.rest.first()?;
         if mode == Mode::Prefill
-            || self.cfg.lanes != 2
+            || self.cfg.lanes < 2
             || self.cfg.decode_lane_rows == 0
             || !(self.cfg.decode_lane_rows..=self.cfg.decode_lane_max_rows).contains(&total)
             || rows.len() < 2
@@ -2371,12 +2459,30 @@ impl GlmForward {
         (best <= self.s.rows && total - best <= lane_b.rows).then_some(best)
     }
 
-    /// Make lane `i`'s buffers the active ones (`s`); the other lane's wait in `s2`.
+    /// Make lane `i`'s buffers the active ones (`s`). The others wait in `rest`: lane j's at
+    /// `j - 1`, but lane 0's at the active lane's place.
     fn use_lane(&mut self, i: usize) {
-        if i != self.lane {
-            let other = self.s2.as_mut().expect("a two-lane forward");
-            std::mem::swap(&mut self.s, other);
-            self.lane = i;
+        if i == self.lane {
+            return;
+        }
+        if self.lane > 0 {
+            // Lane 0's back to `s`, the active lane's to its place.
+            std::mem::swap(&mut self.s, &mut self.rest[self.lane - 1]);
+        }
+        if i > 0 {
+            std::mem::swap(&mut self.s, &mut self.rest[i - 1]);
+        }
+        self.lane = i;
+    }
+
+    /// Lane `i`'s buffers, wherever they are ([`GlmForward::use_lane`]).
+    fn scratch(&self, i: usize) -> &Scratch {
+        if i == self.lane {
+            &self.s
+        } else if i == 0 {
+            &self.rest[self.lane - 1]
+        } else {
+            &self.rest[i - 1]
         }
     }
 
@@ -2392,13 +2498,13 @@ impl GlmForward {
         logits: bool,
     ) -> Result<Vec<u32>> {
         let total: usize = rows.iter().sum();
-        let two = self.two_lanes(mode, &input, total);
+        let n_lanes = self.prefill_lanes(mode, &input, total);
         // Decode and verify: two lanes of whole requests.
         let decode_at = self.decode_cut(mode, &input, rows);
         let cap = if mode == Mode::Verify {
             self.v.rows
-        } else if two {
-            2 * self.s.rows.min(self.s2.as_ref().map_or(0, |s| s.rows))
+        } else if n_lanes > 1 {
+            n_lanes * self.lane_rows()
         } else {
             self.s.rows
         };
@@ -2451,33 +2557,31 @@ impl GlmForward {
             }
             _ => None,
         };
-        // The lanes: the two halves of the rows (a request across the middle is split, lane B
-        // continuing it); a decode or verify pass's requests in two (cut between requests); or
-        // one lane of every row.
-        let parts = if two {
-            let at = total.div_ceil(2);
-            let (a, b, split) = cut(&reqs, at);
-            let na = a.len();
-            let first_b = split.unwrap_or(na);
-            vec![
-                (a, 0, 0..at, None, split),
-                (b, first_b, at..total, split.map(|k| (k, na)), None),
-            ]
-        } else if let Some(at) = decode_at {
-            let (a, b, _) = cut(&reqs, at);
-            let na = a.len();
-            vec![(a, 0, 0..at, None, None), (b, na, at..total, None, None)]
-        } else {
-            vec![(reqs.clone(), 0, 0..total, None, None)]
+        // The lanes: the rows in `n_lanes` even parts, lane i from row ceil(i total / n_lanes) (a
+        // request across a cut is split, the next lane continuing it); a decode or verify pass's
+        // requests in two (cut between requests); or one lane of every row.
+        let at: Vec<usize> = match decode_at {
+            Some(at) => vec![at],
+            None => (1..n_lanes)
+                .map(|i| (i * total).div_ceil(n_lanes))
+                .collect(),
         };
+        let parts = cut(&reqs, total, &at);
         let st = self.stream.clone();
         let mut lanes = Vec::with_capacity(parts.len());
         let mut logit_base = 0;
-        for (i, (lreqs, first, span, continues, goes_on)) in parts.into_iter().enumerate() {
+        for (i, part) in parts.into_iter().enumerate() {
+            let Part {
+                reqs: lreqs,
+                first,
+                span,
+                continues,
+                goes_on,
+            } = part;
             self.use_lane(i);
             let n = span.len();
-            // Prefill: each request's last row (not lane A's part of a request lane B goes on
-            // with). Decode and verify: every row.
+            // Prefill: each request's last row (not a lane's part of a request the next lane goes
+            // on with). Decode and verify: every row.
             let logit_rows: Vec<i32> = match mode {
                 Mode::Prefill => lreqs
                     .iter()
@@ -2535,7 +2639,7 @@ impl GlmForward {
             });
             logit_base += nl;
         }
-        self.lane_b = lanes.get(1).map(|l| l.base);
+        self.lane_bases = lanes.iter().map(|l| l.base).collect();
         self.mark(usize::MAX, "embed")?;
         // Every pass through the head captures the drafter's taps (`crate::draft`).
         let taps = head && self.draft.is_some();
@@ -2545,7 +2649,7 @@ impl GlmForward {
         self.run_lanes(mode, &mut lanes, layers, taps, heads)?;
         self.decode_lane_passes += u64::from(decode_at.is_some());
         // Tails of prefill and decode passes were committed in the layers: back to the slots,
-        // lane A's first (a split request's final tail is lane B's).
+        // lane by lane (a split request's final tail is its last lane's).
         if mode != Mode::Verify {
             for (i, lane) in lanes.iter().enumerate() {
                 self.use_lane(i);
@@ -2582,8 +2686,8 @@ impl GlmForward {
             return Ok(picks);
         }
         // Commit the positions, lane by lane, and with a drafter append each lane's rows to its
-        // slots' contexts right after (lane A's first: a request the cut split gets lane A's
-        // part, then lane B's), the calls one-lane passes of the same rows make.
+        // slots' contexts right after (in lane order: a request a cut split gets each lane's part
+        // in turn), the calls one-lane passes of the same rows make.
         for lane in &lanes {
             let ks = &mut kvs[lane.first..lane.first + lane.reqs.len()];
             for (kv, r) in ks.iter_mut().zip(&lane.reqs) {
@@ -2604,13 +2708,18 @@ impl GlmForward {
         Ok(picks)
     }
 
-    /// Layers `layers` over the lanes: per layer, each lane's attention sublayer, then its FFN.
-    /// An MoE FFN's routed experts go to the backend (`submit`) and are collected later
-    /// (`finish`): a lane's next attention waits for its own, at most the backend's depth are
-    /// out at once, and the oldest is collected first. With two lanes, one lane's attention
-    /// runs while the other's experts are out. With `heads` (decode and verify lanes), each
-    /// lane's head runs once its last layer is complete, lane A's while lane B's last call is
-    /// out.
+    /// Calls in flight at most over `lanes` lanes: the backend's depth, and one a lane.
+    fn depth(&self, lanes: usize) -> usize {
+        self.experts.depth().clamp(1, lanes.max(1))
+    }
+
+    /// Layers `layers` over the lanes: per layer, each lane's attention sublayer, then its FFN,
+    /// the lanes in turn. An MoE FFN's routed experts go to the backend (`submit`) and are
+    /// collected later (`finish`): a lane's next attention waits for its own, at most the
+    /// backend's depth are out at once, and the oldest is collected first. With several lanes,
+    /// a lane's attention runs while earlier lanes' experts are out. With `heads` (decode and
+    /// verify lanes), each lane's head runs once its last layer is complete, lane A's while lane
+    /// B's last call is out.
     fn run_lanes(
         &mut self,
         mode: Mode,
@@ -2619,7 +2728,7 @@ impl GlmForward {
         taps: bool,
         heads: bool,
     ) -> Result<()> {
-        let depth = self.experts.depth().clamp(1, 2);
+        let depth = self.depth(lanes.len());
         let mut flight: VecDeque<usize> = VecDeque::new();
         let model = self.model.clone();
         if let Some(o) = self.ops.get_mut().as_mut() {
@@ -2633,7 +2742,7 @@ impl GlmForward {
             t.active = true;
             t.mode = mode;
             t.used = 0;
-            t.recs = vec![Default::default(); model.shape.layers];
+            t.recs = vec![vec![TraceRec::default(); lanes.len()]; model.shape.layers];
             t.starts.clear();
             t.loop_start = Instant::now();
             // The backend's own record of the pass's calls (`LaneTrace::wire`).
@@ -2777,17 +2886,17 @@ impl GlmForward {
         self.mark(l, "ffn_hc")
     }
 
-    /// Lane B's first request continues lane A's request `k` (of `n`): before DSA layer `l`,
-    /// its tail is the one lane A's part left at that layer (lane A ran the layer first, on the
-    /// same stream). `nb`: lane B's requests.
+    /// The active lane's first request continues the previous lane's request `k` (of `n`): before
+    /// DSA layer `l`, its tail is the one the previous lane's part left at that layer (that lane
+    /// ran the layer first, on the same stream). `nb`: the active lane's requests.
     fn continue_tail(&mut self, l: usize, k: usize, n: usize, nb: usize) -> Result<()> {
-        debug_assert_eq!(self.lane, 1, "lane B's buffers are active");
+        debug_assert!(self.lane > 0, "a lane after the first is active");
         let j = self.model.shape.dsa_index[l].expect("a DSA layer");
-        let a = self.s2.as_ref().expect("lane A's buffers");
+        let before = self.scratch(self.lane - 1);
         self.s.batch_tails.copy_from(
             &self.stream,
             j * nb * TAIL,
-            &a.batch_tails,
+            &before.batch_tails,
             (j * n + k) * TAIL,
             TAIL,
         )
@@ -2823,7 +2932,7 @@ impl GlmForward {
     }
 
     /// The head over each lane's last streams, then the LM head and the argmax over the pass's
-    /// logit rows (gathered into lane A's buffers, in request order). Returns the picks when
+    /// logit rows (gathered into lane 0's buffers, in request order). Returns the picks when
     /// `logits`.
     fn head(&mut self, lanes: &[Lane], total: usize, logits: bool) -> Result<Vec<u32>> {
         let st = self.stream.clone();
@@ -2852,13 +2961,11 @@ impl GlmForward {
                 "glm53f_hc_head",
             )?;
             if logits && !whole && !lane.logit_rows.is_empty() {
-                let a = if i == 0 {
-                    &self.s
-                } else {
-                    self.s2.as_ref().expect("lane A's buffers")
-                };
-                let dst: *mut u8 = a.head_sel.byte_ptr(lane.logit_base * HIDDEN * 2);
-                // SAFETY: rows of the head output; indices < the lane's rows; lane A's head
+                let dst: *mut u8 = self
+                    .scratch(0)
+                    .head_sel
+                    .byte_ptr(lane.logit_base * HIDDEN * 2);
+                // SAFETY: rows of the head output; indices < the lane's rows; lane 0's head
                 // buffer holds every logit row of the pass.
                 launched(
                     unsafe {
@@ -2932,13 +3039,8 @@ impl GlmForward {
             "glm53f_hc_head",
         )?;
         self.mark(usize::MAX, "head_hc")?;
-        let a = if i == 0 {
-            &self.s
-        } else {
-            self.s2.as_ref().expect("lane A's buffers")
-        };
         // Lane A's logit rows hold every row of the pass (checked before the pass).
-        let out: *mut f32 = a.logits.ptr(lane.logit_base * VOCAB);
+        let out: *mut f32 = self.scratch(0).logits.ptr(lane.logit_base * VOCAB);
         let lm = self.model.head.lm_head.mat();
         unsafe {
             self.gemm.bf16(
@@ -2957,7 +3059,7 @@ impl GlmForward {
         self.mark(usize::MAX, "lm_head")
     }
 
-    /// The greedy picks of the pass's first `lr` logit rows (lane A's buffers, which the pass's
+    /// The greedy picks of the pass's first `lr` logit rows (lane 0's buffers, which the pass's
     /// end leaves active).
     fn argmax(&mut self, lr: usize) -> Result<Vec<u32>> {
         self.use_lane(0);
@@ -3031,12 +3133,13 @@ impl GlmForward {
 
     /// Close a traced pass: its per-layer record, from the events (waits for the stream).
     fn finish_trace(&mut self, lanes: &[Lane]) -> Result<()> {
+        let n = lanes.len();
+        let depth = self.depth(n);
         let Some(t) = self.trace.as_mut().filter(|t| t.active) else {
             return Ok(());
         };
         t.active = false;
         self.stream.synchronize()?;
-        let n = lanes.len();
         let mut layers = Vec::new();
         for (i, &(l, at)) in t.starts.iter().enumerate() {
             if !self.model.shape.is_moe(l) {
@@ -3071,7 +3174,7 @@ impl GlmForward {
             mode: t.mode,
             rows: lanes.iter().map(|l| l.rows).collect(),
             requests: lanes.iter().map(|l| l.reqs.len()).collect(),
-            depth: self.experts.depth().clamp(1, 2),
+            depth,
             loop_ms: (t.loop_end - t.loop_start).as_secs_f64() * 1e3,
             layers,
             wire: self.experts.trace_end(),
@@ -4181,5 +4284,98 @@ impl GlmForward {
         self.experts.submit(&ex.call(lane), &st)?;
         lane.exchange = Some(ex);
         self.mark(l, "routed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(slot: usize, rows: usize, row0: usize) -> Req {
+        Req {
+            slot,
+            start: 100 * slot,
+            rows,
+            row0,
+            state_off: 0,
+            conv_off: 0,
+            tail_row: 0,
+        }
+    }
+
+    /// A lane's first request among the pass's, rows, `continues` and `goes_on`.
+    type Place = (usize, Range<usize>, Option<(usize, usize)>, Option<usize>);
+
+    /// A part's place in the pass and its requests' (slot, start, rows, row0).
+    fn part(p: &Part) -> (Place, Vec<(usize, usize, usize, usize)>) {
+        (
+            (p.first, p.span.clone(), p.continues, p.goes_on),
+            p.reqs
+                .iter()
+                .map(|r| (r.slot, r.start, r.rows, r.row0))
+                .collect(),
+        )
+    }
+
+    /// Two requests of 150 and 211 rows in four lanes (cuts at 91, 181 and 271): the first split
+    /// once, the second across three lanes, its middle part a lane of its own; then cut between
+    /// the requests (the decode lanes' cut), and not at all.
+    #[test]
+    fn a_pass_cut_into_lanes() {
+        let reqs = [req(0, 150, 0), req(1, 211, 150)];
+        let parts: Vec<_> = cut(&reqs, 361, &[91, 181, 271]).iter().map(part).collect();
+        assert_eq!(
+            parts,
+            vec![
+                ((0, 0..91, None, Some(0)), vec![(0, 0, 91, 0)]),
+                (
+                    (0, 91..181, Some((0, 1)), Some(1)),
+                    vec![(0, 91, 59, 0), (1, 100, 31, 59)]
+                ),
+                ((1, 181..271, Some((1, 2)), Some(0)), vec![(1, 131, 90, 0)]),
+                ((1, 271..361, Some((0, 1)), None), vec![(1, 221, 90, 0)]),
+            ]
+        );
+        let parts: Vec<_> = cut(&reqs, 361, &[150]).iter().map(part).collect();
+        assert_eq!(
+            parts,
+            vec![
+                ((0, 0..150, None, None), vec![(0, 0, 150, 0)]),
+                ((1, 150..361, None, None), vec![(1, 100, 211, 0)]),
+            ]
+        );
+        let parts: Vec<_> = cut(&reqs, 361, &[]).iter().map(part).collect();
+        assert_eq!(
+            parts,
+            vec![(
+                (0, 0..361, None, None),
+                vec![(0, 0, 150, 0), (1, 100, 211, 150)]
+            )]
+        );
+    }
+
+    /// Two lanes follow the rule of the two lanes before: a second lane from twice `min_rows`
+    /// rows, or when one lane does not hold the pass. More lanes: one per `min_rows` rows, and as
+    /// many as the rows need.
+    #[test]
+    fn the_lanes_a_pass_runs_in() {
+        for (min, first, rows) in [(8, 33, 33), (16, 64, 32), (64, 2048, 2048), (1, 5, 5)] {
+            for total in 1..=2 * rows {
+                let two = 1 + usize::from(total > first || total >= 2 * min);
+                assert_eq!(lanes_for(total, 2, min, first, rows), two, "{total} rows");
+            }
+        }
+        // Lanes of 2,048 rows, a lane per 64 rows.
+        let four = |t: usize| lanes_for(t, 4, 64, 2048, 2048);
+        assert_eq!(
+            [1, 127, 128, 191, 192, 256, 8192].map(four),
+            [1, 1, 2, 2, 3, 4, 4]
+        );
+        // Lane 0 holds a larger verify pass (256 rows), the others 100 rows each: 250 rows fit in
+        // one lane, 300 need three lanes.
+        let small = |t: usize| lanes_for(t, 4, 1000, 256, 100);
+        assert_eq!([250, 257, 300, 301].map(small), [1, 3, 3, 4]);
+        // Four lanes of 100 hold 400 rows; the caller refuses more.
+        assert_eq!(small(401), 4);
     }
 }

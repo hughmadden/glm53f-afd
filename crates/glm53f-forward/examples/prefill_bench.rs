@@ -1,4 +1,4 @@
-//! Two-lane prefill passes over all 45 decoder layers with the op profile: per operation, the
+//! Prefill passes in lanes over all 45 decoder layers with the op profile: per operation, the
 //! GPU time of each lane's attention sublayer and shared expert (`glm53f_forward::opprof`).
 //!
 //! ```sh
@@ -15,8 +15,10 @@
 //! Environment:
 //! - `GLM53F_CHECKPOINT_DIR`: the official checkpoint or its coordinator subset (required);
 //! - `GLM53F_BENCH_LANE_ROWS`: rows per lane, comma-separated for several runs (default 2048);
-//! - `GLM53F_BENCH_PASSES`: two-lane passes per run (default 4), one request whose prompt they
-//!   cut (the later passes' DSA layers attend over more context);
+//! - `GLM53F_BENCH_LANES`: lanes per pass, comma-separated for several runs (default 2; 1 to 4),
+//!   so a pass holds lanes x lane rows;
+//! - `GLM53F_BENCH_PASSES`: passes per run (default 4), one request whose prompt they cut (the
+//!   later passes' DSA layers attend over more context);
 //! - `GLM53F_BENCH_LOADED`: decoder layers loaded (default 5), `GLM53F_BENCH_LAYERS` run (45);
 //! - `GLM53F_BENCH_OPS=0`: the same passes without the op profile (its overhead);
 //! - `GLM53F_BENCH_KDA_CHUNKED=1`: KDA through the chunked prefill kernel instead of the chain
@@ -62,11 +64,15 @@ fn main() {
         eprintln!("set GLM53F_CHECKPOINT_DIR");
         return;
     };
-    let lane_rows: Vec<usize> = std::env::var("GLM53F_BENCH_LANE_ROWS")
-        .unwrap_or_else(|_| "2048".into())
-        .split(',')
-        .filter_map(|v| v.trim().parse().ok())
-        .collect();
+    let list = |k: &str, d: &str| -> Vec<usize> {
+        std::env::var(k)
+            .unwrap_or_else(|_| d.into())
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect()
+    };
+    let lane_rows = list("GLM53F_BENCH_LANE_ROWS", "2048");
+    let lane_counts = list("GLM53F_BENCH_LANES", "2");
     let passes = env_usize("GLM53F_BENCH_PASSES", 4).max(1);
     let loaded = env_usize("GLM53F_BENCH_LOADED", 5);
     let ops_on = std::env::var("GLM53F_BENCH_OPS").map_or(true, |v| v != "0");
@@ -81,23 +87,28 @@ fn main() {
         device::peak_bandwidth().unwrap() / 1e9,
         loaded.min(layers) - 1,
     );
-    for &lane in &lane_rows {
-        run(
-            &dir,
-            &shape,
-            loaded.min(layers),
-            lane,
-            passes,
-            ops_on,
-            all_tables,
-        );
+    for &lanes in &lane_counts {
+        for &lane in &lane_rows {
+            run(
+                &dir,
+                &shape,
+                loaded.min(layers),
+                lanes,
+                lane,
+                passes,
+                ops_on,
+                all_tables,
+            );
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     dir: &std::path::Path,
     shape: &ModelShape,
     loaded: usize,
+    lanes: usize,
     lane: usize,
     passes: usize,
     ops_on: bool,
@@ -109,7 +120,8 @@ fn run(
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let weights = model.bytes;
     let stream = Arc::new(Stream::new().unwrap());
-    let prompt = passes * 2 * lane;
+    let pass = lanes * lane;
+    let prompt = passes * pass;
     let pages = KvLayout::pages_for(prompt + 64);
     let kv = KvPool::new(
         KvConfig {
@@ -123,8 +135,8 @@ fn run(
     )
     .unwrap();
     let fcfg = ForwardConfig {
-        max_rows: 2 * lane,
-        lanes: 2,
+        max_rows: pass,
+        lanes,
         max_requests: 1,
         max_verify_rows: 8,
         kda_chunked_prefill: std::env::var("GLM53F_BENCH_KDA_CHUNKED").is_ok_and(|v| v == "1"),
@@ -139,10 +151,9 @@ fn run(
     let (free, _) = device::mem_info().unwrap();
     let b = fwd.scratch_bytes();
     println!(
-        "\n== lanes of {lane} rows: {passes} passes of {} rows (a {prompt}-token prompt); weights \
-         {:.2} GB ({:.1} s); forward buffers {:.2} GiB; {:.1} GiB free; op profile {}; KDA through \
-         the {}",
-        2 * lane,
+        "\n== {lanes} lane(s) of {lane} rows: {passes} passes of {pass} rows (a {prompt}-token \
+         prompt); weights {:.2} GB ({:.1} s); forward buffers {:.2} GiB; {:.1} GiB free; op \
+         profile {}; KDA through the {}",
         weights as f64 / 1e9,
         t0.elapsed().as_secs_f64(),
         b as f64 / (1u64 << 30) as f64,
@@ -162,7 +173,7 @@ fn run(
     // A warm-up pass on a second slot would need its own pages: the first pass is the warm-up
     // (cuBLAS picks its kernels, events are created); its table is printed too.
     let mut walls = Vec::new();
-    for (p, chunk) in toks.chunks(2 * lane).enumerate() {
+    for (p, chunk) in toks.chunks(pass).enumerate() {
         let t = Instant::now();
         fwd.prefill(&mut [(&mut kv, chunk)]).unwrap();
         fwd.stream().synchronize().unwrap();
@@ -172,8 +183,8 @@ fn run(
         println!(
             "pass {p} (positions {}..{}): {wall:.1} ms host wall, {:.0} tok/s of coordinator work; \
              PIPE {}",
-            p * 2 * lane,
-            (p + 1) * 2 * lane,
+            p * pass,
+            (p + 1) * pass,
             chunk.len() as f64 / wall * 1e3,
             trace.summary()
         );

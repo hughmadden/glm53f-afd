@@ -38,6 +38,9 @@
 //!    from 4 rows (the decode lanes' exchanges four planes, the verify lanes' row slices); requests
 //!    written by the frame-fill kernel. The `STEP` lines, with the wire's record, show the schedule
 //!    on a shared GPU, not the overlap of separate machines.
+//! 4. **In a forward of four prefill lanes** (routed experts of zeros): the decode lanes are the
+//!    prefill's first two, so test 1's script (its prompts prefilled in up to four lanes) gives
+//!    the bits of two passes per step, as in a two-lane forward.
 //!
 //! ```sh
 //! GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
@@ -52,17 +55,13 @@ mod drafting;
 use std::sync::Arc;
 
 use common::*;
-use glm53f_dsa::cache::{
-    LATENT_RECORD_BYTES, PAGE_POOL_CODES_OFFSET, PAGE_POOL_SCALES_OFFSET, PAGE_TOKENS,
-    TAIL_TOKEN_BYTES,
-};
 use glm53f_forward::device::{self, DeviceBuffer, Stream};
 use glm53f_forward::draft::DraftReq;
 use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts, ZeroExperts};
-use glm53f_forward::forward::{ForwardConfig, GlmForward, Mode};
+use glm53f_forward::forward::{ForwardConfig, GlmForward, Mode, MAX_LANES};
 use glm53f_forward::gemm::Fp8Act;
 use glm53f_forward::kv::GlmKv;
-use glm53f_forward::shape::{INDEX_DIM, SAMPLE_VOCAB, VOCAB};
+use glm53f_forward::shape::{SAMPLE_VOCAB, VOCAB};
 
 const LAYERS: usize = 5;
 
@@ -197,43 +196,6 @@ fn flipped_rows(a: &[(usize, Vec<i32>)], b: &[(usize, Vec<i32>)]) -> (Vec<bool>,
     }
     let tainted = (0..total).map(|r| r >= from[owner[r]]).collect();
     (tainted, flips)
-}
-
-/// What a slot keeps, as bytes: every KDA layer's state and conv window, every DSA layer's tail
-/// (its valid tokens) and the committed rows of its pages (latent records, complete pools' keys
-/// and scales).
-fn kept(fwd: &GlmForward, kv: &GlmKv) -> Vec<u8> {
-    let shape = fwd.shape();
-    let mut out = Vec::new();
-    for j in 0..shape.kda_layers {
-        out.extend(
-            kv.download_state(j)
-                .unwrap()
-                .iter()
-                .flat_map(|x| x.to_le_bytes()),
-        );
-        out.extend(
-            kv.download_conv(j)
-                .unwrap()
-                .iter()
-                .flat_map(|x| x.to_le_bytes()),
-        );
-    }
-    let t = kv.tokens();
-    for j in 0..shape.dsa_layers {
-        let tail = kv.download_tail(j).unwrap();
-        let n = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
-        out.extend(&tail[..16 + n.min(3) * TAIL_TOKEN_BYTES]);
-        for p in 0..t.div_ceil(PAGE_TOKENS) {
-            let b = kv.download_page_block(p, j).unwrap();
-            let rows = (t - p * PAGE_TOKENS).min(PAGE_TOKENS);
-            let pools = rows / 4;
-            out.extend(&b[..rows * LATENT_RECORD_BYTES]);
-            out.extend(&b[PAGE_POOL_CODES_OFFSET..PAGE_POOL_CODES_OFFSET + pools * INDEX_DIM]);
-            out.extend(&b[PAGE_POOL_SCALES_OFFSET..PAGE_POOL_SCALES_OFFSET + pools * 4]);
-        }
-    }
-    out
 }
 
 /// A run's outputs: every pass's picks and logit rows in request order, and what each slot kept.
@@ -570,6 +532,40 @@ fn decode_and_verify_in_two_lanes() {
     );
     step(&mut fwd, &mut kvs);
     assert_eq!(fwd.decode_lane_passes(), n0 + 1);
+}
+
+#[test]
+fn decode_lanes_in_a_four_lane_forward() {
+    if !gpu_with(7.0) {
+        return;
+    }
+    let cfg = ForwardConfig {
+        max_rows: 128,
+        lanes: MAX_LANES,
+        min_lane_rows: 8,
+        decode_lane_rows: 2,
+        max_verify_rows: 32,
+        max_requests: 8,
+        ..ForwardConfig::default()
+    };
+    let Some(mut fwd) = forward_with(LAYERS, cfg, |_| Box::new(ZeroExperts), 12, 96, 16) else {
+        return;
+    };
+    fwd.set_lane_trace(true, false);
+    let lanes = script(&mut fwd, How::Lanes);
+    fwd.cfg.decode_lane_rows = 0;
+    let seq = script(&mut fwd, How::TwoPasses);
+    let exact = bits(&lanes.logits, &seq.logits) && lanes.picks == seq.picks;
+    let kept_exact = lanes.kept == seq.kept;
+    eprintln!(
+        "six requests in a forward of {MAX_LANES} prefill lanes, zero routed experts, test 1's \
+         script: two decode lanes against two passes, logits and picks bit for bit {exact}, the \
+         slots' state {kept_exact}"
+    );
+    assert!(
+        exact && kept_exact,
+        "two decode lanes differ from two passes"
+    );
 }
 
 /// Every stored ring row of two slots' contexts (positions `lo .. len`, the drafter's five

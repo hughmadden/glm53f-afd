@@ -84,7 +84,7 @@ impl ExpertBackend for PartialExperts {
 
     /// Both enqueue a call's work within `submit` and `finish`, on the stream.
     fn depth(&self) -> usize {
-        2
+        glm53f_forward::forward::MAX_LANES
     }
 }
 
@@ -161,7 +161,10 @@ pub fn load(o: &Options, max_tokens: usize) -> Result<Engine, String> {
     let (experts, zero): (Box<dyn ExpertBackend>, usize) = match &o.experts {
         Experts::Remote(addrs) => {
             eprintln!("[score] connecting the expert ranks {addrs:?}");
-            (Box::new(s(RemoteExperts::connect(addrs, rows))?), 0)
+            (
+                Box::new(s(RemoteExperts::connect(addrs, rows, o.lanes))?),
+                0,
+            )
         }
         Experts::Local { dir, gib } => {
             let have = expert_layers(dir, &shape)?;

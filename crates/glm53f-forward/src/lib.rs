@@ -19,7 +19,7 @@
 //! | `kv` | The pool (pages, page tables, KDA states, conv windows, DSA tails) and [`kv::GlmKv`], one request's view |
 //! | `experts` | [`experts::ExpertBackend`], `LocalFp8Experts`, `ZeroExperts` |
 //! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
-//! | `forward` | [`forward::GlmForward`]: the layer loop in one lane or two (a prefill's lanes overlap one lane's attention with the other's routed experts), the head, prefill / decode / verify / commit, taps, stage timing and the lane trace; `ForwardBuffers`, every buffer a pass uses, allocated up front |
+//! | `forward` | [`forward::GlmForward`]: the layer loop in one lane or up to four (a prefill's lanes overlap one lane's attention with the others' routed experts; decode and verify in two), the head, prefill / decode / verify / commit, taps, stage timing and the lane trace; `ForwardBuffers`, every buffer a pass uses, allocated up front |
 //! | `opprof` | The op profile of prefill passes (`GLM53F_PROFILE_OPS=1`): each operation's GPU time in each lane's attention and shared expert, per layer, and the `OPS` table |
 //! | `draft` | The DFlash2 drafter in the forward (`glm53f-dflash`): its taps (the mean of the four streams after layers 5, 14, 24, 33 and 42), the committed rows appended to each slot's ring, the drafts |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
@@ -95,7 +95,7 @@
 //! cargo test --release -p glm53f-forward --features coordinator --test serve
 //! cargo test --release -p glm53f-forward --features coordinator --test draft           # the drafter's taps and context
 //! cargo test --release -p glm53f-forward --features coordinator --test draft_lossless  # speculation changes no token
-//! cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission   # two-lane prefill; memory
+//! cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission   # prefill in lanes; memory
 //! cargo run  --release -p glm53f-forward --features cuda --example gemm_bench
 //! cargo run  --release -p glm53f-forward --features cuda --example decode_bench
 //! ```

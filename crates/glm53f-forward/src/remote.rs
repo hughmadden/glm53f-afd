@@ -75,15 +75,18 @@
 //! `finish`, so it already runs on the GPU while `finish` blocks on the returns; the hook has
 //! nothing to add and is not used.
 //!
-//! **Two exchanges in flight** (the forward's two-lane prefill; mimo26f-afd perf reset R4). Over
-//! RDMA the wire client takes a second request while the first is out (each rank pre-posts two
-//! receive slots), so [`ExpertBackend::depth`] is 2 and `finish` collects the oldest. Over TCP it
-//! is 1: a second multi-megabyte write can block against the first return. `GLM53F_WIRE_INFLIGHT=1`
-//! holds an RDMA wire to one as well (the lanes then take turns on the wire, as over TCP). Each
-//! exchange keeps its own return path (the wire client decides by its row count), and `finish`
-//! checks the layout it collects against it. The device buffers are reused safely either way:
-//! `submit` waits for its device work (the download, or the copies into the request body)
-//! before it returns, and every `finish` enqueues its reads on the one stream, in order.
+//! **Exchanges in flight** (the forward's prefill lanes; mimo26f-afd perf reset R4, from two to
+//! [`MAX_LANES`]). Over RDMA the wire client takes more requests while the first is out, one per
+//! lane the backend is connected for ([`RemoteExperts::connect`]'s `depth`, at most what every
+//! rank queues: a rank takes as many requests as it posts receive slots, four by default,
+//! `glm53f-rank serve --recv-slots`), so [`ExpertBackend::depth`] is that many and `finish`
+//! collects the oldest. Over TCP it is 1: a second multi-megabyte write can block against the
+//! first return. `GLM53F_WIRE_INFLIGHT=N` caps an RDMA wire at N (1: the lanes take turns on the
+//! wire, as over TCP). Each exchange keeps its own return path (the wire client decides by its
+//! row count), and `finish` checks the layout it collects against it. The device buffers are
+//! reused safely at any depth: `submit` waits for its device work (the download, or the copies
+//! into the request body) before it returns, and every `finish` enqueues its reads on the one
+//! stream, in order.
 //!
 //! **Numerics.** The ranks hold EXL3 4-bit experts and receive FP8 rows, so the routed output is
 //! not the local FP8 experts' bits: the rank crate measures a cosine of at least 0.990 against the
@@ -107,10 +110,13 @@ use crate::device::{check, launched, DeviceBuffer, Event, Stream};
 use crate::error::{invalid, Error, Result};
 use crate::experts::{ExpertBackend, ExpertCall};
 use crate::ffi;
+use crate::forward::MAX_LANES;
 use crate::shape::{HIDDEN, TOP_K};
 
 /// Expert ranks (the wire's four TP4 shares).
 pub const RANKS: usize = 4;
+// Every lane of the forward can have its exchange in flight.
+const _: () = assert!(MAX_LANES <= glm53f_coordinator::wire::MAX_DEPTH);
 /// Rows of one exchange at most (the wire's request cap).
 pub const MAX_ROWS: usize = 4096;
 /// UE8M0 scale bytes per wire row (one per 32 values).
@@ -386,12 +392,12 @@ pub struct RemoteExperts {
     /// their path is off).
     body: Vec<Mapped>,
     rings: Vec<Mapped>,
-    /// Recorded after each `finish`'s reads of the receive buffers (two: two exchanges may be
-    /// collected between sends), and waited on before the next send.
-    read_done: [Event; 2],
+    /// Recorded after each `finish`'s reads of the receive buffers (one per exchange that can be
+    /// collected between two sends: [`MAX_LANES`]), and waited on before the next send.
+    read_done: Vec<Event>,
     reads: usize,
-    /// Exchanges in flight, oldest first (at most [`ExpertBackend::depth`]), and the most a
-    /// pipelined wire takes (`GLM53F_WIRE_INFLIGHT`, 2 by default).
+    /// Exchanges in flight, oldest first (at most [`ExpertBackend::depth`]), and a cap on a
+    /// pipelined wire's (`GLM53F_WIRE_INFLIGHT`; none by default).
     sent: VecDeque<Sent>,
     inflight: usize,
     failed: Option<String>,
@@ -435,14 +441,16 @@ impl RemoteExperts {
             routes: Vec::with_capacity(r * TOP_K),
             body: Vec::new(),
             rings: Vec::new(),
-            read_done: [Event::new()?, Event::new()?],
+            read_done: (0..MAX_LANES)
+                .map(|_| Event::new())
+                .collect::<Result<_>>()?,
             reads: 0,
             sent: VecDeque::new(),
             inflight: std::env::var("GLM53F_WIRE_INFLIGHT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2)
-                .clamp(1, 2),
+                .unwrap_or(MAX_LANES)
+                .clamp(1, MAX_LANES),
             failed: None,
             times: Arc::new(Mutex::new(WireTimes::default())),
             pass: None,
@@ -508,13 +516,24 @@ impl RemoteExperts {
         max_rows * (HIDDEN * 4 + HIDDEN + SCALES + SCALES * 4 + RANKS * HIDDEN * 2 + HIDDEN * 4)
     }
 
+    /// Host bytes of the wire client's buffers, page-locked by the fast paths: the receive
+    /// buffers (over RDMA a slot of the largest return per exchange in flight and rank) and the
+    /// request body (`WireClient::host_bytes`).
+    pub fn host_bytes(&self) -> (usize, usize) {
+        self.wire.host_bytes()
+    }
+
     /// Connect to the four ranks (`addrs[r]` is rank `r`, `host:port`) with GLM-5.3-Flash's wire
     /// configuration, the return path from the environment (`WireConfig::from_env`:
     /// `GLM53F_ROW_SHARDED_MIN_ROWS`, `GLM53F_EXCHANGE_DTYPE`) and the fast paths from the
-    /// environment ([`FastPaths::from_env`]). Over RDMA when `GLM53F_RDMA=1` (see
+    /// environment ([`FastPaths::from_env`]), for up to `depth` exchanges in flight (the
+    /// forward's lanes; `WireConfig::depth`). Over RDMA when `GLM53F_RDMA=1` (see
     /// `glm53f_coordinator::wire`).
-    pub fn connect(addrs: &[String], max_rows: usize) -> Result<RemoteExperts> {
-        let cfg = WireConfig::from_env().map_err(Error::Other)?;
+    pub fn connect(addrs: &[String], max_rows: usize, depth: usize) -> Result<RemoteExperts> {
+        let cfg = WireConfig {
+            depth: depth.clamp(1, MAX_LANES),
+            ..WireConfig::from_env().map_err(Error::Other)?
+        };
         RemoteExperts::connect_with(addrs, max_rows, cfg, FastPaths::from_env())
     }
 
@@ -559,7 +578,7 @@ impl RemoteExperts {
     /// Wait until the collected returns have been read on the device: a send re-posts the
     /// receive buffers they lie in.
     fn reads_done(&self) -> Result<()> {
-        for e in &self.read_done[..self.reads.min(2)] {
+        for e in &self.read_done[..self.reads.min(self.read_done.len())] {
             e.synchronize()?;
         }
         Ok(())
@@ -874,7 +893,7 @@ impl RemoteExperts {
             }
             None => return Err("no returns collected".into()),
         }
-        self.read_done[self.reads % 2].record(stream)?;
+        self.read_done[self.reads % self.read_done.len()].record(stream)?;
         self.reads += 1;
         Ok(())
     }
@@ -918,12 +937,10 @@ impl ExpertBackend for RemoteExperts {
         self.collect(call, stream)
     }
 
+    /// The wire's (one over TCP; over RDMA what it was connected for and every rank queues),
+    /// capped by `GLM53F_WIRE_INFLIGHT`.
     fn depth(&self) -> usize {
-        if self.wire.pipelined() {
-            self.inflight
-        } else {
-            1
-        }
+        self.wire.depth().min(self.inflight)
     }
 
     fn trace_begin(&mut self) {

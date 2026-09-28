@@ -17,14 +17,15 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use glm53f_dsa::cache;
 use glm53f_forward::device::{self, DeviceBuffer, Stream};
 use glm53f_forward::embed::HostEmbedding;
 use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts};
 use glm53f_forward::forward::{ForwardConfig, GlmForward};
 use glm53f_forward::gemm::Fp8Act;
-use glm53f_forward::kv::{KvConfig, KvPool};
+use glm53f_forward::kv::{GlmKv, KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
-use glm53f_forward::shape::{ModelShape, TOP_K};
+use glm53f_forward::shape::{ModelShape, INDEX_DIM, TOP_K, VOCAB};
 use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
 use glm53f_forward::Result;
 use glm53f_layers::testkit::goldens::{self, GoldenSet};
@@ -200,6 +201,112 @@ impl Goldens {
         };
         (ids("token_ids"), ids("decode_token_ids"))
     }
+}
+
+/// Where a pass of `total` rows in `n` lanes cuts them (the forward's rule, `forward.rs` "Lanes
+/// (prefill)"): lane i starts at row `ceil(i total / n)`.
+pub fn lane_cuts(total: usize, n: usize) -> Vec<usize> {
+    (1..n).map(|i| (i * total).div_ceil(n)).collect()
+}
+
+/// The rows of each lane of a pass of `total` rows in `n` lanes.
+pub fn lane_rows(total: usize, n: usize) -> Vec<usize> {
+    let mut at = lane_cuts(total, n);
+    at.push(total);
+    at.iter()
+        .scan(0, |lo, &hi| {
+            let r = hi - *lo;
+            *lo = hi;
+            Some(r)
+        })
+        .collect()
+}
+
+/// Prefill `prompts` into `kvs` (a slot each) as one-lane passes over their rows laid end to end,
+/// cut at the pass rows `cuts` (ascending): each pass takes every prompt's rows in its range, as
+/// the forward's lanes of one pass hold them. Returns each prompt's pick and the logits of its
+/// last row, in prompt order.
+pub fn prefill_in_passes(
+    fwd: &mut GlmForward,
+    kvs: &mut [GlmKv],
+    prompts: &[&[u32]],
+    cuts: &[usize],
+) -> (Vec<u32>, Vec<f32>) {
+    let total: usize = prompts.iter().map(|p| p.len()).sum();
+    let mut picks = vec![0u32; prompts.len()];
+    let mut logits = vec![0f32; prompts.len() * VOCAB];
+    let mut lo = 0;
+    for hi in cuts.iter().copied().chain(std::iter::once(total)) {
+        // Each prompt's rows in [lo, hi), from its own first row.
+        let (mut segs, mut row) = (Vec::new(), 0);
+        for (i, p) in prompts.iter().enumerate() {
+            let (a, b) = (lo.max(row), hi.min(row + p.len()));
+            if a < b {
+                segs.push((i, a - row..b - row));
+            }
+            row += p.len();
+        }
+        let first = segs[0].0;
+        let got = {
+            let mut pass: Vec<(&mut GlmKv, &[u32])> = kvs[first..first + segs.len()]
+                .iter_mut()
+                .zip(&segs)
+                .map(|(k, (i, r))| (k, &prompts[*i][r.clone()]))
+                .collect();
+            fwd.prefill(&mut pass).unwrap()
+        };
+        let l = fwd.logits(segs.len()).unwrap();
+        for (k, (i, r)) in segs.iter().enumerate() {
+            if r.end == prompts[*i].len() {
+                picks[*i] = got[k];
+                logits[i * VOCAB..(i + 1) * VOCAB].copy_from_slice(&l[k * VOCAB..(k + 1) * VOCAB]);
+            }
+        }
+        lo = hi;
+    }
+    (picks, logits)
+}
+
+/// What a slot keeps, as bytes: every KDA layer's state and conv window, every DSA layer's tail
+/// (its valid tokens) and the committed rows of its pages (latent records, complete pools' keys
+/// and scales).
+pub fn kept(fwd: &GlmForward, kv: &GlmKv) -> Vec<u8> {
+    let shape = fwd.shape();
+    let mut out = Vec::new();
+    for j in 0..shape.kda_layers {
+        out.extend(
+            kv.download_state(j)
+                .unwrap()
+                .iter()
+                .flat_map(|x| x.to_le_bytes()),
+        );
+        out.extend(
+            kv.download_conv(j)
+                .unwrap()
+                .iter()
+                .flat_map(|x| x.to_le_bytes()),
+        );
+    }
+    let t = kv.tokens();
+    for j in 0..shape.dsa_layers {
+        let tail = kv.download_tail(j).unwrap();
+        let n = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
+        out.extend(&tail[..16 + n.min(3) * cache::TAIL_TOKEN_BYTES]);
+        for p in 0..t.div_ceil(cache::PAGE_TOKENS) {
+            let b = kv.download_page_block(p, j).unwrap();
+            let rows = (t - p * cache::PAGE_TOKENS).min(cache::PAGE_TOKENS);
+            let pools = rows / 4;
+            out.extend(&b[..rows * cache::LATENT_RECORD_BYTES]);
+            out.extend(
+                &b[cache::PAGE_POOL_CODES_OFFSET
+                    ..cache::PAGE_POOL_CODES_OFFSET + pools * INDEX_DIM],
+            );
+            out.extend(
+                &b[cache::PAGE_POOL_SCALES_OFFSET..cache::PAGE_POOL_SCALES_OFFSET + pools * 4],
+            );
+        }
+    }
+    out
 }
 
 /// Error of `got` against `want`.

@@ -6,7 +6,9 @@
 //!    each: 32 + 32, 32 + 32, then 11 + 11) gives, at each pass's last row, the bits of the
 //!    logits a prefill of the prompt up to that row writes for its last row (the same passes,
 //!    the same kernels), whichever other rows are scored with it (the head's GEMV takes them in
-//!    groups of up to 8), and leaves the slot as the prefill of the whole prompt does.
+//!    groups of up to 8), and leaves the slot as the prefill of the whole prompt does. Every row
+//!    of a 128-row pass in 2, 3 and 4 lanes gives the bits of one-lane passes of the lanes' rows,
+//!    each lane's rows read from its own head output.
 //! 2. **The decode path.** In passes of 8 and of 5 rows (the row-independent decode kernels, one
 //!    lane), every row's logits are the bits of serial decode steps.
 //! 3. **The two paths.** Passes of 8 rows against one pass of 200 rows (two lanes of 100, the
@@ -25,7 +27,7 @@ mod common;
 
 use common::*;
 use glm53f_forward::experts::ZeroExperts;
-use glm53f_forward::forward::{ForwardConfig, GlmForward};
+use glm53f_forward::forward::{ForwardConfig, GlmForward, MAX_LANES};
 use glm53f_forward::kv::GlmKv;
 use glm53f_forward::shape::{SAMPLE_VOCAB, VOCAB};
 
@@ -104,9 +106,10 @@ fn scoring_a_teacher_forced_sequence() {
     if !gpu_with(7.0) {
         return;
     }
+    // Lanes of 128 rows: passes in up to four lanes, two unless said otherwise.
     let cfg = ForwardConfig {
-        max_rows: 256,
-        lanes: 2,
+        max_rows: 128 * MAX_LANES,
+        lanes: MAX_LANES,
         min_lane_rows: 8,
         max_verify_rows: 8,
         max_requests: 4,
@@ -115,6 +118,7 @@ fn scoring_a_teacher_forced_sequence() {
     let Some(mut fwd) = forward_with(LAYERS, cfg, |_| Box::new(ZeroExperts), 6, 64, 8) else {
         return;
     };
+    fwd.cfg.lanes = 2;
     let kl = fwd.shape().kda_layers;
 
     // 1. The forward's own logits: passes of 64 rows, as a prefill with max_rows 64 cuts the
@@ -171,32 +175,37 @@ fn scoring_a_teacher_forced_sequence() {
     assert!(slot_same, "scoring left the slot otherwise than a prefill");
     drop((kv, full, alone));
 
-    // Every row of a two-lane pass: a pass of 128 rows in lanes of 64 gives the bits of two
-    // one-lane passes of 64 (`tests/lanes.rs`), so each row's logits must too, lane B's rows
-    // included.
+    // Every row of a pass in lanes: a pass of 128 rows in N lanes gives the bits of N one-lane
+    // passes of the lanes' rows (`tests/lanes.rs`), so each row's logits must too, every lane's
+    // rows included.
     let first: Vec<usize> = (0..128).collect();
     fwd.cfg.max_rows = 128;
-    let mut kv = fwd.kv.slot().unwrap();
-    let two = fwd.score(&mut kv, &prompt[..128], &first, 128).unwrap();
-    assert_eq!(
-        fwd.take_lane_trace().expect("a traced pass").rows,
-        vec![64, 64]
-    );
-    fwd.cfg.lanes = 1;
-    fwd.cfg.max_rows = 64;
-    let mut kv1 = fwd.kv.slot().unwrap();
-    let one = fwd.score(&mut kv1, &prompt[..128], &first, 64).unwrap();
+    for n in 2..=MAX_LANES {
+        fwd.cfg.lanes = n;
+        let mut kv = fwd.kv.slot().unwrap();
+        let lanes = fwd.score(&mut kv, &prompt[..128], &first, 128).unwrap();
+        let rows = fwd.take_lane_trace().expect("a traced pass").rows;
+        assert_eq!(rows, lane_rows(128, n));
+        // One-lane passes of the lanes' rows: of 128 rows, passes of lane 0's rows cut the same
+        // lanes (64 + 64, 43 + 43 + 42, 32 x 4).
+        fwd.cfg.lanes = 1;
+        let mut kv1 = fwd.kv.slot().unwrap();
+        let one = fwd
+            .score(&mut kv1, &prompt[..128], &first, rows[0])
+            .unwrap();
+        let lanes_exact = (0..128).all(|r| bits(row(&lanes, r)) == bits(row(&one, r)));
+        let slot_same = image(&kv, kl) == image(&kv1, kl);
+        eprintln!(
+            "128 rows in one pass of {n} lanes ({rows:?}) against one-lane passes of {} rows: \
+             every row bit for bit: {lanes_exact}; the slot the same: {slot_same}",
+            rows[0]
+        );
+        assert!(
+            lanes_exact && slot_same,
+            "a row of the {n}-lane pass, or the slot, differs from one-lane passes"
+        );
+    }
     fwd.cfg.lanes = 2;
-    let lanes_exact = (0..128).all(|r| bits(row(&two, r)) == bits(row(&one, r)));
-    eprintln!(
-        "128 rows in one pass of two lanes (64 + 64) against two one-lane passes of 64: every \
-         row bit for bit: {lanes_exact}"
-    );
-    assert!(
-        lanes_exact,
-        "a row of the two-lane pass differs from one-lane passes"
-    );
-    drop((kv, kv1));
 
     // 2. The decode path: passes of 8 rows or fewer give the bits of serial decode steps.
     fwd.cfg.max_rows = 256;

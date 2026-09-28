@@ -6,6 +6,13 @@
 //! design). Connection setup is exchanged by the caller over its TCP socket with
 //! [`HANDSHAKE_MAGIC`] + [`Info::to_bytes`]; TCP stays the fallback transport.
 //!
+//! **Receive slots in the handshake.** A side names the receive slots it keeps
+//! posted ([`Info::recv_slots`], in the `Info` word that was reserved and zero), so
+//! its peer knows how many messages it may send ahead: a rank queues that many
+//! requests. A peer built before the field sends zero and posts two
+//! ([`LEGACY_RECV_SLOTS`], [`Info::peer_slots`]); it ignores the word, so the
+//! handshake is unchanged for it.
+//!
 //! Without the `rdma` feature the native shim is not built and [`Endpoint::open`]
 //! returns an error, so callers keep a TCP path.
 
@@ -19,8 +26,11 @@ pub const HANDSHAKE_MAGIC: &[u8; 8] = b"M26RDMA1";
 pub const HANDSHAKE_LEN: usize = 8 + INFO_LEN;
 /// Serialized [`Info`] length.
 pub const INFO_LEN: usize = 32;
+/// Receive slots a peer posts when its handshake does not say ([`Info::recv_slots`] 0): the
+/// builds before the field posted two.
+pub const LEGACY_RECV_SLOTS: u32 = 2;
 
-/// One side's queue-pair coordinates (the C `m26r_info`).
+/// One side's queue-pair coordinates (the C `m26r_info`) and the receive slots it keeps posted.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Info {
@@ -28,7 +38,10 @@ pub struct Info {
     pub psn: u32,
     pub gid: [u8; 16],
     pub mtu: u32,
-    pub reserved: u32,
+    /// Receive slots this side keeps posted: messages its peer may send ahead of it (0: not
+    /// said). The C shim's `reserved` word, which `m26r_local_info` leaves at zero: the caller
+    /// sets it.
+    pub recv_slots: u32,
 }
 
 impl Info {
@@ -38,6 +51,7 @@ impl Info {
         b[4..8].copy_from_slice(&self.psn.to_le_bytes());
         b[8..24].copy_from_slice(&self.gid);
         b[24..28].copy_from_slice(&self.mtu.to_le_bytes());
+        b[28..32].copy_from_slice(&self.recv_slots.to_le_bytes());
         b
     }
 
@@ -52,8 +66,18 @@ impl Info {
             psn: u32::from_le_bytes(b[4..8].try_into().ok()?),
             gid,
             mtu: u32::from_le_bytes(b[24..28].try_into().ok()?),
-            reserved: 0,
+            recv_slots: u32::from_le_bytes(b[28..32].try_into().ok()?),
         })
+    }
+
+    /// The receive slots the peer that sent this posts: [`Info::recv_slots`], or
+    /// [`LEGACY_RECV_SLOTS`] when it does not say.
+    pub fn peer_slots(&self) -> u32 {
+        if self.recv_slots == 0 {
+            LEGACY_RECV_SLOTS
+        } else {
+            self.recv_slots
+        }
     }
 }
 
@@ -396,8 +420,23 @@ mod tests {
 
     #[test]
     fn info_round_trips() {
-        let i = Info { qpn: 0x1234, psn: 0xabcdef, gid: [7; 16], mtu: 5, reserved: 0 };
+        let i = Info { qpn: 0x1234, psn: 0xabcdef, gid: [7; 16], mtu: 5, recv_slots: 4 };
         assert_eq!(Info::from_bytes(&i.to_bytes()), Some(i));
+        assert_eq!(i.peer_slots(), 4);
+    }
+
+    /// A peer built before the receive-slot word sent zero there (its `to_bytes` wrote bytes
+    /// 0..28 of a zeroed buffer) and posts two slots; a peer that says, what it says.
+    #[test]
+    fn a_handshake_without_receive_slots_means_two() {
+        let mut old = [0u8; INFO_LEN];
+        old[0..4].copy_from_slice(&7u32.to_le_bytes());
+        old[24..28].copy_from_slice(&5u32.to_le_bytes());
+        let i = Info::from_bytes(&old).unwrap();
+        assert_eq!((i.qpn, i.mtu, i.recv_slots, i.peer_slots()), (7, 5, 0, LEGACY_RECV_SLOTS));
+        let new = Info { recv_slots: 3, ..i }.to_bytes();
+        assert_eq!(new[..28], old[..28], "the other fields are where they were");
+        assert_eq!(Info::from_bytes(&new).unwrap().peer_slots(), 3);
     }
 
     #[test]

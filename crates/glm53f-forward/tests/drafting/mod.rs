@@ -56,9 +56,9 @@ impl ExpertBackend for SomeExperts {
         }
     }
 
-    /// Both run a call's work in `submit`: two lanes may have calls in flight.
+    /// Both run a call's work in `submit`: every lane may have a call in flight.
     fn depth(&self) -> usize {
-        2
+        glm53f_forward::forward::MAX_LANES
     }
 }
 

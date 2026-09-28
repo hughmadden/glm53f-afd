@@ -14,9 +14,9 @@
 //!   with the routes, `finish` waits for the ranks' planes and sums them into `out` on the
 //!   stream.
 //!
-//! **Calls in flight.** A two-lane prefill (`crate::forward`) submits one lane's layer while the
-//! other lane's is still out: [`ExpertBackend::depth`] says how many calls may be submitted and
-//! not yet finished. They are finished oldest first.
+//! **Calls in flight.** A prefill in several lanes (`crate::forward`) submits a lane's layer while
+//! earlier lanes' are still out: [`ExpertBackend::depth`] says how many calls may be submitted and
+//! not yet finished (the forward keeps at most one a lane). They are finished oldest first.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,6 +28,7 @@ use glm53f_model::safetensors::Checkpoint;
 use crate::device::{launched, DeviceBuffer, Stream};
 use crate::error::{invalid, Result};
 use crate::ffi;
+use crate::forward::MAX_LANES;
 use crate::gemm::{Fp8Input, Gemm, GemmPolicy};
 use crate::shape::{HIDDEN, MOE_INTER, TOP_K};
 use crate::weights::{Fp8W, Loader};
@@ -60,7 +61,7 @@ pub trait ExpertBackend: Send {
     /// The routed sum is in `call.out` for work enqueued on `stream` after this returns. Calls
     /// in flight are finished in the order they were submitted.
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()>;
-    /// Calls that may be in flight at once (submitted, not yet finished): 1 or 2.
+    /// Calls that may be in flight at once (submitted, not yet finished), at least 1.
     fn depth(&self) -> usize {
         1
     }
@@ -81,7 +82,7 @@ impl ExpertBackend for ZeroExperts {
         Ok(())
     }
     fn depth(&self) -> usize {
-        2
+        MAX_LANES
     }
     fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> Result<()> {
         let n = call.rows * HIDDEN * 2;
@@ -399,6 +400,6 @@ impl ExpertBackend for LocalFp8Experts {
 
     /// `submit` enqueues all of a call's work (its scratch is reused in stream order).
     fn depth(&self) -> usize {
-        2
+        MAX_LANES
     }
 }

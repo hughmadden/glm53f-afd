@@ -30,7 +30,8 @@ themselves instead, and each returns a quarter of the rows
 - The forward uses it (glm53f-forward's `RemoteExperts`, from
   `GLM53F_ROW_SHARDED_MIN_ROWS` rows): two-lane prefill of layers 0-4 on the
   four daemons over loopback picks the four-plane path's tokens on every
-  decided row (glm53f-forward `tests/remote_experts.rs`).
+  decided row, and four lanes give the bits of four passes of the same rows
+  (glm53f-forward `tests/remote_experts.rs`).
 - The expert kernel has a large-M family for prefill and a fused epilogue,
   reduce and plan (28 September 2026): 1.16–1.32× on the development GPU at
   512–4,096 rows and at one or two rows, the same bits
@@ -48,7 +49,9 @@ themselves instead, and each returns a quarter of the rows
     are in `docs/PERFORMANCE.md`), and the split kernels' options swept there
     ([On a Spark](#on-a-spark));
   - the RDMA path, for the coordinator's link and the peer mesh (built, but
-    untested without a fabric).
+    untested without a fabric; the receive slots that queue the prefill
+    lanes' requests are tested on the CPU against a model of the receive
+    queue).
 
 Contents:
 
@@ -821,6 +824,26 @@ coordinator's `glm53f-rdma`. The frames are `DS41RTE3` v3 with the L4 ladder
 - the BF16 return is written straight into the registered send buffer;
 - the slot is re-posted before the return goes out.
 
+**Queued requests.** The coordinator keeps up to one exchange in flight per
+prefill lane (`glm53f-serve --prefill-lanes`, up to four). Over RDMA a
+request lands in a receive slot the rank posted beforehand, so a rank takes
+as many requests ahead of the one it computes as it posts slots:
+`--recv-slots` (4 by default). Every slot is posted when the connection
+opens; a queue pair's receive queue is first in, first out, so the requests
+land in the oldest posted slots in the order they were sent and are served in
+that order; each slot is posted again, at the back of the queue, once its
+request is on the device (`transport::RecvSlots`, whose bookkeeping
+`transport.rs` tests on the CPU against a model of the receive queue: up to N
+requests in flight on N slots are never refused and are served in order).
+The rank names its slots in the RDMA handshake (`glm53f_rdma::Info::recv_slots`,
+a word that was reserved and zero), and the coordinator keeps no more
+exchanges in flight than every rank queues. The frames are unchanged
+(`DS41RTE3` v3 and v4); a rank built before the field sends zero, which the
+coordinator reads as two slots, and ignores the coordinator's word. A request
+with no slot posted is not lost: the NIC retries it (receiver-not-ready
+retries without limit) until a slot is posted again. The peer mesh keeps two
+slots per link: its frames are copied out as soon as they are polled.
+
 **Over TCP** the same code runs on owned buffers.
 
 **Failures.** A failed request gets a `Status::Error` return and the
@@ -829,6 +852,9 @@ rank.
 
 **Flags and environment variables:**
 
+- `--recv-slots N` (`GLM53F_RANK_RECV_SLOTS`, 1 to 16, default 4): RDMA
+  receive slots per coordinator connection, the requests it queues (17 MiB
+  each, page-locked);
 - `--peers A0,A1,A2,A3` (`GLM53F_RANK_PEERS`): the four ranks' peer-mesh
   addresses in rank order; this rank listens on its own;
 - `--peer-timeout-ms N` (`GLM53F_RANK_PEER_TIMEOUT_MS`, default 10,000): how
@@ -919,8 +945,8 @@ requests and returns (`glm53f-wire`, `tests/row_shard.rs`).
   serving thread polls the receive queue, as the RDMA design polls
   completions.
 - **Keys.** An exchange is keyed by request id and layer. Frames of another
-  exchange (the coordinator's other prefill lane, which a faster peer may
-  already be sending) wait until their exchange claims them. The coordinator
+  exchange (another of the coordinator's prefill lanes, which a faster peer
+  may already be sending) wait until their exchange claims them. The coordinator
   starts each connection's request ids at a random base, so a stale frame
   never matches a later exchange; frames nobody claims are dropped after twice
   the timeout.

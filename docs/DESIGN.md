@@ -59,7 +59,7 @@ no deployment-specific details in it.
    │  host RAM tier: evicted pages and snapshots                            │
    └───────────────┬───────────────────────────────────────▲───────────────┘
       routed rows (FP8 or NVFP4 hidden, routes, weights) │ expert output (BF16)
-                   │   RDMA RC over RoCE v2, two lanes     │
+                   │   RDMA RC over RoCE v2, 2-4 lanes     │
    ┌───────────────▼───────────────────────────────────────┴───────────────┐
    │ Expert ranks: 4 × DGX Spark (TP4: a quarter of every expert's width)   │
    │  zero-copy frame input · grouped expert kernel · output to send slot   │
@@ -192,6 +192,15 @@ to about C1 throughput. This design rules that out.
 - Long prompts run as a chunk × layer wavefront.
 - In segments of about 2 s, decode rounds for the other slots run in between.
 - Short prompts that arrive together prefill in one pass.
+- **Lanes** (as built). A prefill pass is cut into 2 to 4 lanes
+  (`--prefill-lanes`) that take turns on the coordinator's GPU, layer by layer:
+  while the ranks compute one lane's routed experts, the GPU runs the next lanes'
+  attention. Up to one exchange per lane is in flight; the ranks queue them in
+  their RDMA receive slots and serve them in order. In N lanes the GPU waits only
+  when a lane's exchange takes longer than the other N − 1 lanes' attention (two
+  lanes on the target hardware: 12 ms of exchange against 8.7 ms of attention
+  per 2,048-row lane and MoE layer). N lanes give the bits of N passes over the
+  lanes' rows (`crates/glm53f-forward/src/forward.rs`, "Lanes (prefill)").
 
 **Admission.**
 - Each request reserves its prompt plus an output allowance, not the maximum

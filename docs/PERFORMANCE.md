@@ -65,6 +65,7 @@ serve the other; 4,096-row passes in two lanes of 2,048):
 - With them, the host's per-lane work falls to about 0.25 ms, and the layer to 25.1 ms with the GPU 72% busy.
 - With the rank kernel tuned for GB10 (6–8% faster end to end), the exchange of a 2,048-row lane fell to 12 ms and the MoE layer to 22.2 ms.
 - **The coordinator's attention is now the bound:** 4.3 µs per row per MoE layer, 84% of the GPU's time with lanes of 4,096 rows (36.5 of 43.4 ms per layer).
+- **Three and four lanes** (`--prefill-lanes 3`, 4; built 29 September 2026, not yet run on the target hardware). A 2,048-row lane's exchange (12.0 ms) is longer than the other lane's attention (8.7 ms), so in two lanes each lane's chain of attention, then exchange, sets the pace and the GPU waits. In N lanes the exchange hides while it takes at most the other N − 1 lanes' attention. Estimated, not measured: up to about +20% with three lanes today (in two lanes the GPU idles 16–18% of a MoE layer), more once the chunked KDA prefill and the FP8 KDA projections shorten the attention; the ranks' own limit is about 14 ms per 4,096 rows per layer (the rank kernel's 13.3 ms on GB10). The development GPU's side of it is §5b.
 - The reduce-scatter return is slower over a TCP mesh between the ranks. They encode and sum peer rows on the CPU, so it stays off.
 
 **Against a vLLM recipe on the same four Sparks without a coordinator GPU**

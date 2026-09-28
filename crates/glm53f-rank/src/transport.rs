@@ -8,6 +8,7 @@
 //! exercises bitflip/truncation/reorder/duplicate over a real byte channel
 //! without touching any live buffer.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// A byte-oriented transport: send a frame's bytes, receive a frame's bytes.
@@ -594,12 +595,175 @@ mod tests {
         let got = client.join().expect("client thread");
         assert_eq!(got, ret2, "large return round-trip");
     }
+
+    /// The receive slots against a model of the NIC's receive queue: a sender keeps up to
+    /// `window` requests unanswered; each takes the oldest posted slot (none posted: the NIC
+    /// refuses it, a receiver-not-ready retry) and completes in that order; the rank takes the
+    /// next completion, holds its slot while it serves the request, then releases it (posted
+    /// again) and answers. The steps interleave at random (`seed`). Returns the requests in the
+    /// order served and the refusals.
+    fn simulate(slots: u32, window: usize, requests: usize, seed: u64) -> (Vec<usize>, usize) {
+        let mut ring = RecvSlots::new(slots);
+        let mut rq: VecDeque<u32> = ring.open().into_iter().collect();
+        let mut cq: VecDeque<(u32, usize)> = VecDeque::new();
+        let (mut sent, mut answered, mut refused) = (0usize, 0usize, 0usize);
+        let (mut served, mut serving) = (Vec::new(), None);
+        let mut s = seed;
+        while answered < requests {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            match (s >> 33) % 3 {
+                0 if sent < requests && sent - answered < window => match rq.pop_front() {
+                    Some(slot) => {
+                        cq.push_back((slot, sent));
+                        sent += 1;
+                    }
+                    None => refused += 1,
+                },
+                1 if serving.is_none() => {
+                    if let Some((slot, req)) = cq.pop_front() {
+                        ring.arrived(slot).expect("the oldest posted slot completes first");
+                        assert_eq!(ring.held(), Some(slot));
+                        serving = Some(req);
+                    }
+                }
+                2 => {
+                    if let Some(req) = serving.take() {
+                        rq.push_back(ring.release().expect("a held slot"));
+                        served.push(req);
+                        answered += 1;
+                    }
+                }
+                _ => {}
+            }
+            // Posted and not yet taken: the completions waiting, then the NIC's receive queue.
+            let nic: Vec<u32> = cq.iter().map(|c| c.0).chain(rq.iter().copied()).collect();
+            assert_eq!(ring.posted.iter().copied().collect::<Vec<_>>(), nic, "the bookkeeping is the NIC's");
+            assert!(ring.held().is_none_or(|h| !nic.contains(&h)), "a held slot is never posted");
+        }
+        (served, refused)
+    }
+
+    /// With N slots, up to N requests queue while the rank serves: none is refused, and they
+    /// are served in the order sent. One more than the slots in flight is refused at times (what
+    /// the two slots before did to a third lane's request).
+    #[test]
+    fn requests_queue_in_the_receive_slots_and_are_served_in_order() {
+        for slots in 1..=6u32 {
+            for window in 1..=slots as usize {
+                for seed in 0..20 {
+                    let (served, refused) = simulate(slots, window, 64, seed);
+                    assert_eq!(served, (0..64).collect::<Vec<_>>(), "{slots} slots, {window} in flight");
+                    assert_eq!(refused, 0, "{slots} slots, {window} in flight: a request found no posted slot");
+                }
+            }
+        }
+        let refused: usize = (0..20).map(|seed| simulate(2, 3, 64, seed).1).sum();
+        assert!(refused > 0, "three in flight on two slots were never refused");
+    }
+
+    /// A completion must be the oldest posted slot's and come with no slot held; a released
+    /// slot is posted again at the back.
+    #[test]
+    fn completions_out_of_order_or_while_a_slot_is_held_are_refused() {
+        let mut ring = RecvSlots::new(3);
+        assert_eq!(ring.open(), vec![0, 1, 2]);
+        assert!(ring.arrived(1).is_err(), "slot 0 is the oldest posted");
+        ring.arrived(0).unwrap();
+        assert!(ring.arrived(1).is_err(), "slot 0 is still held");
+        assert_eq!((ring.release(), ring.release()), (Some(0), None));
+        for slot in [1, 2, 0, 1] {
+            ring.arrived(slot).unwrap();
+            assert_eq!(ring.release(), Some(slot));
+        }
+        assert_eq!(ring.posted(), 3);
+        assert_eq!(RecvSlots::new(0).slots(), 1, "at least one slot");
+    }
+}
+
+/// Requests a rank queues by default on an RDMA connection: the receive slots it posts
+/// (`glm53f-rank serve --recv-slots`), as many as the coordinator's deepest pipeline (four
+/// prefill lanes, one exchange in flight each).
+pub const RECV_SLOTS: u32 = 4;
+
+/// The receive slots of an RDMA connection, as the NIC and the serving loop use them (CPU
+/// bookkeeping, so the logic is tested without a NIC).
+///
+/// Every slot is posted when the connection opens. A queue pair's receive queue is first in,
+/// first out: each arriving message takes the oldest posted slot, and the completions come in
+/// that order. So up to `slots` requests can arrive before the rank serves one: they wait in
+/// their slots and are served in the order they came. The serving loop holds one slot at a time
+/// (the request it reads where the NIC landed it), and a slot it releases is posted again, at the
+/// back of the queue. A sender that keeps at most `slots` requests unanswered therefore always
+/// finds a slot posted: the rank holds at most one per request not yet answered.
+#[derive(Debug)]
+pub struct RecvSlots {
+    slots: u32,
+    /// The posted slots, oldest first: the next message lands in the front one.
+    posted: VecDeque<u32>,
+    /// The slot whose request the serving loop is reading.
+    held: Option<u32>,
+}
+
+impl RecvSlots {
+    /// `slots` receive slots (at least one), none posted yet.
+    pub fn new(slots: u32) -> RecvSlots {
+        RecvSlots { slots: slots.max(1), posted: VecDeque::new(), held: None }
+    }
+
+    pub fn slots(&self) -> u32 {
+        self.slots
+    }
+
+    /// Slots posted now.
+    pub fn posted(&self) -> usize {
+        self.posted.len()
+    }
+
+    /// The slot the serving loop holds.
+    pub fn held(&self) -> Option<u32> {
+        self.held
+    }
+
+    /// Every slot, in the order to post them when the connection opens.
+    pub fn open(&mut self) -> Vec<u32> {
+        self.posted = (0..self.slots).collect();
+        self.held = None;
+        self.posted.iter().copied().collect()
+    }
+
+    /// A message completed in `slot`: it is held until [`RecvSlots::release`]. It must be the
+    /// oldest posted slot, and no other slot held; anything else means the connection's
+    /// receive queue is not what this side posted, and it fails.
+    pub fn arrived(&mut self, slot: u32) -> Result<(), String> {
+        if let Some(h) = self.held {
+            return Err(format!("rdma: a message in slot {slot} while slot {h} is still held"));
+        }
+        if self.posted.front() != Some(&slot) {
+            return Err(format!(
+                "rdma: a message in slot {slot}, but the oldest posted slot is {:?} (of {:?})",
+                self.posted.front(),
+                self.posted
+            ));
+        }
+        self.posted.pop_front();
+        self.held = Some(slot);
+        Ok(())
+    }
+
+    /// The held slot's message was used: the slot to post again (`None` when none is held).
+    pub fn release(&mut self) -> Option<u32> {
+        let slot = self.held.take()?;
+        self.posted.push_back(slot);
+        Some(slot)
+    }
 }
 
 /// RDMA RC transport (perf reset R2 part 2): frames arrive by SEND into a
-/// two-slot registered receive ring and leave by SEND from a registered buffer;
+/// registered receive ring of `slots` slots ([`RecvSlots`]: requests queue in
+/// them while the rank computes) and leave by SEND from a registered buffer;
 /// completions are busy-polled. The TCP socket stays open for peer-shutdown
-/// detection only. Selected per connection by the coordinator's handshake.
+/// detection only. Selected per connection by the coordinator's handshake, in
+/// which this side names its receive slots (`glm53f_rdma::Info::recv_slots`).
 ///
 /// The ranks' peer mesh (`crate::mesh`) uses the same transport, sized for its
 /// exchange frames: the rank that connects opens it ([`RdmaTransport::connect_sized`],
@@ -615,8 +779,9 @@ pub struct RdmaTransport {
     half: usize,
     send_cur: usize,
     send_pending: [bool; 2],
-    /// Receive slot lent out by `recv_slot`, re-posted by `release_slot`.
-    held: Option<u32>,
+    /// The receive slots: posted, and the one lent out by `recv_slot` until
+    /// `release_slot`.
+    ring: RecvSlots,
     stream: std::net::TcpStream,
 }
 
@@ -624,6 +789,10 @@ pub struct RdmaTransport {
 /// frame, page-rounded.
 const RDMA_REQ_SLOT: usize = (glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::REQUEST_ROW_BYTES).div_ceil(4096) * 4096;
 const RDMA_RET_MAX: usize = (glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::RETURN_ROW_BYTES).div_ceil(4096) * 4096;
+
+fn io_err(e: String) -> std::io::Error {
+    std::io::Error::other(e)
+}
 
 /// The RoCE v2 device, port and GID index that own `stream`'s local IPv4 (the
 /// inference-fabric rule of `glm53f_rdma::fabric_port`; loopback and the test
@@ -644,14 +813,21 @@ fn roce_for(stream: &std::net::TcpStream) -> std::io::Result<(String, u8, i32)> 
 
 impl RdmaTransport {
     /// If the peer opened with the RDMA handshake, complete it and return the
-    /// transport; `Ok(None)` means a plain TCP peer (nothing was consumed).
-    pub fn accept(stream: &std::net::TcpStream) -> std::io::Result<Option<Self>> {
-        Self::accept_sized(stream, RDMA_REQ_SLOT, RDMA_RET_MAX)
+    /// transport, with `slots` receive slots for requests (at most that many
+    /// queue: [`RecvSlots`]); `Ok(None)` means a plain TCP peer (nothing was
+    /// consumed).
+    pub fn accept(stream: &std::net::TcpStream, slots: u32) -> std::io::Result<Option<Self>> {
+        Self::accept_sized(stream, RDMA_REQ_SLOT, RDMA_RET_MAX, slots)
     }
 
-    /// [`RdmaTransport::accept`] with two receive slots of `recv_slot` bytes
+    /// [`RdmaTransport::accept`] with `slots` receive slots of `recv_slot` bytes
     /// and two send halves of `send_half` bytes (both page-rounded).
-    pub fn accept_sized(stream: &std::net::TcpStream, recv_slot: usize, send_half: usize) -> std::io::Result<Option<Self>> {
+    pub fn accept_sized(
+        stream: &std::net::TcpStream,
+        recv_slot: usize,
+        send_half: usize,
+        slots: u32,
+    ) -> std::io::Result<Option<Self>> {
         use glm53f_rdma::{AlignedBuf, Endpoint, Info, HANDSHAKE_LEN, HANDSHAKE_MAGIC};
         use std::io::{Error, ErrorKind, Read, Write};
         // Blocking peek, no timeout: a TCP coordinator may connect long before its
@@ -675,42 +851,49 @@ impl RdmaTransport {
         let remote = Info::from_bytes(&hello[8..]).ok_or_else(|| Error::new(ErrorKind::InvalidData, "short rdma hello"))?;
         let (dev, port, gid) = roce_for(stream)?;
         let (recv_slot, half) = (recv_slot.div_ceil(4096) * 4096, send_half.div_ceil(4096) * 4096);
-        let mut recv = AlignedBuf::new(2 * recv_slot);
+        let mut ring = RecvSlots::new(slots);
+        let mut recv = AlignedBuf::new(ring.slots() as usize * recv_slot);
         let mut send = AlignedBuf::new(2 * half);
-        let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, 2, None)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        ep.post_recv(0).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        ep.post_recv(1).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        ep.connect(&remote).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, ring.slots(), None).map_err(io_err)?;
+        for slot in ring.open() {
+            ep.post_recv(slot).map_err(io_err)?;
+        }
+        ep.connect(&remote).map_err(io_err)?;
         let mut reply = Vec::with_capacity(HANDSHAKE_LEN);
         reply.extend_from_slice(HANDSHAKE_MAGIC);
-        reply.extend_from_slice(&ep.local_info().to_bytes());
+        reply.extend_from_slice(&Info { recv_slots: ring.slots(), ..ep.local_info() }.to_bytes());
         s.write_all(&reply)?;
-        eprintln!("rdma: RC on {dev} port {port} gid {gid} (qpn {} -> {})", ep.local_info().qpn, remote.qpn);
+        eprintln!(
+            "rdma: RC on {dev} port {port} gid {gid} (qpn {} -> {}), {} receive slots",
+            ep.local_info().qpn,
+            remote.qpn,
+            ring.slots()
+        );
         stream.set_nonblocking(true)?;
-        Ok(Some(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], held: None, stream: s }))
+        Ok(Some(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], ring, stream: s }))
     }
 
     /// The connecting side of the handshake (as the coordinator's wire client
     /// does it): open an RC queue pair on the RoCE device that owns `stream`'s
-    /// local IPv4, post both receive slots, send `M26RDMA1` and this side's
+    /// local IPv4, post the `slots` receive slots, send `M26RDMA1` and this side's
     /// queue-pair coordinates, and connect to the answer. Sizes as
     /// [`RdmaTransport::accept_sized`].
-    pub fn connect_sized(stream: &std::net::TcpStream, recv_slot: usize, send_half: usize) -> std::io::Result<Self> {
+    pub fn connect_sized(stream: &std::net::TcpStream, recv_slot: usize, send_half: usize, slots: u32) -> std::io::Result<Self> {
         use glm53f_rdma::{AlignedBuf, Endpoint, Info, HANDSHAKE_LEN, HANDSHAKE_MAGIC};
         use std::io::{Error, ErrorKind, Read, Write};
         let (dev, port, gid) = roce_for(stream)?;
         let (recv_slot, half) = (recv_slot.div_ceil(4096) * 4096, send_half.div_ceil(4096) * 4096);
-        let mut recv = AlignedBuf::new(2 * recv_slot);
+        let mut ring = RecvSlots::new(slots);
+        let mut recv = AlignedBuf::new(ring.slots() as usize * recv_slot);
         let mut send = AlignedBuf::new(2 * half);
-        let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, 2, None)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        ep.post_recv(0).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        ep.post_recv(1).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, ring.slots(), None).map_err(io_err)?;
+        for slot in ring.open() {
+            ep.post_recv(slot).map_err(io_err)?;
+        }
         let mut s = stream.try_clone()?;
         let mut msg = Vec::with_capacity(HANDSHAKE_LEN);
         msg.extend_from_slice(HANDSHAKE_MAGIC);
-        msg.extend_from_slice(&ep.local_info().to_bytes());
+        msg.extend_from_slice(&Info { recv_slots: ring.slots(), ..ep.local_info() }.to_bytes());
         s.write_all(&msg)?;
         let mut reply = [0u8; HANDSHAKE_LEN];
         s.read_exact(&mut reply)?;
@@ -718,10 +901,27 @@ impl RdmaTransport {
             return Err(Error::new(ErrorKind::InvalidData, "rdma: the peer answered without the RDMA magic"));
         }
         let remote = Info::from_bytes(&reply[8..]).ok_or_else(|| Error::new(ErrorKind::InvalidData, "short rdma hello"))?;
-        ep.connect(&remote).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        ep.connect(&remote).map_err(io_err)?;
         eprintln!("rdma: RC on {dev} port {port} gid {gid} (qpn {} -> {})", ep.local_info().qpn, remote.qpn);
         stream.set_nonblocking(true)?;
-        Ok(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], held: None, stream: s })
+        Ok(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], ring, stream: s })
+    }
+
+    /// The receive slots (their bookkeeping).
+    pub fn recv_slots(&self) -> &RecvSlots {
+        &self.ring
+    }
+
+    /// The frame that completed in `slot` (`len` bytes), copied out, and the slot
+    /// posted again.
+    fn take_copy(&mut self, slot: u32, len: usize) -> Result<Vec<u8>, String> {
+        self.ring.arrived(slot)?;
+        let base = slot as usize * self.ep.slot_len();
+        let frame = self.recv.as_slice()[base..base + len].to_vec();
+        if let Some(s) = self.ring.release() {
+            self.ep.post_recv(s)?;
+        }
+        Ok(frame)
     }
 
     /// A received frame if one is waiting (copied out, its slot re-posted),
@@ -729,12 +929,7 @@ impl RdmaTransport {
     /// queue pair failed.
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>, String> {
         match self.ep.wait_recv(std::time::Duration::ZERO, Some(std::time::Duration::ZERO))? {
-            Some((slot, len)) => {
-                let base = slot as usize * self.ep.slot_len();
-                let frame = self.recv.as_slice()[base..base + len].to_vec();
-                self.ep.post_recv(slot)?;
-                Ok(Some(frame))
-            }
+            Some((slot, len)) => self.take_copy(slot, len).map(Some),
             None if self.peer_gone() => Err("rdma: the peer closed the connection".into()),
             None => Ok(None),
         }
@@ -815,34 +1010,39 @@ impl ByteTransport for RdmaTransport {
 
     fn recv(&mut self) -> Option<Vec<u8>> {
         let (slot, len) = self.next_frame()?;
-        let base = slot as usize * self.ep.slot_len();
-        let frame = self.recv.as_slice()[base..base + len].to_vec();
-        if let Err(e) = self.ep.post_recv(slot) {
-            eprintln!("rdma: re-post recv failed: {e}");
-            return None;
+        match self.take_copy(slot, len) {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                eprintln!("rdma: receive failed: {e}");
+                None
+            }
         }
-        Some(frame)
     }
 
     fn in_place_recv(&self) -> bool {
         true
     }
 
+    /// The next request where it landed; the requests behind it wait in their
+    /// slots, in order.
     fn recv_slot(&mut self) -> Option<(*const u8, usize)> {
-        if self.held.is_some() {
+        if self.ring.held().is_some() {
             eprintln!("rdma: recv_slot while a slot is still held");
             return None;
         }
         let (slot, len) = self.next_frame()?;
-        self.held = Some(slot);
+        if let Err(e) = self.ring.arrived(slot) {
+            eprintln!("{e}");
+            return None;
+        }
         // SAFETY: within the registered ring; the slot is not re-posted (so the
         // NIC cannot write it) until release_slot.
         Some((unsafe { self.recv.as_ptr().add(slot as usize * self.ep.slot_len()) } as *const u8, len))
     }
 
     fn release_slot(&mut self) -> std::io::Result<()> {
-        if let Some(slot) = self.held.take() {
-            self.ep.post_recv(slot).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        if let Some(slot) = self.ring.release() {
+            self.ep.post_recv(slot).map_err(io_err)?;
         }
         Ok(())
     }

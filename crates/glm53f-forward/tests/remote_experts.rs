@@ -14,12 +14,14 @@
 //!    EXL3 4-bit experts are not the FP8 experts' bits: the rank crate measures a cosine of at
 //!    least 0.990 per row against the reference (`glm53f-rank`, `tests/real_experts.rs`).
 //!
-//! 3. **Two lanes on the four rank daemons** (the serving path: the forward's own routing): the
-//!    oracle's prompt, and two prompts batched across the lanes' cut, each as two lanes, as the
-//!    same rows in two passes one after the other (bit for bit equal: over TCP the lanes take
-//!    turns on the wire, one exchange in flight), and as one pass (the same tokens but on near
-//!    ties, logits within the chain's bound); with the lane trace of each pass (a shared GPU, so
-//!    it shows the schedule, not the overlap of separate machines).
+//! 3. **Lanes on the four rank daemons** (the serving path: the forward's own routing): the
+//!    oracle's prompt, and two prompts batched across the lanes' cuts, each in 2, 3 and 4 lanes,
+//!    as the same rows in that many passes one after the other (bit for bit equal: over TCP the
+//!    lanes take turns on the wire, one exchange in flight), and as one pass (the same tokens but
+//!    on near ties, logits within the chain's bound); with the lane trace of each pass (a shared
+//!    GPU, so it shows the schedule, not the overlap of separate machines). Then the batch in
+//!    four lanes with row slices (the prefill reduce-scatter over the ranks' peer mesh) against
+//!    four passes, bit for bit.
 //! 4. **Return paths and fast paths on the four rank daemons** (with their peer mesh): the
 //!    row-sharded return against four planes, and the fast paths against the host paths, call
 //!    by call on layers 3 and 4 (the oracle's MoE inputs) and through two-lane prefill of layers
@@ -57,7 +59,7 @@ use common::*;
 use glm53f_coordinator::wire::{Collected, ReturnPath, WireClient, WireConfig};
 use glm53f_forward::device::{DeviceBuffer, Stream};
 use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts, ZeroExperts};
-use glm53f_forward::forward::{ForwardConfig, GlmForward, Tap, TapBuf, TapPoint};
+use glm53f_forward::forward::{ForwardConfig, GlmForward, Tap, TapBuf, TapPoint, MAX_LANES};
 use glm53f_forward::gemm::Fp8Act;
 use glm53f_forward::remote::{FastPaths, RemoteExperts, WireTimes, RANKS};
 use glm53f_forward::shape::{HC, HIDDEN, SAMPLE_VOCAB, TOP_K, VOCAB};
@@ -672,7 +674,7 @@ fn layers_0_to_4_on_four_rank_daemons() {
 
     // The EXL3 experts on four rank daemons.
     let (daemons, addrs) = spawn_ranks(&bin, &dirs);
-    let remote = RemoteExperts::connect(&addrs, rows).expect("connect to the ranks");
+    let remote = RemoteExperts::connect(&addrs, rows, cfg.lanes).expect("connect to the ranks");
     let times = remote.times();
     let remote = Arc::new(Mutex::new(remote));
     let rem = run(&mut fwd, &remote, &g, &prompt, &steps);
@@ -763,7 +765,7 @@ fn layers_0_to_4_on_four_rank_daemons() {
     );
 }
 
-// ---- 3. Two lanes on the rank daemons ----------------------------------------------------------
+// ---- 3. Lanes on the rank daemons --------------------------------------------------------------
 
 /// Logits rows of two runs: the relative RMS of every value and the largest per row, and the
 /// rows (of those whose two best logits in `reference` are at least 0.25 apart) whose picks agree.
@@ -794,15 +796,15 @@ fn bits(a: &[f32], b: &[f32]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-/// Prompts in one prefill (with `cut`: the rows before it in one pass, the rest in a second),
-/// then `steps` batched decode steps: every logit row (the prompts' last rows, then each step's)
-/// and the picks. The steps take the tokens of `tokens` (a run's picks) when given, else the
-/// run's own picks, so runs compared step by step see the same tokens.
+/// Prompts in one prefill (with `cuts`: in one-lane passes cut at those rows, as a pass's lanes
+/// hold them), then `steps` batched decode steps: every logit row (the prompts' last rows, then
+/// each step's) and the picks. The steps take the tokens of `tokens` (a run's picks) when given,
+/// else the run's own picks, so runs compared step by step see the same tokens.
 fn run_prompts(
     fwd: &mut GlmForward,
     prompts: &[&[u32]],
     steps: usize,
-    cut: Option<usize>,
+    cuts: &[usize],
     tokens: Option<&[u32]>,
 ) -> (Vec<f32>, Vec<u32>) {
     let mut kvs: Vec<_> = prompts
@@ -813,53 +815,7 @@ fn run_prompts(
             kv
         })
         .collect();
-    let (mut picks, mut logits) = match cut {
-        None => {
-            let mut segs: Vec<(&mut glm53f_forward::kv::GlmKv, &[u32])> =
-                kvs.iter_mut().zip(prompts).map(|(k, p)| (k, *p)).collect();
-            let picks = fwd.prefill(&mut segs).unwrap();
-            (picks, fwd.logits(prompts.len()).unwrap())
-        }
-        Some(at) => {
-            // The request the cut falls in is the last one of the first pass.
-            let mut row = 0;
-            let mut first: Vec<(usize, usize)> = Vec::new();
-            for (i, p) in prompts.iter().enumerate() {
-                if row < at {
-                    first.push((i, p.len().min(at - row)));
-                }
-                row += p.len();
-            }
-            let (split, n) = *first.last().unwrap();
-            let mut segs: Vec<(&mut glm53f_forward::kv::GlmKv, &[u32])> = kvs
-                .iter_mut()
-                .zip(prompts)
-                .zip(&first)
-                .map(|((k, p), &(_, n))| (k, &p[..n]))
-                .collect();
-            let mut picks = fwd.prefill(&mut segs).unwrap();
-            let mut logits = fwd.logits(first.len()).unwrap();
-            let rest: Vec<&[u32]> = std::iter::once(&prompts[split][n..])
-                .chain(prompts[split + 1..].iter().copied())
-                .collect();
-            let mut segs: Vec<(&mut glm53f_forward::kv::GlmKv, &[u32])> = kvs[split..]
-                .iter_mut()
-                .zip(rest)
-                .filter(|(_, p)| !p.is_empty())
-                .collect();
-            let skip = usize::from(n == prompts[split].len());
-            let second = fwd.prefill(&mut segs).unwrap();
-            let l2 = fwd.logits(second.len()).unwrap();
-            // The first pass's row for the split request is not a prompt's last row.
-            if skip == 0 {
-                picks.pop();
-                logits.truncate(logits.len() - VOCAB);
-            }
-            picks.extend(second);
-            logits.extend(l2);
-            (picks, logits)
-        }
-    };
+    let (mut picks, mut logits) = prefill_in_passes(fwd, &mut kvs, prompts, cuts);
     let n = prompts.len();
     let mut last = picks.clone();
     for s in 0..steps {
@@ -886,7 +842,7 @@ fn prompt_ids(seed: u64, n: usize) -> Vec<u32> {
 }
 
 #[test]
-fn two_lanes_on_four_rank_daemons() {
+fn lanes_on_four_rank_daemons() {
     let Some(g) = Goldens::load(&["layer00-prefill", "head"]) else {
         return;
     };
@@ -897,9 +853,11 @@ fn two_lanes_on_four_rank_daemons() {
         return;
     }
     let (n1, n2) = (150usize, 211usize);
+    let total = n1 + n2;
+    // Lanes of 361 rows: one lane holds the whole batch.
     let cfg = ForwardConfig {
-        max_rows: 2 * (n1 + n2),
-        lanes: 2,
+        max_rows: MAX_LANES * total,
+        lanes: MAX_LANES,
         min_lane_rows: 8,
         max_verify_rows: 8,
         max_requests: 4,
@@ -907,7 +865,7 @@ fn two_lanes_on_four_rank_daemons() {
     };
     let (daemons, addrs) = spawn_ranks(&bin, &dirs);
     let rows = cfg.lane_rows().max(cfg.max_verify_rows);
-    let remote = RemoteExperts::connect(&addrs, rows).expect("connect to the ranks");
+    let remote = RemoteExperts::connect(&addrs, rows, cfg.lanes).expect("connect to the ranks");
     let times = remote.times();
     let depth = remote.depth();
     let Some(mut fwd) = forward_with(5, cfg, |_| Box::new(remote), 8, 256, 16) else {
@@ -918,110 +876,128 @@ fn two_lanes_on_four_rank_daemons() {
     let gl = g.f32("head", "head.logits");
     let prompts = [prompt_ids(1, n1), prompt_ids(2, n2)];
     let batch: Vec<&[u32]> = prompts.iter().map(|p| &p[..]).collect();
-    let at = (n1 + n2).div_ceil(2);
 
-    // The oracle's prompt: its fixed decode tokens after the prefill, the forward's own routing.
-    let chain = |fwd: &mut GlmForward, cut: Option<usize>| -> (Vec<f32>, Vec<u32>) {
-        let mut kv = fwd.kv.slot().unwrap();
-        kv.reserve(PROMPT + STEPS).unwrap();
-        if let Some(k) = cut {
-            fwd.prefill(&mut [(&mut kv, &prompt[..k])]).unwrap();
-        }
-        let mut picks = fwd
-            .prefill(&mut [(&mut kv, &prompt[cut.unwrap_or(0)..])])
-            .unwrap();
-        let mut logits = fwd.logits(1).unwrap();
+    // The oracle's prompt (in one-lane passes cut at `cuts`), then its fixed decode tokens, the
+    // forward's own routing.
+    let chain = |fwd: &mut GlmForward, cuts: &[usize]| -> (Vec<f32>, Vec<u32>) {
+        let mut kv = [fwd.kv.slot().unwrap()];
+        kv[0].reserve(PROMPT + STEPS).unwrap();
+        let (mut picks, mut logits) = prefill_in_passes(fwd, &mut kv, &[&prompt[..]], cuts);
         for &t in &steps {
-            picks.extend(fwd.decode(&mut [(&mut kv, t)]).unwrap());
+            picks.extend(fwd.decode(&mut [(&mut kv[0], t)]).unwrap());
             logits.extend(fwd.logits(1).unwrap());
         }
         (logits, picks)
     };
     fwd.cfg.lanes = 1;
-    let one = chain(&mut fwd, None);
-    let seq = chain(&mut fwd, Some(17));
-    let b_one = run_prompts(&mut fwd, &batch, 4, None, None);
+    let one = chain(&mut fwd, &[]);
+    let b_one = run_prompts(&mut fwd, &batch, 4, &[], None);
     let tb_one = fwd.take_lane_trace().unwrap();
     // Every batch run's steps take the tokens the one-pass run's steps took (the prompts' picks,
     // then each step's).
     let feed = b_one.1[..8].to_vec();
-    let b_seq = run_prompts(&mut fwd, &batch, 4, Some(at), Some(&feed));
-    fwd.cfg.lanes = 2;
-    let two = chain(&mut fwd, None);
-    let t_two = fwd.take_lane_trace().unwrap();
-    let b_two = run_prompts(&mut fwd, &batch, 4, None, Some(&feed));
-    let tb_two = fwd.take_lane_trace().unwrap();
+    let mut failed = Vec::new();
+    for n in 2..=MAX_LANES {
+        fwd.cfg.lanes = 1;
+        let seq = chain(&mut fwd, &lane_cuts(PROMPT, n));
+        let b_seq = run_prompts(&mut fwd, &batch, 4, &lane_cuts(total, n), Some(&feed));
+        fwd.cfg.lanes = n;
+        let lanes = chain(&mut fwd, &[]);
+        let t_lanes = fwd.take_lane_trace().unwrap();
+        let b_lanes = run_prompts(&mut fwd, &batch, 4, &[], Some(&feed));
+        let tb_lanes = fwd.take_lane_trace().unwrap();
+        assert_eq!(t_lanes.rows, lane_rows(PROMPT, n));
+        assert_eq!(tb_lanes.rows, lane_rows(total, n));
+        let (rel, worst, decided, agree) = lane_cmp(&lanes.0, &one.0, &lanes.1, &one.1);
+        let e = err(&lanes.0, &gl).rel_rms;
+        let a = (0..=STEPS)
+            .filter(|&k| {
+                argmax(&lanes.0[k * VOCAB..(k + 1) * VOCAB])
+                    == argmax(&gl[k * VOCAB..(k + 1) * VOCAB])
+            })
+            .count();
+        let (brel, bworst, bdecided, bagree) = lane_cmp(&b_lanes.0, &b_one.0, &b_lanes.1, &b_one.1);
+        let (exact, bexact) = (
+            bits(&lanes.0, &seq.0) && lanes.1 == seq.1,
+            bits(&b_lanes.0, &b_seq.0) && b_lanes.1 == b_seq.1,
+        );
+        eprintln!(
+            "{n} lanes on four rank daemons (TCP loopback, {depth} exchange in flight at most): \
+             the oracle's prompt in lanes of {:?} rows: against {n} passes bit for bit {exact}; \
+             against the golden logits relative RMS {e:.3e}, argmax {a}/9; against one pass \
+             {rel:.3e} (worst row {worst:.3e}), picks {agree}/{decided} of the rows decided by \
+             0.25; two prompts of {n1} and {n2} tokens in lanes of {:?} rows, 4 steps after: \
+             against {n} passes bit for bit {bexact}; against one pass {brel:.3e} (worst row \
+             {bworst:.3e}), picks {bagree}/{bdecided} decided",
+            t_lanes.rows, tb_lanes.rows
+        );
+        eprintln!(
+            "lane trace (loopback, the ranks on this GPU), two prompts in {n} lanes: {}",
+            tb_lanes.summary()
+        );
+        if !(exact && bexact) {
+            failed.push(format!("{n} lanes against {n} passes"));
+        }
+        // The rank chain's bounds (test 2) against the oracle; one pass within the same.
+        if !(e < 0.08 && a >= 8) {
+            failed.push(format!("{n} lanes against the golden: {e:.3e}, {a}/9"));
+        }
+        if !(worst < 0.08 && bworst < 0.08) {
+            failed.push(format!(
+                "{n} lanes against one pass: {worst:.3e}, {bworst:.3e}"
+            ));
+        }
+        if (agree, bagree) != (decided, bdecided) || decided < 6 || bdecided < 6 {
+            failed.push(format!(
+                "{n} lanes pick other tokens than one pass: {agree}/{decided}, {bagree}/{bdecided}"
+            ));
+        }
+    }
     let wire = times.lock().unwrap().clone();
-    drop(fwd);
-    drop(daemons);
-
-    assert_eq!(t_two.rows, vec![17, 16]);
-    assert_eq!(tb_two.rows, vec![at, n1 + n2 - at]);
-    let (rel, worst, decided, agree) = lane_cmp(&two.0, &one.0, &two.1, &one.1);
-    let e2 = err(&two.0, &gl).rel_rms;
-    let a2 = (0..=STEPS)
-        .filter(|&k| {
-            argmax(&two.0[k * VOCAB..(k + 1) * VOCAB]) == argmax(&gl[k * VOCAB..(k + 1) * VOCAB])
-        })
-        .count();
-    let (brel, bworst, bdecided, bagree) = lane_cmp(&b_two.0, &b_one.0, &b_two.1, &b_one.1);
-    let (exact, bexact) = (
-        bits(&two.0, &seq.0) && two.1 == seq.1,
-        bits(&b_two.0, &b_seq.0) && b_two.1 == b_seq.1,
-    );
-    eprintln!(
-        "two lanes on four rank daemons (TCP loopback, {depth} exchange in flight at most): \
-         the oracle's prompt in lanes of 17 and 16 rows: against two passes bit for bit {exact}; \
-         against the golden logits relative RMS {e2:.3e}, argmax {a2}/9; against one pass \
-         {rel:.3e} (worst row {worst:.3e}), picks {agree}/{decided} of the rows decided by 0.25; \
-         two prompts of {n1} and {n2} tokens in lanes of {at} and {} rows, 4 steps after: \
-         against two passes bit for bit {bexact}; against one pass {brel:.3e} (worst row \
-         {bworst:.3e}), picks {bagree}/{bdecided} decided",
-        n1 + n2 - at
-    );
-    eprintln!(
-        "lane trace (loopback, the ranks on this GPU), the oracle's prompt: {}",
-        t_two.summary()
-    );
-    eprintln!(
-        "lane trace (loopback), two prompts in two lanes: {}",
-        tb_two.summary()
-    );
     eprintln!(
         "lane trace (loopback), the same in one pass: {}",
         tb_one.summary()
     );
     eprintln!("wire exchanges (loopback), by layer and rows:");
     report_times(&wire);
-    for ((l, r), x) in &wire {
-        eprintln!(
-            "  layer {l}, {r:>3} rows: host send {:.3} ms, upload {:.3} ms per exchange",
-            x.send_ms / x.count.max(1) as f64,
-            x.upload_ms / x.count.max(1) as f64
-        );
+
+    // The prefill reduce-scatter in four lanes: row slices from 16 rows (every lane of the batch),
+    // against four one-lane passes of the same rows, bit for bit (the ranks split and sum each
+    // exchange as a pass of its rows would).
+    let (_, rs) = wire_configs();
+    drop(fwd.set_experts(Box::new(ZeroExperts)));
+    fwd.set_experts(Box::new(
+        RemoteExperts::connect_with(&addrs, rows, rs, FastPaths::from_env())
+            .expect("connect to the ranks"),
+    ));
+    fwd.cfg.lanes = 1;
+    let r_seq = run_prompts(
+        &mut fwd,
+        &batch,
+        2,
+        &lane_cuts(total, MAX_LANES),
+        Some(&feed),
+    );
+    fwd.cfg.lanes = MAX_LANES;
+    let r_lanes = run_prompts(&mut fwd, &batch, 2, &[], Some(&feed));
+    let t_rs = fwd.take_lane_trace().unwrap();
+    let rs_exact = bits(&r_lanes.0, &r_seq.0) && r_lanes.1 == r_seq.1;
+    let w = t_rs.wire.clone().unwrap_or_default();
+    eprintln!(
+        "row slices from 16 rows, the two prompts in {MAX_LANES} lanes of {:?} rows against \
+         {MAX_LANES} passes: bit for bit {rs_exact}; the wire's record: {w}",
+        t_rs.rows
+    );
+    drop(fwd.set_experts(Box::new(ZeroExperts)));
+    drop(fwd);
+    drop(daemons);
+    if !rs_exact {
+        failed.push("row slices: four lanes against four passes".into());
     }
-    assert!(
-        exact && bexact,
-        "two lanes differ from two passes of the same rows"
-    );
-    // The rank chain's bounds (test 2) against the oracle; one pass within the same.
-    assert!(
-        e2 < 0.08 && a2 >= 8,
-        "two lanes against the golden: {e2:.3e}, {a2}/9"
-    );
-    assert!(
-        worst < 0.08 && bworst < 0.08,
-        "two lanes against one pass: {worst:.3e}, {bworst:.3e}"
-    );
-    assert_eq!(
-        (agree, bagree),
-        (decided, bdecided),
-        "two lanes pick other tokens than one pass"
-    );
-    assert!(
-        decided >= 6 && bdecided >= 6,
-        "rows decided: {decided}, {bdecided}"
-    );
+    if !w.contains(&format!("row slices {}:", 2 * MAX_LANES)) {
+        failed.push(format!("row slices: the wire's record: {w}"));
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }
 
 // ---- 4. Return paths and fast paths on the rank daemons -------------------------------------
@@ -1364,7 +1340,7 @@ fn row_sharded_two_lane_prefill_on_four_rank_daemons() {
         fwd.set_experts(Box::new(connect(c, fast)));
         let one = chain(&mut fwd);
         let t_one = fwd.take_lane_trace().unwrap();
-        let two = run_prompts(&mut fwd, &batch, 4, None, feed.as_deref());
+        let two = run_prompts(&mut fwd, &batch, 4, &[], feed.as_deref());
         let t_two = fwd.take_lane_trace().unwrap();
         feed.get_or_insert_with(|| two.1[..8].to_vec());
         assert_eq!(t_one.rows, vec![17, 16]);

@@ -34,7 +34,7 @@
 //! link and direction (`glm53f_wire::row_shard`).
 //!
 //! **Exchanges** are keyed by request id and layer (`reduce_scatter::Exchange`).
-//! Frames of another exchange (the coordinator's other prefill lane, which a
+//! Frames of another exchange (another of the coordinator's prefill lanes, which a
 //! faster peer may already be sending) wait in a pending list until their
 //! exchange claims them; frames nobody claims within twice the timeout, and
 //! the oldest beyond [`MAX_PENDING`] per peer, are dropped, which only
@@ -75,6 +75,10 @@ pub const MAX_PENDING: usize = 8;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest exchange frame: a quarter of the largest request, in BF16.
 const MAX_FRAME: usize = glm53f_wire::HEADER_LEN + MAX_ROWS.div_ceil(WORLD) * 2 * crate::consts::HIDDEN;
+/// Receive slots of an RDMA link. Two are enough however many requests the coordinator queues:
+/// the serving thread copies a frame out as soon as it polls it, and a peer is at most one
+/// exchange ahead (it cannot finish an exchange without this rank's frame).
+const MESH_SLOTS: u32 = 2;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
@@ -576,12 +580,12 @@ fn open_link(peer: usize, stream: TcpStream, rdma: bool, dialled: bool, timeout:
     let seq = StreamSender::new(WireNaive::NONE);
     if rdma {
         let t = if dialled {
-            let t = RdmaTransport::connect_sized(&stream, MAX_FRAME, MAX_FRAME).map_err(|e| e.to_string())?;
+            let t = RdmaTransport::connect_sized(&stream, MAX_FRAME, MAX_FRAME, MESH_SLOTS).map_err(|e| e.to_string())?;
             // Both queue pairs are connected once this byte is out: the peer may send.
             ready(&ctl, true)?;
             t
         } else {
-            let t = RdmaTransport::accept_sized(&stream, MAX_FRAME, MAX_FRAME)
+            let t = RdmaTransport::accept_sized(&stream, MAX_FRAME, MAX_FRAME, MESH_SLOTS)
                 .map_err(|e| e.to_string())?
                 .ok_or("the peer's hello asked for RDMA but it did not open it")?;
             ready(&ctl, false)?;

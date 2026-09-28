@@ -94,8 +94,8 @@ Each binary runs only on the architecture it was built for; the rank checks this
 
    Without `GLM53F_RDMA=1` the exchange runs over TCP on the same fabric addresses (with or
    without CRCs, as long as the ranks agree). It loads the weights (and with `--drafter` the
-   drafter's), connects the ranks in rank order, allocates every buffer a pass uses (both
-   prefill lanes' scratch for `--prefill-rows`, the verify scratch, the attention workspaces,
+   drafter's), connects the ranks in rank order, allocates every buffer a pass uses (every
+   prefill lane's scratch for `--prefill-rows`, the verify scratch, the attention workspaces,
    the expert exchange's buffers, the drafter's tap buffer and working memory), then sizes the
    KV page pool from what is left less `--reserve-gib` (1 by default), logs what it allocated
    for what, and prints `serving the API on ...`.
@@ -112,14 +112,18 @@ describes each.
 
 ### Prefill lanes and device memory
 
-- **Two lanes.** A prefill pass of `--prefill-rows` rows (4,096 by default) runs in
-  `--prefill-lanes` lanes (2 by default): lane B's attention runs while the ranks compute lane
-  A's routed experts, and the other way round. Over RDMA two exchanges are in flight (the ranks
-  hold lane B's request while they compute lane A's); over TCP one. A lane is one exchange, at
-  most 4,096 rows, so `--prefill-rows 8192 --prefill-lanes 2` gives two lanes of 4,096 and
-  `--prefill-lanes 1` the serial pass. `crates/glm53f-serve/src/lib.rs` explains the default.
-  With `--drafter` each lane captures the drafter's taps for its own rows, and the rows reach
-  the drafter's context lane by lane, as two one-lane passes would give them.
+- **Lanes.** A prefill pass of `--prefill-rows` rows (4,096 by default) runs in
+  `--prefill-lanes` lanes (2 by default, up to 4): while the ranks compute one lane's routed
+  experts, the GPU runs the next lanes' attention, the lanes in turn. Over RDMA one exchange per
+  lane is in flight (the ranks queue the requests in their receive slots and compute them in
+  order; a rank queues four by default, `--recv-slots`, and says so in the RDMA handshake); over
+  TCP one. A lane is one exchange, at most 4,096 rows, so `--prefill-rows 8192 --prefill-lanes 2`
+  gives two lanes of 4,096, `--prefill-rows 12288 --prefill-lanes 3` three, and
+  `--prefill-lanes 1` the serial pass. A pass of R rows in N lanes cuts them evenly (lane i from
+  row ceil(i R / N)); smaller passes take a lane per 64 rows. `crates/glm53f-serve/src/lib.rs`
+  explains the default and when more lanes pay. With `--drafter` each lane captures the
+  drafter's taps for its own rows, and the rows reach the drafter's context lane by lane, as
+  one-lane passes of the same rows would give them.
 - **Memory.** Nothing a pass, a draft or an append to the drafter's context uses is allocated
   after start-up. Snapshot marks (the KDA states
   of a prompt or turn end, 141 MiB) take pages of the KV pool, which admission counts, so a
@@ -129,7 +133,8 @@ describes each.
   working memory and per-slot ring, the expert exchange, the slots' state, the pool (with what
   the snapshot banks would take of it if full) and what was left free.
 - **Decode lanes.** `--decode-lanes MIN[-MAX]` runs decode and verify passes of MIN to MAX rows
-  (over two requests or more) in the same two lanes, cut between requests; off by default. Each
+  (over two requests or more) in the prefill's first two lanes, cut between requests (it needs
+  `--prefill-lanes` 2 or more); off by default. Each
   lane is exactly a pass over its own requests (`crates/glm53f-forward/tests/decode_lanes.rs`),
   so it changes timing only. It overlaps one lane's coordinator work with the other's routed
   experts, but each lane reads the coordinator's weights and the ranks read the experts each
@@ -144,7 +149,10 @@ describes each.
   layer (median), the wall time, each lane's GPU time for its attention and its shared expert,
   the host's time waiting for the routes, in `submit` and in `finish` (blocked on the ranks,
   then the returns placed), and each lane's exchange as the coordinator sees it (`submit`
-  returned to `finish` returned: about the other lane's work when the exchange is hidden). It
+  returned to `finish` returned: about the other lanes' work when the exchange is hidden), and
+  the calls in flight at most (`depth`). With N lanes the GPU stays busy while each lane's
+  exchange takes at most the other N - 1 lanes' attention; time in `finish` is the GPU waiting
+  for the ranks. It
   ends with the wire's record of the pass: which request and return paths served, and per
   return path (row slices, four planes) the exchanges and the medians of the host's time in
   `submit` (of it, waiting for the device's copies), in `finish` waiting for the returns, and
@@ -231,6 +239,9 @@ logits are meaningless.
   from `--experts-dir` (a checkpoint holding the experts of the layers run).
 - `--dev-layers 0-N` runs decoder layers 0 to N only, then the head, so the whole serving loop
   runs with a slice of the weights. **The output is meaningless text by design.**
+- `crates/glm53f-forward/examples/prefill_bench.rs` times prefill passes in 1 to 4 lanes on one
+  GPU (`GLM53F_BENCH_LANES=2,3,4`, `GLM53F_BENCH_LANE_ROWS`), the routed experts returning zeros:
+  the GPU side of the lanes, not their overlap with the ranks.
 - `crates/glm53f-forward/examples/logits_digest.rs` scores a fixed 6,000-token prompt in two-lane
   prefill passes and prints a digest of 162 rows of logits. A change meant to move no bit (a
   kernel's schedule, where buffers live) is checked by running it before and after the change on
@@ -243,14 +254,15 @@ logits are meaningless.
 The tests that do this themselves:
 
 ```sh
-# RemoteExperts against the oracle and the local FP8 experts, on four rank daemons; the row-sharded
-# return and the fast paths against four planes and the host paths, per call and in two-lane prefill.
+# RemoteExperts against the oracle and the local FP8 experts, on four rank daemons; prefill in 2 to
+# 4 lanes against as many passes; the row-sharded return and the fast paths against four planes and
+# the host paths, per call and in prefill lanes.
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_RANK_BIN=.../glm53f-rank \
 GLM53F_RANK_DIRS=<rank-0>,<rank-1>,<rank-2>,<rank-3> \
   cargo test --release -p glm53f-forward --features coordinator --test remote_experts -- --nocapture --test-threads=1
 
-# Two-lane prefill against one lane (bit for bit against the same rows as two passes) and the
-# goldens; admission and snapshots under a tight pool.
+# Prefill in 2 to 4 lanes against one lane (bit for bit against the same rows as that many passes,
+# at every depth of calls in flight) and the goldens; admission and snapshots under a tight pool.
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission -- --nocapture --test-threads=1
 
@@ -299,8 +311,8 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
-| `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 or 2 (default 2) |
-| `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes 2`) |
+| `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 2); at most 4,096 rows per lane |
+| `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes` 2 or more) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
 | `GLM53F_KDA_STATE_BF16=1` | `--kda-state-bf16` | Numerics under test, off by default (D8): the KDA recurrent states in BF16 |
 | `GLM53F_PREFILL_W8A16=1` | `--prefill-w8a16` | Numerics under test, off by default: FP8 projections over 8 rows with BF16 activations |
@@ -319,8 +331,9 @@ greedy walk too).
 **Expert wire:** `GLM53F_RDMA=1` (coordinator: RDMA RC, in an `rdma` build; the ranks follow the
 coordinator's handshake), `GLM53F_WIRE_NOCRC=1` (frames without CRC32C; both sides must agree;
 RDMA requires it), `GLM53F_WIRE_MIN_GBPS` (the fabric's floor rate, default 100),
-`GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_WIRE_INFLIGHT=1` (one
-exchange in flight over RDMA too, instead of two: the prefill lanes then take turns on the wire),
+`GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_WIRE_INFLIGHT=N` (at
+most N exchanges in flight over RDMA, instead of one per prefill lane; 1: the lanes take turns on
+the wire),
 `GLM53F_TIMELINE=1` (cross-host timeline events), `GLM53F_PROFILE=1` (per-exchange timings on the
 coordinator, a `PIPE` line per prefill pass and a `STEP` line per decode step). The return path: `GLM53F_ROW_SHARDED_MIN_ROWS=N`
 (exchanges of N rows and more, at least 4, reduce-scattered by the ranks; unset or 0: four planes
@@ -333,7 +346,9 @@ written by the frame-fill kernel instead of the copies; default 0) and
 `GLM53F_WIRE_MAPPED_ROWS=N` (four-plane returns of up to N rows summed in place; default 64).
 
 **Rank:** `GLM53F_RANK_TRACE=1` (a timing line per request), `GLM53F_RANK_DUMP_FRAME=<path>`
-with `GLM53F_RANK_DUMP_LAYER` (write one request frame for offline replay).
+with `GLM53F_RANK_DUMP_LAYER` (write one request frame for offline replay),
+`GLM53F_RANK_RECV_SLOTS` (`--recv-slots`: the requests an RDMA connection queues, 4 by default;
+the coordinator keeps no more exchanges in flight than every rank queues).
 
 **Tests:** `GLM53F_CHECKPOINT_DIR`, `GLM53F_EXPERTS_DIR`, `GLM53F_GOLDENS` (default
 `oracle/goldens`), `GLM53F_TOKENIZER`, `GLM53F_EXL3_DIR`, `GLM53F_FP8_DIR`, `GLM53F_RANK_BIN`,

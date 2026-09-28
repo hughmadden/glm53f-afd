@@ -28,6 +28,13 @@
 //!   frame, and [`WireClient::plane_buffers`] the connections' receive buffers, which then never
 //!   move. A caller's device paths run the same way on both transports, so tests on one machine
 //!   exercise them; over TCP they save nothing.
+//! - **Exchanges in flight** (perf reset R4, generalised from two): over RDMA up to
+//!   [`WireConfig::depth`] exchanges may be sent before the oldest is collected
+//!   ([`WireClient::depth`]; the forward's prefill lanes keep one each). Each rank connection
+//!   posts that many receive slots for the returns, and a rank queues as many requests as it
+//!   posts receive slots, which it names in the RDMA handshake (`glm53f_rdma::Info::recv_slots`;
+//!   an older rank says nothing and posts two), so the depth is the smaller of the two. Over TCP
+//!   one: a second multi-megabyte write can block against the first return.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -66,13 +73,20 @@ pub struct WireConfig {
     /// scale (see the module documentation).
     pub routed_scale: f32,
     pub return_path: ReturnPath,
+    /// Exchanges in flight at most over RDMA (the forward's lanes): the receive slots each rank
+    /// connection posts. A rank that queues fewer requests (its handshake's receive slots) lowers
+    /// it at connection time ([`WireClient::depth`]); over TCP it is one.
+    pub depth: usize,
 }
+
+/// Exchanges in flight at most ([`WireConfig::depth`]).
+pub const MAX_DEPTH: usize = 4;
 
 impl WireConfig {
     /// GLM-5.3-Flash as the reference routes it: 288 experts, the routed scale 2.5 inside the
-    /// gate weights (so 1.0 here), four-plane returns.
+    /// gate weights (so 1.0 here), four-plane returns, two exchanges in flight over RDMA.
     pub fn glm53_flash() -> WireConfig {
-        WireConfig { experts: 288, routed_scale: 1.0, return_path: ReturnPath::FourPlaneSum }
+        WireConfig { experts: 288, routed_scale: 1.0, return_path: ReturnPath::FourPlaneSum, depth: 2 }
     }
 
     /// [`WireConfig::glm53_flash`] with the return path from the environment:
@@ -292,20 +306,25 @@ pub fn quantize_hidden_batched(hidden: &[f32]) -> Result<Vec<HiddenRow>, String>
 /// was 2,048).
 const REQ_MAX: usize = glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::REQUEST_ROW_BYTES;
 /// One half of the double-buffered RDMA request body (perf reset P6), page-rounded.
+///
+/// Two halves serve any depth: a half is reused once the sends that read it completed, and a
+/// SEND completes when the rank's NIC has placed it in a posted receive slot, not when the rank
+/// has computed it. A rank posts a slot for every exchange the client may have in flight, so the
+/// send of request k is complete long before request k + 2 claims its half.
 const REQ_HALF: usize = REQ_MAX.div_ceil(4096) * 4096;
 /// Largest return frame, rounded to a page: one RDMA receive slot.
 const RET_SLOT: usize =
     (glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::RETURN_ROW_BYTES).div_ceil(4096) * 4096;
 
 /// RDMA mode for one rank (perf reset R2 part 2): an RC queue pair with a
-/// two-slot receive ring and a per-rank header buffer; the request body buffer is
-/// shared by all ranks and owned by [`WireClient`].
+/// receive ring of one slot per exchange in flight and a per-rank header buffer;
+/// the request body buffer is shared by all ranks and owned by [`WireClient`].
 struct RdmaConn {
     ep: glm53f_rdma::Endpoint,
     recv: glm53f_rdma::AlignedBuf,
     hdr: glm53f_rdma::AlignedBuf,
-    /// Slots of returns already read, re-posted before the next request (two
-    /// with the R4 two-lane prefill: both lanes' returns can be held at once).
+    /// Slots of returns already read, re-posted before the next request (up to
+    /// the depth: every lane's returns can be held at once).
     consumed: Vec<u32>,
     /// `(slot, len)` of the last return.
     last: Option<(u32, usize)>,
@@ -547,8 +566,10 @@ impl SparkConn {
 
     /// Switch this connection to RDMA: open an RC queue pair on the RoCE device
     /// that owns the TCP socket's local IPv4, exchange queue-pair coordinates over
-    /// the socket, connect, and pre-post both receive slots.
-    fn rdma_setup(&mut self, body: &mut glm53f_rdma::AlignedBuf) -> Result<(), String> {
+    /// the socket, connect, and pre-post `slots` receive slots (one per exchange in
+    /// flight). Returns the requests the rank queues: the receive slots its
+    /// handshake names.
+    fn rdma_setup(&mut self, body: &mut glm53f_rdma::AlignedBuf, slots: usize) -> Result<usize, String> {
         use glm53f_rdma::{AlignedBuf, Endpoint, Info, HANDSHAKE_LEN, HANDSHAKE_MAGIC};
         let ip = match self.stream.local_addr().map_err(|e| e.to_string())? {
             std::net::SocketAddr::V4(a) => *a.ip(),
@@ -561,13 +582,13 @@ impl SparkConn {
                 (d, p, g, 0)
             }
         };
-        let mut recv = AlignedBuf::new(2 * RET_SLOT);
+        let mut recv = AlignedBuf::new(slots * RET_SLOT);
         let mut hdr = AlignedBuf::new(4096);
-        let mut ep = Endpoint::open(&dev, port, gid, Some(body), &mut recv, 2, Some(&mut hdr))?;
+        let mut ep = Endpoint::open(&dev, port, gid, Some(body), &mut recv, slots as u32, Some(&mut hdr))?;
         self.stream.set_nonblocking(false).map_err(|e| e.to_string())?;
         let mut msg = Vec::with_capacity(HANDSHAKE_LEN);
         msg.extend_from_slice(HANDSHAKE_MAGIC);
-        msg.extend_from_slice(&ep.local_info().to_bytes());
+        msg.extend_from_slice(&Info { recv_slots: slots as u32, ..ep.local_info() }.to_bytes());
         self.stream.write_all(&msg).map_err(|e| format!("rdma handshake write: {e}"))?;
         let mut reply = [0u8; HANDSHAKE_LEN];
         self.stream.read_exact(&mut reply).map_err(|e| format!("rdma handshake read: {e}"))?;
@@ -576,13 +597,20 @@ impl SparkConn {
         }
         let remote = Info::from_bytes(&reply[8..]).ok_or("rdma: short handshake")?;
         ep.connect(&remote)?;
-        ep.post_recv(0)?;
-        ep.post_recv(1)?;
+        for slot in 0..slots as u32 {
+            ep.post_recv(slot)?;
+        }
         self.stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-        eprintln!("[wire] rank {} RDMA RC on {dev} port {port} gid {gid} (qpn {} -> {})", self.rank,
-            ep.local_info().qpn, remote.qpn);
+        let queued = remote.peer_slots() as usize;
+        eprintln!(
+            "[wire] rank {} RDMA RC on {dev} port {port} gid {gid} (qpn {} -> {}); {slots} receive slots, the rank queues {queued} requests{}",
+            self.rank,
+            ep.local_info().qpn,
+            remote.qpn,
+            if remote.recv_slots == 0 { " (an older rank: it does not say)" } else { "" }
+        );
         self.rdma = Some(RdmaConn { ep, recv, hdr, consumed: Vec::new(), last: None, sends_out: 0 });
-        Ok(())
+        Ok(queued)
     }
 
     /// RDMA receive of one return: busy-poll the completion, validate the header.
@@ -616,9 +644,12 @@ pub struct WireClient {
     /// RDMA mode: the request body shared by all ranks (dropped after `conns`,
     /// whose endpoints hold its registration).
     rdma_body: Option<glm53f_rdma::AlignedBuf>,
-    /// Sent, not yet collected exchanges, oldest first (perf reset R4: two lanes in
-    /// flight over RDMA). Each keeps its return path: the two lanes' exchanges may differ.
+    /// Sent, not yet collected exchanges, oldest first (perf reset R4: the prefill
+    /// lanes' in flight over RDMA). Each keeps its return path: the lanes' exchanges may differ.
     inflight: std::collections::VecDeque<Inflight>,
+    /// Exchanges in flight at most over RDMA: the configured depth, lowered to what every rank
+    /// queues ([`WireClient::depth`]).
+    depth: usize,
     /// The exchange whose returns the receive buffers hold (the last one collected).
     last: Option<Last>,
     /// The body half the next in-place request is built in (perf reset P6).
@@ -640,7 +671,7 @@ impl WireClient {
                 return Err(format!("wire: the row-sharded return needs at least {SPARKS} rows (one per rank), not {min_rows}"));
             }
         }
-        if cfg.experts == 0 || !cfg.routed_scale.is_finite() {
+        if cfg.experts == 0 || !cfg.routed_scale.is_finite() || !(1..=MAX_DEPTH).contains(&cfg.depth) {
             return Err(format!("wire: bad configuration {cfg:?}"));
         }
         let mut conns = Vec::with_capacity(SPARKS);
@@ -648,6 +679,7 @@ impl WireClient {
             conns.push(SparkConn::connect(rank, a).map_err(|e| format!("wire connect {a}: {e}"))?);
         }
         let mut rdma_body = None;
+        let mut depth = cfg.depth;
         if std::env::var("GLM53F_RDMA").map(|v| v == "1").unwrap_or(false) {
             if !glm53f_wire::frame::crc_disabled() {
                 return Err("GLM53F_RDMA=1 needs GLM53F_WIRE_NOCRC=1 (one request body is shared by all ranks)".into());
@@ -656,7 +688,11 @@ impl WireClient {
             // for its send completion; a half is reused only once reaped.
             let mut body = glm53f_rdma::AlignedBuf::new(2 * REQ_HALF);
             for c in conns.iter_mut() {
-                c.rdma_setup(&mut body)?;
+                // A rank that queues fewer requests than the depth lowers it.
+                depth = depth.min(c.rdma_setup(&mut body, cfg.depth)?);
+            }
+            if depth < cfg.depth {
+                eprintln!("[wire] {depth} exchanges in flight at most (asked for {}): a rank queues no more", cfg.depth);
             }
             rdma_body = Some(body);
         }
@@ -665,6 +701,7 @@ impl WireClient {
             next_request_id: request_id_base(),
             rdma_body,
             inflight: Default::default(),
+            depth,
             last: None,
             send_half: 0,
             tcp_body: None,
@@ -672,13 +709,25 @@ impl WireClient {
         })
     }
 
-    /// Exchanges that may be in flight at once: 2 over RDMA, 1 over TCP ([`WireClient::pipelined`]).
-    fn limit(&self) -> usize {
+    /// Exchanges that may be in flight at once: over RDMA the configured depth, at most what
+    /// every rank queues; 1 over TCP ([`WireClient::pipelined`]).
+    pub fn depth(&self) -> usize {
         if self.pipelined() {
-            2
+            self.depth
         } else {
             1
         }
+    }
+
+    /// Host bytes of the buffers the client holds now (page-locked over RDMA; a caller may
+    /// page-lock them over TCP): the receive buffers (one slot of the largest return per
+    /// exchange in flight and rank over RDMA, one per rank over TCP once
+    /// [`WireClient::plane_buffers`] grew them) and the request body with the per-rank headers.
+    pub fn host_bytes(&self) -> (usize, usize) {
+        let recv = self.conns.iter().map(|c| c.rdma.as_ref().map_or(c.buf.len(), |r| r.recv.len())).sum();
+        let hdr: usize = self.conns.iter().filter_map(|c| c.rdma.as_ref()).map(|r| r.hdr.len()).sum();
+        let body = self.rdma_body.as_ref().or(self.tcp_body.as_ref()).map_or(0, |b| b.len());
+        (recv, body + hdr)
     }
 
     /// The request flags of a `tokens`-row exchange: a reduce-scatter with the configured
@@ -807,7 +856,7 @@ impl WireClient {
         if self.rdma_body.is_none() && self.tcp_body.is_none() {
             return Err("wire: the in-place sends need the request body (RDMA, or send_buffers() over TCP)".into());
         }
-        let limit = self.limit();
+        let limit = self.depth();
         if self.inflight.len() >= limit {
             return Err(format!("wire: {} exchanges already in flight (limit {limit})", self.inflight.len()));
         }
@@ -957,8 +1006,8 @@ impl WireClient {
     }
 
     /// Whether more than one exchange may be in flight (perf reset R4). Only the
-    /// RDMA transport: the Spark pre-posts two receive slots, so a second request
-    /// lands while the first is computed. Over TCP a second multi-MB write can
+    /// RDMA transport: the Spark pre-posts receive slots, so later requests land
+    /// while the first is computed. Over TCP a second multi-MB write can
     /// deadlock against the first return (both sides blocked in `write`).
     pub fn pipelined(&self) -> bool {
         self.rdma_body.is_some()
@@ -982,7 +1031,7 @@ impl WireClient {
                 scales.len()
             ));
         }
-        let limit = self.limit();
+        let limit = self.depth();
         if self.inflight.len() >= limit {
             return Err(format!("wire: {} exchanges already in flight (limit {limit})", self.inflight.len()));
         }
@@ -1511,7 +1560,7 @@ mod tests {
     }
 
     fn config(scale: f32) -> WireConfig {
-        WireConfig { experts: 288, routed_scale: scale, return_path: ReturnPath::FourPlaneSum }
+        WireConfig { experts: 288, routed_scale: scale, return_path: ReturnPath::FourPlaneSum, depth: 2 }
     }
 
     /// End-to-end: 4 mock ranks each return a fixed 1.0 partial; the client's rank-ordered sum
@@ -1667,6 +1716,21 @@ mod tests {
             drop(client);
             server.join().expect("server join");
         }
+    }
+
+    /// The depth: 1 to `MAX_DEPTH` exchanges in flight; over TCP one, whatever was asked.
+    #[test]
+    fn the_depth_is_bounded_and_one_over_tcp() {
+        let (seen_tx, _seen) = std::sync::mpsc::channel();
+        let (addr, server) = mock_ranks(0, |_| 1.0, seen_tx, None);
+        let addrs = vec![addr; SPARKS];
+        for depth in [0, MAX_DEPTH + 1] {
+            assert!(WireClient::connect(&addrs, WireConfig { depth, ..config(1.0) }).is_err(), "depth {depth}");
+        }
+        let client = WireClient::connect(&addrs, WireConfig { depth: MAX_DEPTH, ..config(1.0) }).expect("connect");
+        assert_eq!((client.pipelined(), client.depth()), (false, 1));
+        drop(client);
+        server.join().expect("server join");
     }
 
     #[test]
