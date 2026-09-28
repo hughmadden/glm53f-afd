@@ -38,8 +38,19 @@ struct RawScratch {
 ///   2; or -1 for none: the MMA warps rotate their own input);
 /// - `plan`: 1 the planning kernel, 2 the split gate/up blocks plan the call
 ///   themselves (split kernels, up to 512 routes; the planning kernel above);
-/// - `l2`: large-M kernels, 1 default caching of the trellis words, 2 an L2
-///   evict-first policy for them.
+/// - `l2`: 1 default caching of the trellis words, 2 an L2 evict-first policy
+///   for them (both kernel families);
+/// - `pf`: split kernels, trellis words loaded 1, 2 or 4 k tiles ahead (1
+///   with the large-M kernels);
+/// - `ord`: split kernels' block order, 1 the split slowest, 2 a group's
+///   gate/up blocks adjacent and the down blocks chunk by chunk with the
+///   splits fastest, so the fused steps read partial sums that were just
+///   written (1 with the large-M kernels);
+/// - `pdl`: 2 launches the split down kernel as a programmatic dependent
+///   launch (`sm_90` and later): its blocks plan themselves from the routes
+///   and load their first trellis words while the gate/up kernel ends (split
+///   kernels with `plan` 2 and `fuse` 2, up to 512 routes; older devices run
+///   the same kernels in stream order).
 ///
 /// Only `sk`, `skd` and `fp32_swiglu` change a bit of the output (the tests
 /// compare the others bit for bit).
@@ -58,6 +69,9 @@ pub struct Cfg {
     pub gp: c_int,
     pub plan: c_int,
     pub l2: c_int,
+    pub pf: c_int,
+    pub ord: c_int,
+    pub pdl: c_int,
 }
 
 impl Cfg {
@@ -80,6 +94,9 @@ impl Cfg {
                 "gp" => self.gp = v,
                 "plan" => self.plan = v,
                 "l2" => self.l2 = v,
+                "pf" => self.pf = v,
+                "ord" => self.ord = v,
+                "pdl" => self.pdl = v,
                 other => return Err(format!("kernel configuration: unknown key {other:?}")),
             }
         }
@@ -89,7 +106,7 @@ impl Cfg {
     /// `mt=.. sk=.. ...` (every field).
     pub fn text(&self) -> String {
         format!(
-            "mt={},sk={},skd={},fp32_swiglu={},big={},nt={},gw={},gp={},plan={},fuse={},discard={},l2={}",
+            "mt={},sk={},skd={},fp32_swiglu={},big={},nt={},gw={},gp={},plan={},fuse={},discard={},l2={},pf={},ord={},pdl={}",
             self.mt,
             self.sk,
             self.skd,
@@ -101,7 +118,10 @@ impl Cfg {
             self.plan,
             self.fuse,
             self.discard,
-            self.l2
+            self.l2,
+            self.pf,
+            self.ord,
+            self.pdl
         )
     }
 }

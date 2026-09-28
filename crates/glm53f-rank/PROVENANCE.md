@@ -126,7 +126,16 @@ All from `src/tensorfold/families/glm5_next/cuda/` unless the path says otherwis
   - the plan inside the split gate/up blocks (`self_plan`, `block_scan128`),
     which repeats `plan_kernel`'s checks with each expert's pairs in route
     order;
-  - the device helpers `ldsm_a`, `cp_async16`, `row_load`/`row_rotate`.
+  - the device helpers `ldsm_a`, `cp_async16`, `row_load`/`row_rotate`;
+  - and, for the split kernels at decode sizes (29 September 2026): the ring
+    of trellis words loaded 1, 2 or 4 k tiles ahead with branch-free refills
+    and the evict-first policy as a template parameter (`pf`, `l2`), the
+    down input staged in shared memory, the block orders that keep partial
+    sums in L2 (`ord`), the L2 prefetches of scale vectors (`prefetch_l2`),
+    the programmatic dependent launch of the down kernel with down blocks
+    that plan themselves (`pdl`: `griddepcontrol` and
+    `cudaLaunchKernelEx`, as documented for CUDA's runtime), and phase events
+    recorded only after phases that ran a kernel.
 - **Configuration policy:** `src/exl3_cuda.rs` (`Cfg` and its text form,
   `resolve_cfg`, `Policy` with the `GLM53F_RANK_*` environment).
 - **Tests:**
@@ -135,4 +144,5 @@ All from `src/tensorfold/families/glm5_next/cuda/` unless the path says otherwis
   - the goldens in `tests/exl3_golden.rs`, computed by running TensorFold's
     `exl3.py`.
 - **Benchmark:** `examples/exl3_bench.rs` (real layer images from a rank
-  directory, configuration lists and sweeps, minimum or median times).
+  directory, taken in turn when several are given, configuration lists and
+  sweeps, minimum or median times, a digest of each configuration's outputs).

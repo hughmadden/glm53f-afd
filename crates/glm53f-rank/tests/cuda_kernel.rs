@@ -15,7 +15,9 @@
 //!   64 rows under a fixed prefill configuration of either kernel family;
 //! - schedules: both kernel families, their tilings, both plans, fused and
 //!   unfused steps and the L2 discard give the unfused split kernels' output
-//!   bit for bit at the same K splits (8 to 4,096 rows);
+//!   bit for bit at the same K splits (8 to 4,096 rows); so do the split
+//!   kernels' trellis prefetch depth, L2 evict-first policy and block order,
+//!   every combination at 1, 2, 4, 8, 16, 32 and 64 rows, and at other splits;
 //! - prefill, 512 and 4,096 rows: sampled rows against the kernel-order
 //!   reference;
 //! - the FP32 output of the prefill reduce-scatter (`ffn_f32`), rounded to
@@ -328,6 +330,72 @@ fn kernel_matches_the_references() {
             eprintln!("M{rows} {c}: {differ} values differ from the unfused split kernels");
             assert_eq!(differ, 0, "M{rows} {c}");
         }
+    }
+    k.cfg = None;
+
+    // The split kernels' schedule knobs at every decode and verify size, at the small regime's K splits: the trellis
+    // prefetch depth, the L2 evict-first policy, the block order and the L2 discard, every combination, against the
+    // unfused split kernels with the planning kernel (the default schedule is one of them).
+    for rows in [1usize, 2, 4, 8, 16, 32, 64] {
+        let (p, s) = testkit::wire_rows(0x5EED_A000 + rows as u64, rows);
+        let (ids, w) = testkit::routes(0x5EED_A100 + rows as u64, rows, 0);
+        k.cfg = Some(Cfg::default().parse_over("big=1,mt=2,sk=8,skd=2,plan=1,fuse=1,discard=1").unwrap());
+        let want = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+        let mut schedules = Vec::new();
+        for pf in [1, 2, 4] {
+            for l2 in [1, 2] {
+                for ord in [1, 2] {
+                    for discard in [1, 2] {
+                        for pdl in [1, 2] {
+                            schedules.push(format!(
+                                "big=1,mt=1,sk=8,skd=2,plan=2,fuse=2,pf={pf},l2={l2},ord={ord},discard={discard},pdl={pdl}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        schedules.push("big=1,mt=2,sk=8,skd=2,plan=2,fuse=2,discard=2,pf=2,l2=2,ord=2".into());
+        schedules.push("big=1,mt=2,sk=8,skd=2,plan=2,fuse=2,discard=2,pf=4,ord=1,pdl=2".into());
+        schedules.push("big=1,mt=2,sk=8,skd=2,plan=1,fuse=1,discard=1,pf=4,ord=2".into());
+        schedules.push("big=1,mt=1,sk=8,skd=2,plan=1,fuse=2,discard=1,pf=4,l2=2,ord=2".into());
+        for c in &schedules {
+            k.cfg = Some(Cfg::default().parse_over(c).unwrap());
+            let got = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+            let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "M{rows} {c}");
+        }
+        eprintln!("M{rows}: {} split-kernel schedules equal the unfused split kernels bit for bit", schedules.len());
+    }
+    // The same knobs at other K splits: a prefetch ring deeper than a down block's K range (skd 16 and 32: two k
+    // tiles and one), the block order with one split per matrix, and a prefill size with the planning kernel.
+    for (rows, sk, skd) in [(8usize, 32, 32), (8, 16, 16), (64, 4, 8), (200, 1, 1)] {
+        let (p, s) = testkit::wire_rows(0x5EED_B000 + rows as u64, rows);
+        let (ids, w) = testkit::routes(0x5EED_B100 + rows as u64, rows, 0);
+        let base = format!("big=1,sk={sk},skd={skd}");
+        k.cfg = Some(Cfg::default().parse_over(&format!("{base},mt=2,plan=1,fuse=1,discard=1")).unwrap());
+        let want = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+        for c in [
+            format!("{base},mt=1,pf=4,ord=2,l2=2,fuse=2,discard=2"),
+            format!("{base},mt=1,pf=2,ord=1,l2=2,fuse=2,discard=1"),
+            format!("{base},mt=2,pf=4,ord=2,l2=1,fuse=1,discard=1"),
+            format!("{base},mt=2,pf=2,ord=2,l2=2,fuse=2,discard=2"),
+            format!("{base},mt=1,pf=4,ord=2,l2=2,fuse=2,discard=2,plan=2,pdl=2"),
+        ] {
+            k.cfg = Some(Cfg::default().parse_over(&c).unwrap());
+            let got = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+            let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            eprintln!("M{rows} {c}: {differ} values differ from the unfused split kernels");
+            assert_eq!(differ, 0, "M{rows} {c}");
+        }
+    }
+    // The knobs of the split kernels are refused with the large-M kernels, and the programmatic dependent launch
+    // without the plan in the gate/up blocks or the fused steps.
+    for c in ["big=2,pf=2", "big=2,ord=2", "big=2,pdl=2", "pf=3", "ord=3", "pdl=3"] {
+        assert!(exl3_cuda::resolve_cfg(4096, Some(Cfg::default().parse_over(c).unwrap())).is_err(), "{c}");
+    }
+    for c in ["pdl=2,plan=1", "pdl=2,fuse=1"] {
+        assert!(exl3_cuda::resolve_cfg(8, Some(Cfg::default().parse_over(c).unwrap())).is_err(), "{c}");
     }
     k.cfg = None;
 

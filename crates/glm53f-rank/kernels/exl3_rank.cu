@@ -12,7 +12,9 @@
 // Two kernel families share every piece of arithmetic outside the matrix products:
 // - the split kernels (`gateup_kernel`, `down_kernel`: 16 or 32 rows a group, four warps of 128 columns, K split
 //   into partial sums) serve decode and verify windows; at those sizes the gate/up blocks can plan the call
-//   themselves (`self_plan`) instead of waiting for `plan_kernel`;
+//   themselves (`self_plan`) instead of waiting for `plan_kernel`, the trellis words are loaded 1, 2 or 4 k tiles
+//   ahead, a group's blocks can run together so that the fused steps find the partial sums in L2, and the down
+//   kernel can start before the gate/up kernel ends (a programmatic dependent launch, sm_90 and later);
 // - the large-M kernels (`gateup_big`, `down_big`: 32 or 64 rows a group, 8 or 16 warps, persistent blocks)
 //   serve prefill: each decoded trellis tile feeds up to 8 MMAs, the rotated input rows and the down input are
 //   double-buffered in shared memory, the trellis words are loaded several k tiles ahead, and m tiles past the
@@ -29,17 +31,17 @@
 // fixed order) with these changes: TP4 slices (N = 512 for gate/up, K = 512 for down); each block's four
 // warps cover the slice's four 128-column Hadamard blocks, so the input rotation is computed once per block
 // in shared memory, straight from the FP8 wire row (no rotated-input buffer); up to two 16-row tiles per
-// block for prefill; the next k tile's weights are loaded while the current one is multiplied. The planner
+// block for prefill; the next k tiles' weights are loaded while the current one is multiplied. The planner
 // takes MiMo's one-CTA route plan (mimo26f-afd v1.2.0 `crates/mimo26-spark/kernels/b1_serve.cu`, MIT) to 288
-// experts. The large-M kernels, the plan in the gate/up blocks and the fused epilogue and reduce are written
-// here. See PROVENANCE.md.
+// experts. The large-M kernels, the plan in the gate/up blocks, the fused epilogue and reduce, and the split
+// kernels' prefetch ring, block orders and dependent launch are written here. See PROVENANCE.md.
 //
 // Every output depends only on its own row: the tensor cores keep rows independent, and every sum (K splits,
 // the 8 slots) runs in a fixed order. With the same K splits (SK, SKD) and SwiGLU a row gets the same bits
-// whatever else is in the batch; the kernel family, the rows per group, the tilings, the plan, the fusion and
-// the L2 policies do not change a bit (the same products are accumulated in the same order into the same
-// sums). Build with --fmad=false: the CPU reference (src/reference.rs) repeats the epilogues' separate
-// multiplies and adds.
+// whatever else is in the batch; the kernel family, the rows per group, the tilings, the plan, the fusion, the
+// L2 policies, the prefetch depth, the block order and the dependent launch do not change a bit (the same
+// products are accumulated in the same order into the same sums). Build with --fmad=false: the CPU reference
+// (src/reference.rs) repeats the epilogues' separate multiplies and adds.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -191,6 +193,23 @@ __device__ __forceinline__ uint32_t ldg_w(const uint32_t* p, bool hint, uint64_t
     return __ldg(p);
 }
 
+// Programmatic dependent launch (sm_90 and later; nothing on older devices, where the host launches the dependent
+// kernel in stream order): the gate/up kernel lets the down kernel start early, and the down kernel waits for the
+// gate/up grid to complete (its memory visible) before it reads what that grid wrote.
+__device__ __forceinline__ void grid_launch_dependents() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void grid_dependency_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+// Fetch the 128-byte line holding `p` into L2 (no register is written, nothing waits for it).
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p)); }
+
 // Drop one 128-byte line of scratch from L2 without writing it back (its contents become undefined).
 __device__ __forceinline__ void discard_line(const void* p) {
 #if __CUDA_ARCH__ >= 800
@@ -224,7 +243,9 @@ struct Args {
     int discard;             // drop consumed partial sums from L2
     int nch;                 // down output chunks (4,096 / chunk width)
     int selfplan;            // the split gate/up blocks plan the call (no plan_kernel)
-    int l2hint;              // large-M kernels: trellis words loaded evict-first
+    int l2hint;              // trellis words loaded evict-first
+    int order;               // split kernels' block order: 1 split slowest, 2 a group's (a chunk's) blocks adjacent
+    int pdl;                 // the down blocks plan themselves and start before the gate/up kernel ends
 };
 
 // ---- the arithmetic outside the matrix products, shared by every kernel ---------------------------------------
@@ -269,14 +290,24 @@ __device__ __forceinline__ uint2 rotate_row(const uint8_t* __restrict__ xr, cons
     return row_rotate(row_load(xr, suh, kb, lane), lane, bad);
 }
 
+// Four FP16 values (8 bytes) as floats.
+__device__ __forceinline__ void half4(uint2 h, float (&f)[4]) {
+    const half2 h01 = *reinterpret_cast<const half2*>(&h.x), h23 = *reinterpret_cast<const half2*>(&h.y);
+    f[0] = __low2float(h01);
+    f[1] = __high2float(h01);
+    f[2] = __low2float(h23);
+    f[3] = __high2float(h23);
+}
+
 // The gate/up epilogue of one (pair gp, 128-block blk), one warp (after TensorFold's gateup_epilogue_kernel): the
 // splits summed in order, rotated back, x svh, GLM's clamped SwiGLU, x down suh, rotated, FP16 into Xd. `ex` is
-// the pair's expert block. Returns whether a gate/up sum was not finite.
+// the pair's expert block. Returns whether a gate/up sum was not finite. The scale vectors are loaded with the
+// first splits' partial sums, not one value at a time after them.
 __device__ __forceinline__ bool epilogue_item(const Args& a, const uint8_t* __restrict__ ex, int gp, int blk, int lane) {
-    const half* svh_g = reinterpret_cast<const half*>(ex + OFF_SVH_G);
-    const half* svh_u = reinterpret_cast<const half*>(ex + OFF_SVH_U);
-    const half* suh_d = reinterpret_cast<const half*>(ex + OFF_SUH_D);
     const int n = blk * 128 + lane * 4;
+    const uint2 sg = *reinterpret_cast<const uint2*>(ex + OFF_SVH_G + 2 * n);
+    const uint2 su = *reinterpret_cast<const uint2*>(ex + OFF_SVH_U + 2 * n);
+    const uint2 sd = *reinterpret_cast<const uint2*>(ex + OFF_SUH_D + 2 * n);
     float gv[4] = {0.f, 0.f, 0.f, 0.f}, uv[4] = {0.f, 0.f, 0.f, 0.f};
     for (int s = 0; s < a.sk; ++s) {
         const float4 zg = __ldcg(reinterpret_cast<const float4*>(a.z + (size_t(0 * a.sk + s) * a.P + gp) * WID + n));
@@ -284,6 +315,10 @@ __device__ __forceinline__ bool epilogue_item(const Args& a, const uint8_t* __re
         gv[0] += zg.x; gv[1] += zg.y; gv[2] += zg.z; gv[3] += zg.w;
         uv[0] += zu.x; uv[1] += zu.y; uv[2] += zu.z; uv[3] += zu.w;
     }
+    float svh_g[4], svh_u[4], suh_d[4];
+    half4(sg, svh_g);
+    half4(su, svh_u);
+    half4(sd, suh_d);
     bool bad = false;
 #pragma unroll
     for (int j = 0; j < 4; ++j) bad = bad || !isfinite(gv[j]) || !isfinite(uv[j]);
@@ -292,8 +327,8 @@ __device__ __forceinline__ bool epilogue_item(const Args& a, const uint8_t* __re
     float v[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        float gg = gv[j] * HAD_SCALE * __half2float(svh_g[n + j]);
-        float uu = uv[j] * HAD_SCALE * __half2float(svh_u[n + j]);
+        float gg = gv[j] * HAD_SCALE * svh_g[j];
+        float uu = uv[j] * HAD_SCALE * svh_u[j];
         float act;
         if (a.bf16) {  // the reference model's BF16 SwiGLU (TensorFold's default)
             gg = fminf(bf16r(gg), LIMIT);
@@ -304,7 +339,7 @@ __device__ __forceinline__ bool epilogue_item(const Args& a, const uint8_t* __re
             uu = fminf(fmaxf(uu, -LIMIT), LIMIT);
             act = gg / (1.f + expf(-gg)) * uu;
         }
-        v[j] = act * __half2float(suh_d[n + j]);
+        v[j] = act * suh_d[j];
     }
     fwht128(v, lane);
     const half2 h0 = __floats2half2_rn(v[0] * HAD_SCALE, v[1] * HAD_SCALE);
@@ -397,20 +432,19 @@ __device__ __forceinline__ void gateup_tail(const Args& a, const Group& G, int g
 
 // Fused reduce: after a down block has stored its partial sums (chunk `chunk` of the output, `cwb` 128-blocks
 // wide), each (row, chunk) of its group counts one arrival; the block that brings a (row, chunk) to all 8 * SKD
-// arrivals (8 slots, every split) reduces it and clears its counter. `list` holds up to the group's pair count,
-// `nl` is shared.
+// arrivals (8 slots, every split) reduces it and clears its counter. Thread t holds the row of the group's pair t
+// in `my_row` (loaded when the block started; a group has at most 64 pairs), -1 past the group's pairs.
+// `list` holds up to the group's pair count, `nl` is shared.
 template <int NW>
-__device__ __forceinline__ void down_tail(const Args& a, const Group& G, int chunk, int cwb, int* list, int* nl) {
+__device__ __forceinline__ void down_tail(const Args& a, int chunk, int cwb, int my_row, int* list, int* nl) {
+    static_assert(NW * 32 >= 64, "a thread per pair of a group of up to 64");
     __threadfence();
     if (threadIdx.x == 0) *nl = 0;
     __syncthreads();
     const int target = TOPK * a.skd;
-    for (int t = threadIdx.x; t < G.count; t += NW * 32) {
-        const int row = a.pair_row[G.start + t];
-        if (atomicAdd(&a.rcnt[row * a.nch + chunk], 1) == target - 1) {
-            a.rcnt[row * a.nch + chunk] = 0;
-            list[atomicAdd(nl, 1)] = row;
-        }
+    if (my_row >= 0 && atomicAdd(&a.rcnt[my_row * a.nch + chunk], 1) == target - 1) {
+        a.rcnt[my_row * a.nch + chunk] = 0;
+        list[atomicAdd(nl, 1)] = my_row;
     }
     __syncthreads();
     const int nrows = *nl;
@@ -630,13 +664,21 @@ __device__ bool self_plan(const Args& a, int g, int gr, bool writer, int* rows_s
 }
 
 // ---- gate and up, split kernel: Z[mat][split][pair][512] = rot(x * suh) @ W_q over this split's K range --------
-// Block (mat, group, split), 4 warps; warp w owns the slice's columns [128 w, 128 w + 128) (8 n tiles). For
-// each 128-wide K block the warps first rotate the block's rows into shared memory (one warp per row), then
-// multiply. MT 16-row tiles per block.
-template <int MT>
+// Block (mat, group, split), 4 warps; warp w owns the slice's columns [128 w, 128 w + 128) (8 n tiles). For each
+// 128-wide K block the warps first rotate the block's rows into shared memory (one warp per row), then multiply.
+// MT 16-row tiles per block. The trellis words are loaded PF k tiles ahead, each register refilled as soon as its
+// word is decoded, with the L2 evict-first policy if HINT (a template parameter: a runtime choice costs a second
+// load instruction per word). Blocks are (mat, group, split) with the split slowest, or with `order` 2 (grid
+// (2 SK, groups)) a group's 2 SK blocks are adjacent, so the fused epilogue reads their partial sums soon after
+// they are written.
+template <int MT, int PF, bool HINT>
 __global__ void __launch_bounds__(128) gateup_kernel(const Args a) {
     constexpr int R = MT * 16;
-    const int mat = blockIdx.x, g = blockIdx.y, split = blockIdx.z;
+    static_assert(8 % PF == 0, "k tiles of a K block are taken PF at a time");
+    if (a.pdl) grid_launch_dependents();  // every block has started: the down kernel may be scheduled
+    const bool o2 = a.order == 2;
+    const int mat = o2 ? int(blockIdx.x & 1) : int(blockIdx.x), g = blockIdx.y;
+    const int split = o2 ? int(blockIdx.x >> 1) : int(blockIdx.z);
     __shared__ __align__(16) half As[R][136];  // 272-byte rows: conflict-free fragment loads
     __shared__ int rows_sh[R];
     __shared__ int last_sh;
@@ -658,6 +700,11 @@ __global__ void __launch_bounds__(128) gateup_kernel(const Args a) {
     const half* suh = reinterpret_cast<const half*>(ex + (mat ? OFF_SUH_U : OFF_SUH_G));
     const int kbs = 32 / a.sk;  // 128-wide K blocks per split
     const int kt_begin = split * kbs * 8, kt_end = kt_begin + kbs * 8;
+    // Only this block reads the suh values of the split's later K blocks (two 128-byte lines each): fetch them into
+    // L2 now, so each K block's rotation does not wait for memory. The group's first block does the same for the
+    // scale vectors of the fused epilogue (svh of gate and up, suh of down: 1 KB each).
+    for (int i = 2 + tid; i < 2 * kbs; i += 128) prefetch_l2(suh + (split * kbs) * 128 + i * 64);
+    if (a.fused && mat == 0 && split == 0 && tid < 24) prefetch_l2(ex + OFF_SVH_G + tid * 128);
 
     float acc[MT][8][2][4];
 #pragma unroll
@@ -669,16 +716,19 @@ __global__ void __launch_bounds__(128) gateup_kernel(const Args a) {
 #pragma unroll
                 for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
 
-    // Trellis words of tile (kt, nt) are at (kt * 32 + nt) * 32 + lane; this warp's 8 n tiles are contiguous.
-    const uint32_t* tp = T + (size_t(kt_begin) * 32 + warp * 8) * 32 + lane;
-    uint32_t wn[8];
+    // Trellis words of tile (kt, nt) are at (kt * 32 + nt) * 32 + lane; this warp's 8 n tiles are contiguous. The
+    // ring: tile kt's words in wr[(kt - kt_begin) % PF] (a split has at least 8 k tiles).
+    const uint64_t pol = HINT ? evict_first_policy() : 0;
+    const uint32_t* Tw = T + size_t(warp * 8) * 32 + lane;
+    uint32_t wr[PF][8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) wn[i] = __ldg(tp + i * 32);
+    for (int p = 0; p < PF; ++p)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) wr[p][i] = ldg_w(Tw + (size_t(kt_begin + p) * 32 + i) * 32, HINT, pol);
     bool bad = false;
 
-    for (int kt = kt_begin; kt < kt_end; ++kt) {
-        const int ktl = kt & 7;
-        if (ktl == 0) {
+    for (int kt = kt_begin; kt < kt_end; kt += PF) {
+        if ((kt & 7) == 0) {
             __syncthreads();  // the previous block's fragments have been read
             const int kb = kt >> 3;
             // Every row's inputs are loaded before the first is rotated: one memory round trip, not R / 4.
@@ -696,32 +746,31 @@ __global__ void __launch_bounds__(128) gateup_kernel(const Args a) {
             }
             __syncthreads();
         }
-        uint32_t w[8];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) w[i] = wn[i];
-        if (kt + 1 < kt_end) {
-            tp += 32 * 32;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) wn[i] = __ldg(tp + i * 32);
-        }
-        uint32_t af[MT][4];
-#pragma unroll
-        for (int m = 0; m < MT; ++m) {
-            const half* r0 = &As[m * 16 + g8][ktl * 16 + 2 * t4];
-            const half* r1 = &As[m * 16 + g8 + 8][ktl * 16 + 2 * t4];
-            af[m][0] = ld32(r0);
-            af[m][1] = ld32(r1);
-            af[m][2] = ld32(r0 + 8);
-            af[m][3] = ld32(r1 + 8);
-        }
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            uint32_t b0[2], b1[2];
-            decode_tile(w[i], lane, b0, b1);
+        for (int p = 0; p < PF; ++p) {
+            const int ktl = (kt + p) & 7;
+            uint32_t af[MT][4];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
-                mma16816(acc[m][i][0], af[m], b0);
-                mma16816(acc[m][i][1], af[m], b1);
+                const half* r0 = &As[m * 16 + g8][ktl * 16 + 2 * t4];
+                const half* r1 = &As[m * 16 + g8 + 8][ktl * 16 + 2 * t4];
+                af[m][0] = ld32(r0);
+                af[m][1] = ld32(r1);
+                af[m][2] = ld32(r0 + 8);
+                af[m][3] = ld32(r1 + 8);
+            }
+            // Tile kt + p + PF, or the split's last tile again past its end (the loop has no branch).
+            const int ktn = kt + p + PF < kt_end ? kt + p + PF : kt_end - 1;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint32_t b0[2], b1[2];
+                decode_tile(wr[p][i], lane, b0, b1);
+                wr[p][i] = ldg_w(Tw + (size_t(ktn) * 32 + i) * 32, HINT, pol);
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    mma16816(acc[m][i][0], af[m], b0);
+                    mma16816(acc[m][i][1], af[m], b1);
+                }
             }
         }
     }
@@ -929,18 +978,70 @@ __global__ void __launch_bounds__(128) gateup_epilogue(const Args a) {
 }
 
 // ---- down, split kernel: Zd[split][pair][4096] = Xd[pair] @ W_q(down) over this split's K range ---------------
-// Block (group, 512-column chunk of the output, split); warp w owns the chunk's columns [128 w, 128 w + 128).
-// A group's pairs are contiguous in Xd.
-template <int MT>
-__global__ void __launch_bounds__(128) down_kernel(const Args a) {
-    const int g = blockIdx.x;
-    if (g >= a.counts[0]) return;
-    const int chunk = blockIdx.y, split = blockIdx.z;
-    const Group G = a.groups[g];
-    __shared__ int list_sh[MT * 16], nl_sh;
+// Block (group, 512-column chunk of the output, split); warp w owns the chunk's columns [128 w, 128 w + 128). A
+// group's pairs are contiguous in Xd; their K range is staged in shared memory with cp.async when the block starts
+// (rows past the group zeroed). The trellis words are loaded PF k tiles ahead, evict-first if HINT, as in the
+// gate/up kernel. Blocks are (group, chunk, split) with the split slowest, or with `order` 2 (grid (SKD, groups,
+// chunks)) chunk by chunk with the splits fastest, so a (row, chunk)'s partial sums are reduced (fused) soon after
+// they are written. Four blocks a multiprocessor at 16 rows (the self-planning path would otherwise take more
+// registers on some targets).
+template <int MT, int PF, bool HINT>
+__global__ void __launch_bounds__(128, MT == 1 ? 4 : 1) down_kernel(const Args a) {
+    constexpr int R = MT * 16;
+    const bool o2 = a.order == 2;
+    const int g = o2 ? blockIdx.y : blockIdx.x, chunk = o2 ? blockIdx.z : blockIdx.y;
+    const int split = o2 ? blockIdx.x : blockIdx.z;
+    __shared__ __align__(16) half As[R][WID + 8];  // 1,040-byte rows: conflict-free fragment loads
+    __shared__ int list_sh[R], nl_sh, rows_sh[R];
+    __shared__ PlanSmem plan_sh;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2, t4 = lane & 3;
+    // The group and this thread's pair row (for the fused reduce): from the plan the gate/up kernel wrote (the group
+    // loaded with the group count; an entry past the count is never used), or, with `pdl`, planned here from the
+    // routes as the gate/up blocks plan (the same plan), before the gate/up kernel has ended.
+    Group G;
+    int my_row;
+    if (a.pdl) {
+        if (!self_plan(a, g, R, false, rows_sh, R, plan_sh)) return;
+        G = plan_sh.G;
+        my_row = tid < R ? rows_sh[tid] : -1;
+    } else {
+        const int ngroups = a.counts[0];
+        G = a.groups[g];
+        if (g >= ngroups) return;
+        my_row = tid < G.count ? a.pair_row[G.start + tid] : -1;
+    }
     const uint32_t* T = reinterpret_cast<const uint32_t*>(a.image + size_t(G.expert) * EXPERT_BYTES + OFF_DOWN_T);
-    const int kts = 32 / a.skd, kt_begin = split * kts, kt_end = kt_begin + kts;
+    const int kts = 32 / a.skd, kt0 = split * kts;
+    // The svh values of this expert and chunk (1 KB), which only the fused reduce reads: into L2 now.
+    if (a.fused && split == 0 && tid < 8)
+        prefetch_l2(a.image + size_t(G.expert) * EXPERT_BYTES + OFF_SVH_D + chunk * 1024 + tid * 128);
+
+    // Down tiles are [32 k tiles][256 n tiles]; this warp's 8 n tiles start at chunk * 32 + warp * 8. The ring: tile
+    // kt's words in wr[(kt - kt0) % PF] (a split can have fewer k tiles than PF).
+    const uint64_t pol = HINT ? evict_first_policy() : 0;
+    const uint32_t* Tw = T + size_t(chunk * 32 + warp * 8) * 32 + lane;
+    uint32_t wr[PF][8];
+#pragma unroll
+    for (int p = 0; p < PF; ++p)
+        if (p < kts)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) wr[p][i] = ldg_w(Tw + (size_t(kt0 + p) * 256 + i) * 32, HINT, pol);
+
+    if (a.pdl) grid_dependency_wait();  // the gate/up kernel has ended: its down input is complete
+    // The group's rows of Xd over this split's K range, 16-byte copies.
+    {
+        const half* xg = a.xd + size_t(G.start) * WID + kt0 * 16;
+        const int cpr = kts * 2;
+        for (int i = tid; i < R * cpr; i += 128) {
+            const int r = i / cpr, c = i % cpr;
+            half* dst = &As[r][c * 8];
+            if (r < G.count) cp_async16(dst, xg + size_t(r) * WID + c * 8);
+            else *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        cp_async_commit();
+        cp_async_wait<0>();
+        __syncthreads();
+    }
 
     float acc[MT][8][2][4];
 #pragma unroll
@@ -952,40 +1053,34 @@ __global__ void __launch_bounds__(128) down_kernel(const Args a) {
 #pragma unroll
                 for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
 
-    // Down tiles are [32 k tiles][256 n tiles]; this warp's 8 n tiles start at chunk * 32 + warp * 8.
-    const uint32_t* tp = T + (size_t(kt_begin) * 256 + chunk * 32 + warp * 8) * 32 + lane;
-    uint32_t wn[8];
+    for (int kl = 0; kl < kts; kl += PF) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) wn[i] = __ldg(tp + i * 32);
-    const half* xg = a.xd + size_t(G.start) * WID;
-    for (int kt = kt_begin; kt < kt_end; ++kt) {
-        uint32_t w[8];
+        for (int p = 0; p < PF; ++p) {
+            if (p == 0 || kl + p < kts) {
+                const int kt = kt0 + kl + p;
+                uint32_t af[MT][4];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) w[i] = wn[i];
-        if (kt + 1 < kt_end) {
-            tp += 256 * 32;
+                for (int m = 0; m < MT; ++m) {
+                    const half* r0 = &As[m * 16 + g8][(kl + p) * 16 + 2 * t4];
+                    const half* r1 = &As[m * 16 + g8 + 8][(kl + p) * 16 + 2 * t4];
+                    af[m][0] = ld32(r0);
+                    af[m][1] = ld32(r1);
+                    af[m][2] = ld32(r0 + 8);
+                    af[m][3] = ld32(r1 + 8);
+                }
+                // Tile kt + PF, or the split's last tile again past its end (the loop has no branch).
+                const int ktn = kl + p + PF < kts ? kt + PF : kt0 + kts - 1;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) wn[i] = __ldg(tp + i * 32);
-        }
-        const int k = kt * 16 + 2 * t4;
-        uint32_t af[MT][4];
+                for (int i = 0; i < 8; ++i) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile(wr[p][i], lane, b0, b1);
+                    wr[p][i] = ldg_w(Tw + (size_t(ktn) * 256 + i) * 32, HINT, pol);
 #pragma unroll
-        for (int m = 0; m < MT; ++m) {
-            const int r0 = m * 16 + g8, r1 = r0 + 8;
-            const bool ok0 = r0 < G.count, ok1 = r1 < G.count;
-            af[m][0] = ok0 ? ld32(xg + size_t(r0) * WID + k) : 0u;
-            af[m][1] = ok1 ? ld32(xg + size_t(r1) * WID + k) : 0u;
-            af[m][2] = ok0 ? ld32(xg + size_t(r0) * WID + k + 8) : 0u;
-            af[m][3] = ok1 ? ld32(xg + size_t(r1) * WID + k + 8) : 0u;
-        }
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            uint32_t b0[2], b1[2];
-            decode_tile(w[i], lane, b0, b1);
-#pragma unroll
-            for (int m = 0; m < MT; ++m) {
-                mma16816(acc[m][i][0], af[m], b0);
-                mma16816(acc[m][i][1], af[m], b1);
+                    for (int m = 0; m < MT; ++m) {
+                        mma16816(acc[m][i][0], af[m], b0);
+                        mma16816(acc[m][i][1], af[m], b1);
+                    }
+                }
             }
         }
     }
@@ -1006,7 +1101,7 @@ __global__ void __launch_bounds__(128) down_kernel(const Args a) {
                         make_float2(acc[m][i][h][2], acc[m][i][h][3]);
             }
     }
-    if (a.fused) down_tail<4>(a, G, chunk, 4, list_sh, &nl_sh);
+    if (a.fused) down_tail<4>(a, chunk, 4, my_row, list_sh, &nl_sh);
 }
 
 // ---- down, large-M kernel -------------------------------------------------------------------------------------
@@ -1031,6 +1126,7 @@ __global__ void __launch_bounds__(256) down_big(const Args a) {
         const int g = item % ngroups, chunk = (item / ngroups) % a.nch, split = item / (ngroups * a.nch);
         const Group G = a.groups[g];
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2, t4 = lane & 3;
+        const int my_row = tid < G.count ? a.pair_row[G.start + tid] : -1;  // for the fused reduce
         const int mt_used = (G.count + 15) >> 4;
         const int kts = 32 / a.skd, kt0 = split * kts, nkc = kts / KC, kt_last = kt0 + kts - 1;
         const half* xg = a.xd + size_t(G.start) * WID;
@@ -1126,7 +1222,7 @@ __global__ void __launch_bounds__(256) down_big(const Args a) {
                             make_float2(acc[m][i][h][2], acc[m][i][h][3]);
                 }
         }
-        if (a.fused) down_tail<NW>(a, G, chunk, CW / 128, list_sh, &nl_sh);
+        if (a.fused) down_tail<NW>(a, chunk, CW / 128, my_row, list_sh, &nl_sh);
         __syncthreads();  // the next item reuses the shared buffers and item_sh
     }
 }
@@ -1161,6 +1257,49 @@ cudaError_t launch_persistent(K* fn, int threads, int items, int sms, cudaStream
     if (n < 1) n = 1;
     fn<<<n, threads, 0, st>>>(a);
     return cudaGetLastError();
+}
+
+// Launch the split kernels with the trellis prefetch depth `pf` (1, 2 or 4), 16-row tiles `mt` (1 or 2) and the
+// evict-first policy `hint`, 128 threads a block; the down kernel with programmatic stream serialization when
+// `pdl` (it may then start before the gate/up kernel ends, and waits for it in the kernel).
+template <class K>
+cudaError_t launch_one(K* fn, bool pdl, dim3 grid, cudaStream_t st, const Args& a) {
+    if (!pdl) {
+        fn<<<grid, 128, 0, st>>>(a);
+        return cudaGetLastError();
+    }
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid;
+    lc.blockDim = dim3(128);
+    lc.dynamicSmemBytes = 0;
+    lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at;
+    lc.numAttrs = 1;
+    return cudaLaunchKernelEx(&lc, fn, a);
+}
+
+template <int MT, bool HINT>
+cudaError_t launch_split_mt(bool down, int pf, bool pdl, dim3 grid, cudaStream_t st, const Args& a) {
+    if (down) {
+        if (pf == 4) return launch_one(down_kernel<MT, 4, HINT>, pdl, grid, st, a);
+        if (pf == 2) return launch_one(down_kernel<MT, 2, HINT>, pdl, grid, st, a);
+        return launch_one(down_kernel<MT, 1, HINT>, pdl, grid, st, a);
+    }
+    if (pf == 4) return launch_one(gateup_kernel<MT, 4, HINT>, false, grid, st, a);
+    if (pf == 2) return launch_one(gateup_kernel<MT, 2, HINT>, false, grid, st, a);
+    return launch_one(gateup_kernel<MT, 1, HINT>, false, grid, st, a);
+}
+
+cudaError_t launch_split(bool down, int mt, int pf, bool hint, bool pdl, dim3 grid, cudaStream_t st, const Args& a) {
+    if (mt == 1) {
+        if (hint) return launch_split_mt<1, true>(down, pf, pdl, grid, st, a);
+        return launch_split_mt<1, false>(down, pf, pdl, grid, st, a);
+    }
+    if (hint) return launch_split_mt<2, true>(down, pf, pdl, grid, st, a);
+    return launch_split_mt<2, false>(down, pf, pdl, grid, st, a);
 }
 
 struct Dev {
@@ -1206,6 +1345,7 @@ struct g53r_scratch {
     Dev xrows, iw, groups, meta, pair_row, pair_route, inverse, z, xd, zd, out, gcnt, rcnt;
     std::vector<uint8_t> hiw;
     int sms = 1;             // the device's multiprocessors (persistent grids)
+    int cc = 0;              // its compute capability, major * 10 + minor (programmatic dependent launch from 90)
     bool discarded = false;  // the last call dropped its partial sums from L2 (g53r_debug_copy refuses)
 };
 
@@ -1219,12 +1359,19 @@ struct g53r_scratch {
 // - gp: large-M gate/up, rotation warps per block (0: the MMA warps rotate; 2, with gw 8 and mt 2);
 // - plan: 1 plan_kernel, 2 the split gate/up blocks plan the call themselves (up to 512 routes; plan_kernel
 //   above);
-// - l2: large-M kernels, 1 default caching of the trellis words, 2 an L2 evict-first policy for them;
+// - l2: 1 default caching of the trellis words, 2 an L2 evict-first policy for them (both families);
 // - fuse: 1 separate epilogue and reduce kernels, 2 fused into gate/up and down;
-// - discard: 1 keep the partial sums, 2 drop them from L2 once consumed (fused only).
+// - discard: 1 keep the partial sums, 2 drop them from L2 once consumed (fused only);
+// - pf: split kernels, trellis words loaded 1, 2 or 4 k tiles ahead (1 with the large-M kernels, which have their
+//   own depth);
+// - ord: split kernels' block order, 1 the split slowest, 2 a group's gate/up blocks adjacent and the down blocks
+//   chunk by chunk with the splits fastest (1 with the large-M kernels);
+// - pdl: 2 launches the split down kernel as a programmatic dependent launch (sm_90 and later): its blocks plan
+//   themselves and load their first trellis words while the gate/up kernel ends (with plan 2 and fuse 2; up to 512
+//   routes, as the plan in the gate/up blocks; older devices run the same kernels in stream order).
 // Only sk, skd and fp32_swiglu change a bit of the output; the rest are schedules of the same arithmetic.
 struct g53r_cfg {
-    int mt, sk, skd, fp32_swiglu, big, nt, fuse, discard, gw, gp, plan, l2;
+    int mt, sk, skd, fp32_swiglu, big, nt, fuse, discard, gw, gp, plan, l2, pf, ord, pdl;
 };
 
 extern "C" {
@@ -1247,11 +1394,13 @@ int g53r_device_identity(int* arch, int* sms, char* name, size_t namelen) {
 // with one K split each (the bits of the split kernels' (2, 1, 1), whatever the row count): 32-row groups up to
 // 2,048 rows, 64-row groups above (measured on the development GPU; README "The kernel"). On GB10 the L2
 // evict-first policy up to 2,048 rows and 512-column down chunks above were faster (README "Measured on GB10");
-// neither changes a bit.
+// neither changes a bit. Up to 64 rows a group's gate/up blocks run together and the down blocks chunk by chunk,
+// and the consumed partial sums are dropped from L2 (ord 2, discard 2: never slower on the development GPU, 3-9%
+// faster at 4-64 rows; the same bits).
 void g53r_default_cfg(uint32_t rows, g53r_cfg* out) {
-    if (rows <= 64) *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 1, 8, 0, 2, 1};
-    else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2};
-    else *out = g53r_cfg{4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1};
+    if (rows <= 64) *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 2, 8, 0, 2, 1, 1, 2, 1};
+    else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2, 1, 1, 1};
+    else *out = g53r_cfg{4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1, 1, 1, 1};
 }
 
 // Upload one layer image (LAYER_BYTES, host memory) and check its scale vectors.
@@ -1314,6 +1463,10 @@ int g53r_scratch_new(g53r_scratch** out, char* err, size_t errlen) {
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&S->sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
         S->sms < 1)
         S->sms = 1;
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess)
+        S->cc = major * 10 + minor;
     *out = S;
     return 0;
 }
@@ -1350,6 +1503,9 @@ int g53r_resolve_cfg(uint32_t rows, const g53r_cfg* cfg_in, g53r_cfg* out) {
         if (i.gp) c.gp = i.gp < 0 ? 0 : i.gp;
         if (i.plan) c.plan = i.plan;
         if (i.l2) c.l2 = i.l2;
+        if (i.pf) c.pf = i.pf;
+        if (i.ord) c.ord = i.ord;
+        if (i.pdl) c.pdl = i.pdl;
         c.fp32_swiglu = i.fp32_swiglu;
     }
     if (out) *out = c;
@@ -1359,7 +1515,9 @@ int g53r_resolve_cfg(uint32_t rows, const g53r_cfg* cfg_in, g53r_cfg* out) {
                       (c.gw == 8 || c.gw == 16) && (c.gp == 0 || (c.gp == 2 && c.gw == 8 && c.mt == 2)));
     const bool rest = (c.fuse == 1 || c.fuse == 2) && (c.discard == 1 || c.discard == 2) &&
                       (c.fp32_swiglu == 0 || c.fp32_swiglu == 1) && (c.plan == 1 || (c.plan == 2 && c.big == 1)) &&
-                      (c.l2 == 1 || c.l2 == 2);
+                      (c.l2 == 1 || c.l2 == 2) && (c.pf == 1 || ((c.pf == 2 || c.pf == 4) && c.big == 1)) &&
+                      (c.ord == 1 || (c.ord == 2 && c.big == 1)) &&
+                      (c.pdl == 1 || (c.pdl == 2 && c.big == 1 && c.plan == 2 && c.fuse == 2));
     return div && fam && rest ? 0 : 1;
 }
 
@@ -1379,7 +1537,8 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
         set_msg(err, errlen,
                 "ffn: bad configuration (split kernels: mt 1 or 2; large-M kernels: mt 2 or 4, nt 1, 2 or 4, gw 8 or "
                 "16, gp 0 (-1) or 2 with gw 8 and mt 2, skd at most 4; sk and skd divide 32; fuse and discard 1 or 2; plan 1, or "
-                "2 with the split kernels; l2 1 or 2)");
+                "2 with the split kernels; l2 1 or 2; pf 1, or 2 or 4 with the split kernels; ord 1, or 2 with the "
+                "split kernels; pdl 1, or 2 with the split kernels, plan 2 and fuse 2)");
         return 1;
     }
     const bool big = cfg.big == 2, fused = cfg.fuse == 2, discard = fused && cfg.discard == 2;
@@ -1459,15 +1618,23 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
     a.nch = nch;
     a.selfplan = !big && cfg.plan == 2 && routes <= 512;
     a.l2hint = cfg.l2 == 2 ? 1 : 0;
+    a.order = cfg.ord;
+    a.pdl = a.selfplan && fused && cfg.pdl == 2 ? 1 : 0;  // the down blocks plan themselves (up to 512 routes)
 
+    // Phase events: one is recorded only where a phase that ran a kernel ends; an empty phase (the plan inside the
+    // gate/up blocks, the fused epilogue and reduce) ends at the event before it and times zero. Every record is a
+    // command of its own on the stream (about a microsecond of GPU time between two kernels).
+    // With `pdl` nothing may stand between the two products' kernels: the gate/up phase then times both.
     G53R_CK(cudaEventRecord(S->e0, S->st), "event 0");
+    cudaEvent_t ev_p = S->e0, ev_a = a.pdl ? S->ec : S->ea, ev_b = ev_a, ev_1 = S->ec;
     if (!a.selfplan) {
         plan_kernel<<<1, 1024, 0, S->st>>>(ids_d, w_d, int(rows), gr, S->groups.as<Group>(), counts, S->pair_row.as<int>(),
                                            S->pair_route.as<int>(), S->inverse.as<int>(), fault);
         G53R_CK(cudaGetLastError(), "plan launch");
+        G53R_CK(cudaEventRecord(S->ep, S->st), "event p");
+        ev_p = S->ep;
     }
-    G53R_CK(cudaEventRecord(S->ep, S->st), "event p");
-    const dim3 gu_grid(2, max_groups, cfg.sk);
+    const dim3 gu_grid = cfg.ord == 2 ? dim3(2 * cfg.sk, max_groups) : dim3(2, max_groups, cfg.sk);
     if (big) {
         const int items = 2 * max_groups * cfg.sk;
         if (cfg.gp == 0) {
@@ -1486,17 +1653,17 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
             return 2;
         }
     } else {
-        if (cfg.mt == 1) gateup_kernel<1><<<gu_grid, 128, 0, S->st>>>(a);
-        else gateup_kernel<2><<<gu_grid, 128, 0, S->st>>>(a);
+        G53R_CK(launch_split(false, cfg.mt, cfg.pf, a.l2hint != 0, false, gu_grid, S->st, a), "gate/up launch");
     }
     G53R_CK(cudaGetLastError(), "gate/up launch");
-    G53R_CK(cudaEventRecord(S->ea, S->st), "event a");
+    if (!a.pdl) G53R_CK(cudaEventRecord(S->ea, S->st), "event a");
     if (!fused) {
         gateup_epilogue<<<routes, 128, 0, S->st>>>(a);
         G53R_CK(cudaGetLastError(), "epilogue launch");
+        G53R_CK(cudaEventRecord(S->eb, S->st), "event b");
+        ev_b = S->eb;
     }
-    G53R_CK(cudaEventRecord(S->eb, S->st), "event b");
-    const dim3 dn_grid(max_groups, nch, cfg.skd);
+    const dim3 dn_grid = cfg.ord == 2 ? dim3(cfg.skd, max_groups, nch) : dim3(max_groups, nch, cfg.skd);
     if (big) {
         const int items = max_groups * nch * cfg.skd;
         if (cfg.mt == 2) {
@@ -1513,16 +1680,17 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
             return 2;
         }
     } else {
-        if (cfg.mt == 1) down_kernel<1><<<dn_grid, 128, 0, S->st>>>(a);
-        else down_kernel<2><<<dn_grid, 128, 0, S->st>>>(a);
+        const bool pdl_launch = a.pdl && S->cc >= 90;  // older devices: stream order (the kernel's wait is empty)
+        G53R_CK(launch_split(true, cfg.mt, cfg.pf, a.l2hint != 0, pdl_launch, dn_grid, S->st, a), "down launch");
     }
     G53R_CK(cudaGetLastError(), "down launch");
     G53R_CK(cudaEventRecord(S->ec, S->st), "event c");
     if (!fused) {
         reduce_kernel<<<rows * 8, 128, 0, S->st>>>(a);
         G53R_CK(cudaGetLastError(), "reduce launch");
+        G53R_CK(cudaEventRecord(S->e1, S->st), "event 1");
+        ev_1 = S->e1;
     }
-    G53R_CK(cudaEventRecord(S->e1, S->st), "event 1");
     S->discarded = discard;
     G53R_CK(cudaMemcpyAsync(f32 ? static_cast<void*>(f32_out) : static_cast<void*>(bf16_out), S->out.p, out_bytes,
                             cudaMemcpyDeviceToHost, S->st),
@@ -1546,12 +1714,12 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
     auto t2 = std::chrono::steady_clock::now();
     if (ms) {
         float gpu = 0, ph[5] = {0, 0, 0, 0, 0};
-        cudaEventElapsedTime(&gpu, S->e0, S->e1);
-        cudaEventElapsedTime(&ph[0], S->e0, S->ep);
-        cudaEventElapsedTime(&ph[1], S->ep, S->ea);
-        cudaEventElapsedTime(&ph[2], S->ea, S->eb);
-        cudaEventElapsedTime(&ph[3], S->eb, S->ec);
-        cudaEventElapsedTime(&ph[4], S->ec, S->e1);
+        cudaEventElapsedTime(&gpu, S->e0, ev_1);
+        if (ev_p != S->e0) cudaEventElapsedTime(&ph[0], S->e0, ev_p);
+        cudaEventElapsedTime(&ph[1], ev_p, ev_a);
+        if (ev_b != ev_a) cudaEventElapsedTime(&ph[2], ev_a, ev_b);
+        if (ev_b != S->ec) cudaEventElapsedTime(&ph[3], ev_b, S->ec);
+        if (ev_1 != S->ec) cudaEventElapsedTime(&ph[4], S->ec, ev_1);
         ms[0] = std::chrono::duration<float, std::milli>(t1 - t0).count();
         ms[1] = gpu;
         ms[2] = std::chrono::duration<float, std::milli>(t2 - t1).count() - gpu;
@@ -1566,7 +1734,9 @@ static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload
 // use its row stride for both). `ids`, `weights`: [rows * 8], row-major top-8. Writes the rank's partial rows,
 // BF16 [rows * 4,096], to `bf16_out` (host). `cfg` may be null (defaults). `ms` (9 floats, may be null):
 // host staging and uploads, GPU time, download and checks, groups; then the GPU phases plan, gate/up,
-// epilogue, down, reduce (the epilogue and reduce phases are empty when they are fused). Returns 0 on success.
+// epilogue, down, reduce (zero when no kernel of their own ran: the plan in the gate/up blocks, the fused
+// epilogue and reduce; with `pdl` the gate/up phase times both products and the down phase is zero). Returns 0
+// on success.
 int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_t payload_pitch, const uint8_t* scales,
              size_t scales_pitch, const int32_t* ids, const float* weights, uint32_t rows, uint16_t* bf16_out,
              const g53r_cfg* cfg_in, float* ms, char* err, size_t errlen) {

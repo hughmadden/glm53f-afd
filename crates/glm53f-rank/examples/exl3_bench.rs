@@ -4,7 +4,9 @@
 //!
 //! ```text
 //! cargo run -p glm53f-rank --release --features cuda --example exl3_bench -- [options]
-//!   --dir <rank-dir> [--layer N]   a real layer image (default: the first layer of the manifest)
+//!   --dir <rank-dir> [--layer N]   a real layer image (default: the first layer of the manifest); with a
+//!                                  list (`--layer 3,4`) the calls take the layers in turn, as a serving
+//!                                  rank does, so that no call finds its weights in L2 from the call before
 //!   --rows 1,8,2048                row counts (default 1,2,4,8,16,64,512,1024,2048,4096)
 //!   --sweep                        also try a set of configurations of each kernel family
 //!   --cfg mt=4,nt=1,...            also try this configuration (repeatable; keys as in exl3_cuda::Cfg,
@@ -23,6 +25,10 @@
 //! run the kernel's policy with the environment's overrides
 //! (`GLM53F_RANK_SMALL`, `_MID`, `_LARGE`, `_SMALL_MAX`, `_MID_MAX`; README
 //! "The kernel").
+//!
+//! Every line ends with `bits` and the first 16 hex digits of the SHA-256 of
+//! the configuration's outputs over the calls of the first pass: equal digests
+//! are equal bits, between configurations and between builds.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -32,6 +38,7 @@ use glm53f_rank::exl3_cuda::{self, Cfg, CudaKernel};
 use glm53f_rank::kernel::{ExpertKernel, Rows};
 use glm53f_rank::layout::EXPERT_BYTES;
 use glm53f_rank::manifest::Manifest;
+use glm53f_rank::sha256::{hex, Sha256};
 use glm53f_rank::testkit;
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -43,19 +50,35 @@ fn cfg(s: &str) -> Cfg {
     Cfg::default().parse_over(s).expect("configuration")
 }
 
-/// The sweep. Up to 64 rows: the split kernels' split counts (which change a
-/// decode row's bits: pick one configuration for every size up to 64), the
+/// The sweep. Up to 64 rows, first the schedules of the default K splits,
+/// which keep a decode row's bits: the split kernels' block order and L2
+/// discard as they were before (`ord=1,discard=1`), their trellis prefetch
+/// depth (`pf`) and evict-first trellis loads (`l2=2`) with either, the
 /// planning kernel against the plan in the gate/up blocks, unfused against
-/// fused. Above: the kernels as they were before the large-M family (unfused,
-/// planning kernel), then the large-M kernels' group rows (`mt`), gate/up warps
-/// (`gw`) and rotation warps (`gp`), down chunk width (`nt`), keeping the
-/// partial sums in L2 (`discard=1`) and the evict-first trellis loads (`l2=2`);
-/// these never change a bit.
+/// fused, and the large-M kernels at the same splits; then the split kernels'
+/// split counts (which change a decode row's bits: pick one configuration for
+/// every size up to 64). Above: the kernels as they were before the large-M
+/// family (unfused, planning kernel), then the large-M kernels' group rows
+/// (`mt`), gate/up warps (`gw`) and rotation warps (`gp`), down chunk width
+/// (`nt`), keeping the partial sums in L2 (`discard=1`) and the evict-first
+/// trellis loads (`l2=2`); these never change a bit.
 fn sweep(rows: usize) -> Vec<Cfg> {
     let list: &[&str] = if rows <= 64 {
         &[
+            "ord=1,discard=1",
+            "pf=2",
+            "pf=4",
+            "l2=2",
+            "pf=2,l2=2",
+            "pf=4,l2=2",
+            "ord=1,discard=1,pf=2",
+            "ord=1,discard=1,pf=4",
+            "ord=1,discard=1,l2=2",
+            "ord=1,discard=1,pf=2,l2=2",
             "big=1,mt=1,sk=8,skd=2,plan=1",
+            "big=1,mt=1,sk=8,skd=2,plan=1,pf=2,l2=2",
             "big=1,mt=1,sk=8,skd=2,plan=2,fuse=1",
+            "big=2,mt=2,gw=8,nt=2,sk=8,skd=2,l2=2",
             "big=1,mt=1,sk=4,skd=1",
             "big=1,mt=1,sk=4,skd=2",
             "big=1,mt=1,sk=8,skd=1",
@@ -65,7 +88,7 @@ fn sweep(rows: usize) -> Vec<Cfg> {
         ]
     } else {
         &[
-            "big=1,mt=2,sk=1,skd=1,plan=1,fuse=1,discard=1",
+            "big=1,mt=2,sk=1,skd=1,plan=1,fuse=1,discard=1,ord=1",
             "big=2,mt=2,gw=8,nt=1",
             "big=2,mt=2,gw=8,nt=2",
             "big=2,mt=2,gw=8,nt=4",
@@ -86,7 +109,7 @@ fn sweep(rows: usize) -> Vec<Cfg> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut do_sweep, mut dir, mut layer) = (false, None::<PathBuf>, None::<u32>);
+    let (mut do_sweep, mut dir, mut layer_list) = (false, None::<PathBuf>, Vec::<u32>::new());
     let (mut passes_arg, mut use_min) = (None::<usize>, false);
     let mut sizes: Vec<usize> = vec![1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096];
     let mut extra: Vec<Cfg> = Vec::new();
@@ -94,7 +117,10 @@ fn main() {
         match a.as_str() {
             "--sweep" => do_sweep = true,
             "--dir" => dir = Some(PathBuf::from(args.next().expect("--dir DIR"))),
-            "--layer" => layer = Some(args.next().expect("--layer N").parse().expect("--layer N")),
+            "--layer" => {
+                layer_list =
+                    args.next().expect("--layer N[,N..]").split(',').map(|x| x.parse().expect("--layer N[,N..]")).collect()
+            }
             "--rows" => sizes = args.next().expect("--rows LIST").split(',').map(|x| x.parse().expect("row count")).collect(),
             "--cfg" => extra.push(cfg(&args.next().expect("--cfg key=value,..."))),
             "--passes" => passes_arg = Some(args.next().expect("--passes N").parse().expect("--passes N")),
@@ -103,23 +129,33 @@ fn main() {
         }
     }
     println!("device: {}", exl3_cuda::check_device().expect("device gate"));
-    let image = match &dir {
+    let images: Vec<Vec<u8>> = match &dir {
         None => {
             println!("weights: synthetic layer");
-            testkit::layer_image(0xBE7C_0001)
+            vec![testkit::layer_image(0xBE7C_0001)]
         }
         Some(d) => {
             let m = Manifest::read(d).expect("manifest");
-            let l = layer.unwrap_or_else(|| m.layers.first().expect("an empty manifest").layer);
-            let e = m.entry(l).unwrap_or_else(|| panic!("layer {l} is not in {}", d.display()));
-            println!("weights: layer {l} of rank {} ({})", m.rank, e.file);
-            std::fs::read(d.join(&e.file)).expect("layer image")
+            if layer_list.is_empty() {
+                layer_list.push(m.layers.first().expect("an empty manifest").layer);
+            }
+            layer_list
+                .iter()
+                .map(|&l| {
+                    let e = m.entry(l).unwrap_or_else(|| panic!("layer {l} is not in {}", d.display()));
+                    println!("weights: layer {l} of rank {} ({})", m.rank, e.file);
+                    std::fs::read(d.join(&e.file)).expect("layer image")
+                })
+                .collect()
         }
     };
     let mut k = CudaKernel::new().expect("kernel (check the GLM53F_RANK_* configuration variables)");
     println!("{}", k.policy.summary());
-    let layer = k.prepare_layer(&image).unwrap();
-    drop(image);
+    let layers: Vec<_> = images.iter().map(|im| k.prepare_layer(im).unwrap()).collect();
+    drop(images);
+    if layers.len() > 1 {
+        println!("calls take the {} layers in turn", layers.len());
+    }
 
     for &rows in &sizes {
         let (p, s) = testkit::wire_rows(0xBE7C_1000 + rows as u64, rows);
@@ -148,18 +184,23 @@ fn main() {
                 continue;
             }
             // Warm up (a configuration the kernel refuses is skipped), then time every routing once per pass.
-            if let Err(e) = k.ffn(&layer, Rows::separate(&p, &s, rows).unwrap(), &routes[0].0, &routes[0].1, &mut out) {
+            if let Err(e) = k.ffn(&layers[0], Rows::separate(&p, &s, rows).unwrap(), &routes[0].0, &routes[0].1, &mut out) {
                 println!("M{rows:<4} {}: {e}", used.text());
                 continue;
             }
             let (mut gpu, mut wall, mut gbs) = (Vec::new(), Vec::new(), Vec::new());
             let mut phases: [Vec<f64>; 5] = Default::default();
+            let mut bits = Sha256::new();
             let passes = passes_arg.unwrap_or(if rows <= 64 { 8 } else { 3 });
-            for _ in 0..passes {
-                for (ids, w) in &routes {
+            for pass in 0..passes {
+                for (i, (ids, w)) in routes.iter().enumerate() {
+                    let layer = &layers[(pass * routes.len() + i) % layers.len()];
                     let t = std::time::Instant::now();
-                    let st = k.ffn(&layer, Rows::separate(&p, &s, rows).unwrap(), ids, w, &mut out).unwrap();
+                    let st = k.ffn(layer, Rows::separate(&p, &s, rows).unwrap(), ids, w, &mut out).unwrap();
                     wall.push(t.elapsed().as_secs_f64() * 1e3);
+                    if pass == 0 {
+                        bits.update(&out.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                    }
                     gpu.push(st.gpu_ms as f64);
                     for (p, &m) in phases.iter_mut().zip(&st.phase_ms) {
                         p.push(m as f64);
@@ -174,7 +215,12 @@ fn main() {
             let phases = phases.map(|v| if use_min { v.iter().cloned().fold(f64::INFINITY, f64::min) } else { median(v) });
             let gbs = if use_min { gbs.iter().cloned().fold(0.0, f64::max) } else { median(gbs) };
             let distinct = routes[0].0.iter().collect::<BTreeSet<_>>().len();
-            let tag = format!("{}{}", used.text(), if c.is_none() { " (default)" } else { "" });
+            let tag = format!(
+                "{}{}  bits {}",
+                used.text(),
+                if c.is_none() { " (default)" } else { "" },
+                &hex(&bits.finalize())[..16]
+            );
             let ph = format!(
                 "plan {:.3} gate/up {:.3} epi {:.3} down {:.3} reduce {:.3} ms",
                 phases[0], phases[1], phases[2], phases[3], phases[4]

@@ -35,9 +35,18 @@ themselves instead, and each returns a quarter of the rows
   reduce and plan (28 September 2026): 1.16–1.32× on the development GPU at
   512–4,096 rows and at one or two rows, the same bits
   ([Measured on the development GPU](#measured-on-the-development-gpu)).
+- The split kernels, which serve every decode and verify window, have
+  schedule options for GB10's memory (29 September 2026): the trellis words
+  loaded up to 4 k tiles ahead (`pf`), evict-first (`l2`), a block order that
+  keeps partial sums in L2 (`ord`), and the down kernel started before the
+  gate/up kernel ends (`pdl`, `sm_90` and later). Fewer fixed costs per call
+  and the new block order make the defaults 1.04–1.12× faster on the
+  development GPU at 1–64 rows, the same bits
+  ([Decode sizes](#decode-sizes-29-september-2026)).
 - Not yet done:
   - the new kernels on a Spark (`sm_121`; the earlier kernel's GB10 numbers
-    are in `docs/PERFORMANCE.md`);
+    are in `docs/PERFORMANCE.md`), and the split kernels' options swept there
+    ([On a Spark](#on-a-spark));
   - the RDMA path, for the coordinator's link and the peer mesh (built, but
     untested without a fabric).
 
@@ -63,7 +72,7 @@ cargo test -p glm53f-rank --release
 
 # The kernels, on a CUDA GPU (default target sm_89; use at most a few GB).
 cargo test -p glm53f-rank --release --features cuda -- --test-threads=1
-cargo run  -p glm53f-rank --release --features cuda --example exl3_bench -- [--dir <rank-dir>] [--sweep] [--min]
+cargo run  -p glm53f-rank --release --features cuda --example exl3_bench -- [--dir <rank-dir> [--layer 3,4]] [--sweep] [--min]
 
 # Real experts (the tests skip without these; see tests/real_experts.rs).
 GLM53F_EXL3_DIR=<copy holding layers 3-4 of the EXL3 checkpoint> \
@@ -279,7 +288,9 @@ pieces:
 `kernels/exl3_rank.cu` has two C entry points, `g53r_ffn` (BF16 rows) and
 `g53r_ffn_f32` (the same sums before their BF16 rounding, for the
 reduce-scatter). A call uploads the rows, runs its kernels on one stream and
-synchronizes once. The stages:
+synchronizes once. It records a timing event only where a phase that ran a
+kernel of its own ends: every event is a command on the stream, about a
+microsecond of GPU time between two kernels. The stages:
 
 1. **Plan:** it checks the routes, counts the (row, slot) pairs per expert,
    places them in ascending expert order and cuts each expert's pairs into
@@ -318,8 +329,21 @@ The rotation, the epilogue and the reduce are each one device function
   windows. A block is one (matrix, group, K split) of 16 or 32 rows; its 4
   warps cover the slice's four 128-column Hadamard blocks. K is split into
   partial sums (8 for gate/up and 2 for down by default) so that enough
-  blocks stream the few experts' weights; the next k tile's trellis words are
-  loaded while the current one is multiplied.
+  blocks stream the few experts' weights:
+  - the trellis words are loaded `pf` k tiles ahead (1, 2 or 4), in a ring
+    of registers where each word's register is refilled as soon as the word
+    is decoded (the loop has no branch: past the split's end it reloads its
+    last tile);
+  - with `l2` 2 they are loaded with an L2 evict-first policy (a template
+    parameter: a runtime choice costs a second load instruction per word,
+    which the one-row case showed);
+  - the down kernel stages its group's down input for its K range in shared
+    memory with `cp.async` when it starts, instead of loading the A
+    fragments from memory every k tile;
+  - memory the blocks would otherwise wait for is fetched into L2 when they
+    start: each gate/up block's `suh` values of its split's later K blocks
+    (only that block reads them, one DRAM round trip per K block otherwise),
+    and the scale vectors the fused epilogue and reduce read.
 - **Large-M kernels** (`gateup_big`, `down_big`), for prefill. Persistent
   blocks take work items from a counter in grid order:
   - gate/up: an item is one (matrix, group) of up to 32 or 64 rows (`mt` 2 or
@@ -345,14 +369,33 @@ partial sums the fused step reads were just written by the other blocks, so
 they come from L2; with `discard` the step then drops those lines from L2
 (`discard.global.L2`) instead of letting them be written back to memory.
 Because the down items run chunk by chunk, a chunk's partial sums live in L2
-for about one chunk's pass; `nt` sets how wide that is.
+for about one chunk's pass; `nt` sets how wide that is. The split kernels'
+blocks run in grid order, with the split slowest (`ord` 1): the partial sums
+of the first splits were written a whole kernel before the fused step reads
+them. With `ord` 2 (the default up to 64 rows) a group's 2·`sk` gate/up blocks
+are adjacent, and the down blocks run chunk by chunk with the splits fastest,
+so their partial sums are read, and with `discard` dropped, while still in L2.
+
+**Programmatic dependent launch** (`pdl` 2, `sm_90` and later). The down
+kernel is launched with programmatic stream serialization. Every gate/up block
+first allows it to be scheduled (`griddepcontrol.launch_dependents`); the down
+blocks, which then start on free multiprocessors while the gate/up kernel
+ends, plan the call themselves from the routes (the plan in the gate/up
+blocks: the same plan), load their first trellis words, and wait until the
+gate/up grid has completed and its memory is visible (`griddepcontrol.wait`)
+before they read its down input. Nothing may stand between the two kernels on
+the stream, so the call's gate/up phase then times both products. On an older
+device the same kernels run in stream order: the development GPU tests this
+path, not the overlap.
 
 **What changes a bit.** Every row's arithmetic is independent of the other
 rows: the tensor-core rows are independent, and every sum runs in a fixed
 order. Only the K splits (`sk`, `skd`) and `fp32_swiglu` change the result;
-the kernel family, the rows per group, the tilings, the plan, the fusion and
-the L2 policies are schedules of the same products and sums, bit for bit
-(`tests/cuda_kernel.rs` compares 13 schedules at 5 row counts). So **under one
+the kernel family, the rows per group, the tilings, the plan, the fusion, the
+L2 policies, the trellis prefetch depth, the block order and the dependent
+launch are schedules of the same products and sums, bit for bit
+(`tests/cuda_kernel.rs` compares 13 schedules at 5 row counts, and 52
+split-kernel schedules at 1, 2, 4, 8, 16, 32 and 64 rows). So **under one
 configuration a row gets the same bits whatever else is in the batch.**
 
 **Configurations** (`g53r_cfg`, `exl3_cuda::Cfg`; zero fields take the
@@ -370,14 +413,17 @@ defaults for the row count):
 | `plan` | 1, 2 | the planning kernel, or the gate/up blocks plan (split kernels, up to 512 routes) |
 | `fuse` | 1, 2 | separate epilogue and reduce kernels, or fused |
 | `discard` | 1, 2 | keep the fused steps' partial sums, or drop them from L2 |
-| `l2` | 1, 2 | large-M: default caching of the trellis words, or an L2 evict-first policy |
+| `l2` | 1, 2 | default caching of the trellis words, or an L2 evict-first policy (both families) |
+| `pf` | 1, 2, 4 (split only) | split kernels: trellis words loaded `pf` k tiles ahead |
+| `ord` | 1, 2 (split only) | split kernels' block order: the split slowest, or a group's (a down chunk's) blocks together |
+| `pdl` | 1, 2 (split, `plan` 2, `fuse` 2) | the down kernel as a programmatic dependent launch (`sm_90` and later) |
 
 **Which configuration a call runs** (`exl3_cuda::Policy`, the daemon prints
 it at start-up):
 
 | Rows | Default | Environment |
 |---|---|---|
-| 1 – `GLM53F_RANK_SMALL_MAX` (64) | split: `mt=1,sk=8,skd=2,plan=2,fuse=2,discard=1` | `GLM53F_RANK_SMALL` |
+| 1 – `GLM53F_RANK_SMALL_MAX` (64) | split: `mt=1,sk=8,skd=2,plan=2,fuse=2,discard=2,ord=2` (`pf=1,l2=1,pdl=1`) | `GLM53F_RANK_SMALL` |
 | to `GLM53F_RANK_MID_MAX` (2,048) | large-M: `mt=2,gw=8,nt=2,fuse=2,discard=2,l2=2` | `GLM53F_RANK_MID` |
 | above | large-M: `mt=4,gw=16,nt=4,fuse=2,discard=2` | `GLM53F_RANK_LARGE` |
 
@@ -416,6 +462,14 @@ on the GPU):
 - **Schedules:** at 8, 64, 200, 512 and 4,096 rows, 13 schedules (both
   families, `mt`, `nt`, `gw`, `gp`, both plans, fused and not, with and
   without `discard`) give the unfused split kernels' output bit for bit.
+- **The split kernels' options:** at 1, 2, 4, 8, 16, 32 and 64 rows, every
+  combination of `pf` 1, 2, 4, `l2`, `ord`, `discard` and `pdl` (48), and four
+  with `mt` 2 or the planning kernel, give the unfused split kernels' output
+  bit for bit at the small regime's splits; so do four at splits where the
+  prefetch ring is longer than a down block's K range (`skd` 16 and 32), at
+  `sk=4,skd=8` and at 200 rows. The options are refused with the large-M
+  kernels, and `pdl` without the plan in the gate/up blocks or the fused
+  steps.
 - **End to end against the kernel-order reference:** RMS ≤ 2e-3 of the row's
   RMS at 1–8 rows and at 512 and 4,096 rows. Those one-ulp accumulation
   differences occasionally tip a BF16 rounding.
@@ -498,6 +552,80 @@ MMA loop, since the GPU's performance counters are not available here):
   about 25 µs at one row. On a Spark, whose memory is unified, those copies
   are memory to memory.
 
+### Decode sizes (29 September 2026)
+
+Method: `exl3_bench --dir <rank-0 directory> --layer 3,4 --rows
+1,2,4,8,16,32,64 --passes 8 --min`. The calls take layers 3 and 4 in turn, as
+a serving rank reads another layer's image on every call; 16 routings per
+size. Before (the kernel as of the previous commit, with the same bench) and
+after, five runs each, interleaved; the table gives the fastest call's GPU
+time of the 640 per size and build. Every line's `bits` digest is the same in
+both builds and in every configuration below, at every size.
+
+| Rows | Before | After | Speedup | Bench GB/s, before → after |
+|---:|---:|---:|---:|---:|
+| 1 | 0.037 ms | 0.033 ms | 1.12× | 689 → 771 |
+| 2 | 0.047 ms | 0.045 ms | 1.04× | 1,078 → 1,127 |
+| 4 | 0.117 ms | 0.111 ms | 1.05× | 795 → 843 |
+| 8 | 0.208 ms | 0.198 ms | 1.05× | 840 → 883 |
+| 16 | 0.390 ms | 0.364 ms | 1.07× | 852 → 903 |
+| 32 | 0.601 ms | 0.563 ms | 1.07× | 854 → 918 |
+| 64 | 0.885 ms | 0.804 ms | 1.10× | 836 → 917 |
+
+The bandwidth column is the bench's (the fastest call's weight bytes over its
+time); at two rows it exceeds the card's memory, because part of the weights
+are still in its 72 MB L2 from two calls before. At 128–4,096 rows (the
+large-M kernels, three runs each) the times are within 1% of before, the same
+bits.
+
+What made the difference, each change the same bits:
+
+- **Fewer events.** Three of a call's six timing events closed empty phases
+  (the plan in the gate/up blocks, the fused epilogue and reduce), each about
+  a microsecond of GPU time. Under nsys (one row, minimum; nsys adds its own
+  launch cost) the gap from the end of the gate/up kernel to the start of the
+  down kernel fell from 4.6 to 2.6 µs, and the span from the start of the one
+  to the end of the other by about 3 µs.
+- **The block order with `discard`** (`ord=2,discard=2`, now the default):
+  against `ord=1,discard=1` in the same build, 64 rows 0.808 against 0.885
+  ms, 32 rows 0.563 against 0.601, 16 rows 0.368 against 0.384, 8 rows 0.198
+  against 0.205, 4 rows 0.111 against 0.115; at one and two rows within the
+  noise (±2 µs; the discards run in the last blocks' tails). Either alone
+  gains little (64 rows: 0.866 with `ord=2`, 0.871 with `discard=2`).
+- The down kernel's down input in shared memory and its group, pair rows
+  and first trellis words loaded together; the scale vectors of the fused
+  steps and the `suh` values of later K blocks fetched ahead (for GB10's
+  memory latency: here its L2 holds them anyway).
+
+The options against the new default, in the same build (three runs each,
+fastest call, ms):
+
+| Rows | Default | `ord=1,discard=1` | `pf=2` | `pf=4` | `l2=2` | `pf=2,l2=2` | `pdl=2` |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.034 | 0.032 | 0.036 | 0.036 | 0.038 | 0.036 | 0.033 |
+| 2 | 0.044 | 0.044 | 0.046 | 0.047 | 0.049 | 0.047 | 0.044 |
+| 4 | 0.111 | 0.115 | 0.115 | 0.125 | 0.088 | 0.113 | 0.111 |
+| 8 | 0.198 | 0.205 | 0.201 | 0.207 | 0.193 | 0.200 | 0.202 |
+| 16 | 0.368 | 0.384 | 0.371 | 0.366 | 0.353 | 0.370 | 0.371 |
+| 32 | 0.563 | 0.601 | 0.572 | 0.570 | 0.558 | 0.564 | 0.566 |
+| 64 | 0.808 | 0.885 | 0.816 | 0.810 | 0.793 | 0.795 | 0.820 |
+
+- **`pf`** gains nothing on this card: at one row the gate/up kernel already
+  streams its 16.8 MB in 19 µs, near the card's memory speed, with 512 KB in
+  flight. The gate/up kernel with `pf=4` takes 167 registers (three blocks
+  a multiprocessor instead of four) and loses at 4–8 rows.
+- **`l2=2`** is faster from 4 rows (the 4-row minimum varies between runs,
+  0.088–0.115 ms) and 10–12% slower at one and two rows, where each
+  multiprocessor runs one block and the hinted loads' latency shows.
+- **`pdl=2`** runs here in stream order: the down blocks plan themselves,
+  equal at 1–4 rows and 1–2% slower at 8–64. Its overlap needs `sm_90` or
+  later.
+- The large-M kernels at the small regime's splits
+  (`big=2,mt=2,gw=8,nt=2,sk=8,skd=2,l2=2`, the same bits) were 5–70% slower
+  than the split kernels' schedule before at 1–32 rows, and even at 64 rows
+  (0.873 against 0.883 ms): the planning kernel, and a persistent grid of
+  256-thread blocks for few groups.
+
 ## On a Spark
 
 The GB10 numbers of the kernel before these changes are in
@@ -506,17 +634,24 @@ unchanged in the arithmetic; every schedule knob is read from the environment
 at start-up, so the sweep needs no rebuild.
 
 ```sh
-# On the Spark (arm64, CUDA 13).
+# On the Spark (arm64, CUDA 13). The daemon (cuda,rdma) and the kernel test and bench (cuda) in separate
+# target directories: a build with other features relinks target/release/glm53f-rank without them.
 export GLM53F_CUDA_ARCH=sm_121        # GLM53F_CUDA_LIB if libcudart is not in /usr/local/cuda/lib64
-cargo test  -p glm53f-rank --release --features cuda --test cuda_kernel -- --nocapture --test-threads=1
-cargo run   -p glm53f-rank --release --features cuda --example exl3_bench -- --dir <rank-dir> --layer 3 --min --passes 4
-cargo run   -p glm53f-rank --release --features cuda --example exl3_bench -- --dir <rank-dir> --layer 3 --min --sweep \
-  --rows 1,8,64,512,1024,2048,4096
-cargo build -p glm53f-rank --release --features cuda,rdma
+CARGO_TARGET_DIR=target-rank  cargo build -p glm53f-rank --release --features cuda,rdma
+CARGO_TARGET_DIR=target-bench cargo test  -p glm53f-rank --release --features cuda --test cuda_kernel -- --nocapture --test-threads=1
+CARGO_TARGET_DIR=target-bench cargo build -p glm53f-rank --release --features cuda --example exl3_bench
+B=target-bench/release/examples/exl3_bench
+$B --dir <rank-dir> --layer 3,4 --min --passes 4
+$B --dir <rank-dir> --layer 3,4 --min --sweep --rows 1,2,4,8,16,32,64,512,1024,2048,4096
+
+# Decode: the split kernels' options (each keeps the default's bits: compare the lines' `bits` digests).
+$B --dir <rank-dir> --layer 3,4 --rows 1,2,4,8,16,32,64 --min --passes 8 \
+  --cfg ord=1,discard=1 --cfg pf=2 --cfg pf=4 --cfg l2=2 --cfg pf=2,l2=2 --cfg pf=4,l2=2 \
+  --cfg pdl=2 --cfg pdl=2,pf=2 --cfg pdl=2,pf=4 --cfg pdl=2,pf=2,l2=2 --cfg pdl=2,pf=4,l2=2
 
 # The sweep's winners become the defaults without a rebuild, for example:
-GLM53F_RANK_MID=nt=1,l2=2 GLM53F_RANK_LARGE=mt=4,gw=16,nt=1 \
-  cargo run -p glm53f-rank --release --features cuda --example exl3_bench -- --dir <rank-dir> --layer 3 --min
+GLM53F_RANK_SMALL=pf=4,l2=2,pdl=2 GLM53F_RANK_MID=nt=1,l2=2 GLM53F_RANK_LARGE=mt=4,gw=16,nt=1 \
+  $B --dir <rank-dir> --layer 3,4 --min
 
 # Once per rank: cut its share and serve it. --peers lists the four ranks' peer-mesh
 # addresses in rank order (the same list on every rank) for the prefill reduce-scatter.
@@ -530,12 +665,16 @@ GLM53F_RDMA=1 target/release/glm53f-rank serve --rank R --dir <rank-dir> --liste
 - **Kernel test:** it should pass unchanged; the schedule comparisons are bit
   for bit on any GPU, and only the tensor cores' accumulation rounding could
   differ from the references.
-- **Decode (1–8 rows):** the default against `plan=1` and against
-  `fuse=1` (the separate epilogue and reduce), and the split counts of the
-  sweep. The fixed phases were about 26 µs of 145 at one row. The gate is at
-  least 200 GB/s.
+- **Decode (1–64 rows):** the default against `ord=1,discard=1` (the block
+  order before), then the bytes in flight (`pf` 2 and 4: expected to matter
+  most at 1–3 rows, see [Measured on GB10](#measured-on-gb10)), `l2=2`, and
+  `pdl=2` (the down kernel's start overlapped with the gate/up kernel's end,
+  which the development GPU cannot show), and their combinations; `plan=1`
+  and `fuse=1` as before. The small regime is one configuration for every
+  size up to 64 rows, so the choice weighs one-row decode against 16–64-row
+  verify windows. The target is 230 GB/s at 1–64 rows.
 - **Prefill (512–4,096 rows):** the default against
-  `big=1,mt=2,sk=1,skd=1,plan=1,fuse=1,discard=1` (the kernels before), then
+  `big=1,mt=2,sk=1,skd=1,plan=1,fuse=1,discard=1,ord=1` (the kernels before), then
   `mt` and `gw` (32- or 64-row groups; where the crossover sits on 48 SMs),
   `nt` 1, 2, 4 with `discard` 2 against 1, and `l2=2`. On GB10 the down
   partials and the down input compete for a smaller L2 than on the 4090: a
@@ -581,8 +720,38 @@ changes a bit.
 
 - GB10's memory peaks at 273 GB/s, so the split kernels, which serve every
   decode and verify window, reach 68–75% of it and the large-M kernel 86%.
-- An evict-first policy for the split kernels' weight stream is the next
-  bit-neutral step.
+
+**What the table says about the split kernels** (arithmetic on the table;
+the conclusions are inferences until the options are swept on a Spark):
+
+- **Their cost is per expert, not per call.** One row reads 8 expert blocks
+  in 0.134 ms and two or three rows 15 in 0.254 ms: 17.1 µs an expert and no
+  fixed cost left over (0.134 = F + 8x and 0.254 = F + 15x give x = 17.1 µs,
+  F = −3 µs). From 4 rows the kernels take 15.5–15.8 µs an expert, the
+  large-M kernels 13.6. The split kernels stream slower; their plan,
+  epilogue and reduce are not what is missing.
+- **They look latency-bound.** At one row the gate/up kernel runs 128 blocks
+  of 4 warps, each warp with one k tile of trellis words (1 KB) in flight:
+  512 KB in flight. At 189 GB/s, Little's law (bytes in flight = bandwidth ×
+  latency) puts the memory's latency at about 2.7 µs; the large-M kernels
+  (96 blocks of 8 warps, 1 KB each: 768 KB) at 234 GB/s give 3.3 µs. At that
+  latency 273 GB/s needs about 750 KB in flight before any queueing. `pf=2`
+  and `pf=4` put two and four times the bytes in flight (1 and 2 MB at one
+  row).
+- **Larger windows' partial sums can leave L2.** With the split slowest
+  (`ord=1`), the gate/up partial sums of the first splits (2 × 8 × pairs ×
+  2 KB: 4 MB at 16 rows, 17 MB at 64) and the down partial sums (2 × pairs ×
+  16 KB: the same) are read a whole kernel after they are written. In an L2
+  smaller than the 4090's they are written back and read again: up to about
+  67 MB beside 730 MB of weights at 64 rows. `ord=2` with `discard=2`
+  (the default now) reads them while they are in L2 and never writes them
+  back; `l2=2` protects them from the other side.
+- **Dependent round trips cost more here.** Each is a latency of the order
+  above: the down kernel's start (the group, then its first trellis words)
+  and the gate/up kernel's tail (the epilogue) sit between the two weight
+  streams of every call. `pdl=2` overlaps the down kernel's start with the
+  gate/up kernel's end; the scale vectors are now fetched into L2 before they
+  are needed.
 
 ## The rank directory
 
@@ -848,9 +1017,10 @@ bandwidth turns out to be the limit and the KL gate allows it.
 
 ## Open issues
 
-1. **Spark numbers.** The large-M kernels, the fused epilogue and reduce and
-   the plan in the gate/up blocks are measured on the 4090 only; the kernel
-   test, the sweep and the defaults on GB10 are listed in
+1. **Spark numbers.** The large-M kernels, the fused epilogue and reduce, the
+   plan in the gate/up blocks and the split kernels' options (`pf`, `l2`,
+   `ord`, `pdl`) are measured on the 4090 only, and `pdl`'s overlap not at
+   all; the kernel test, the sweep and the defaults on GB10 are listed in
    [On a Spark](#on-a-spark). The 4090 is a proxy.
 2. **KL gates.** Three numerics choices need them:
    - the wire's FP8 rows, where BF16 would be a protocol change;
@@ -876,8 +1046,15 @@ bandwidth turns out to be the limit and the KL gate allows it.
    - 16-row tiles pad each group by 11% at uniform routing, more with skewed
      routing; 8-row granularity needs the weights as the A operand (the
      decoded fragments are already that operand's layout);
-   - graphs, or programmatic dependent launch on `sm_90` and later, for the
-     fixed decode shapes (not available on the 4090);
+   - graphs for the fixed decode shapes (the dependent launch between the two
+     products is `pdl`, not yet measured where it applies);
+   - the split gate/up kernel's rotation at each K block boundary: two
+     barriers and a round trip for the rows' inputs (an L2 hit now that the
+     `suh` values are fetched ahead). A double-buffered rotation from inputs
+     loaded a K block ahead (as in the large-M kernel) removes both, but a
+     first version took 147 registers at 16 rows against 128 (three blocks a
+     multiprocessor instead of four); staging the inputs in shared memory
+     with `cp.async` would not;
    - the uploads and downloads of a call (about 25 µs of wall time at one row
      on the 4090): one staging copy each way, or the output written straight
      into the send buffer through mapped memory.
