@@ -1,10 +1,61 @@
 # Expected performance
 
-**Status: model, with the first measurements (28 September 2026).** The Spark
-expert kernel has been measured on GB10 (§1, §2, §3, §5, §6). Every other figure
-is still derived from published or measured numbers of related engines on the
-same class of hardware. Each derivation is shown so it can be checked and
-replaced as real receipts arrive. Layout and format letters refer to [SIZING.md](SIZING.md).
+**Status: measured and modelled (28 September 2026).** §0 gives the first
+measurements of the whole engine on its target hardware. The other sections are
+the model it was designed against, derived from published or measured numbers of
+related engines; they are kept so each derivation can be checked against §0.
+Layout and format letters refer to [SIZING.md](SIZING.md).
+
+## 0. Measured on the target hardware
+
+**Setup:**
+- One RTX 5090 coordinator and four DGX Spark (GB10) expert ranks, over RoCE v2 RDMA at 200 Gb/s.
+- EXL3 K4 experts, FP8 MLA cache, BF16 KDA projections, the embedding in host RAM.
+- All 45 layers, 16 slots. Thinking on (the model's default) unless stated.
+- Single runs; between runs, ±2–3% is typical.
+
+**Decode, one stream:**
+
+| Case | Code | Prose | Counting |
+|---|---:|---:|---:|
+| No drafter | 52.7 | 52.7 | 52.7 |
+| DFlash2 (chain τ 0.7), greedy, thinking off | **111.3** | 62.4 | **128.4** |
+| DFlash2, greedy, thinking on | 82.7 | 73.3 | 169.1 |
+| DFlash2, sampled (T 0.7), thinking off | 113.5 | 67.0 | 123.1 |
+
+- Figures are tok/s. Without a drafter, 52.7 tok/s is 19.0 ms per token.
+- With the drafter, 51–71% of verified drafts are kept (τ 0.3–0.7), 3.0–3.4 tokens per verify window.
+- The model below expected 36–43 tok/s without a drafter (§2) and 110–130 / 75–105 / 125–145 with it (§3).
+
+**Where a one-row step goes** (traced medians per MoE layer): the coordinator's own work 0.25 ms,
+the rank kernel 0.168 ms, the wire about 33 µs beyond the rank's compute.
+
+**Concurrency, aggregate:**
+
+| Streams | No drafter | DFlash2 (τ 0.7) |
+|---|---:|---:|
+| C4 | 126.5 tok/s | 143.3 tok/s |
+| C16 | 241 tok/s | **299 tok/s** |
+
+The model expected 350–480 tok/s at C16 (§4). At 16 requests the verify passes reach 128 rows, and
+nothing yet overlaps the drafter with the forward or the coordinator with the ranks in decode.
+
+**Prefill** is a **MISS** against the 4.5–6K tok/s of §5:
+- about 1.1K tok/s with 256-row passes and 1.7K tok/s with 4,096-row passes, flat from 4K to 79K tokens;
+- traced per MoE layer at 4,096 rows: the coordinator 34.6 ms, the rank kernel 16.8 ms, the transfer 8.6 ms, all serial.
+
+Two-lane pipelining (the coordinator computing one half of a pass while the ranks serve the other)
+is the first fix; it models at about 2.8K tok/s.
+
+**Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
+in 44–49 s (§6).
+
+**Quality spot checks:**
+- a number hidden at 37% depth is retrieved from 8.8K and 79K tokens of filler, with and without the drafter;
+- `harness/api_contract.py` passes all 12 rows on the real model.
+
+The KL gate against the published BF16 teacher ([KL-GATE.md](KL-GATE.md)) waits for the engine's
+score mode.
 
 ## 1. Anchors
 
