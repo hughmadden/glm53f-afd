@@ -45,14 +45,17 @@ serve the other; 4,096-row passes in two lanes of 2,048):
 
 | Prompt | 4K | 19K | 79K |
 |---|---:|---:|---:|
-| Two lanes (default) | 2,717 tok/s | 2,964 tok/s | 2,899 tok/s |
+| Two lanes, with the exchange fast paths (default since the fast paths) | **3,033 tok/s** | **3,369 tok/s** | **3,350 tok/s** |
+| Two lanes, host encode and pageable uploads | 2,717 tok/s | 2,964 tok/s | 2,899 tok/s |
 | One lane | 1,633 tok/s | 1,725 tok/s | 1,715 tok/s |
 
 - A 79K-token prompt takes 27 s.
 - This is still a **MISS** against the 4.5–6K tok/s of §5.
 - 8,192-row passes reach about 3.1K, but take 3 GiB more buffers, which shrinks the pool below a 1M-token request.
-- Per MoE layer the GPU is busy 66% of a 27.5 ms layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
-- The reduce-scatter return and the RDMA fast paths address that host work.
+- Without the fast paths, the GPU is busy 66% of a 27.5 ms MoE layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
+- With them, the host's per-lane work falls to about 0.25 ms, and the layer to 25.1 ms with the GPU 72% busy.
+- The bound is now each lane's chain of attention (about 9 ms) then exchange (about 15 ms): the ranks' compute and the transfer.
+- The reduce-scatter return is slower over a TCP mesh between the ranks. They encode and sum peer rows on the CPU, so it stays off.
 
 **Against a vLLM recipe on the same four Sparks without a coordinator GPU**
 ([tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark), TP4, NVFP4 experts, its README's figures):
@@ -75,8 +78,11 @@ in 44–49 s (§6).
 - a number hidden at 37% depth is retrieved from 8.8K and 79K tokens of filler, with and without the drafter;
 - `harness/api_contract.py` passes all 12 rows on the real model.
 
-The KL gate against the published BF16 teacher ([KL-GATE.md](KL-GATE.md)) waits for the engine's
-score mode.
+**KL gate** against the published BF16 teacher ([KL-GATE.md](KL-GATE.md) §6a):
+- decode path 0.0245 nats, top-1 95.1%, equal within its standard error to the published 0.0246
+  for the same 4-bit experts;
+- prefill path 0.0282 nats, top-1 94.7%;
+- both pass.
 
 ## 1. Anchors
 

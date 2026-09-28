@@ -1,9 +1,8 @@
 # KL gate
 
-**Status (28 September 2026): the harness, the teacher subset and the engine side
-(`glm53f-score`, section 4) are ready; the gate has not yet run on the target hardware.** Until it
-does, the model's quality has only been spot-checked (arithmetic, needle retrieval, coherent
-text).
+**Status (28 September 2026): the gate has run on the target hardware, and both engine paths
+pass** (section 6a). The decode path scores 0.0245 nats against the BF16 teacher, equal within its
+standard error to the published figure for the same 4-bit experts.
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -421,6 +420,33 @@ keeps every row's KL for later paired comparisons. `--windows` and `--exclude` s
 registry's calibration-clean scope ("clean17") excludes `final-0003`, `-0007`, `-0011`, `-0015`,
 `-0019`, `-0021`, `-0022` and `-0023`, and is compared only with clean17 figures. Exit status: 0
 pass, 1 error, 3 gate failed.
+
+## 6a. First result on the target hardware (28 September 2026)
+
+**Configuration:**
+- One RTX 5090 and four GB10 expert ranks over RDMA, all 45 layers.
+- Official FP8 non-expert weights, BF16 KDA projections, EXL3 K4 routed experts.
+- FP8 MLA cache, FP8 wire rows, no drafting.
+- The first gate's rows: 25 windows × 189.
+
+| Engine path | Mean KL (nats) | + 1.96 SE | Top-1 agreement | Gate |
+|---|---:|---:|---:|---|
+| `--pass-rows 8` (decode kernels; FP8 projections take BF16 activations) | **0.02446** | 0.02662 | 0.9510 | PASS |
+| `--pass-rows 4096` (prefill kernels, two lanes; E4M3 activations) | 0.02825 | 0.03099 | 0.9471 | PASS |
+
+**Against the published figures** (section 2, all 25 windows):
+- EXL3 K4 measures 0.024555, offline, with no KV-cache quantization. The decode path matches it
+  within its standard error, although it adds an FP8 cache and FP8 wire rows.
+- The scopes differ: 189 rows per window here, every row there.
+
+**Prefill path against decode path** (`compare`, paired over 4,725 rows):
+- The prefill path is worse by **0.0038 nats**, 95% window bootstrap [0.0004, 0.0090].
+- Top-1 disagreements: 125 rows one way against 100 the other (McNemar p = 0.11).
+- The likely source is the prefill FP8 GEMMs' activation quantization (E4M3 per 128 columns),
+  which the decode path does not use. A W8A16 or finer-scaled prefill path is the candidate fix.
+- The weakest window in both runs is `final-0021` (legal text): 0.047–0.052 nats, top-1 0.89–0.90.
+
+**Timings:** loading 4.3 s, then 23.8 s for the whole plan at 4,096 rows per pass and 279 s at 8.
 
 ## 7. Open points
 
