@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+use crate::copy::CopyIndex;
 use crate::hostcache::{HostCache, Kind};
 use crate::model::{ImageSpan, KvSlot, ModelForward, Token};
 use crate::radix::RadixIndex;
@@ -66,6 +67,8 @@ pub(crate) struct Active<S: KvSlot> {
     /// Snapshot points inside this slot's history.
     pub(crate) points: Vec<Point<S::Mark>>,
     pub(crate) sampling: Option<Sampling>,
+    /// The copy windows' index over `hist` (`crate::copy`; empty unless the request copies).
+    pub(crate) copy: CopyIndex,
 }
 
 /// A request whose prompt is still being prefilled (mimo26f-afd perf reset Q1): one segment per

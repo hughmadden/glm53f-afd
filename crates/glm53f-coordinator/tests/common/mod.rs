@@ -57,6 +57,44 @@ pub fn logits(h: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Context tokens a copying model's induction matches ([`copying_logits`]).
+pub const INDUCTION: usize = 8;
+
+/// A copying model's logits after `ctx` (`MockModel::copying`): the hash model's, with the token
+/// that followed the most recent earlier occurrence of the last [`INDUCTION`] tokens (one of them
+/// may differ) raised above every other: an induction head that goes on copying past a
+/// substituted token. After one prefix in forty the copy is left for the hash model's pick (an
+/// edit).
+pub fn copying_logits(ctx: &[Token]) -> Vec<f32> {
+    let h = prefix_hash(ctx);
+    let mut l = logits(h);
+    let n = ctx.len();
+    if n <= INDUCTION || splitmix(h ^ 0xed17).is_multiple_of(40) {
+        return l;
+    }
+    let tail = &ctx[n - INDUCTION..];
+    let close = |e: usize| ctx[e - INDUCTION..e].iter().zip(tail).filter(|(a, b)| a != b).count() <= 1;
+    if let Some(e) = (INDUCTION..n).rev().find(|&e| close(e)) {
+        l[ctx[e] as usize] = 7.0;
+    }
+    l
+}
+
+/// Serial generation by the copying model: what every request must produce with
+/// `MockModel::copying`.
+pub fn copying_reference(prompt: &[Token], max: usize, sampling: Option<Sampling>, eos: &[Token]) -> Vec<Token> {
+    let mut ctx = prompt.to_vec();
+    let mut out = Vec::new();
+    loop {
+        let t = select_pick(&copying_logits(&ctx), BOUND, &Pick::at(sampling, out.len() as u64));
+        out.push(t);
+        if eos.contains(&t) || out.len() >= max {
+            return out;
+        }
+        ctx.push(t);
+    }
+}
+
 /// Serial generation: what every request must produce, whatever the batching, speculation or
 /// caching.
 pub fn reference(prompt: &[Token], max: usize, sampling: Option<Sampling>, eos: &[Token]) -> Vec<Token> {
@@ -308,6 +346,8 @@ pub struct MockModel {
     /// Simulated cost of a pass and of each row.
     pub pass_ns: u64,
     pub row_ns: u64,
+    /// The copying model ([`copying_logits`]) instead of the hash model.
+    pub copying: bool,
 }
 
 impl MockModel {
@@ -320,7 +360,13 @@ impl MockModel {
             batch_rows: 64,
             pass_ns: 1_000_000,
             row_ns: 250_000,
+            copying: false,
         }
+    }
+
+    /// The logits after `toks`, whose state is `h`.
+    fn next_logits(&self, toks: &[Token], h: u64) -> Vec<f32> {
+        if self.copying { copying_logits(toks) } else { logits(h) }
     }
 
     fn cost(&self, rows: usize) {
@@ -370,7 +416,7 @@ impl ModelForward for MockModel {
                 }
                 s.slot.append(t)?;
             }
-            let l = logits(s.slot.state);
+            let l = self.next_logits(&s.slot.toks, s.slot.state);
             out.push(SegmentOut { next: select_pick(&l, BOUND, &s.pick), logits: s.keep_logits.then_some(l) });
         }
         Ok(out)
@@ -383,7 +429,7 @@ impl ModelForward for MockModel {
             .map(|r| {
                 r.slot.check()?;
                 r.slot.append(r.token)?;
-                Ok(select_pick(&logits(r.slot.state), BOUND, &r.pick))
+                Ok(select_pick(&self.next_logits(&r.slot.toks, r.slot.state), BOUND, &r.pick))
             })
             .collect()
     }
@@ -427,10 +473,15 @@ impl ModelForward for MockModel {
             }
             // The positional state stays at the committed position; the rows go pending.
             let mut h = slot.state;
+            let mut ctx = if self.copying { slot.toks.clone() } else { Vec::new() };
             let mut picks = Vec::new();
             for (t, p) in w.tokens.iter().zip(w.picks) {
+                if *t as usize >= BOUND {
+                    return Err(format!("verify: token {t} past the vocabulary"));
+                }
                 h = step(h, *t);
-                picks.push(select_pick(&logits(h), BOUND, p));
+                ctx.push(*t);
+                picks.push(select_pick(&self.next_logits(&ctx, h), BOUND, p));
             }
             slot.pending = w.tokens.to_vec();
             out.push(picks);
@@ -473,11 +524,13 @@ pub struct Setup {
     pub host: Option<glm53f_coordinator::HostTierConfig>,
     pub eos: Vec<Token>,
     pub tweak: fn(&mut SchedulerConfig),
+    /// The copying model ([`copying_logits`]).
+    pub copying: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Setup { slots: 4, base: 64, budget: 10_000_000, block: 0, host: None, eos: Vec::new(), tweak: |_| {} }
+        Setup { slots: 4, base: 64, budget: 10_000_000, block: 0, host: None, eos: Vec::new(), tweak: |_| {}, copying: false }
     }
 }
 
@@ -499,7 +552,8 @@ pub fn test_config(eos: Vec<Token>, clock: Clock) -> SchedulerConfig {
 
 pub fn harness(s: Setup) -> Harness {
     let dev = device(s.budget);
-    let model = MockModel::new(&dev, s.block);
+    let mut model = MockModel::new(&dev, s.block);
+    model.copying = s.copying;
     let log = model.log.clone();
     let slots: Vec<MockSlot> = (0..s.slots).map(|i| MockSlot::new(i, &dev, s.base)).collect();
     let mut cfg = test_config(s.eos.clone(), model.clock_fn());

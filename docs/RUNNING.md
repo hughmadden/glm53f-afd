@@ -176,6 +176,31 @@ describes each.
   receive buffers (summed in place at decode sizes). Each has an off switch for comparisons;
   the results do not depend on them (`crates/glm53f-forward/src/remote.rs`).
 
+### Copy windows
+
+With the drafter, a greedy request whose last 24 tokens occurred earlier in its prompt or output
+verifies the up to 7 tokens that followed them instead of the drafter's proposals, and the drafter
+skips it for that step (`crates/glm53f-coordinator/src/copy.rs`; TensorFold's idea, as mimo26f-afd
+v1.3.0 ported it). Greedy output is unchanged; sampled requests never copy.
+`--copy-windows off` (or `GLM53F_COPY_WINDOWS=0`) turns them off.
+
+- **Log.** Every 64 speculative steps a `[copy]` line gives the windows copied, the copied tokens
+  kept, and the tokens a copied and a drafted window delivered. The `[drafter]` line counts both
+  kinds of window.
+- **Measuring.** Tokens per verify round do not move with other traffic, so compare them with
+  copy windows off and on (`[copy]` and `[drafter]` lines, or a client that counts the stream's
+  bursts) on copy-heavy requests (a file written back with an edit, an `edit_file` call, a quote)
+  and on fresh code and prose. On one GPU:
+
+  ```sh
+  # The copy index's host cost: 1 and 48 requests, contexts up to 1,048,576 tokens.
+  cargo run --release -p glm53f-coordinator --example copy_cost
+  # Copies replayed on real text (tokenizer and template, no model): how often a copy is found and
+  # how many of its tokens a greedy target keeps, at an entry of 8 and of 24 tokens.
+  GLM53F_TOKENIZER=... GLM53F_CHECKPOINT_DIR=... \
+    cargo run --release -p glm53f-coordinator --example copy_replay
+  ```
+
 ## The KL gate
 
 `glm53f-score` runs the engine's side of the gate against the BF16 teacher panel
@@ -234,6 +259,13 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test decode_lanes --test draft_lossless -- --nocapture --test-threads=1
 
+# Copy windows lossless (plain, speculative, and speculative with copies, token for token), and
+# tokens per verify round with copies off and on (ignored: --ignored). The forward copies its
+# context only with every layer loaded, which fits 24 GB with FP8 KDA projections.
+GLM53F_DRAFT_TEST_LAYERS=45 GLM53F_TEST_NUMERICS=kda-fp8 GLM53F_TOKENIZER=... \
+GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
+  cargo test --release -p glm53f-forward --features coordinator --test copy_windows -- --nocapture --test-threads=1
+
 # One streamed chat completion through glm53f-serve in development mode.
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
@@ -265,6 +297,7 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_API_ADDR` | `--listen` | The API's address (default `127.0.0.1:8100`) |
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
+| `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 or 2 (default 2) |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes 2`) |

@@ -30,6 +30,13 @@
 //! ([`SchedulerConfig::spec_max_rows`], [`crate::spec::budget`]): under load the rows go to the
 //! drafts most likely to be kept.
 //!
+//! **Copy windows** ([`SchedulerConfig::copy_windows`], [`crate::copy`]): a greedy request whose
+//! last 24 tokens ([`crate::copy::ENTRY`]) occurred earlier in its context verifies the tokens that
+//! followed them (up to the drafts' cap) in place of drafts, and the drafter skips it for the step;
+//! its kept rows still reach the drafter's context through the commit. A copy is verified whole (the
+//! policy reads the drafter's probabilities) and takes part in the row budget at
+//! [`crate::copy::TOKEN_P`] a token.
+//!
 //! Every row type joins the same step: greedy, sampled and (with masks) constrained rows carry
 //! their own [`Pick`].
 
@@ -39,8 +46,9 @@ use std::sync::{mpsc, Arc};
 
 use glm53f_api::engine::QueuePlace;
 
+use crate::copy::CopyIndex;
 use crate::hostcache::{HostCache, Kind};
-use crate::model::{DecodeRow, DraftRow, ImageSpan, KvSlot, Limits, ModelForward, Pick, Segment, Token, Window};
+use crate::model::{DecodeRow, Draft, DraftRow, ImageSpan, KvSlot, Limits, ModelForward, Pick, Segment, Token, Window};
 use crate::pool::{Active, Pool, PoolStats, Prefilling};
 use crate::sampling::{After, Sampling};
 use crate::spec::SpecPolicy;
@@ -105,6 +113,10 @@ pub struct SchedulerConfig {
     /// (`crate::spec::budget`: past it the least likely drafts are dropped); 0 for no budget. A
     /// forward's verify pass must hold this many (or the slots' windows, if fewer).
     pub spec_max_rows: usize,
+    /// Copy windows for greedy requests (`crate::copy`): drafts copied from the request's own
+    /// context where its last tokens repeat an earlier span. Off here; the daemon's
+    /// `--copy-windows` decides.
+    pub copy_windows: bool,
     /// Granularity of the prefix index's shared-prefix count (4: GLM-5.3-Flash's indexer pool).
     pub granularity: usize,
     pub clock: Clock,
@@ -126,6 +138,7 @@ impl SchedulerConfig {
             spec: true,
             policy: SpecPolicy::default(),
             spec_max_rows: crate::spec::MAX_VERIFY_ROWS,
+            copy_windows: false,
             granularity: 4,
             clock: wall_clock(),
         }
@@ -169,15 +182,35 @@ pub struct SchedStats {
     /// Decode passes and the rows they carried.
     pub decode_steps: u64,
     pub decode_rows: u64,
-    /// Speculative steps, drafts verified and drafts accepted.
+    /// Speculative steps, their verify windows (one per request a step), drafts verified and drafts
+    /// accepted (copied tokens included).
     pub spec_steps: u64,
+    pub windows: u64,
     pub drafts_verified: u64,
     pub drafts_accepted: u64,
+    /// Windows that verified a copy (`crate::copy`), and their copied tokens verified and
+    /// accepted.
+    pub copy_windows: u64,
+    pub copies_verified: u64,
+    pub copies_accepted: u64,
     /// Requests refused at admission and requests that waited for memory.
     pub refused: u64,
     pub stalls: u64,
     /// Prompts deferred behind an identical prefill.
     pub deferred: u64,
+}
+
+impl SchedStats {
+    /// Tokens a verify window delivered on average (its accepted drafts and the target's own token;
+    /// a request stopping inside a run counts the run whole): over windows that verified a copy,
+    /// and over the others.
+    pub fn tokens_per_window(&self) -> (f64, f64) {
+        let other = self.windows - self.copy_windows;
+        (
+            (self.copies_accepted + self.copy_windows) as f64 / self.copy_windows.max(1) as f64,
+            (self.drafts_accepted - self.copies_accepted + other) as f64 / other.max(1) as f64,
+        )
+    }
 }
 
 /// Whether prompt `ids` starts with the in-flight prompt `inflight` (worth waiting for: its
@@ -200,7 +233,7 @@ fn start<S: KvSlot>(pool: &mut Pool<S>, active: &mut Vec<Active<S>>, p: Prefilli
     let done = eos.contains(&next) || max <= 1;
     let mut hist = ids;
     hist.push(next);
-    let a = Active { slot, last: next, generated: 1, max, tx, cancel, hist, points, sampling };
+    let a = Active { slot, last: next, generated: 1, max, tx, cancel, hist, points, sampling, copy: CopyIndex::default() };
     if a.tx.send(Ok(next)).is_err() || done {
         pool.retire(a);
     } else {
@@ -236,7 +269,11 @@ impl<M: ModelForward> Scheduler<M> {
         let spec = cfg.spec && limits.block > 1;
         let pool = Pool::new(slots, cache, cfg.bank, cfg.min_retain, cfg.granularity);
         eprintln!("[coordinator] decode: {}; device snapshot banks {} prompt + {} turn",
-            if spec { format!("speculative (block {})", limits.block) } else { "one token per step".to_string() },
+            match (spec, cfg.copy_windows) {
+                (true, true) => format!("speculative (block {}), copy windows for greedy requests", limits.block),
+                (true, false) => format!("speculative (block {})", limits.block),
+                (false, _) => "one token per step".to_string(),
+            },
             cfg.bank, cfg.bank);
         Scheduler {
             model,
@@ -621,30 +658,77 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    /// Copy windows for this step (`crate::copy`): per running request, the tokens it verifies in
+    /// place of drafts (at most its cap), or none. Only greedy requests copy: a sampled request's
+    /// draw leaves the copied text more often, and a failed copy costs the step its drafts.
+    fn copies(&mut self, caps: &[usize]) -> Vec<Vec<Token>> {
+        let (on, bound) = (self.cfg.copy_windows, self.limits.sample_vocab);
+        self.active
+            .iter_mut()
+            .zip(caps)
+            .map(|(a, &k)| {
+                if !on || a.sampling.is_some() {
+                    return Vec::new();
+                }
+                if a.copy.indexed() == 0 {
+                    // Room for every position the request can reach, so its index never rehashes.
+                    a.copy.reserve(a.hist.len() + a.max - a.generated);
+                }
+                a.copy.propose(&a.hist, k, bound)
+            })
+            .collect()
+    }
+
     /// One speculative step (perf reset S1): draft, choose each request's verify length, verify
     /// every window in one pass, accept the longest run the target agrees with, deliver it plus
-    /// the target's own next token, and commit exactly the delivered rows.
+    /// the target's own next token, and commit exactly the delivered rows. A request with a copy
+    /// window verifies its copy instead of drafts, and the drafter skips it.
     fn spec_step(&mut self) {
         let lim = self.limits;
         // Never draft past the token budget: a step emits at most k + 1.
         let caps: Vec<usize> = self.active.iter().map(|a| (a.max - a.generated - 1).min(lim.drafts())).collect();
-        let drafts = {
-            let mut rows: Vec<DraftRow<'_, M::Slot>> = self
-                .active
-                .iter_mut()
-                .zip(&caps)
-                .map(|(a, &k)| DraftRow { slot: &mut a.slot, last: a.last, max: k, pick: Pick::at(a.sampling, a.generated as u64) })
-                .collect();
-            self.model.draft(&mut rows)
-        };
-        let drafts = match drafts {
-            Ok(d) if d.len() == self.active.len() && d.iter().all(|d| d.probs.len() == d.tokens.len()) => d,
-            Ok(_) => return self.fail_active("draft", "the drafter returned a malformed draft".into()),
-            Err(e) => return self.fail_active("draft", e),
-        };
+        let copies = self.copies(&caps);
+        let mut drafts = vec![Draft::default(); self.active.len()];
+        let need = copies.iter().filter(|c| c.is_empty()).count();
+        if need > 0 {
+            let got = {
+                let mut rows: Vec<DraftRow<'_, M::Slot>> = self
+                    .active
+                    .iter_mut()
+                    .zip(&caps)
+                    .zip(&copies)
+                    .filter(|(_, c)| c.is_empty())
+                    .map(|((a, &k), _)| DraftRow { slot: &mut a.slot, last: a.last, max: k, pick: Pick::at(a.sampling, a.generated as u64) })
+                    .collect();
+                self.model.draft(&mut rows)
+            };
+            match got {
+                Ok(d) if d.len() == need && d.iter().all(|d| d.probs.len() == d.tokens.len()) => {
+                    let slots = drafts.iter_mut().zip(&copies).filter(|(_, c)| c.is_empty());
+                    for ((slot, _), d) in slots.zip(d) {
+                        *slot = d;
+                    }
+                }
+                Ok(_) => return self.fail_active("draft", "the drafter returned a malformed draft".into()),
+                Err(e) => return self.fail_active("draft", e),
+            }
+        }
+        for (d, c) in drafts.iter_mut().zip(&copies).filter(|(_, c)| !c.is_empty()) {
+            *d = Draft { tokens: c.clone(), probs: vec![crate::copy::TOKEN_P; c.len()] };
+        }
         let probs: Vec<Vec<f32>> = drafts.iter().map(|d| d.probs.clone()).collect();
-        // The policy's lengths, then the step's row budget (the most likely drafts first).
-        let ks = crate::spec::budget(&probs, &self.cfg.policy.lengths(&probs, &caps), self.cfg.spec_max_rows);
+        // The policy's lengths for drafted windows (a copy is verified whole), then the step's row
+        // budget (the most likely drafts first).
+        let policy_caps: Vec<usize> = caps.iter().zip(&copies).map(|(&k, c)| if c.is_empty() { k } else { 0 }).collect();
+        let lengths: Vec<usize> = self
+            .cfg
+            .policy
+            .lengths(&probs, &policy_caps)
+            .into_iter()
+            .zip(&copies)
+            .map(|(k, c)| if c.is_empty() { k } else { c.len() })
+            .collect();
+        let ks = crate::spec::budget(&probs, &lengths, self.cfg.spec_max_rows);
         let blocks: Vec<Vec<Token>> = self
             .active
             .iter()
@@ -678,13 +762,19 @@ impl<M: ModelForward> Scheduler<M> {
         // window's first row is `last`, whose row the slot did not hold yet).
         let mut keeps = Vec::with_capacity(blocks.len());
         let mut done = Vec::with_capacity(blocks.len());
-        for ((a, b), g) in self.active.iter_mut().zip(&blocks).zip(&sel) {
+        for (((a, b), g), c) in self.active.iter_mut().zip(&blocks).zip(&sel).zip(&copies) {
             let mut acc = 0;
             while acc + 1 < b.len() && b[acc + 1] == g[acc] {
                 acc += 1;
             }
+            self.stats.windows += 1;
             self.stats.drafts_verified += (b.len() - 1) as u64;
             self.stats.drafts_accepted += acc as u64;
+            if !c.is_empty() {
+                self.stats.copy_windows += 1;
+                self.stats.copies_verified += (b.len() - 1) as u64;
+                self.stats.copies_accepted += acc as u64;
+            }
             let mut delivered = 0;
             let mut finished = false;
             for &next in b[1..=acc].iter().chain(std::iter::once(&g[acc])) {
@@ -713,5 +803,23 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
         self.active = keep;
+        if self.cfg.copy_windows && self.stats.spec_steps.is_multiple_of(COPY_LOG_STEPS) {
+            let st = &self.stats;
+            let (copied, drafted) = st.tokens_per_window();
+            eprintln!(
+                "[copy] {} steps, {} windows: {} copied ({:.1}%), {} of {} copied tokens kept ({:.1}%); {copied:.2} \
+                 tokens a copied window, {drafted:.2} a drafted one",
+                st.spec_steps,
+                st.windows,
+                st.copy_windows,
+                100.0 * st.copy_windows as f64 / st.windows.max(1) as f64,
+                st.copies_accepted,
+                st.copies_verified,
+                100.0 * st.copies_accepted as f64 / st.copies_verified.max(1) as f64
+            );
+        }
     }
 }
+
+/// Speculative steps between two log lines of the copy windows' counters.
+const COPY_LOG_STEPS: u64 = 64;

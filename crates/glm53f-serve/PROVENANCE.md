@@ -1,6 +1,6 @@
 # Provenance: glm53f-serve
 
-Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). All dates are 28 September 2026.
+Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). Dates are 28 and 29 September 2026.
 No code is copied. The daemon follows the shape of mimo26f-afd v1.2.0's coordinator binary and
 wires this repository's crates together.
 
@@ -18,6 +18,7 @@ wires this repository's crates together.
 | src/main.rs (the drafter) | The DFlash2 drafter loaded next to the weights before the KV is sized (its ring in each slot's fixed state), attached to the forward, verify passes sized for every slot's window, its memory logged; off in a development mode of fewer than 44 layers | 2026-09-28 |
 | src/main.rs (start-up memory) | The allocation order (the experts' and the forward's buffers before the KV pool, the pool from what is left) and the memory plan logged at start-up; the prefill lanes and the lane trace (`GLM53F_PROFILE`) | 2026-09-28 |
 | tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
+| src/lib.rs, src/main.rs (copy windows) | `--copy-windows on\|off` (`GLM53F_COPY_WINDOWS`), on by default, handed to the scheduler (`SchedulerConfig::copy_windows`); its documentation and test | 2026-09-29 |
 | Cargo.toml | The manifest | 2026-09-28 |
 
 ## Test data

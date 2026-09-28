@@ -16,7 +16,8 @@
 //!   slot's page and state export.
 //! - [`sampling`] and `gpu` (feature `cuda`): DS41RT v15's sampling contract, the per-row token
 //!   masks, the CPU reference and the GPU sampler.
-//! - [`spec`]: the verify-length policy.
+//! - [`spec`]: the verify-length policy; [`copy`]: copy windows, drafts copied from a greedy
+//!   request's own context.
 //! - [`queue`] and [`engine`]: the bounded request queue (429 before a response starts) and the
 //!   [`glm53f_api::Engine`] implementation; [`glm_prompt`]: GLM-5.3-Flash's chat template and
 //!   tokenizer for it.
@@ -26,6 +27,7 @@
 //! Ported from mimo26f-afd v1.2.0 `crates/mimo26-coordinator` (PROVENANCE.md records every
 //! behavioural difference). Standard library only.
 
+pub mod copy;
 pub mod engine;
 pub mod fp8;
 pub mod glm_prompt;

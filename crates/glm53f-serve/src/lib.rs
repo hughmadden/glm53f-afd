@@ -47,6 +47,7 @@
 //! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass: 2 overlaps one lane's attention with the other's experts on the ranks, 1 runs the pass serially |
 //! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (needs `--prefill-lanes 2`); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
+//! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
 //! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 (68 MiB less per slot and per snapshot) |
 //! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (64 MiB of GEMM scratch) |
@@ -147,6 +148,28 @@
 //! weights once, and the ranks read the experts each lane's rows name, so two lanes of many rows
 //! read most of the 288 experts twice. A run on the target hardware decides the range.
 //!
+//! # Copy windows
+//!
+//! Coding agents' output repeats its context: a file written back with an edit, an edit call
+//! quoting the lines it replaces. With `--copy-windows on` (the default) and the drafter, a greedy
+//! request whose last 24 tokens occurred earlier in its prompt or output verifies the up to 7 tokens
+//! that followed them instead of the drafter's proposals, and the drafter skips it for the step
+//! (`glm53f-coordinator`'s `copy` module; the idea is TensorFold's, as mimo26f-afd v1.3.0 ported
+//! it). The verify pass checks copied tokens as it checks drafts, so greedy output is unchanged.
+//! Sampled requests never copy: a draw leaves copied text more often, and a failed copy costs the
+//! step its drafts.
+//!
+//! - **Why 24 tokens.** Replayed on real text (`glm53f-coordinator`'s `copy_replay` example), an
+//!   entry of 8 tokens (mimo26f-afd's) copied in 101 rounds of a fresh-code reply and kept 37% of
+//!   the copied tokens; at 24, fresh code copied twice and prose never, while rewrites, edits and
+//!   quotes copied 86-96% of their replies at 7.9 tokens a copy round.
+//! - **Cost.** A step's lookup took 0.2-1.6 µs of host time per request (the median; at most 0.27
+//!   ms for 48 requests of a million tokens each), and a long prompt is indexed at up to 16,384
+//!   tokens a step over its first steps: 1.1 ms a step for a million tokens, 13.6 ms for the first
+//!   (`glm53f-coordinator`'s `copy_cost` example, on a development machine).
+//! - **Counters.** Every 64 speculative steps a `[copy]` line gives the windows copied, the copied
+//!   tokens kept, and the tokens a copied and a drafted window delivered.
+//!
 //! # Development mode
 //!
 //! `--dev-layers 0-N` runs decoder layers 0 to N only and applies the head to what comes out:
@@ -169,6 +192,7 @@ options:
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
   --prefill-rows <r>  --prefill-lanes 1|2  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
+  --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
 numerics under test (off by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
   --kda-state-bf16    KDA recurrent states stored in BF16 (D8)
@@ -283,6 +307,9 @@ pub struct Options {
     pub decode_lanes: (usize, usize),
     /// The DFlash2 drafter's directory (none: no speculative decoding).
     pub drafter: Option<PathBuf>,
+    /// With the drafter: copy windows for greedy requests
+    /// (`glm53f_coordinator::SchedulerConfig::copy_windows`).
+    pub copy_windows: bool,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
     pub dev_layers: Option<usize>,
     /// Numerics under test.
@@ -351,6 +378,15 @@ fn parse_ranks(s: &str) -> Result<Vec<String>, String> {
     Ok(addrs)
 }
 
+/// `on` or `off` (the environment's `1` and `0` too).
+fn on_off(flag: &str, v: &str) -> Result<bool, String> {
+    match v.trim() {
+        "on" | "1" => Ok(true),
+        "off" | "0" => Ok(false),
+        other => Err(format!("{flag}: {other:?}, expected on or off")),
+    }
+}
+
 fn number<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, String> {
     v.parse()
         .map_err(|_| format!("{flag}: {v:?} is not a valid number"))
@@ -386,6 +422,10 @@ impl Options {
         };
         let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
+        let mut copy_windows = match env("GLM53F_COPY_WINDOWS") {
+            Some(v) => on_off("GLM53F_COPY_WINDOWS", &v)?,
+            None => true,
+        };
         let mut numerics = Numerics::from_env(env);
         let mut it = args.iter();
         while let Some(k) = it.next() {
@@ -410,6 +450,7 @@ impl Options {
                 "--prefill-lanes" => prefill_lanes = number(k, &val()?)?,
                 "--decode-lanes" => decode_lanes = parse_decode_lanes(&val()?)?,
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
+                "--copy-windows" => copy_windows = on_off(k, &val()?)?,
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -471,6 +512,7 @@ impl Options {
             prefill_lanes,
             decode_lanes,
             drafter,
+            copy_windows,
             dev_layers,
             numerics,
         })
@@ -738,6 +780,30 @@ mod tests {
         // The flags take no value.
         let o = Options::parse(&args("--kda-state-bf16 --checkpoint /c"), &env).unwrap();
         assert!(o.numerics.kda_state_bf16 && o.checkpoint == PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn copy_windows_are_on_unless_turned_off() {
+        let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        assert!(Options::parse(&args("--checkpoint /c"), &env).unwrap().copy_windows);
+        let o = Options::parse(&args("--checkpoint /c --copy-windows off"), &env).unwrap();
+        assert!(!o.copy_windows);
+        let off = |k: &str| match k {
+            "GLM53F_COPY_WINDOWS" => Some("0".to_string()),
+            other => env(other),
+        };
+        assert!(!Options::parse(&args("--checkpoint /c"), &off).unwrap().copy_windows);
+        // The flag wins over the environment.
+        let o = Options::parse(&args("--checkpoint /c --copy-windows on"), &off).unwrap();
+        assert!(o.copy_windows);
+        for bad in ["--copy-windows", "--copy-windows yes"] {
+            assert!(Options::parse(&args(&format!("--checkpoint /c {bad}")), &env).is_err(), "{bad}");
+        }
+        let bad_env = |k: &str| match k {
+            "GLM53F_COPY_WINDOWS" => Some("maybe".to_string()),
+            other => env(other),
+        };
+        assert!(Options::parse(&args("--checkpoint /c"), &bad_env).is_err());
     }
 
     #[test]

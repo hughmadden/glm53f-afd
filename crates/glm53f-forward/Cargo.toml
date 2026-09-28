@@ -50,6 +50,8 @@ glm53f-coordinator = { path = "../glm53f-coordinator", optional = true }
 [dev-dependencies]
 # Mock expert ranks in tests/remote_experts.rs.
 glm53f-wire = { path = "../glm53f-wire" }
+# Chat requests rendered with the official template in tests/copy_windows.rs.
+glm53f-api = { path = "../glm53f-api" }
 
 [[example]]
 name = "gemm_bench"

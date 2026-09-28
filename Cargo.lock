@@ -31,6 +31,7 @@ version = "0.1.0"
 name = "glm53f-forward"
 version = "0.1.0"
 dependencies = [
+ "glm53f-api",
  "glm53f-coordinator",
  "glm53f-dflash",
  "glm53f-dsa",

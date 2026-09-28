@@ -80,7 +80,8 @@ mod daemon {
             ));
         }
         let eos = codec.stop_ids()?;
-        let sched = SchedulerConfig::from_env(eos.clone());
+        let mut sched = SchedulerConfig::from_env(eos.clone());
+        sched.copy_windows = o.copy_windows;
 
         // 1. The coordinator's weights: the embedding in host RAM, the rest on the GPU.
         let (free0, total) = s(device::mem_info())?;

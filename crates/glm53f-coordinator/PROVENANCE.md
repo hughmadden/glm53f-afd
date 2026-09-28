@@ -38,6 +38,8 @@ DS41RT code is copied here.
 | Device hidden quantizer | mimo26f-afd @ bab9fa2 : crates/mimo26-attn/kernels/kv_cache_fp8.cu (lines 160-169, 171-178) | `861f85df38b3641374a2a4ea1478c9c67502f9b4975e539da37dc0c569a5d5c3` | kernels/wire.cu | Kernel verbatim (namespace qualifier dropped); entry point renamed, takes a `cudaStream_t` | tests/gpu.rs | 2026-09-28 |
 | Sampler check | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/examples/sample_check.rs | `0fd93f37f84a1524b090abedb2d5d09ee942b6548b02ad94abd12f9df6539e99` | examples/sample_check.rs | GLM-5.3-Flash's widths (154,880 rows, ids below 154,856); `Pick`s through `gpu::select_rows_host` against `select_pick`; the timing covers the whole selection | `cargo run --release --features cuda --example sample_check` | 2026-09-28 |
 | Build script | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/build.rs | `a40762247399ff0f0c32e242210ba51322c07007b882cf12d483d4cc722fe15b` | build.rs | Rewritten in the shape of this repository's other kernel crates (`GLM53F_NVCC`, `GLM53F_CUDA_ARCH`, `GLM53F_CUDA_LIB`, cudart only); the source's nvcc flags kept | `--features cuda` builds | 2026-09-28 |
+| Copy windows' index (`CopyIndex`: grams, the chain of earlier occurrences, the longest backward match, the periodic run) | mimo26f-afd @ c6cc2ff (v1.3.0) : crates/mimo26-coordinator/src/copy.rs | `6ae2b7aad8e5874f054edfc8c2da7ae6c520be16a86a2d63621e3b24702f29e8` | src/copy.rs | Token ids `u32`; an entry of 24 matching tokens (`ENTRY`, `with_entry`) over the source's 8-token grams; grams keyed by a 64-bit fingerprint in the standard library's keyed map, each candidate checked against the context; at most `CATCH_UP` positions indexed a call, no copy until caught up; `reserve`; ids at or past the model's bound end a copy, and a copy under 2 tokens is none; `matched`, `indexed`, `bytes`. See Copy windows below | `copy::tests` (the source's 4 tests at its entry of 8 through `with_entry`, with the bound; 3 new); tests/copy_windows.rs; glm53f-forward tests/copy_windows.rs | 2026-09-29 |
+| Copy windows in the speculative step (greedy requests only; a copy verified in place of drafts; the drafter skips the request, whose kept rows still reach its context) | mimo26f-afd @ c6cc2ff : crates/mimo26-coordinator/src/api.rs (lines 221-222, 721, 767, 1029-1034) and src/dforward.rs (lines 1652-1695) | `5557d695ed06ab52b8e8f1d3be8bfbaa361148a9d5a583b9bcb9e7c0057cc1d1` (api.rs), `f6f449c5e9bb7fb73c2dab4003b0c3b41658fee9f24f78507279dc1549a50508` (dforward.rs) | src/scheduler.rs (`copies`, `spec_step`), src/pool.rs (`Active::copy`) | In the model-agnostic scheduler over `ModelForward::draft` (asked only for the requests without a copy); copies join the step's row budget at `copy::TOKEN_P` a token; `SchedulerConfig::copy_windows`, off in the shell (the daemon's `--copy-windows`, on by default, in place of `MIMO26_COPY`); counters and the `[copy]` line | tests/copy_windows.rs; glm53f-forward tests/copy_windows.rs | 2026-09-29 |
 
 ## Written here
 
@@ -48,9 +50,12 @@ DS41RT code is copied here.
 | src/glm_prompt.rs | `GlmPrompts`: GLM-5.3-Flash's tokenizer and chat template (`glm53f-tokenizer`) behind `PromptCodec`, the official template enforced | 2026-09-28 |
 | src/gpu.rs | FFI to the kernels and the few CUDA runtime calls, `DeviceBuffer`, `Sampler`, page-locking | 2026-09-28 |
 | src/lib.rs, Cargo.toml | Crate root and manifest | 2026-09-28 |
+| examples/copy_cost.rs | The copy index's host cost: the indexing rate, and a step's lookup at 1 and 48 requests with nothing and with everything matching, contexts up to 1,048,576 tokens | 2026-09-29 |
+| examples/copy_replay.rs | Copy windows replayed on real text through the tokenizer and template (no model): rounds with copies at an entry of 8 and of 24 tokens, and a copy at every position by the match behind it | 2026-09-29 |
 | kernels/select.cu (`mask_rows_kernel`, `glm53f_coord_mask_rows`) | The per-row grammar mask | 2026-09-28 |
 | kernels/glm53f_coord.h | The kernels' C ABI | 2026-09-28 |
 | tests/common/mod.rs | A toy deterministic model and slot behind the traits (its positional state is a hash of the whole prefix, checked on every call), simulated memory and time, a call log | 2026-09-28 |
+| tests/common/mod.rs (`copying_logits`, `copying_reference`, `MockModel::copying`), tests/copy_windows.rs | A copying variant of the toy model (its pick follows the last earlier occurrence of its last 8 tokens, one of them may differ, with edits) and the copy windows' tests (see Tests) | 2026-09-29 |
 | tests/scheduler.rs, tests/host_tier.rs, tests/engine.rs, tests/glm_prompt.rs, tests/gpu.rs | See Tests | 2026-09-28 |
 | tests/row_sharded.rs | Four real rank daemons on one GPU over loopback: the row-sharded return against the four-plane sum within the rank README's bound (BF16 and FP8 exchange) and both against the oracle's layers 3 and 4; decode stays four-plane; loopback timings; a dead peer fails the request | 2026-09-28 |
 | examples/wire_bench.rs | The exchange alone against four running ranks, four-plane and row-sharded on the same synthetic rows: per-exchange times, bytes into the coordinator, the two outputs' difference | 2026-09-28 |
@@ -119,6 +124,36 @@ DS41RT code is copied here.
     implemented.
 14. Not ported: the host reference backend (one request at a time on the CPU), vision encoding.
     New: counters (`SchedStats`, `PoolStats`).
+
+### Copy windows (mimo26f-afd v1.3.0)
+
+1. **The entry is 24 tokens.** The source proposed a copy on any match of its 8-token grams, as
+   TensorFold's tree proposer does; TensorFold's chain proposer (`DFlashProposer.propose`) replaces
+   the drafter's block only on a match of 24 (`confident_match`). This engine's drafter is a chain
+   cut at a confidence of 0.7, whose windows are short where it is unsure, while a copy verifies up
+   to 8 rows. Replayed on real text (`examples/copy_replay.rs`), an entry of 8 copied in 101
+   rounds of a 3,959-token fresh-code reply, keeping 37% of the copied tokens; 24 copied in 2, and
+   in none of a prose reply, while rewrites, edits and quotes copied 86-96% of their replies at
+   7.9 tokens a copy round. The index keeps the source's 8-token grams; the longest match among the
+   candidates must reach the entry.
+2. **Fingerprinted grams.** The source keyed its map by the 8 ids; here by a 64-bit fingerprint
+   (half the table at a million positions) in the standard library's keyed map, so a prompt cannot
+   flood a bucket. Each candidate is compared with the context, so a collision costs a candidate.
+3. **Bounded indexing.** The source indexed the whole context at a request's first proposal. Here
+   a call indexes at most `CATCH_UP` (16,384) positions and copies nothing until it has caught up,
+   so a million-token prompt (prefilled, or resumed from a snapshot) takes 64 steps, 1.1 ms each
+   (the median; 13.6 ms for the first, which first touches the reserved table), instead of one
+   step of about 90 ms (`examples/copy_cost.rs`). The scheduler reserves room for every position a
+   request can reach, so the map never rehashes (unreserved, growing maps stalled a step of 48
+   requests for up to 87 ms).
+4. **Ids past the bound end a copy** (image rows), and a copy cut below 2 tokens is none.
+5. **Where it runs.** The source proposed in its API loop and verified in its forward's
+   `spec_step`, which drafted only for the requests without a copy. Here the scheduler proposes
+   and asks `ModelForward::draft` only for the others; a copy skips the verify-length policy, as in
+   the source, and joins the step's row budget (new here) at `copy::TOKEN_P` a token.
+6. **The switch.** `SchedulerConfig::copy_windows`, off in the shell; the daemon's
+   `--copy-windows on|off` (`GLM53F_COPY_WINDOWS`), on by default, in place of `MIMO26_COPY`.
+   Counters in `SchedStats` and a `[copy]` line every 64 speculative steps (new).
 
 ### Host RAM tier
 
@@ -192,14 +227,17 @@ DS41RT code is copied here.
 
 ## Tests
 
-- **CPU** (`cargo test -p glm53f-coordinator`): 44 unit tests (sampling, radix, host tier, queue,
-  spec, streaming, wire over four mock ranks with the in-place sends' frames byte for byte, E4M3,
-  engine helpers) and 24 integration tests:
-  `tests/scheduler.rs` (11: batched decode, mixed greedy and sampled rows, admission waiting and
-  refusal, prefill segments between decode steps, verify windows with partial accepts, stops
-  inside an accepted run, radix reuse exact / extending / divergent with the branch gap, a
-  deferred identical prompt forking a running request, snapshots through RAM under bank pressure,
-  retained slots through RAM under memory pressure, a parked prefill resumed), `tests/host_tier.rs`
+- **CPU** (`cargo test -p glm53f-coordinator`): 52 unit tests (sampling, radix, host tier, queue,
+  spec, copy windows' index, streaming, wire over four mock ranks with the in-place sends' frames
+  byte for byte, E4M3, engine helpers) and 29 integration tests:
+  `tests/scheduler.rs` (12: batched decode, mixed greedy and sampled rows, admission waiting and
+  refusal, prefill segments between decode steps, verify windows with partial accepts, the verify
+  row budget, stops inside an accepted run, radix reuse exact / extending / divergent with the
+  branch gap, a deferred identical prompt forking a running request, snapshots through RAM under
+  bank pressure, retained slots through RAM under memory pressure, a parked prefill resumed),
+  `tests/copy_windows.rs` (4, on the copying toy model: every token serial decoding's with copy
+  windows on and off, copied windows never drafted for; sampled requests never copy; a stop inside
+  a copied run commits only what was delivered; copies held to the row budget), `tests/host_tier.rs`
   (3: page sharing and exact restores, the v1.1.1 eviction case, prompt before turn),
   `tests/engine.rs` (7), `tests/glm_prompt.rs` (3: 41 reference template renders through the
   API's parser; with `GLM53F_TOKENIZER` set, the official tokenizer's ids for 40 of them).
