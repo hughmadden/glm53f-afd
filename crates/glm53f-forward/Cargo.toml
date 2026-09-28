@@ -23,6 +23,7 @@ name = "glm53f-forward"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "GLM-5.3-Flash coordinator model path: device weights, BF16 GEMMs, the GLM device KV and the forward (prefill, decode, verify and commit)"
 publish = false
 

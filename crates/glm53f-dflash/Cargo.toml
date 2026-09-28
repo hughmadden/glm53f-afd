@@ -18,6 +18,7 @@ name = "glm53f-dflash"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "GLM-5.3-Flash DFlash2 drafter: f32 CPU reference, CUDA forward and the drafting seam"
 publish = false
 

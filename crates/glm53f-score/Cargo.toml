@@ -13,6 +13,7 @@ name = "glm53f-score"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "KL gate scorer: GLM-5.3-Flash's teacher-forced logits for the rows of a klgate plan, written as safetensors"
 publish = false
 

@@ -82,8 +82,8 @@
 //!
 //! # Prefill rows and lanes
 //!
-//! The default, 4,096 rows in two lanes of 2,048, comes from the first run on the fabric (4,096-row
-//! passes, one lane, traced per MoE layer): the coordinator's work between exchanges took 34.6 ms,
+//! Until 29 September 2026 the default was 4,096 rows in two lanes of 2,048; it came from the
+//! first run on the target hardware (4,096-row passes, one lane, traced per MoE layer): the coordinator's work between exchanges took 34.6 ms,
 //! the rank's compute 16.8 ms and the transfer about 8.6 ms, all serial. Two lanes overlap each
 //! lane's coordinator work with the other lane's exchange, so a layer costs about twice the larger
 //! of the two per lane. Taking the coordinator's work as linear in rows (0.25 ms at one row) and
@@ -138,13 +138,14 @@
 //! the largest request the pool admits: when that is less than `--max-context` (the model's
 //! 1,048,576 tokens by default), it says so.
 //!
-//! **Slots.** Each slot holds 181 MiB whatever its length (the KDA states and conv windows, and
-//! with the drafter its 40 MiB context ring). With the drafter a verify pass holds every slot's
+//! **Slots.** Each slot holds 113 MiB whatever its length with the default BF16 KDA states (181 MiB
+//! with `--kda-state-f32`): the KDA states and conv windows, and with the drafter its 40 MiB
+//! context ring. With the drafter a verify pass holds every slot's
 //! window of up to 8 rows, capped by the step's row budget (`GLM53F_SPEC_MAX_ROWS`, 256): its
 //! saved inputs and logits take about 4.9 MiB a row. The drafter's working memory grows with the
 //! slots too (152, 267 and 383 MiB for 16, 32 and 48). All of it comes out of the page pool. On
-//! the target's coordinator (31.4 GiB, the drafter on, the defaults otherwise), from its measured
-//! 16-slot plan and the buffers of the other counts:
+//! the target's coordinator (31.4 GiB, the drafter on), as first measured with F32 KDA states and
+//! two prefill lanes (see the note below the table for today's defaults):
 //!
 //! | Slots | Verify rows | Slots' state | Verify buffers | KV pool | Tokens |
 //! |---:|---:|---:|---:|---:|---:|

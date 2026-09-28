@@ -16,6 +16,8 @@
 name = "glm53f-api"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
 description = "OpenAI-compatible HTTP/1.1 API (A8): /v1/models + /v1/chat/completions, model Dialect seam (MiMo reference dialect), Engine trait"
 publish = false
 

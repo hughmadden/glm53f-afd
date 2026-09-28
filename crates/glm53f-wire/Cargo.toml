@@ -21,6 +21,8 @@
 name = "glm53f-wire"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
 description = "DS41RTE3 v3 request/compact-return frames (4360-B rows, 8192-B BF16 partials), CRC32C + seq L4 ladder"
 publish = false
 

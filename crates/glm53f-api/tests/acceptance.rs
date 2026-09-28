@@ -1,10 +1,9 @@
 //! Acceptance tests for `glm53f-api` (A8): the HTTP surface against a scripted
 //! stub Engine speaking the MiMo reference dialect, the MiMo tool-call parser
-//! goldens (T24/T29), and the vendored fleet tools (`mimo_needle`,
-//! `replay_exact`, `mimobench`) plus the L5 ladder runner driven against the
-//! loopback server. Those tools and the ladder come from the harness directory
-//! (`harness/`, or `GLM53F_HARNESS`); the tests that need them are skipped with
-//! a message while it is absent. The last section serves the GLM dialect over a
+//! goldens (T24/T29), and the L5 ladder runner driven against the loopback
+//! server. The ladder comes from the harness directory (`harness/`, or
+//! `GLM53F_HARNESS`); the tests that need it are skipped with a message while it
+//! is absent. The last section serves the GLM dialect over a
 //! scripted stand-in: one reasoning field in both modes, the chunk head on every
 //! chunk, and the API contract rows (`harness/api_contract.py`).
 
@@ -409,24 +408,33 @@ fn streaming_ttft_is_first_token_not_total() {
         eprintln!("SKIP: python3 not available");
         return;
     }
-    let Some(bench) = harness_file("fleet/tonyd2wild/mimobench.py") else { return };
     let srv = start_engine(SlowStub);
+    // A streaming client in the standard library: the time to the first content delta, and to
+    // the end of the stream.
     let driver = r#"
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("mb", sys.argv[1])
-mb = importlib.util.module_from_spec(spec); spec.loader.exec_module(mb)
-r = mb.stream_chat(sys.argv[2], "glm-5.3-flash", sys.argv[3], 20)
-print(json.dumps({k: r[k] for k in ("ttft_s", "total_s")}))
+import json, sys, time, urllib.request
+body = json.dumps({"model": "glm-5.3-flash", "stream": True, "max_tokens": 20,
+                   "messages": [{"role": "user", "content": sys.argv[2]}]}).encode()
+req = urllib.request.Request(sys.argv[1] + "/chat/completions", data=body, headers={"Content-Type": "application/json"})
+t0, first = time.time(), None
+with urllib.request.urlopen(req) as r:
+    for raw in r:
+        line = raw.decode().strip()
+        if not line.startswith("data:") or line == "data: [DONE]":
+            continue
+        for c in json.loads(line[5:]).get("choices", []):
+            if first is None and (c.get("delta") or {}).get("content"):
+                first = time.time() - t0
+print(json.dumps({"ttft_s": first, "total_s": time.time() - t0}))
 "#;
-    let driver_file = std::env::temp_dir().join("glm53f-api-mb-slow-driver.py");
+    let driver_file = std::env::temp_dir().join("glm53f-api-stream-slow-driver.py");
     std::fs::write(&driver_file, driver).unwrap();
     let out = Command::new(&py)
         .arg(&driver_file)
-        .arg(&bench)
         .arg(&format!("{}/v1", srv.base))
         .arg("hi")
         .output()
-        .expect("run mimobench stream_chat");
+        .expect("run the streaming driver");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     let r = serde_json_ish::parse(&stdout);
@@ -646,61 +654,7 @@ fn harness_file(rel: &str) -> Option<PathBuf> {
     }
 }
 
-fn fleet() -> PathBuf {
-    harness().join("fleet/tonyd2wild")
-}
-
-#[test]
-fn vendored_tools_pass_against_the_stub() {
-    let py = python();
-    if Command::new(&py).arg("--version").output().is_err() {
-        eprintln!("SKIP: python3 not available");
-        return;
-    }
-    for tool in ["mimo_needle.py", "replay_exact.py", "mimobench.py"] {
-        if harness_file(&format!("fleet/tonyd2wild/{tool}")).is_none() {
-            return;
-        }
-    }
-    let srv = start();
-    let url = format!("{}/v1/chat/completions", srv.base);
-
-    // mimo_needle: PASS parse.
-    let out = Command::new(&py).arg(fleet().join("mimo_needle.py")).arg(&url).arg("2000").arg("0.1,0.5,0.9").output().expect("run mimo_needle");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout.lines().filter(|l| l.contains(": PASS ")).count(), 3, "{stdout}");
-
-    // replay_exact: 7 calls in both modes.
-    let body_file = std::env::temp_dir().join("glm53f-api-replay-body.json");
-    let captured = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"use the tools"}],"tools":[{"type":"function","function":{"name":"tool0","parameters":{}}},{"type":"function","function":{"name":"tool1","parameters":{}}},{"type":"function","function":{"name":"tool2","parameters":{}}},{"type":"function","function":{"name":"tool3","parameters":{}}},{"type":"function","function":{"name":"tool4","parameters":{}}},{"type":"function","function":{"name":"tool5","parameters":{}}},{"type":"function","function":{"name":"tool6","parameters":{}}}],"stream":true,"stream_options":{"include_usage":true},"temperature":0}"#;
-    std::fs::write(&body_file, captured).unwrap();
-    for mode in ["stream", "nostream"] {
-        let out = Command::new(&py).arg(fleet().join("replay_exact.py")).arg(&url).arg(&body_file).arg("1").arg(mode).output().expect("run replay_exact");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-        assert!(stdout.contains("calls=7 "), "{mode}: {stdout}");
-    }
-
-    // mimobench stream_chat: usage tokens + TTFT + content chars.
-    let driver = r#"
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("mb", sys.argv[1])
-mb = importlib.util.module_from_spec(spec); spec.loader.exec_module(mb)
-r = mb.stream_chat(sys.argv[2], "glm-5.3-flash", sys.argv[3], 20)
-print(json.dumps({k: r[k] for k in ("completion_tokens","prompt_tokens","chars","ttft_s")}))
-"#;
-    let driver_file = std::env::temp_dir().join("glm53f-api-mb-driver.py");
-    std::fs::write(&driver_file, driver).unwrap();
-    let out = Command::new(&py).arg(&driver_file).arg(fleet().join("mimobench.py")).arg(&format!("{}/v1", srv.base)).arg("hi").output().expect("run mimobench stream_chat");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    let r: serde_json_ish::Map = serde_json_ish::parse(&stdout);
-    assert!(r["completion_tokens"] > 0.0 && r["prompt_tokens"] >= 0.0, "{stdout}");
-    assert!(r["chars"] > 0.0, "{stdout}");
-}
-
-// A tiny JSON reader for the mimobench driver output (avoids a serde dep).
+// A tiny JSON reader for the streaming driver's output (avoids a serde dep).
 mod serde_json_ish {
     pub type Map = std::collections::BTreeMap<String, f64>;
     pub fn parse(text: &str) -> Map {

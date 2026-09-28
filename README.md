@@ -92,8 +92,8 @@ alone. Their figures are as they report them; they were not re-run here.
 - **The single-stream row is like for like.** This engine ran mmastrac's own `dev/repro/decode.py`
   prompts and method: 512 tokens, temperature 0, the median of three runs after a warm-up, tok/s
   including the time to the first token.
-  - That recipe's "thinking off" renders the model's low reasoning effort, which is what
-    `reasoning_effort: "low"` renders here.
+  - That recipe's "thinking off" renders the model's low reasoning effort. So does this engine's
+    since 29 September (`reasoning_effort: "low"` renders the same).
   - Its figures are the ones reported in its commit
     [`3e03894`](https://github.com/mmastrac/glm-5.3-flash-4x-gx10/commit/3e03894ef0) on that
     branch. Against them this engine is 11% / 20% / 22% faster. The branch has moved on since:
@@ -174,6 +174,14 @@ curl -N http://<api-host>:8100/v1/chat/completions -H 'Content-Type: application
 The API serves `GET /v1/models` and `POST /v1/chat/completions`, streamed or not, with tool calls
 and reasoning (`reasoning_content`). Thinking is on by default, as the model's chat template renders
 it.
+- The template has no thinking-off mode; it renders a reasoning effort of Low, High or Max, Max by
+  default.
+- A request that turns thinking off (`chat_template_kwargs.enable_thinking: false`, or
+  `thinking.type: "disabled"`) gets the template's Low effort: a short plan under
+  `reasoning_content`, then the answer.
+- `reasoning_effort: "none"` asks for no reasoning at all (an empty think block), for callers with
+  tiny token budgets.
+- `reasoning_effort: "low"` / `"high"` / `"max"` choose the effort directly.
 
 ## Status and limitations
 
