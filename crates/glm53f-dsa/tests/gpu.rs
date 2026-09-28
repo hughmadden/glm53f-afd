@@ -1,10 +1,12 @@
 //! CUDA kernels against the CPU reference on random data (feature `cuda`).
 //!
 //! Run with `cargo test --release --features cuda --test gpu`. The tests use
-//! well under 1 GiB of device memory and skip when less than 2 GiB is free.
+//! well under 1 GiB of device memory, take turns on the GPU, and skip when less
+//! than 2 GiB is free.
 #![cfg(feature = "cuda")]
 
 use std::ptr;
+use std::sync::{Mutex, MutexGuard};
 
 use glm53f_dsa::cache::{self, PagedLayer, Tail, PAGE_LAYER_BYTES, PAGE_POOLS, PAGE_TOKENS};
 use glm53f_dsa::config::DsaConfig;
@@ -19,20 +21,26 @@ use glm53f_dsa::select::{self, top_k};
 
 const MIN_FREE: usize = 2 << 30;
 
-/// Skip (return false) when the shared GPU is short of memory.
-fn gpu_ready() -> bool {
+/// The tests take turns on the GPU: a CUDA graph capture (in
+/// `index_select_workspace_reuse`) is invalidated by a device-wide
+/// synchronization from another thread.
+static GPU: Mutex<()> = Mutex::new(());
+
+/// The GPU, or None (skip) when the shared GPU is short of memory.
+fn gpu_ready() -> Option<MutexGuard<'static, ()>> {
+    let guard = GPU.lock().unwrap_or_else(|e| e.into_inner());
     match gpu::mem_info() {
         Ok((free, _)) if free >= MIN_FREE => {
             gpu::init().expect("init");
-            true
+            Some(guard)
         }
         Ok((free, _)) => {
             eprintln!("skipping: {} MiB free on the GPU", free >> 20);
-            false
+            None
         }
         Err(e) => {
             eprintln!("skipping: {e}");
-            false
+            None
         }
     }
 }
@@ -94,9 +102,9 @@ fn random_latent(rng: &mut Rng) -> Vec<f32> {
 
 #[test]
 fn latent_write_is_bit_exact() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(1);
     let tokens = 300;
     let table = shuffled_table(tokens, &mut rng);
@@ -157,9 +165,9 @@ fn latent_write_is_bit_exact() {
 /// and the tail rewrite after acceptance.
 #[test]
 fn pool_write_and_tail_commit_match_cpu() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let cfg = DsaConfig::glm53_flash();
     let mut rng = Rng::new(2);
     let d = 128;
@@ -318,45 +326,141 @@ struct IndexOut {
     max_pools: usize,
 }
 
+/// `glm53f_dsa_index_select` and its variants (same signature).
+type SelectFn = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    f32,
+    *const i32,
+    *const i32,
+    i32,
+    i32,
+    DsaCache,
+    i32,
+    i32,
+    *mut core::ffi::c_void,
+    u64,
+    *mut i32,
+    *mut i32,
+    *mut i32,
+    *mut f32,
+    ffi::CudaStream,
+) -> i32;
+
+/// Device inputs, workspace and outputs of one selection case.
+struct IndexRun {
+    dev: DevCache,
+    ws: DeviceBuffer,
+    ws_bytes: u64,
+    q: DeviceBuffer,
+    w: DeviceBuffer,
+    pos: DeviceBuffer,
+    req: DeviceBuffer,
+    pools: DeviceBuffer,
+    tokens: DeviceBuffer,
+    counts: DeviceBuffer,
+    scores: DeviceBuffer,
+    rows: usize,
+    max_pools: usize,
+    chunk_pools: i32,
+    chunks: i32,
+    score_scale: f32,
+}
+
+impl IndexRun {
+    /// Uploads the case; the plan is glm53f_dsa_index_plan's unless `chunk_pools` is given.
+    fn new(case: &IndexCase, score_scale: f32, chunk_pools: Option<i32>) -> Self {
+        let rows = case.pos.len();
+        let max_pools = ((*case.pos.iter().max().unwrap() + 1) / 4).max(1) as usize;
+        let (sms, _, _) = gpu::device_info().unwrap();
+        let (mut cp, mut chunks) = (0i32, 0i32);
+        unsafe { ffi::glm53f_dsa_index_plan(rows as i32, max_pools as i32, sms, &mut cp, &mut chunks) };
+        if let Some(c) = chunk_pools {
+            cp = c;
+            chunks = (max_pools as i32 + c - 1) / c;
+        }
+        let ws_bytes = unsafe { ffi::glm53f_dsa_index_workspace_bytes(rows as i32, chunks) };
+        Self {
+            dev: DevCache::upload(&case.layer, &case.table, case.table.len()),
+            ws: DeviceBuffer::alloc(ws_bytes as usize).unwrap(),
+            ws_bytes,
+            q: DeviceBuffer::from_slice(&case.q).unwrap(),
+            w: DeviceBuffer::from_slice(&case.w).unwrap(),
+            pos: DeviceBuffer::from_slice(&case.pos).unwrap(),
+            req: DeviceBuffer::from_slice(&vec![0i32; rows]).unwrap(),
+            pools: DeviceBuffer::alloc(rows * 512 * 4).unwrap(),
+            tokens: DeviceBuffer::alloc(rows * 2051 * 4).unwrap(),
+            counts: DeviceBuffer::alloc(rows * 2 * 4).unwrap(),
+            scores: DeviceBuffer::alloc(rows * max_pools * 4).unwrap(),
+            rows,
+            max_pools,
+            chunk_pools: cp,
+            chunks,
+            score_scale,
+        }
+    }
+
+    /// Fills the workspace with one byte value (and waits: launches may use another stream).
+    fn fill_workspace(&self, byte: u8) {
+        check(unsafe { ffi::cudaMemset(self.ws.ptr(), byte as i32, self.ws.bytes()) }, "memset").unwrap();
+        gpu::sync().unwrap();
+    }
+
+    /// Clears the outputs (scores to NaN, the rest to 0x7F bytes).
+    fn clear_outputs(&self) {
+        self.scores.upload(&vec![f32::NAN; self.rows * self.max_pools]).unwrap();
+        for b in [&self.pools, &self.tokens, &self.counts] {
+            check(unsafe { ffi::cudaMemset(b.ptr(), 0x7F, b.bytes()) }, "memset").unwrap();
+        }
+        gpu::sync().unwrap();
+    }
+
+    /// Launches `f` on `stream` (no synchronization).
+    fn launch(&self, f: SelectFn, stream: ffi::CudaStream) -> Result<(), String> {
+        check(
+            unsafe {
+                f(
+                    self.q.as_ptr(), self.w.as_ptr(), self.score_scale, self.pos.as_ptr(), self.req.as_ptr(), self.rows as i32, self.max_pools as i32,
+                    self.dev.view(), self.chunk_pools, self.chunks, self.ws.ptr(), self.ws_bytes, self.pools.as_mut_ptr(), self.tokens.as_mut_ptr(),
+                    self.counts.as_mut_ptr(), self.scores.as_mut_ptr(), stream,
+                )
+            },
+            "index_select",
+        )
+    }
+
+    fn outputs(&self) -> IndexOut {
+        gpu::sync().unwrap();
+        IndexOut {
+            pools: self.pools.download(self.rows * 512).unwrap(),
+            tokens: self.tokens.download(self.rows * 2051).unwrap(),
+            counts: self.counts.download(self.rows * 2).unwrap(),
+            scores: self.scores.download(self.rows * self.max_pools).unwrap(),
+            max_pools: self.max_pools,
+        }
+    }
+}
+
+/// One call of `f` on a workspace filled with `fill` (0 for index_select_prepared).
+fn run_index_with(case: &IndexCase, score_scale: f32, chunk_pools: Option<i32>, f: SelectFn, fill: u8) -> IndexOut {
+    let run = IndexRun::new(case, score_scale, chunk_pools);
+    run.fill_workspace(fill);
+    run.clear_outputs();
+    run.launch(f, ptr::null_mut()).unwrap();
+    run.outputs()
+}
+
+/// `glm53f_dsa_index_select` on a workspace that holds garbage.
 fn run_index(case: &IndexCase, score_scale: f32, chunk_pools: Option<i32>) -> IndexOut {
-    let rows = case.pos.len();
-    let max_pools = ((*case.pos.iter().max().unwrap() + 1) / 4).max(1) as usize;
-    let dev = DevCache::upload(&case.layer, &case.table, case.table.len());
-    let (sms, _, _) = gpu::device_info().unwrap();
-    let (mut cp, mut chunks) = (0i32, 0i32);
-    unsafe { ffi::glm53f_dsa_index_plan(rows as i32, max_pools as i32, sms, &mut cp, &mut chunks) };
-    if let Some(c) = chunk_pools {
-        cp = c;
-        chunks = (max_pools as i32 + c - 1) / c;
-    }
-    let ws_bytes = unsafe { ffi::glm53f_dsa_index_workspace_bytes(rows as i32, chunks) };
-    let ws = DeviceBuffer::alloc(ws_bytes as usize).unwrap();
-    let dq = DeviceBuffer::from_slice(&case.q).unwrap();
-    let dw = DeviceBuffer::from_slice(&case.w).unwrap();
-    let dpos = DeviceBuffer::from_slice(&case.pos).unwrap();
-    let dreq = DeviceBuffer::from_slice(&vec![0i32; rows]).unwrap();
-    let pools = DeviceBuffer::zeroed(rows * 512 * 4).unwrap();
-    let tokens = DeviceBuffer::zeroed(rows * 2051 * 4).unwrap();
-    let counts = DeviceBuffer::zeroed(rows * 2 * 4).unwrap();
-    let dbg = DeviceBuffer::from_slice(&vec![f32::NAN; rows * max_pools]).unwrap();
-    check(
-        unsafe {
-            ffi::glm53f_dsa_index_select(
-                dq.as_ptr(), dw.as_ptr(), score_scale, dpos.as_ptr(), dreq.as_ptr(), rows as i32, max_pools as i32, dev.view(), cp, chunks, ws.ptr(), ws_bytes,
-                pools.as_mut_ptr(), tokens.as_mut_ptr(), counts.as_mut_ptr(), dbg.as_mut_ptr(), ptr::null_mut(),
-            )
-        },
-        "index_select",
-    )
-    .unwrap();
-    gpu::sync().unwrap();
-    IndexOut {
-        pools: pools.download(rows * 512).unwrap(),
-        tokens: tokens.download(rows * 2051).unwrap(),
-        counts: counts.download(rows * 2).unwrap(),
-        scores: dbg.download(rows * max_pools).unwrap(),
-        max_pools,
-    }
+    run_index_with(case, score_scale, chunk_pools, ffi::glm53f_dsa_index_select, 0xA5)
+}
+
+fn assert_same_selection(got: &IndexOut, want: &IndexOut, what: &str) {
+    assert_eq!(got.counts, want.counts, "{what}: counts");
+    assert_eq!(got.pools, want.pools, "{what}: pools");
+    assert_eq!(got.tokens, want.tokens, "{what}: tokens");
+    let same_scores = got.scores.iter().zip(&want.scores).all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(same_scores, "{what}: scores differ");
 }
 
 fn cpu_scores(case: &IndexCase, r: usize, scale: f32) -> Vec<f32> {
@@ -400,9 +504,9 @@ fn check_row_layout(out: &IndexOut, r: usize, pos: usize, want_pools: &[u32]) {
 /// many ties, must match exactly. Tiny chunks force three merge levels.
 #[test]
 fn index_select_exact_on_integer_data() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(3);
     let pos = vec![19_999, 2050, 2051, 10_002, 3, 1, 2046, 7_777];
     let case = build_index_case(&mut rng, pos.clone(), true);
@@ -429,9 +533,9 @@ fn index_select_exact_on_integer_data() {
 /// the CPU's only at near-ties.
 #[test]
 fn index_select_random_matches_cpu() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(4);
     let scale = (128f32).powf(-0.5);
     let pos = vec![40_003, 2051, 9_000, 1_000];
@@ -473,13 +577,76 @@ fn index_select_random_matches_cpu() {
     eprintln!("random index scores: worst |gpu - cpu| / bound = {worst:.3}; near-tie swaps {boundary}");
 }
 
+/// The fused kernel (`index_select`, `index_select_prepared`) and the first
+/// implementation (`index_select_v1`) return identical scores, selections and
+/// token lists on random data, dense and sparse rows alike, for the default
+/// plan, many small chunks (three merge levels) and one chunk per row (no
+/// merge).
+#[test]
+fn index_select_variants_agree() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let mut rng = Rng::new(9);
+    let scale = (128f32).powf(-0.5);
+    let pos = vec![60_001, 2051, 9_000, 1_000, 2_050, 33_333, 4_096, 20_480];
+    let case = build_index_case(&mut rng, pos, false);
+    for chunk in [None, Some(64), Some(15_040)] {
+        let v1 = run_index_with(&case, scale, chunk, ffi::glm53f_dsa_index_select_v1, 0);
+        let v2 = run_index_with(&case, scale, chunk, ffi::glm53f_dsa_index_select, 0xA5);
+        let v2p = run_index_with(&case, scale, chunk, ffi::glm53f_dsa_index_select_prepared, 0);
+        assert_same_selection(&v2, &v1, &format!("index_select vs v1, chunk {chunk:?}"));
+        assert_same_selection(&v2p, &v1, &format!("index_select_prepared vs v1, chunk {chunk:?}"));
+    }
+}
+
+/// One workspace across calls: `index_select` on garbage, repeated;
+/// `index_select_prepared` after one zero-fill, repeated and interleaved with
+/// `index_select`; both captured in CUDA graphs and replayed. Every call gives
+/// the first implementation's result.
+#[test]
+fn index_select_workspace_reuse() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let mut rng = Rng::new(10);
+    let scale = (128f32).powf(-0.5);
+    let case = build_index_case(&mut rng, vec![50_001, 7_000, 2_051, 12], false);
+    let want = run_index_with(&case, scale, Some(64), ffi::glm53f_dsa_index_select_v1, 0);
+    let run = IndexRun::new(&case, scale, Some(64));
+    let expect = |what: &str| assert_same_selection(&run.outputs(), &want, what);
+    run.fill_workspace(0xFF);
+    for i in 0..3 {
+        run.clear_outputs();
+        run.launch(ffi::glm53f_dsa_index_select, ptr::null_mut()).unwrap();
+        expect(&format!("index_select call {i} on garbage"));
+    }
+    run.fill_workspace(0);
+    for (i, f) in [ffi::glm53f_dsa_index_select_prepared, ffi::glm53f_dsa_index_select_prepared, ffi::glm53f_dsa_index_select, ffi::glm53f_dsa_index_select_prepared]
+        .into_iter()
+        .enumerate()
+    {
+        run.clear_outputs();
+        run.launch(f, ptr::null_mut()).unwrap();
+        expect(&format!("interleaved call {i}"));
+    }
+    let stream = gpu::Stream::new().unwrap();
+    for f in [ffi::glm53f_dsa_index_select as SelectFn, ffi::glm53f_dsa_index_select_prepared] {
+        run.clear_outputs();
+        // 4 calls captured in one graph, replayed 3 times.
+        gpu::time_graph_us(&stream, 4, 3, |s| run.launch(f, s)).unwrap();
+        expect("graph replay");
+    }
+}
+
 /// 1M-token context (262,144 pools): the kept set is exactly the top 512 of the
-/// GPU's scores, and sampled scores match the CPU.
+/// GPU's scores, sampled scores match the CPU, and the prepared variant and
+/// the first implementation return the same outputs.
 #[test]
 fn index_select_one_million_tokens() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(5);
     let n_pools = 262_144usize;
     let pages = n_pools / PAGE_POOLS;
@@ -540,6 +707,7 @@ fn index_select_one_million_tokens() {
         let tokens = DeviceBuffer::zeroed(rows * 2051 * 4).unwrap();
         let counts = DeviceBuffer::zeroed(rows * 8).unwrap();
         let dbg = DeviceBuffer::alloc(rows * max_pools * 4).unwrap();
+        check(unsafe { ffi::cudaMemset(dbg.ptr(), 0x7F, dbg.bytes()) }, "memset").unwrap();
         check(
             unsafe {
                 ffi::glm53f_dsa_index_select(
@@ -558,6 +726,32 @@ fn index_select_one_million_tokens() {
             scores: dbg.download(rows * max_pools).unwrap(),
             max_pools,
         };
+        // The prepared variant and the first implementation agree exactly.
+        for (name, f) in [("index_select_prepared", ffi::glm53f_dsa_index_select_prepared as SelectFn), ("index_select_v1", ffi::glm53f_dsa_index_select_v1)] {
+            ws.zero().unwrap();
+            for b in [&pools, &tokens, &counts, &dbg] {
+                check(unsafe { ffi::cudaMemset(b.ptr(), 0x7F, b.bytes()) }, "memset").unwrap();
+            }
+            check(
+                unsafe {
+                    f(
+                        dq.as_ptr(), dw.as_ptr(), scale, dpos.as_ptr(), dreq.as_ptr(), rows as i32, max_pools as i32, view, cp, chunks, ws.ptr(), ws_bytes,
+                        pools.as_mut_ptr(), tokens.as_mut_ptr(), counts.as_mut_ptr(), dbg.as_mut_ptr(), ptr::null_mut(),
+                    )
+                },
+                name,
+            )
+            .unwrap();
+            gpu::sync().unwrap();
+            let other = IndexOut {
+                pools: pools.download(rows * 512).unwrap(),
+                tokens: tokens.download(rows * 2051).unwrap(),
+                counts: counts.download(rows * 2).unwrap(),
+                scores: dbg.download(rows * max_pools).unwrap(),
+                max_pools,
+            };
+            assert_same_selection(&other, &out, &format!("1M context, {rows} row(s): {name}"));
+        }
         for r in 0..rows {
             let p = pos[r] as usize;
             let n = (p + 1) / 4;
@@ -620,8 +814,27 @@ fn random_token_list(rng: &mut Rng, tokens: usize, n: usize) -> Vec<u32> {
     v
 }
 
+/// `glm53f_dsa_mla_sparse_attn` and its first implementation (same signature).
+type AttnFn = unsafe extern "C" fn(
+    *const u16,
+    *const i32,
+    i32,
+    *const i32,
+    *const i32,
+    i32,
+    f32,
+    DsaCache,
+    i32,
+    i32,
+    *mut core::ffi::c_void,
+    u64,
+    *mut f32,
+    *mut f32,
+    ffi::CudaStream,
+) -> i32;
+
 #[allow(clippy::too_many_arguments)]
-fn run_attn(case: &AttnCase, q_bf16: &[u16], lists: &[Vec<u32>], splits: i32, groups: i32) -> (Vec<f32>, Vec<f32>) {
+fn run_attn(case: &AttnCase, f: AttnFn, q_bf16: &[u16], lists: &[Vec<u32>], splits: i32, groups: i32) -> (Vec<f32>, Vec<f32>) {
     let rows = lists.len();
     let dev = DevCache::upload(&case.layer, &case.table, case.table.len());
     let mut toks = vec![-1i32; rows * 2051];
@@ -642,7 +855,7 @@ fn run_attn(case: &AttnCase, q_bf16: &[u16], lists: &[Vec<u32>], splits: i32, gr
     let lse = DeviceBuffer::zeroed(rows * 64 * 4).unwrap();
     check(
         unsafe {
-            ffi::glm53f_dsa_mla_sparse_attn(
+            f(
                 dq.as_ptr(), dt.as_ptr(), 2051, dc.as_ptr(), dreq.as_ptr(), rows as i32, 0.0625, dev.view(), splits, groups, ws.ptr(), ws_bytes,
                 o.as_mut_ptr(), lse.as_mut_ptr(), ptr::null_mut(),
             )
@@ -656,12 +869,14 @@ fn run_attn(case: &AttnCase, q_bf16: &[u16], lists: &[Vec<u32>], splits: i32, gr
 
 /// Sparse attention against the CPU (decoded FP8 latents, BF16 query) for
 /// selections of 2,051, 2,048, 777, 64 and 1 tokens, split and unsplit, with 1,
-/// 2 and 4 head groups per block.
+/// 2 and 4 head groups per block and glm53f_dsa_mla_plan's plan: the current
+/// kernel and the first implementation, each within the same bounds, and
+/// within those bounds of each other.
 #[test]
 fn sparse_attention_matches_cpu() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(6);
     let tokens = 3000;
     let case = build_attn_case(&mut rng, tokens);
@@ -672,26 +887,40 @@ fn sparse_attention_matches_cpu() {
     let qr: Vec<f32> = q_bf16.iter().map(|b| bf16_bits_to_f32(*b)).collect();
     let want: Vec<(Vec<f32>, Vec<f32>)> = (0..rows).map(|r| cpu_attention(&qr[r * 32768..(r + 1) * 32768], &case.latents, &lists[r], 0.0625)).collect();
     let amax = case.latents.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));
-    for (splits, groups) in [(1, 1), (1, 2), (1, 4), (4, 1), (8, 2), (33, 1)] {
-        let (o, lse) = run_attn(&case, &q_bf16, &lists, splits, groups);
-        let mut worst_rel = 0.0f64;
-        for r in 0..rows {
-            for h in 0..64 {
-                let (w, g) = (&want[r].0[h * 512..(h + 1) * 512], &o[(r * 64 + h) * 512..(r * 64 + h + 1) * 512]);
-                let num: f64 = w.iter().zip(g).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-                let den: f64 = w.iter().map(|a| (*a as f64).powi(2)).sum();
-                let rel = (num / den.max(1e-30)).sqrt();
-                worst_rel = worst_rel.max(rel);
-                // BF16 probabilities: relative 2^-9 per weight.
-                assert!(rel < 4e-3, "splits {splits} groups {groups} row {r} head {h}: rel {rel}");
-                for (a, b) in w.iter().zip(g) {
-                    assert!((a - b).abs() <= 4e-3 * amax, "row {r} head {h}: {a} vs {b}");
+    let (sms, _, _) = gpu::device_info().unwrap();
+    let (mut plan_splits, mut plan_groups) = (0i32, 0i32);
+    unsafe { ffi::glm53f_dsa_mla_plan(rows as i32, 2051, sms, &mut plan_splits, &mut plan_groups) };
+    assert!((1..=64).contains(&plan_splits) && [1, 2, 4].contains(&plan_groups), "plan {plan_splits} x {plan_groups}");
+    let kernels: [(&str, AttnFn); 2] = [("sparse_attn", ffi::glm53f_dsa_mla_sparse_attn), ("sparse_attn_v1", ffi::glm53f_dsa_mla_sparse_attn_v1)];
+    for (splits, groups) in [(1, 1), (1, 2), (1, 4), (4, 1), (8, 2), (33, 1), (plan_splits, plan_groups)] {
+        let outs: Vec<(Vec<f32>, Vec<f32>)> = kernels.iter().map(|(_, f)| run_attn(&case, *f, &q_bf16, &lists, splits, groups)).collect();
+        for ((name, _), (o, lse)) in kernels.iter().zip(&outs) {
+            let mut worst_rel = 0.0f64;
+            for r in 0..rows {
+                for h in 0..64 {
+                    let (w, g) = (&want[r].0[h * 512..(h + 1) * 512], &o[(r * 64 + h) * 512..(r * 64 + h + 1) * 512]);
+                    let num: f64 = w.iter().zip(g).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+                    let den: f64 = w.iter().map(|a| (*a as f64).powi(2)).sum();
+                    let rel = (num / den.max(1e-30)).sqrt();
+                    worst_rel = worst_rel.max(rel);
+                    // 16-bit probabilities: relative 2^-9 (BF16, v1) or 2^-11 (F16) per weight.
+                    assert!(rel < 4e-3, "{name} splits {splits} groups {groups} row {r} head {h}: rel {rel}");
+                    for (a, b) in w.iter().zip(g) {
+                        assert!((a - b).abs() <= 4e-3 * amax, "{name} row {r} head {h}: {a} vs {b}");
+                    }
+                    let (wl, gl) = (want[r].1[h], lse[r * 64 + h]);
+                    assert!((wl - gl).abs() <= 1e-4 * (1.0 + wl.abs()), "{name} lse row {r} head {h}: {wl} vs {gl}");
                 }
-                let (wl, gl) = (want[r].1[h], lse[r * 64 + h]);
-                assert!((wl - gl).abs() <= 1e-4 * (1.0 + wl.abs()), "lse row {r} head {h}: {wl} vs {gl}");
             }
+            eprintln!("{name} splits {splits} groups {groups}: worst per-head rel L2 vs CPU {worst_rel:.2e}");
         }
-        eprintln!("sparse attention splits {splits} groups {groups}: worst per-head rel L2 {worst_rel:.2e}");
+        let (a, b) = (&outs[0].0, &outs[1].0);
+        for rh in 0..rows * 64 {
+            let (x, y) = (&a[rh * 512..(rh + 1) * 512], &b[rh * 512..(rh + 1) * 512]);
+            let num: f64 = x.iter().zip(y).map(|(p, q)| ((p - q) as f64).powi(2)).sum();
+            let den: f64 = y.iter().map(|q| (*q as f64).powi(2)).sum();
+            assert!((num / den.max(1e-30)).sqrt() < 4e-3, "current vs first kernel, row-head {rh}");
+        }
     }
 }
 
@@ -700,9 +929,9 @@ fn sparse_attention_matches_cpu() {
 /// expanded reference form on FP8-decoded latents.
 #[test]
 fn absorbed_gpu_path_matches_expanded_cpu() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let cfg = DsaConfig::glm53_flash();
     let mut rng = Rng::new(7);
     let kv_b: Vec<f32> = rng.normals(64 * 512 * 512, 0.05).into_iter().map(bf16_round).collect();
@@ -762,11 +991,63 @@ fn absorbed_gpu_path_matches_expanded_cpu() {
     }
 }
 
+/// Absorb is bit-exact for every rows-per-block size (1, 2, 4 and 8, partial
+/// blocks included) and its BF16 output is the f32 result rounded; un-absorb is
+/// within the summation-order bound of an f64 reference.
+#[test]
+fn absorb_and_unabsorb_row_counts() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let cfg = DsaConfig::glm53_flash();
+    let mut rng = Rng::new(11);
+    let kv_b: Vec<f32> = rng.normals(64 * 512 * 512, 0.05).into_iter().map(bf16_round).collect();
+    let kv_b_bits: Vec<u16> = kv_b.iter().map(|v| f32_to_bf16_bits(*v)).collect();
+    let w = MlaWeights { q_a_proj: vec![], q_a_norm: vec![], q_b_proj: vec![], kv_a_proj: vec![], kv_a_norm: vec![], kv_b_proj: kv_b.clone(), o_proj: vec![] };
+    let dkv = DeviceBuffer::from_slice(&kv_b_bits).unwrap();
+    let mut worst = 0.0f64;
+    for rows in [1usize, 2, 3, 4, 5, 8, 9, 17] {
+        let q = rng.normals(rows * 64 * 256, 1.0);
+        let o_lat = rng.normals(rows * 64 * 512, 1.0);
+        let dq = DeviceBuffer::from_slice(&q).unwrap();
+        let qa16 = DeviceBuffer::zeroed(rows * 64 * 512 * 2).unwrap();
+        let qa32 = DeviceBuffer::zeroed(rows * 64 * 512 * 4).unwrap();
+        check(unsafe { ffi::glm53f_dsa_mla_absorb_q(dq.as_ptr(), dkv.as_ptr(), rows as i32, qa16.as_mut_ptr(), qa32.as_mut_ptr(), ptr::null_mut()) }, "absorb").unwrap();
+        let dol = DeviceBuffer::from_slice(&o_lat).unwrap();
+        let o = DeviceBuffer::zeroed(rows * 64 * 256 * 4).unwrap();
+        check(unsafe { ffi::glm53f_dsa_mla_unabsorb_v(dol.as_ptr(), dkv.as_ptr(), rows as i32, o.as_mut_ptr(), ptr::null_mut()) }, "unabsorb").unwrap();
+        gpu::sync().unwrap();
+        let got32: Vec<f32> = qa32.download(rows * 64 * 512).unwrap();
+        let got16: Vec<u16> = qa16.download(rows * 64 * 512).unwrap();
+        let got_o: Vec<f32> = o.download(rows * 64 * 256).unwrap();
+        for r in 0..rows {
+            let want = mla::absorb_q(&cfg, &w, &q[r * 16384..(r + 1) * 16384]);
+            assert_eq!(&got32[r * 32768..(r + 1) * 32768], &want[..], "{rows} rows: absorb row {r} is bit-exact");
+            for (i, v) in want.iter().enumerate() {
+                assert_eq!(got16[r * 32768 + i], f32_to_bf16_bits(*v), "{rows} rows: BF16 absorb row {r} element {i}");
+            }
+            for h in 0..64 {
+                let ol = &o_lat[(r * 64 + h) * 512..(r * 64 + h + 1) * 512];
+                for v in 0..256 {
+                    let wv = w.wv_row(&cfg, h, v);
+                    let exact: f64 = wv.iter().zip(ol).map(|(a, b)| *a as f64 * *b as f64).sum();
+                    let mag: f64 = wv.iter().zip(ol).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+                    let d = (got_o[(r * 64 + h) * 256 + v] as f64 - exact).abs();
+                    let bound = glm53f_dsa::num::gamma(512) * mag;
+                    assert!(d <= bound, "{rows} rows: un-absorb row {r} head {h} value {v}: off by {d} (bound {bound})");
+                    worst = worst.max(d / bound);
+                }
+            }
+        }
+    }
+    eprintln!("un-absorb: worst error / (gamma_512 sum |w o|) = {worst:.3}");
+}
+
 #[test]
 fn dense_rows_and_no_pools() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     let mut rng = Rng::new(8);
     // Every row dense: the kernels skip scoring and keep all visible pools.
     let pos = vec![0, 1, 2, 3, 4, 7, 100, 2047, 2050];
@@ -793,9 +1074,9 @@ mod common;
 /// weights and proxy inputs (embedding rows through layer 3's input norm).
 #[test]
 fn layer3_gpu_against_fixtures() {
-    if !gpu_ready() {
+    let Some(_gpu) = gpu_ready() else {
         return;
-    }
+    };
     if cfg!(debug_assertions) {
         eprintln!("skipping: needs --release");
         return;

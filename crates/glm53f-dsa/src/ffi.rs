@@ -83,6 +83,49 @@ unsafe extern "C" {
         stream: CudaStream,
     ) -> CudaError;
 
+    /// `glm53f_dsa_index_select` without the counter reset: the workspace was zero-filled
+    /// before its first use and serves only calls with the same `rows` and `chunks`.
+    pub fn glm53f_dsa_index_select_prepared(
+        q: *const f32,
+        w: *const f32,
+        score_scale: f32,
+        row_pos: *const i32,
+        row_req: *const i32,
+        rows: i32,
+        max_pools: i32,
+        cache: DsaCache,
+        chunk_pools: i32,
+        chunks: i32,
+        workspace: *mut c_void,
+        workspace_bytes: u64,
+        pools_out: *mut i32,
+        tokens_out: *mut i32,
+        counts_out: *mut i32,
+        debug_scores: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+
+    /// The first selection implementation (same contract and outputs), kept for A/B comparison.
+    pub fn glm53f_dsa_index_select_v1(
+        q: *const f32,
+        w: *const f32,
+        score_scale: f32,
+        row_pos: *const i32,
+        row_req: *const i32,
+        rows: i32,
+        max_pools: i32,
+        cache: DsaCache,
+        chunk_pools: i32,
+        chunks: i32,
+        workspace: *mut c_void,
+        workspace_bytes: u64,
+        pools_out: *mut i32,
+        tokens_out: *mut i32,
+        counts_out: *mut i32,
+        debug_scores: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+
     pub fn glm53f_dsa_mla_latent_write(
         latent: *const f32,
         norm_w: *const f32,
@@ -105,7 +148,28 @@ unsafe extern "C" {
 
     pub fn glm53f_dsa_mla_workspace_bytes(rows: i32, splits: i32) -> u64;
 
+    pub fn glm53f_dsa_mla_plan(rows: i32, max_tokens: i32, sms: i32, splits: *mut i32, head_groups: *mut i32);
+
     pub fn glm53f_dsa_mla_sparse_attn(
+        q_abs: *const u16,
+        tokens: *const i32,
+        token_stride: i32,
+        counts: *const i32,
+        row_req: *const i32,
+        rows: i32,
+        scale: f32,
+        cache: DsaCache,
+        splits: i32,
+        head_groups: i32,
+        workspace: *mut c_void,
+        workspace_bytes: u64,
+        o_lat: *mut f32,
+        lse: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+
+    /// The first sparse-attention implementation (same contract), kept for A/B comparison.
+    pub fn glm53f_dsa_mla_sparse_attn_v1(
         q_abs: *const u16,
         tokens: *const i32,
         token_stride: i32,
@@ -133,6 +197,7 @@ unsafe extern "C" {
     pub fn cudaFree(ptr: *mut c_void) -> CudaError;
     pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> CudaError;
     pub fn cudaMemset(ptr: *mut c_void, value: i32, count: usize) -> CudaError;
+    pub fn cudaMemsetAsync(ptr: *mut c_void, value: i32, count: usize, stream: CudaStream) -> CudaError;
     pub fn cudaMemcpy2D(
         dst: *mut c_void,
         dpitch: usize,
@@ -152,10 +217,23 @@ unsafe extern "C" {
     pub fn cudaEventRecord(event: *mut c_void, stream: CudaStream) -> CudaError;
     pub fn cudaEventSynchronize(event: *mut c_void) -> CudaError;
     pub fn cudaEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> CudaError;
+    pub fn cudaStreamCreateWithFlags(stream: *mut CudaStream, flags: u32) -> CudaError;
+    pub fn cudaStreamDestroy(stream: CudaStream) -> CudaError;
+    pub fn cudaStreamSynchronize(stream: CudaStream) -> CudaError;
+    pub fn cudaStreamBeginCapture(stream: CudaStream, mode: i32) -> CudaError;
+    pub fn cudaStreamEndCapture(stream: CudaStream, graph: *mut *mut c_void) -> CudaError;
+    pub fn cudaGraphInstantiate(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> CudaError;
+    pub fn cudaGraphLaunch(exec: *mut c_void, stream: CudaStream) -> CudaError;
+    pub fn cudaGraphExecDestroy(exec: *mut c_void) -> CudaError;
+    pub fn cudaGraphDestroy(graph: *mut c_void) -> CudaError;
 }
 
 pub const MEMCPY_H2D: i32 = 1;
 pub const MEMCPY_D2H: i32 = 2;
+/// `cudaStreamNonBlocking`: no implicit synchronization with the legacy default stream.
+pub const STREAM_NON_BLOCKING: u32 = 1;
+/// `cudaStreamCaptureModeThreadLocal`: a capture restricts only its own thread.
+pub const CAPTURE_THREAD_LOCAL: i32 = 1;
 /// `cudaDevAttrMultiProcessorCount`.
 pub const ATTR_SM_COUNT: i32 = 16;
 /// `cudaDevAttrComputeCapabilityMajor` / `Minor`.

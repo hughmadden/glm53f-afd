@@ -33,3 +33,7 @@ cuda = []
 [[example]]
 name = "dsa_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "dsa_ab"
+required-features = ["cuda"]

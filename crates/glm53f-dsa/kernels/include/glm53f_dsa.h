@@ -62,8 +62,9 @@ int32_t glm53f_dsa_index_tail_commit(const float* k_raw, const float* gate, cons
                                      const glm53f_dsa_window_t* windows, int32_t n_req,
                                      void* stream);
 
-// Workspace bytes for index_select with `rows` query rows and `chunks` chunks
-// per row (from glm53f_dsa_index_plan): rows x chunks x 4 KiB plus one merge level.
+// Workspace bytes for index_select (and its _prepared and _v1 variants) with
+// `rows` query rows and `chunks` chunks per row (from glm53f_dsa_index_plan):
+// about rows x chunks x 4 KiB, plus the merge levels and arrival counters.
 uint64_t glm53f_dsa_index_workspace_bytes(int32_t rows, int32_t chunks);
 
 // Chunk plan: pools per chunk (a multiple of 64) and chunks per row, for rows
@@ -83,13 +84,42 @@ void glm53f_dsa_index_plan(int32_t rows, int32_t max_pools, int32_t sms, int32_t
 // w: [rows][32] f32 (weights_proj(x) * 32^-0.5). debug_scores (optional,
 // [rows][max_pools] f32) receives every computed score.
 // Precondition (not checked on the device): every row's n <= max_pools <=
-// chunk_pools * chunks, and every visible pool's page is mapped.
+// chunk_pools * chunks, and every visible pool's page is mapped. max_pools is
+// at most 262,144 (1M tokens; larger values return cudaErrorInvalidValue).
+// One kernel: blocks score their chunk and merge through a fan-in-8 tree of
+// arrival counters in the workspace; the block that completes a row's root
+// writes its outputs. The call first zeroes the counters (a small
+// cudaMemsetAsync on `stream`), so the workspace may hold anything.
 int32_t glm53f_dsa_index_select(const float* q, const float* w, float score_scale,
                                 const int32_t* row_pos, const int32_t* row_req, int32_t rows,
                                 int32_t max_pools, glm53f_dsa_cache_t cache, int32_t chunk_pools,
                                 int32_t chunks, void* workspace, uint64_t workspace_bytes,
                                 int32_t* pools_out, int32_t* tokens_out, int32_t* counts_out,
                                 float* debug_scores, void* stream);
+
+// glm53f_dsa_index_select without the counter reset. Contract: the workspace
+// was zero-filled before its first use (for example with cudaMemset) and is
+// only used by index_select / index_select_prepared calls with the same
+// `rows` and `chunks`; every completed call leaves the counters zero.
+int32_t glm53f_dsa_index_select_prepared(const float* q, const float* w, float score_scale,
+                                         const int32_t* row_pos, const int32_t* row_req,
+                                         int32_t rows, int32_t max_pools,
+                                         glm53f_dsa_cache_t cache, int32_t chunk_pools,
+                                         int32_t chunks, void* workspace,
+                                         uint64_t workspace_bytes, int32_t* pools_out,
+                                         int32_t* tokens_out, int32_t* counts_out,
+                                         float* debug_scores, void* stream);
+
+// The first implementation of glm53f_dsa_index_select (same contract and
+// outputs): a scoring kernel, merge kernels and a finalize kernel. Kept for
+// A/B comparison.
+int32_t glm53f_dsa_index_select_v1(const float* q, const float* w, float score_scale,
+                                   const int32_t* row_pos, const int32_t* row_req, int32_t rows,
+                                   int32_t max_pools, glm53f_dsa_cache_t cache,
+                                   int32_t chunk_pools, int32_t chunks, void* workspace,
+                                   uint64_t workspace_bytes, int32_t* pools_out,
+                                   int32_t* tokens_out, int32_t* counts_out,
+                                   float* debug_scores, void* stream);
 
 // ---- Sparse MLA --------------------------------------------------------------
 
@@ -108,11 +138,13 @@ int32_t glm53f_dsa_mla_absorb_q(const float* q, const uint16_t* kv_b, int32_t ro
 
 // Sparse attention in latent space. For row r, over tokens[r][0 .. counts[r*2+1])
 // (ascending), per head h: o[r][h] = sum_j softmax_j(scale q_abs[r][h] . c_j) c_j,
-// with c_j decoded from the FP8 record (BF16 tensor-core products, FP32 softmax
-// and accumulation). Writes o_lat [rows][64][512] f32 and lse [rows][64]
-// (natural log of the sum of exp(scale * score)). `splits` > 1 splits each row's
-// tokens across blocks (partials in the workspace, merged at the end);
-// `head_groups` in {1, 2, 4} is how many 16-head groups share one decoded tile.
+// with c_j decoded from the FP8 record (F16 tensor-core products of the exact
+// E4M3 codes and the per-head scaled BF16 query, FP32 softmax and accumulation,
+// probabilities rounded to F16). Writes o_lat [rows][64][512] f32 and lse
+// [rows][64] (natural log of the sum of exp(scale * score)). `splits` > 1 splits
+// each row's tokens across blocks (partials in the workspace, merged at the
+// end); `head_groups` in {1, 2, 4} is how many 16-head groups share one decoded
+// tile. Uses the kernel set up by glm53f_dsa_init (otherwise the v1 kernel).
 uint64_t glm53f_dsa_mla_workspace_bytes(int32_t rows, int32_t splits);
 int32_t glm53f_dsa_mla_sparse_attn(const uint16_t* q_abs, const int32_t* tokens,
                                    int32_t token_stride, const int32_t* counts,
@@ -121,6 +153,25 @@ int32_t glm53f_dsa_mla_sparse_attn(const uint16_t* q_abs, const int32_t* tokens,
                                    int32_t head_groups, void* workspace,
                                    uint64_t workspace_bytes, float* o_lat, float* lse,
                                    void* stream);
+
+// Split plan for sparse_attn: `splits` (1..64) and `head_groups` for `rows` rows
+// of up to `max_tokens` tokens on a device with `sms` multiprocessors (about
+// one block per multiprocessor; measured on the RTX 4090). Any valid plan
+// gives the same result up to rounding.
+void glm53f_dsa_mla_plan(int32_t rows, int32_t max_tokens, int32_t sms, int32_t* splits,
+                         int32_t* head_groups);
+
+// The first implementation of glm53f_dsa_mla_sparse_attn (same contract), kept
+// for A/B comparison. glm53f_dsa_mla_sparse_attn falls back to it when the
+// v2 kernel cannot run (glm53f_dsa_init not called, or a token_stride whose
+// per-block offset table exceeds the device's shared memory).
+int32_t glm53f_dsa_mla_sparse_attn_v1(const uint16_t* q_abs, const int32_t* tokens,
+                                      int32_t token_stride, const int32_t* counts,
+                                      const int32_t* row_req, int32_t rows, float scale,
+                                      glm53f_dsa_cache_t cache, int32_t splits,
+                                      int32_t head_groups, void* workspace,
+                                      uint64_t workspace_bytes, float* o_lat, float* lse,
+                                      void* stream);
 
 // o[r][h][v] = sum_l kv_b[h * 512 + 256 + v][l] * o_lat[r][h][l]. o: [rows][64][256] f32.
 int32_t glm53f_dsa_mla_unabsorb_v(const float* o_lat, const uint16_t* kv_b, int32_t rows,
