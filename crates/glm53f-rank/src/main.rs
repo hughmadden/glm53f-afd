@@ -54,7 +54,7 @@ use glm53f_rank::mesh::{self, Mesh, MeshConfig};
 use glm53f_rank::resident::{write_rank_dir, Resident};
 use glm53f_rank::serve::{return_meta_view, serve_view, serve_view_f32, Layers, Timings};
 use glm53f_rank::transport::{ByteTransport, RdmaTransport, TcpTransport, RECV_SLOTS};
-use glm53f_rank::{boot, timeline};
+use glm53f_rank::{boot, pagecache, timeline};
 use glm53f_wire::frame::{RequestView, ReturnFrame, ReturnRow, FLAG_RETURN_REQUIRED, FLAG_ROW_SLICE};
 use glm53f_wire::l4::{StreamReceiver, StreamSender};
 use glm53f_wire::layout::Status;
@@ -203,6 +203,12 @@ fn verify(a: &Args) -> i32 {
     match boot::readback(dir, a.rank, &a.expect) {
         Ok(r) => {
             println!("{}", r.summary);
+            // Nothing reads the images after this: give back the pages the hashing cached.
+            if let Ok(resident) = Resident::load_manifest(dir, a.rank, &a.expect) {
+                for layer in resident.layers() {
+                    drop_cached(&resident, layer);
+                }
+            }
             0
         }
         Err(e) => {
@@ -212,11 +218,27 @@ fn verify(a: &Args) -> i32 {
     }
 }
 
+/// Give back the page cache's copy of `layer`'s image; a failed hint is only logged.
+fn drop_cached(resident: &Resident, layer: u32) {
+    if let Err(e) = resident.drop_cache(layer) {
+        eprintln!("layer {layer}: page cache not dropped: {e}");
+    }
+}
+
+/// The boot log's memory line: `MemFree` beside `MemAvailable` (the page cache counts as
+/// available, but a CUDA allocation can fail before the kernel reclaims it).
+fn log_memory(when: &str) {
+    if let Some(m) = pagecache::memory_line() {
+        println!("memory {when}: {m}");
+    }
+}
+
 fn serve(a: &Args) -> i32 {
     let Some(dir) = &a.dir else {
         eprintln!("{USAGE}\nerror: serve needs --dir");
         return 2;
     };
+    log_memory("before the boot readback");
     // Boot identity readback: refuse to serve on any mismatch.
     match boot::readback(dir, a.rank, &a.expect) {
         Ok(r) => println!("boot readback: {}", r.summary),
@@ -225,6 +247,7 @@ fn serve(a: &Args) -> i32 {
             return 3;
         }
     }
+    log_memory("after the boot readback");
     let resident = match Resident::load_manifest(dir, a.rank, &a.expect) {
         Ok(r) => r,
         Err(e) => {
@@ -298,7 +321,11 @@ impl<K: ExpertKernel> Rank<K> {
         let image = self.resident.layer_image(layer)?;
         let prepared = self.kernel.prepare_layer(&image).map_err(|e| format!("prepare layer {layer}: {e}"))?;
         self.layers.insert(layer, prepared);
-        Ok(t.elapsed().as_secs_f64() * 1e3)
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        // The image is on the device and this was its last read (the boot readback's was the
+        // first): give back the pages the two reads cached.
+        drop_cached(&self.resident, layer);
+        Ok(ms)
     }
 
     /// Serve `view` into `frame` (header space, then `rows` BF16 rows).
@@ -359,6 +386,7 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
             }
         }
         println!("prepared {} layers in {:.1} s", rank.layers.len(), t.elapsed().as_secs_f64());
+        log_memory("after preparing the layers");
     }
     // The peer mesh lives for the daemon's lifetime, across coordinator connections.
     let mut mesh = match &a.mesh {

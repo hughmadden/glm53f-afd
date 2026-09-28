@@ -107,6 +107,11 @@ All from `src/tensorfold/families/glm5_next/cuda/` unless the path says otherwis
   bookkeeping) and `src/mesh.rs` (the peer mesh: hellos, TCP and RDMA links,
   exchanges keyed by request and layer, timeouts), apart from the designs
   credited above.
+- **Page cache:** `src/pagecache.rs`, the drop of a layer image's cached pages (libc's `posix_fadvise`
+  with `POSIX_FADV_DONTNEED`, declared in the file) once the image is on the device and after
+  `verify`'s hashing, and the `MemAvailable` and `MemFree` figures of the boot log; the idea is from
+  a public recipe's preflight (`docs/REUSE.md`), no code copied. Tests: `tests/pagecache.rs`
+  (the pages leave the cache, counted with `mincore(2)`), `tests/boot.rs`. 29 September 2026.
 - **Test inputs:** `src/testkit.rs`, synthetic layers, rows and routes, with
   scale magnitudes read from the published checkpoint.
 - **Kernel file:** `kernels/exl3_rank.cu` outside the marked TensorFold

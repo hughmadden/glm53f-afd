@@ -93,3 +93,20 @@ fn resident_reads_the_listed_images() {
     assert!(r.layer_image(4).is_err(), "not resident");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The rank drops an image's cached pages once it is on the device: the image reads back the same,
+/// a layer the rank does not hold is an error, and a missing file is one on Linux.
+#[test]
+fn resident_drops_an_images_cache_and_it_reads_back_the_same() {
+    let dir = scratch_dir("drop-cache");
+    write_dir(&dir, 3, &[3, 10]);
+    let r = Resident::load_manifest(&dir, 3, &SMALL).unwrap();
+    let before = r.layer_image(10).unwrap();
+    r.drop_cache(10).expect("drop");
+    assert_eq!(r.layer_image(10).unwrap(), before);
+    assert!(r.drop_cache(4).unwrap_err().contains("not resident on rank 3"));
+    std::fs::remove_file(dir.join(file_name(3, 3))).unwrap();
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    assert!(r.drop_cache(3).unwrap_err().contains("L03.r3.exl3"));
+    std::fs::remove_dir_all(&dir).ok();
+}

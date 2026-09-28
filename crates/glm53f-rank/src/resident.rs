@@ -48,6 +48,13 @@ impl Resident {
         }
         Ok(image)
     }
+
+    /// Give back the page cache's copy of `layer`'s image ([`crate::pagecache`]). The rank calls
+    /// it once the image is on the device; the file is not changed and can be read again.
+    pub fn drop_cache(&self, layer: u32) -> Result<(), String> {
+        let (file, _) = self.files.get(&layer).ok_or_else(|| format!("layer {layer} is not resident on rank {}", self.rank))?;
+        crate::pagecache::drop_file(&self.dir.join(file))
+    }
 }
 
 /// Cut rank `rank`'s share of `layers` from the EXL3 checkpoint in

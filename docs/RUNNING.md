@@ -82,8 +82,9 @@ Each binary runs only on the architecture it was built for; the rank checks this
      --peers 192.0.2.10:8601,192.0.2.11:8601,192.0.2.12:8601,192.0.2.13:8601   # ranks 1-3: .11, .12, .13
    ```
 
-   It verifies every image (size and SHA-256), loads them onto the GPU and prints
-   `listening on ...`. `GLM53F_WIRE_NOCRC=1` sends frames without their CRC32C; both sides must
+   It verifies every image (size and SHA-256), loads them onto the GPU, gives back the page cache's
+   copy of each (`memory ...` lines in the log show `MemAvailable` and `MemFree` on the way) and
+   prints `listening on ...`. `GLM53F_WIRE_NOCRC=1` sends frames without their CRC32C; both sides must
    agree, and the coordinator's RDMA transport requires it. `--peers` (the same list on every
    rank) joins the ranks' mesh for the prefill reduce-scatter; `GLM53F_RDMA=1` on the ranks makes
    the mesh RDMA RC, TCP otherwise (`crates/glm53f-rank/README.md`).

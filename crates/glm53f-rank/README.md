@@ -820,6 +820,18 @@ every failure. It refuses to serve on:
 
 Images are hashed in parallel.
 
+**The page cache** (`pagecache.rs`). The readback hashes each image and the upload reads it again,
+both through the page cache, so a rank used to leave its 38 GB of images cached after boot. The
+kernel counts cached pages as available (`MemAvailable`), but on GB10's unified memory a CUDA
+allocation can fail before it reclaims them (reported for GB10; not measured here), and a rank
+that stops leaves its cache behind for the next process. The rank now gives each image's cached
+pages back (`posix_fadvise` with `POSIX_FADV_DONTNEED`, no privilege needed) once the image is on
+the device; `glm53f-rank verify` does the same for what its hashing cached. The boot log prints
+`MemAvailable` beside `MemFree` before the readback, after it and after the layers are prepared.
+Images are not changed. The hint does nothing off 64-bit Linux, and a failed hint is only logged.
+A start therefore reads its images from disk, where the boot times in
+[docs/PERFORMANCE.md](../../docs/PERFORMANCE.md) §6 were measured with them cached.
+
 **`glm53f-rank slice`** cuts a rank's share from an EXL3 checkpoint. The
 checkpoint can be a whole copy or a subset that holds the wanted layers. The
 slicer:

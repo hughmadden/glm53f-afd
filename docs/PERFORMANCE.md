@@ -419,6 +419,10 @@ above):
   44–49 s per rank from start to listening. That is the boot readback (size and
   SHA-256 of 42 layer images, about 17–19 s) plus device preparation (26–31 s). A
   cold read from NVMe adds its read time.
+  - **Since 29 September 2026** a rank gives each image's cached pages back once it is uploaded
+    (`crates/glm53f-rank/README.md`, "The page cache"), so every start reads its images from NVMe.
+    The cold figure has not been measured on the target hardware; the boot log now prints
+    `MemAvailable` and `MemFree` before the readback, after it and after preparation.
 - **Coordinator:** loads about 14 GB.
 - **Graphs:** captured lazily, per shape.
 - **Expected time to ready: 30–60 s.**

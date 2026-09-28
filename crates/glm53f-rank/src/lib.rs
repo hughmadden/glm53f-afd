@@ -25,6 +25,8 @@
 //!   [`transport`], [`server`], [`serve`], [`route`], [`boot`], [`resident`],
 //!   [`manifest`], [`sha256`], [`wire`], [`timeline`], and, with the `cuda`
 //!   feature, [`cuda`], [`device`] and the kernel backend `exl3_cuda`.
+//! - Memory: [`pagecache`] gives a layer image's cached pages back once it is on the device, and
+//!   reports `MemAvailable` beside `MemFree` for the boot log.
 //!
 //! The seam is the attention/FFN boundary: the rank never touches embeddings,
 //! attention, the KV cache, the router or sampling.
@@ -44,6 +46,7 @@ pub mod kernel;
 pub mod layout;
 pub mod manifest;
 pub mod mesh;
+pub mod pagecache;
 pub mod reduce_scatter;
 pub mod reference;
 pub mod resident;
