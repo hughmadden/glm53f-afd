@@ -118,7 +118,10 @@ impl DeviceBuffer {
         self.upload_at(0, data)
     }
 
-    /// Copy `data` into the buffer at element `offset` (synchronous).
+    /// Copy `data` into the buffer at element `offset` (synchronous: the data is on the device
+    /// when this returns). From pageable memory `cudaMemcpy` may return once the data is staged,
+    /// before its DMA lands, and the legacy stream it uses is not ordered with this crate's
+    /// non-blocking streams; so the device is synchronized after the copy, as [`Self::zero`] does.
     pub fn upload_at<T: Pod>(&self, offset: usize, data: &[T]) -> Result<()> {
         let n = std::mem::size_of_val(data);
         let at = offset * std::mem::size_of::<T>();
@@ -137,7 +140,8 @@ impl DeviceBuffer {
                 )
             },
             "cudaMemcpy H2D",
-        )
+        )?;
+        synchronize()
     }
 
     /// Copy `data` into the buffer at byte `at`, ordered on `stream`. The host slice may be

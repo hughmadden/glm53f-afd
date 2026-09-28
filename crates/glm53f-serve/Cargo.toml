@@ -1,0 +1,41 @@
+# glm53f-serve: the coordinator daemon of glm53f-afd. It loads the coordinator's weights (every
+# non-expert tensor of the official FP8 checkpoint), connects the four expert ranks and serves
+# the OpenAI-compatible API:
+#
+#   HTTP (glm53f-api) -> engine, queue and scheduler (glm53f-coordinator) -> the forward
+#   (glm53f-forward) -> routed experts on the ranks (RemoteExperts, over the wire) -> sampler
+#   -> streamed tokens
+#
+#   cargo test -p glm53f-serve                                     CPU: the options
+#   cargo build --release -p glm53f-serve --features cuda[,rdma]   the daemon
+#
+# The binary follows the shape of mimo26f-afd v1.2.0's coordinator binary (PROVENANCE.md).
+# No external Rust crates.
+[package]
+name = "glm53f-serve"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Coordinator daemon: GLM-5.3-Flash's coordinator weights on the GPU, the four expert ranks over the wire, the OpenAI-compatible API"
+publish = false
+
+[lib]
+name = "glm53f_serve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glm53f-serve"
+path = "src/main.rs"
+
+[features]
+default = []
+# The daemon: the forward, its kernels, the shell's sampler (build.rs of the kernel crates; needs
+# nvcc, and a GPU to run). Without it the binary only says how to build it.
+cuda = ["glm53f-forward/coordinator"]
+# The RDMA RC transport of the expert exchange (libibverbs), for a coordinator on the fabric.
+rdma = ["glm53f-coordinator/rdma"]
+
+[dependencies]
+glm53f-api = { path = "../glm53f-api" }
+glm53f-coordinator = { path = "../glm53f-coordinator" }
+glm53f-forward = { path = "../glm53f-forward" }

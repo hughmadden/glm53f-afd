@@ -44,6 +44,10 @@ glm53f-dsa = { path = "../glm53f-dsa" }
 glm53f-layers = { path = "../glm53f-layers" }
 glm53f-coordinator = { path = "../glm53f-coordinator", optional = true }
 
+[dev-dependencies]
+# Mock expert ranks in tests/remote_experts.rs.
+glm53f-wire = { path = "../glm53f-wire" }
+
 [[example]]
 name = "gemm_bench"
 required-features = ["cuda"]

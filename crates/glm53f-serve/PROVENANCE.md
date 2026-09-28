@@ -1,0 +1,25 @@
+# Provenance: glm53f-serve
+
+Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). All dates are 28 September 2026.
+No code is copied. The daemon follows the shape of mimo26f-afd v1.2.0's coordinator binary and
+wires this repository's crates together.
+
+## Units
+
+| Unit | Source (repo @ commit : path) | sha256 (source file) | Here | Delta | Pinned by | Date |
+|---|---|---|---|---|---|---|
+| The coordinator binary's sequence: load the coordinator's weights, build the device forward, connect the four ranks (addresses from configuration, no default), load the tokenizer, start the engine, serve the API | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/main.rs (lines 10-74, `serving_main`) | `2a6ab00576731ba5ac320815e5da80b420bdbc31379961ccc5748154e3ec9ed2` | src/main.rs | Structure, rewritten over this repository's crates: `GlmForward` and `ServedForward`, `RemoteExperts` or `LocalFp8Experts`, `CoordinatorEngine::start` with the scheduler, `GlmPrompts`, `GlmDialect`. Flags with environment fallbacks (`MIMO26_WEIGHTS_DIR`, `MIMO26_SPARK_ADDRS` and `MIMO26_API_ADDR` became `GLM53F_CHECKPOINT_DIR`, `GLM53F_SPARK_ADDRS` and `GLM53F_API_ADDR`); the API defaults to loopback (was `0.0.0.0:8100`); the KV pool sized from the free memory; the development mode is new; the source's host-forward path, drafter loading, page-locking of the wire buffers and CPU smoke are not ported. | tests/dev_mode.rs (one streamed chat completion through four rank daemons), the unit tests in src/lib.rs | 2026-09-28 |
+
+## Written here
+
+| File | What | Date |
+|---|---|---|
+| src/lib.rs | The options (flags, environment fallbacks, checks), the KV pool's page count, the development-mode banner, and their tests | 2026-09-28 |
+| tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
+| Cargo.toml | The manifest | 2026-09-28 |
+
+## Test data
+
+None is carried. `tests/dev_mode.rs` reads the coordinator's weights named by
+`GLM53F_CHECKPOINT_DIR` and runs a `glm53f-rank` binary (`GLM53F_RANK_BIN`) on rank directories
+cut from the EXL3 checkpoint (`GLM53F_RANK_DIRS`).

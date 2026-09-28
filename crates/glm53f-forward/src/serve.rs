@@ -7,6 +7,9 @@
 //!   with a draw or a mask go through the shell's sampler on the pass's device logits.
 //! - The model has no drafter yet ([`Limits::block`] is 0), so the scheduler decodes one token
 //!   per step; `verify` and `commit` work for windows of up to 8 rows all the same.
+//! - Admission sees the page pool: slots grow into the pages the `KvPool` allocated up front,
+//!   so `free_bytes` is the pool's free pages, less any shortfall of device memory below the
+//!   margin (marks and workspaces come from device memory).
 //! - Images are refused (the vision tower is a later phase).
 
 use glm53f_coordinator::gpu::Sampler;
@@ -131,9 +134,16 @@ impl ModelForward for ServedForward {
         }
     }
 
+    /// The page pool's free pages, in bytes: a slot grows into pages of the pool the `KvPool`
+    /// allocated up front ([`KvSlot::need_bytes`] counts pages), so the device's free memory does
+    /// not measure room for a request. Less any shortfall of the device's free memory below
+    /// `margin`: marks and the forward's workspaces come from device memory, and admission then
+    /// evicts retained slots, which frees both.
     fn free_bytes(&self) -> Result<usize, String> {
         let (free, _) = s(device::mem_info())?;
-        Ok(free.saturating_sub(self.margin))
+        let kv = &self.fwd.kv;
+        let pages = kv.free_pages() * kv.config().layout.page_bytes;
+        Ok(pages.saturating_sub(self.margin.saturating_sub(free)))
     }
 
     fn prefill(&mut self, segs: &mut [Segment<'_, GlmKv>]) -> Result<Vec<SegmentOut>, String> {

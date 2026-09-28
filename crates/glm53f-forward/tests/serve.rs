@@ -47,11 +47,16 @@ fn model_forward_through_the_shell_traits() {
         (lim.vocab, lim.sample_vocab, lim.block),
         (VOCAB, SAMPLE_VOCAB, 0)
     );
+    // Admission counts the page pool's free pages (the pool is allocated up front): two slots of
+    // 128 tokens take 4 of its 64-token pages.
+    let page = m.fwd.kv.config().layout.page_bytes;
+    let free = m.free_bytes().unwrap();
+    assert_eq!(free, m.fwd.kv.free_pages() * page);
     let mut a = m.fwd.kv.slot().unwrap();
     let mut b = m.fwd.kv.slot().unwrap();
     KvSlot::reserve(&mut a, 128).unwrap();
     KvSlot::reserve(&mut b, 128).unwrap();
-    assert!(m.free_bytes().unwrap() > 0);
+    assert_eq!(m.free_bytes().unwrap(), free - 4 * page);
 
     // Two prompts in one pass: one greedy, one sampled; both keep their logits.
     let sampled = Sampling::new(0.8, 0.95, 0, 0.0, Some(7)).unwrap().unwrap();

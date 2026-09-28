@@ -18,6 +18,7 @@
 //! | `gemm` | BF16 GEMMs (a row-independent GEMV for 1-8 rows, cuBLAS beyond) and the FP8 GEMM dispatch |
 //! | `kv` | The pool (pages, page tables, KDA states, conv windows, DSA tails) and [`kv::GlmKv`], one request's view |
 //! | `experts` | [`experts::ExpertBackend`], `LocalFp8Experts`, `ZeroExperts` |
+//! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
 //! | `forward` | [`forward::GlmForward`]: the layer loop, the head, prefill / decode / verify / commit, taps and stage timing |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
 //! | `device`, `cuda`, `cublas`, `ffi` | Device memory, streams and events; the runtime, cuBLAS and kernel bindings |
@@ -114,6 +115,8 @@ pub mod gemm;
 #[cfg(feature = "cuda")]
 pub mod kv;
 #[cfg(feature = "coordinator")]
+pub mod remote;
+#[cfg(feature = "coordinator")]
 pub mod serve;
 #[cfg(feature = "cuda")]
 pub mod weights;
@@ -129,5 +132,12 @@ mod tests {
         send::<crate::forward::GlmForward>();
         send::<crate::kv::GlmKv>();
         send::<crate::kv::KvMark>();
+    }
+
+    #[cfg(feature = "coordinator")]
+    #[test]
+    fn the_served_forward_and_the_remote_experts_move_too() {
+        send::<crate::serve::ServedForward>();
+        send::<crate::remote::RemoteExperts>();
     }
 }

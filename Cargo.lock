@@ -29,6 +29,7 @@ dependencies = [
  "glm53f-kda",
  "glm53f-layers",
  "glm53f-model",
+ "glm53f-wire",
 ]
 
 [[package]]
@@ -55,6 +56,15 @@ dependencies = [
 [[package]]
 name = "glm53f-rdma"
 version = "0.1.0"
+
+[[package]]
+name = "glm53f-serve"
+version = "0.1.0"
+dependencies = [
+ "glm53f-api",
+ "glm53f-coordinator",
+ "glm53f-forward",
+]
 
 [[package]]
 name = "glm53f-tokenizer"

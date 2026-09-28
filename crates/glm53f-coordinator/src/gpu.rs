@@ -103,6 +103,11 @@ pub struct DeviceBuffer {
     bytes: usize,
 }
 
+// SAFETY: a device allocation belongs to the process's CUDA context, not to the thread that made
+// it; the buffer is freed once, by its owner. (A model's forward and its sampler move to the
+// scheduler's thread.)
+unsafe impl Send for DeviceBuffer {}
+
 impl DeviceBuffer {
     pub fn alloc(bytes: usize) -> Result<Self, String> {
         let mut ptr = core::ptr::null_mut();

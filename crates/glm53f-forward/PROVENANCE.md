@@ -3,7 +3,8 @@
 Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). All dates are 28 September 2026.
 No code is copied from outside this repository. The forward is assembled from this repository's
 kernel crates (called through their C ABIs, not copied) and written from the reference's
-semantics; the units below record what each part was written from.
+semantics; the units below record what each part was written from. The remote expert backend
+(`src/remote.rs`) follows the shape of mimo26f-afd's device MoE exchange, rewritten.
 
 Sources:
 
@@ -14,6 +15,8 @@ Sources:
 - **K**: `crates/glm53f-kda` (this repository), MIT.
 - **Q**: `crates/glm53f-dsa` (this repository), MIT.
 - **C**: `crates/glm53f-coordinator` (this repository), MIT. Interface only.
+- **M**: `hughmadden/mimo26f-afd` @ `bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79` (v1.2.0), MIT.
+  Structure only; no code copied.
 - **N**: NVIDIA CUDA runtime and cuBLAS 12.8 public headers (`cuda_runtime_api.h`,
   `driver_types.h`, `library_types.h`, `cublas_api.h`). Function signatures and enumeration
   values only, re-declared in Rust; the libraries are linked from the toolkit.
@@ -27,11 +30,15 @@ Sources:
 | CUDA runtime and cuBLAS declarations | N | — | `src/cuda.rs`, `src/cublas.rs` | Signatures and enumeration values (`CUDA_R_16BF`, `CUBLAS_COMPUTE_32F`, `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`, `cudaHostAllocMapped`, ...) re-declared; the row-major-to-column-major mapping of `cublasGemmEx` written here. | `tests/gemv.rs` (`cublas_agrees_within_rounding`) | 2026-09-28 |
 | Paged cache view, tails, window metadata (the kernels' contracts) | Q : `kernels/include/glm53f_dsa.h`, `src/cache.rs` | as committed at `5dd4dae77bd0e3469ce0e3a20b41c4ff554b253d` (working-tree revision read; it landed in `687e381`) | `src/kv.rs`, `src/kvplan.rs`, `src/forward.rs` | Used as specified: one physical page holds every DSA layer's 35,904-byte block (`page_stride` = the page), batch-local request indices with the page tables and tails gathered per pass. | `tests/verify_commit.rs`, `tests/snapshot.rs` | 2026-09-28 |
 | KDA batch launches, replay commit, conv shift | K : `kernels/glm53f_kda.h` | as committed at `7cee788a37431c4f86fec36ce4cfa2eb23741c18` (working-tree revision read; it landed in `aec0083`) | `src/forward.rs` | Used as specified: per-slot state and conv arenas addressed by offsets; verify rounds keep each KDA layer's projection rows and replay inputs until the commit. | `tests/verify_commit.rs` (bitwise against serial steps) | 2026-09-28 |
-| `KvSlot` and `ModelForward` | C : `src/model.rs` | (untracked when read; committed in `6d6a0dc`) | `src/serve.rs` | Implemented for `GlmKv` and `ServedForward`; the shell's GPU sampler applies draws and masks. | `tests/serve.rs` | 2026-09-28 |
+| `KvSlot` and `ModelForward` | C : `src/model.rs` | (untracked when read; committed in `6d6a0dc`) | `src/serve.rs` | Implemented for `GlmKv` and `ServedForward`; the shell's GPU sampler applies draws and masks. `free_bytes` counts the page pool's free pages (the pool is allocated up front), less any shortfall of device memory below the margin. | `tests/serve.rs` | 2026-09-28 |
+| Remote routed experts: the FFN input quantized on the device into the wire's FP8 rows, sent with the host routes; the four ranks' BF16 planes uploaded and added in rank order on the device | M : `crates/mimo26-coordinator/src/dforward.rs` (`ffn_start`, lines 2133-2208, its TCP path; `moe_finish`, lines 2210-2250); C : `src/wire.rs` (`WireClient`) and `kernels/wire.cu` (`glm53f_coord_quant_scales`, `glm53f_coord_quantize_hidden`, `glm53f_coord_rank_sum_bf16`), called, not copied | M `c048732e72d1b78886a73fc4bb50b820a2fb0077c208909d1fc269d3a62a25fb`; C as committed at `6d6a0dc` | `src/remote.rs` | Structure, rewritten behind `ExpertBackend` (`submit` sends, `finish` collects; the forward enqueues the shared expert between them). The BF16 input is widened before the wire quantizer (the source quantized an f32 hidden); every transport takes `moe_send_raw` (the source's RDMA fast paths P6 and P9 are not ported); the rank sum is rounded to BF16 into the call's output (the source added it to its f32 residual); the routed scale must be 1.0; a failed exchange refuses every later call; wall-clock exchange times by layer and rows. | `tests/remote_experts.rs` (four mock ranks: wire rows, routes and rank sums exact; four rank daemons on real layers 3 and 4: per-row cosine at least 0.990 against the oracle's routed output and against `LocalFp8Experts`, chain logits within 4.6% of the oracle's, argmax 9/9) | 2026-09-28 |
+| Four mock expert ranks on one listener (tests) | C : `src/wire.rs` (tests `read_frame_blocking`, `mock_ranks`) | `552b98c9057284844a9a2ff5644f8b285560bbe0368f13d82c912e6dcc267bad` @ `6d6a0dc` | `tests/remote_experts.rs` | Pattern, rewritten: planes that vary by rank, row and column; every request handed back for checking. | `tests/remote_experts.rs` | 2026-09-28 |
 
 ## Test data
 
 None is carried. The tests read the oracle's golden sets (`oracle/goldens`, or
 `GLM53F_GOLDENS`), whose payloads are regenerated by `oracle/golden_layers.py`, and the
 checkpoint named by `GLM53F_CHECKPOINT_DIR` / `GLM53F_EXPERTS_DIR`. `tests/kv_plan.rs` reads the
-published configs committed in `crates/glm53f-model/tests/data`.
+published configs committed in `crates/glm53f-model/tests/data`. `tests/remote_experts.rs` also
+runs a `glm53f-rank` binary (`GLM53F_RANK_BIN`) on rank directories cut from the EXL3 checkpoint
+(`GLM53F_RANK_DIRS`).

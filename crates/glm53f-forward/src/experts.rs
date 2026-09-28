@@ -9,9 +9,10 @@
 //! - [`LocalFp8Experts`]: the official FP8 experts on this GPU, loaded on demand from the
 //!   checkpoint into a device cache with a byte budget. For tests on one GPU.
 //! - [`ZeroExperts`]: a routed output of zeros (tests that only need the coordinator's path).
-//! - The remote backend (the expert ranks over RDMA) comes from the serving shell's wire
-//!   client: `submit` writes the frames (routes, FP8 or NVFP4 hidden rows) and posts them,
-//!   `finish` waits for the returned plane and copies it into `out` on the stream.
+//! - `crate::remote::RemoteExperts` (feature `coordinator`): the expert ranks, through the
+//!   serving shell's wire client: `submit` quantizes the rows into FP8 wire rows and sends them
+//!   with the routes, `finish` waits for the ranks' planes and sums them into `out` on the
+//!   stream.
 
 use std::collections::HashMap;
 use std::path::Path;
