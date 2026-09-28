@@ -378,8 +378,8 @@ it at start-up):
 | Rows | Default | Environment |
 |---|---|---|
 | 1 – `GLM53F_RANK_SMALL_MAX` (64) | split: `mt=1,sk=8,skd=2,plan=2,fuse=2,discard=1` | `GLM53F_RANK_SMALL` |
-| to `GLM53F_RANK_MID_MAX` (2,048) | large-M: `mt=2,gw=8,nt=2,fuse=2,discard=2` | `GLM53F_RANK_MID` |
-| above | large-M: `mt=4,gw=16,nt=2,fuse=2,discard=2` | `GLM53F_RANK_LARGE` |
+| to `GLM53F_RANK_MID_MAX` (2,048) | large-M: `mt=2,gw=8,nt=2,fuse=2,discard=2,l2=2` | `GLM53F_RANK_MID` |
+| above | large-M: `mt=4,gw=16,nt=4,fuse=2,discard=2` | `GLM53F_RANK_LARGE` |
 
 The variables hold `key=value` pairs over the regime's defaults (for example
 `GLM53F_RANK_LARGE=nt=1,l2=2`). One configuration serves every decode and
@@ -547,6 +547,42 @@ GLM53F_RDMA=1 target/release/glm53f-rank serve --rank R --dir <rank-dir> --liste
 - **Set the defaults** from the sweep in `g53r_default_cfg` (or in the
   environment of the daemon), keeping one configuration up to 64 rows and the
   same `sk`, `skd` above.
+
+## Measured on GB10
+
+`exl3_bench` on one Spark: layer 3 of rank 0, CUDA 13, `--min`. The kernel
+test passes there unchanged.
+
+| Rows | Before the tuning | Change | After |
+|---:|---:|---|---:|
+| 1 | 0.131 ms (194 GB/s) | — | — |
+| 16 | 1.530 ms (221 GB/s, about 103 experts) | — | — |
+| 64 | 3.522 ms (216 GB/s, about 230 experts) | — | — |
+| 2,048 | 7.869 ms | `l2=2` | 7.087 ms |
+| 4,096 | 14.218 ms | `nt=4` | 13.283 ms |
+
+The two changes are now the defaults of the middle and large regimes. Neither
+changes a bit.
+
+**Served** (four ranks, two prefill lanes, the coordinator on an RTX 5090):
+- Prefill improved 1.5–2% with the tuned defaults (lanes of 2,048 rows). The
+  kernel itself was 6–8% faster than the one before it.
+- The rank's trace gives the weight bandwidth of decode-size calls: the
+  distinct expert blocks it read times 3,173,376 bytes, over the GPU time.
+
+| Rows per call | Expert blocks read | GPU time | Bandwidth |
+|---:|---:|---:|---:|
+| 1 | 8 | 0.134 ms | 189 GB/s |
+| 2–3 | 15 | 0.254 ms | 187 GB/s |
+| 4–12 | 32 | 0.495 ms | 205 GB/s |
+| 13–32 | 67 | 1.043 ms | 204 GB/s |
+| 33–64 | 103–110 | 1.62–1.74 ms | 200–201 GB/s |
+| 65–128 (large-M, `l2=2`) | 142 | 1.929 ms | 234 GB/s |
+
+- GB10's memory peaks at 273 GB/s, so the split kernels, which serve every
+  decode and verify window, reach 68–75% of it and the large-M kernel 86%.
+- An evict-first policy for the split kernels' weight stream is the next
+  bit-neutral step.
 
 ## The rank directory
 

@@ -30,31 +30,41 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
 **Where a one-row step goes** (traced medians per MoE layer): the coordinator's own work 0.25 ms,
 the rank kernel 0.168 ms, the wire about 33 µs beyond the rank's compute.
 
-**Concurrency, aggregate:**
+**Concurrency, aggregate** (400-token streams, DFlash2 τ 0.7 unless stated):
 
-| Streams | No drafter | DFlash2 (τ 0.7) |
-|---|---:|---:|
-| C4 | 126.5 tok/s | 143.3 tok/s |
-| C16 | 241 tok/s | **299 tok/s** |
+| Streams | 16 slots (default) | 16 slots, `--decode-lanes 2-16` | 48 slots (`--slots 48 --prefill-rows 2048`) | 48 slots, no drafter |
+|---|---:|---:|---:|---:|
+| C4 | 141 tok/s | **157 tok/s** | — | — |
+| C16 | 300 tok/s | 299 tok/s | 295 tok/s | — |
+| C32 | — | — | 456 tok/s | — |
+| C48 | — | — | **573 tok/s** | 427 tok/s |
 
-The model expected 350–480 tok/s at C16 (§4). At 16 requests the verify passes reach 128 rows, and
-nothing yet overlaps the drafter with the forward or the coordinator with the ranks in decode.
+- At 48 slots, the KV pool is 2.70 GiB (470,592 tokens) and the largest request is 462,336 tokens. At 16 slots, a 1,048,576-token request fits.
+- The model expected 350–480 tok/s at C16 (§4).
+- **Decode is bound by the ranks' weight reads.** At C16 the verify passes carry about 41 rows and take 101 ms. Of each MoE layer's 2.24 ms, 1.73 ms is the exchange and 0.34 ms the coordinator's attention.
+  - The rank's split kernels, which serve every call of up to 64 rows, read expert weights at 187–205 GB/s: 68–75% of GB10's 273 GB/s (`crates/glm53f-rank/README.md`, "Measured on GB10").
+  - More rows per call share more of those reads: 48 streams reach 573 tok/s.
+- Drafting is worth +34% at C48. A draft budget of 128 rows or τ 0.5 each cost about 1.5%.
+- Two decode lanes help only while verify passes stay small (C4: +11%); they are off by default.
 
 **Prefill**, with two-lane pipelining (the coordinator computes one half of a pass while the ranks
 serve the other; 4,096-row passes in two lanes of 2,048):
 
 | Prompt | 4K | 19K | 79K |
 |---|---:|---:|---:|
-| Two lanes, with the exchange fast paths (default since the fast paths) | **3,033 tok/s** | **3,369 tok/s** | **3,350 tok/s** |
+| Two lanes of 4,096 rows (`--prefill-rows 8192`), rank kernel tuned for GB10 | **3,577 tok/s** | **3,663 tok/s** | **3,733 tok/s** |
+| Two lanes of 2,048 (default), rank kernel tuned for GB10 | 3,338 tok/s | 3,678 tok/s | 3,626 tok/s |
+| Two lanes of 2,048, with the exchange fast paths, the rank kernel before | 3,033 tok/s | 3,369 tok/s | 3,350 tok/s |
 | Two lanes, host encode and pageable uploads | 2,717 tok/s | 2,964 tok/s | 2,899 tok/s |
 | One lane | 1,633 tok/s | 1,725 tok/s | 1,715 tok/s |
 
-- A 79K-token prompt takes 27 s.
+- A 79K-token prompt takes 21–22 s.
 - This is still a **MISS** against the 4.5–6K tok/s of §5.
-- 8,192-row passes reach about 3.1K, but take 3 GiB more buffers, which shrinks the pool below a 1M-token request.
+- 8,192-row passes take 3.3 GiB more buffers. At 16 slots that shrinks the pool to 742,592 tokens, below a 1M-token request, so they are not the default.
 - Without the fast paths, the GPU is busy 66% of a 27.5 ms MoE layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
 - With them, the host's per-lane work falls to about 0.25 ms, and the layer to 25.1 ms with the GPU 72% busy.
-- The bound is now each lane's chain of attention (about 9 ms) then exchange (about 15 ms): the ranks' compute and the transfer.
+- With the rank kernel tuned for GB10 (6–8% faster end to end), the exchange of a 2,048-row lane fell to 12 ms and the MoE layer to 22.2 ms.
+- **The coordinator's attention is now the bound:** 4.3 µs per row per MoE layer, 84% of the GPU's time with lanes of 4,096 rows (36.5 of 43.4 ms per layer).
 - The reduce-scatter return is slower over a TCP mesh between the ranks. They encode and sum peer rows on the CPU, so it stays off.
 
 **Against a vLLM recipe on the same four Sparks without a coordinator GPU**
@@ -62,14 +72,15 @@ serve the other; 4,096-row passes in two lanes of 2,048):
 
 | Metric | That recipe | This engine |
 |---|---|---|
-| Single stream | ~55 tok/s | 108–128 on code and counting, 60 on prose |
-| Aggregate | **530 tok/s at 48 streams** | 292 tok/s at 16 streams (16 slots) |
-| Prefill, short prompts | **3.5–4.1K tok/s** (warmed, ~9K) | 2.7–3.0K |
-| Prefill, 114K prompt | 1.9K tok/s | 2.9K at 79K |
+| Single stream | ~55 tok/s | 111–128 on code and counting, 62 on prose |
+| Aggregate | 530 tok/s at 48 streams | **573 tok/s at 48 streams** (48 slots, requests up to 462K tokens); 300 at 16 (16 slots, 1M) |
+| Prefill, short prompts | **3.5–4.1K tok/s** (warmed, ~9K) | 3.3–3.6K at 4K |
+| Prefill, 114K prompt | 1.9K tok/s | **3.6–3.7K at 79K** |
 
-This engine leads at one stream and on long prompts, and trails on aggregate throughput and
-short-prompt prefill. The levers: two-lane decode, more slots and speculation that adapts to load
-for the aggregate; the host path above for prefill.
+This engine leads at one stream, on long prompts and, with 48 slots, on aggregate throughput. It is
+level to slightly behind on short-prompt prefill. The levers: the coordinator's attention kernels for
+prefill; the rank's split kernels (68–75% of the memory bandwidth) and memory for more slots for
+the aggregate.
 
 **Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
 in 44–49 s (§6).

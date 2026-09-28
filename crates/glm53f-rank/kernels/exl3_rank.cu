@@ -1245,11 +1245,13 @@ int g53r_device_identity(int* arch, int* sms, char* name, size_t namelen) {
 // The default configuration for `rows` rows. Up to 64 rows (decode and verify windows) the split kernels share
 // one configuration, so a row's bits do not depend on the window size. Above 64 rows the large-M kernels run
 // with one K split each (the bits of the split kernels' (2, 1, 1), whatever the row count): 32-row groups up to
-// 2,048 rows, 64-row groups above (measured on the development GPU; README "The kernel").
+// 2,048 rows, 64-row groups above (measured on the development GPU; README "The kernel"). On GB10 the L2
+// evict-first policy up to 2,048 rows and 512-column down chunks above were faster (README "Measured on GB10");
+// neither changes a bit.
 void g53r_default_cfg(uint32_t rows, g53r_cfg* out) {
     if (rows <= 64) *out = g53r_cfg{1, 8, 2, 0, 1, 2, 2, 1, 8, 0, 2, 1};
-    else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 1};
-    else *out = g53r_cfg{4, 1, 1, 0, 2, 2, 2, 2, 16, 0, 1, 1};
+    else if (rows <= 2048) *out = g53r_cfg{2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2};
+    else *out = g53r_cfg{4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1};
 }
 
 // Upload one layer image (LAYER_BYTES, host memory) and check its scale vectors.
