@@ -16,10 +16,15 @@
 //! multiples of `seg_quantum` tokens sized from the measured rate.
 //!
 //! **KV reuse** (perf reset K3, `crate::pool`): every prompt end and completion end of 512+
-//! tokens is kept on the device as a snapshot point; a new prompt resumes at its longest exact
-//! point, on the device (in place or forked) or restored from RAM, else prefills cold. Only
-//! pressure (a bank over its size, no free slot, or not enough device memory) copies snapshots
-//! to RAM. A prompt that extends one still prefilling waits for it and then forks its point.
+//! tokens is kept on the device as a snapshot point (a device copy); a new prompt resumes at its
+//! longest exact point, on the device (in place or forked) or restored from RAM, else prefills
+//! cold. No tax unless loaded: points stay on the device, uncopied, until an incoming request
+//! (an admission, a running request's growth, the image encoder) needs their memory or a slot;
+//! then they are evicted least recently used first, wherever they live (retained slots, running
+//! and prefilling requests, which run on), each copied to RAM first when the tier is on, until
+//! the request fits. An optional bank cap ([`SchedulerConfig::bank`]) moves the oldest points to
+//! RAM whatever the load. A prompt that extends one still prefilling waits for it and then forks
+//! its point.
 //!
 //! **Speculation** (perf reset S1 and S2, DS41RT's sample-and-match): drafts are verified in one
 //! target pass per step; a draft is accepted while it equals the target's own pick at that
@@ -49,7 +54,7 @@ use glm53f_api::engine::QueuePlace;
 use crate::copy::CopyIndex;
 use crate::hostcache::{HostCache, Kind};
 use crate::model::{DecodeRow, Draft, DraftRow, ImageSpan, KvSlot, Limits, ModelForward, Pick, Segment, Token, Window};
-use crate::pool::{Active, Pool, PoolStats, Prefilling};
+use crate::pool::{Active, Pool, PoolStats, Prefilling, Want};
 use crate::sampling::{After, Sampling};
 use crate::spec::SpecPolicy;
 
@@ -94,7 +99,9 @@ pub struct SchedulerConfig {
     /// Snapshots shorter than this are neither retained nor stored (the design's
     /// `--host-cache-min-tokens`).
     pub min_retain: usize,
-    /// Device points per bank, prompt and turn (the design's `--prefix-cache-entries`).
+    /// A cap on device points per bank, prompt and turn: past it the oldest goes to RAM whatever
+    /// the load (the design's `--prefix-cache-entries`; the source's 24). 0, the default: no cap,
+    /// a point leaves the device only when an incoming request needs its memory or its slot.
     pub bank: usize,
     /// The longest a running request waits for its next step while prompts prefill.
     pub segment_ms: f64,
@@ -123,12 +130,12 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
-    /// The defaults: the source's values.
+    /// The defaults: the source's values, but no bank cap.
     pub fn new(eos: Vec<Token>) -> Self {
         SchedulerConfig {
             eos,
             min_retain: 512,
-            bank: 24,
+            bank: 0,
             segment_ms: 2000.0,
             seg_quantum: 8192,
             seg_max: 65536,
@@ -145,8 +152,9 @@ impl SchedulerConfig {
     }
 
     /// [`Self::new`] with `GLM53F_PREFILL_SEGMENT_MS`, `GLM53F_SPEC` (0: off),
-    /// `GLM53F_PREFIX_CACHE_ENTRIES`, the speculation policy ([`SpecPolicy::from_env`]) and its
-    /// row budget (`GLM53F_SPEC_MAX_ROWS`, 0 for none).
+    /// `GLM53F_PREFIX_CACHE_ENTRIES` (a bank cap, [`Self::bank`]; unset or 0: none), the
+    /// speculation policy ([`SpecPolicy::from_env`]) and its row budget (`GLM53F_SPEC_MAX_ROWS`,
+    /// 0 for none).
     pub fn from_env(eos: Vec<Token>) -> Self {
         let mut c = Self::new(eos);
         let var = |k: &str| std::env::var(k).ok();
@@ -268,13 +276,17 @@ impl<M: ModelForward> Scheduler<M> {
         let limits = model.limits();
         let spec = cfg.spec && limits.block > 1;
         let pool = Pool::new(slots, cache, cfg.bank, cfg.min_retain, cfg.granularity);
-        eprintln!("[coordinator] decode: {}; device snapshot banks {} prompt + {} turn",
+        eprintln!("[coordinator] decode: {}; {}",
             match (spec, cfg.copy_windows) {
                 (true, true) => format!("speculative (block {}), copy windows for greedy requests", limits.block),
                 (true, false) => format!("speculative (block {})", limits.block),
                 (false, _) => "one token per step".to_string(),
             },
-            cfg.bank, cfg.bank);
+            match cfg.bank {
+                0 => "device snapshots uncapped (to RAM only when an incoming request needs their memory or slot)"
+                    .to_string(),
+                n => format!("device snapshot banks {n} prompt + {n} turn"),
+            });
         Scheduler {
             model,
             cfg,
@@ -344,7 +356,7 @@ impl<M: ModelForward> Scheduler<M> {
             return false;
         }
         self.prefill_round();
-        // Bank overflow from the last step's retirements goes to RAM.
+        // With a bank cap: overflow from the last step's retirements goes to RAM.
         self.pool.enforce_banks(&mut self.active);
         // Retire cancelled requests before spending a step on them.
         let mut i = 0;
@@ -361,7 +373,7 @@ impl<M: ModelForward> Scheduler<M> {
             return true;
         }
         let drafts = if self.spec { self.limits.drafts() } else { 0 };
-        self.pool.grow_active(&self.model, &mut self.active, drafts);
+        self.pool.grow_active(&self.model, &mut self.active, &mut self.prefilling, drafts);
         if self.spec {
             self.spec_step();
         } else {
@@ -410,7 +422,8 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             }
             let rows = self.cfg.admit_rows(job.ids.len(), job.max_tokens);
-            let admitted = self.pool.admit(&self.model, &self.active, &self.prefilling, &job.ids, rows, job.sampling.is_some());
+            let admitted =
+                self.pool.admit(&self.model, &mut self.active, &mut self.prefilling, &job.ids, rows, job.sampling.is_some());
             let (slot, points, resume) = match admitted {
                 Ok(x) => x,
                 // Others hold the memory: wait for them (nothing else is admitted meanwhile).
@@ -555,7 +568,12 @@ impl<M: ModelForward> Scheduler<M> {
                 p.images.iter().filter(|s| s.start < end && s.start + s.image.tokens > p.done).cloned().collect();
             if !spans.is_empty() {
                 let need = self.model.image_bytes(&spans);
-                if let Err(e) = self.pool.make_room_bytes(&self.model, need) {
+                // The prompt's own points are candidates too: it waits at the front meanwhile.
+                let want = Want::Images { prompt: p.ids.len() };
+                self.prefilling.push_front(p);
+                let room = self.pool.make_room(&self.model, need, want, &mut self.active, &mut self.prefilling);
+                p = self.prefilling.pop_front().expect("the prompt making room");
+                if let Err(e) = room {
                     eprintln!("[coordinator] images of a {}-token prompt: {e}", p.ids.len());
                     let _ = p.tx.send(Err(e));
                     self.pool.discard(p.slot, &p.ids, p.points);

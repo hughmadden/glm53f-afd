@@ -57,7 +57,9 @@
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
 //! `GLM53F_HOST_CACHE_GB` (the host RAM tier, 0 for none), `GLM53F_PREFILL_SEGMENT_MS`,
-//! `GLM53F_PREFIX_CACHE_ENTRIES`; with a drafter `GLM53F_SPEC` (0: decode one token a step),
+//! `GLM53F_PREFIX_CACHE_ENTRIES` (a cap on the snapshots kept on the GPU per bank, past which the
+//! oldest go to RAM whatever the load; unset or 0, the default: none, see
+//! [Device memory](#device-memory)); with a drafter `GLM53F_SPEC` (0: decode one token a step),
 //! `GLM53F_SPEC_POLICY` (`fixed`, `conf`, else the chain cut at `GLM53F_SPEC_TAU`),
 //! `GLM53F_SPEC_MAX_ROWS` (the most verify rows a step holds, the most likely drafts first; 256
 //! by default, 0 for none; it also sizes the verify pass, see [Device memory](#device-memory))
@@ -126,9 +128,13 @@
 //! `--reserve-gib`; a pass allocates nothing. Snapshot marks (the KDA states and conv windows of
 //! a prompt or turn end, 141 MiB each; 73 MiB with `--kda-state-bf16`) take pages of the pool (376
 //! each; 195), so admission, which
-//! counts free pages, counts them too: under pressure it evicts retained snapshots to the host
-//! tier, and a mark the pool has no room for is refused (that snapshot is skipped) instead of
-//! running the device out of memory. The start-up log lists what was allocated for what, and
+//! counts free pages, counts them too. Snapshots cost nothing unless loaded: they stay in the
+//! pool, uncopied, as many as fit, and only an incoming request that needs their pages (a prompt,
+//! a restore, a running request's growth) evicts them, least recently used first, finished
+//! conversations' and running requests' alike (a request runs on without its snapshot), each
+//! stored to the host tier first, until the request fits. A mark the pool has no room for is
+//! refused (that snapshot is skipped) instead of running the device out of memory. The start-up
+//! log lists what was allocated for what, and
 //! the largest request the pool admits: when that is less than `--max-context` (the model's
 //! 1,048,576 tokens by default), it says so.
 //!

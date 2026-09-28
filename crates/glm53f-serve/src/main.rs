@@ -73,7 +73,7 @@ mod daemon {
     }
 
     pub fn run(o: &Options) -> Result<(), String> {
-        // The text side first (the scheduler's configuration sizes the snapshot banks below).
+        // The text side first (the scheduler's configuration feeds the memory plan below).
         let codec = GlmPrompts::load(&o.tokenizer, &o.chat_template)?;
         if codec.id_bound() != SAMPLE_VOCAB {
             return Err(format!(
@@ -325,15 +325,20 @@ mod daemon {
         );
         eprintln!(
             "[coordinator]   KV page pool {} ({pages} pages, {} tokens); up to {max_context} \
-             tokens per request; snapshot marks take {} pages ({}) each from the pool (the \
-             banks, {} prompt + {} turn, would take {} if full)",
+             tokens per request; snapshot marks take {} pages ({}) each from the pool, {}",
             gib(pages * layout.page_bytes),
             pages * PAGE,
             layout.mark_pages(),
             mib(mark),
-            sched.bank,
-            sched.bank,
-            gib(2 * sched.bank * mark)
+            match sched.bank {
+                0 => "as many as fit: they leave only when an incoming request needs their pages, \
+                      least recently used first, to RAM when the tier is on"
+                    .to_string(),
+                n => format!(
+                    "at most {n} prompt + {n} turn (GLM53F_PREFIX_CACHE_ENTRIES), {} if full",
+                    gib(2 * n * mark)
+                ),
+            }
         );
         eprintln!(
             "[coordinator]   {}",

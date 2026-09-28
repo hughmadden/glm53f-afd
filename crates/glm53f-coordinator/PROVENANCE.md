@@ -22,6 +22,7 @@ DS41RT code is copied here.
 | Unit | Source (repo @ commit : path) | sha256 (source file) | Here | Delta | Pinned by | Date |
 |---|---|---|---|---|---|---|
 | Scheduler loop, request records, slot pool, snapshot points, admission (`Job`, `Active`, `Prefilling`, `Point`, `Retained`, `Pool`, `admit_rows`, `admit_check`, `extends`, `start`, `scheduler`) | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/api.rs (lines 109-121, 207-293, 324-724, 743-1102) | `a0e03f550971e72b38bf23093d75bc23959e92a25c4cf70cfac81ea5d2f84232` | src/scheduler.rs, src/pool.rs | Ported behind `KvSlot` / `ModelForward`; MiMo's structure kept. Every behavioural change is listed below | tests/scheduler.rs | 2026-09-28 |
+| Snapshot eviction only under load (the source's pressure eviction and bank overflow, the design's `on-evict` store mode) | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/api.rs (lines 389-442 `evict_lru`, `take_free`, `make_room`, `make_room_bytes`; 631-688 `enforce_banks`, `grow_active`; 772 the bank's default) | as above | src/pool.rs (`Want`, `make_room`, `evict_point`, `evict_lru`, `take_free`, `enforce_banks`, `grow_active`), src/scheduler.rs (`SchedulerConfig::bank`), src/hostcache.rs (`victim` shared, `capture_for`) | Written here (2026-09-29) on the source's design: no bank cap by default; room for an incoming request made one point at a time, least recently used first, wherever it lives, running and prefilling requests' included; see Scheduler and slot pool, item 15 | tests/paging.rs; tests/scheduler.rs and tests/host_tier.rs unchanged, also under `GLM53F_PREFIX_CACHE_ENTRIES=24`; glm53f-forward tests/paging.rs | 2026-09-29 |
 | Bounded queue and `Engine::admit` | same file (lines 97-107, 1218-1249) | as above | src/queue.rs | A type of its own (`Queue::admit`); depth default = slot count, 16 | unit tests in the file; tests/engine.rs | 2026-09-28 |
 | `Engine` implementation (`generate`, keep-alive, cancel, `LAST_ENCODE`, `emit_delta`, `CancelOnDrop`, `image_token_id`, `image_spans`, `encode_marked`) | same file (lines 33-40, 130-205, 1197-1394, tests 1460-1519) | as above | src/engine.rs | Text side behind `PromptCodec`; `render_prompt` / `tokenize_prompt` with `PromptOptions`; template errors returned by `generate`; `encode_marked` became `expand_image_marker` (the GLM template renders the image delimiters itself); the host reference backend dropped | unit tests in the file; tests/engine.rs | 2026-09-28 |
 | Verify-length policy (`SpecPolicy`, `chain_length`, `verify_lengths`) | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/dforward.rs (lines 937-994, test 2280-2295) | `c048732e72d1b78886a73fc4bb50b820a2fb0077c208909d1fc269d3a62a25fb` | src/spec.rs | Draft probabilities as slices of any length (were `[f32; 7]`); every length capped at the drafts the model returned; `from_env` gathers the three variables | unit tests in the file | 2026-09-28 |
@@ -57,6 +58,7 @@ DS41RT code is copied here.
 | tests/common/mod.rs | A toy deterministic model and slot behind the traits (its positional state is a hash of the whole prefix, checked on every call), simulated memory and time, a call log | 2026-09-28 |
 | tests/common/mod.rs (`copying_logits`, `copying_reference`, `MockModel::copying`), tests/copy_windows.rs | A copying variant of the toy model (its pick follows the last earlier occurrence of its last 8 tokens, one of them may differ, with edits) and the copy windows' tests (see Tests) | 2026-09-29 |
 | tests/scheduler.rs, tests/host_tier.rs, tests/engine.rs, tests/glm_prompt.rs, tests/gpu.rs | See Tests | 2026-09-28 |
+| tests/paging.rs; tests/common/mod.rs (`test_config` reads `GLM53F_PREFIX_CACHE_ENTRIES`) | Snapshots and the RAM tier under load and without (see Tests); the whole suite can run under a bank cap | 2026-09-29 |
 | tests/row_sharded.rs | Four real rank daemons on one GPU over loopback: the row-sharded return against the four-plane sum within the rank README's bound (BF16 and FP8 exchange) and both against the oracle's layers 3 and 4; decode stays four-plane; loopback timings; a dead peer fails the request | 2026-09-28 |
 | examples/wire_bench.rs | The exchange alone against four running ranks, four-plane and row-sharded on the same synthetic rows: per-exchange times, bytes into the coordinator, the two outputs' difference | 2026-09-28 |
 | PROVENANCE.md | This ledger | 2026-09-28 |
@@ -115,7 +117,8 @@ DS41RT code is copied here.
 11. **Defaults and knobs.** 16 slots (the source: 8; `slot_count()` reads `GLM53F_MAX_SLOTS`),
     created by the caller at their base capacity (the source built 4,096-row slots itself); queue depth defaults to the slot count; every constant of the source
     (`MIN_RETAIN` 512, bank 24, 2,000 ms segments, `SEG_QUANTUM` 8,192, `SEG_MAX` 65,536, the
-    1,024 / 8,192 / 64 allowance) is a `SchedulerConfig` field with the source's value; the clock
+    1,024 / 8,192 / 64 allowance) is a `SchedulerConfig` field with the source's value, except
+    the bank, 0 (no cap) since item 15; the clock
     is injectable; `Scheduler::step` runs one pass (the source's loop is `run`).
 12. **Growth headroom** before a step is `2 * drafts + 2` rows with the model's draft count (the
     source always used 7 drafts).
@@ -124,6 +127,30 @@ DS41RT code is copied here.
     implemented.
 14. Not ported: the host reference backend (one request at a time on the CPU), vision encoding.
     New: counters (`SchedStats`, `PoolStats`).
+15. **Snapshots leave the device only under load (written here, 2026-09-29).** The source copied
+    a snapshot to RAM in two cases: its bank over 24 points (`MIMO26_PREFIX_CACHE_ENTRIES`), with
+    free memory or not, and pressure, which evicted whole retained slots only, so running
+    requests' marks (141 MiB each for GLM-5.3-Flash) could hold the pool while an incoming prefill
+    was refused. Here:
+    - the cap is optional, 0 (none) by default; `GLM53F_PREFIX_CACHE_ENTRIES=N` restores the
+      source's bank overflow unchanged (`Pool::enforce_banks`), with a `[coordinator] bank cap:`
+      log line;
+    - when an admission (a prefill, a restore, an in-place resume growing its slot), a running
+      request's growth or the image encoder needs memory the check does not find, points are
+      evicted one at a time (`Pool::evict_point`), least recently used first by the RAM tier's
+      victim rule (`hostcache::victim`, now shared), wherever they live: retained slots' points
+      and the marks of running and prefilling requests, which run on. Each is stored to RAM first
+      when the tier is on, then its mark dropped; a retained slot left without points is freed.
+      Eviction stops as soon as the check passes. At a full tie a retained slot's point goes
+      first (it never frees less than a running request's mark). The source evicted whole
+      retained slots here; `take_free` still does when a slot is needed;
+    - a point that serves a fork is marked used whatever holds it (the source refreshed only
+      retained points), so a running request's hot prompt point is not the least recently used;
+    - the in-place rewind's later points and a relocation through RAM count as evicted points;
+    - `PoolStats` counts `evicted_points`, `evicted_in_flight` and `bank_overflows`; the
+      `[coordinator] device pressure:` and `slot pressure:` lines name each evicted point, its
+      holder, and the request that needed the room, and the `[hostcache] store` line says why
+      (`HostCache::capture_for`).
 
 ### Copy windows (mimo26f-afd v1.3.0)
 
@@ -227,9 +254,16 @@ DS41RT code is copied here.
 
 ## Tests
 
-- **CPU** (`cargo test -p glm53f-coordinator`): 52 unit tests (sampling, radix, host tier, queue,
+- **CPU** (`cargo test -p glm53f-coordinator`): 53 unit tests (sampling, radix, host tier, queue,
   spec, copy windows' index, streaming, wire over four mock ranks with the in-place sends' frames
-  byte for byte, E4M3, engine helpers) and 29 integration tests:
+  byte for byte, E4M3, engine helpers) and 36 integration tests (also green under
+  `GLM53F_PREFIX_CACHE_ENTRIES=24`, the source's cap): `tests/paging.rs` (7: no load, no RAM
+  traffic, every repeat a device hit, 152 RAM stores under the source's cap of 24 instead; an
+  incoming prompt evicts exactly the seven least recently used points it needs, the last a running
+  request's mark, with the tokens of a run without pressure and later restores from RAM; a running
+  request's mark evicted as it runs; a prefilling request's point evicted; a growing request
+  evicting its own mark last; the tier off drops them; a cap of 24 moves the oldest points as the
+  source did),
   `tests/scheduler.rs` (12: batched decode, mixed greedy and sampled rows, admission waiting and
   refusal, prefill segments between decode steps, verify windows with partial accepts, the verify
   row budget, stops inside an accepted run, radix reuse exact / extending / divergent with the

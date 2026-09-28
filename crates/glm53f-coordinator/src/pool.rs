@@ -1,13 +1,42 @@
 //! The KV slots and snapshot tiers (mimo26f-afd perf reset K3, the DS41RT host cache design in
 //! its `on-evict` store mode): free slots; retained slots holding snapshot points (the device
-//! tier: no copies while nothing is under pressure); the RAM tier behind them. A point goes to
-//! RAM only when the device evicts it: its bank over `bank` points, or its slot or the slot's
-//! memory needed by a request.
+//! tier); the RAM tier behind them.
 //!
 //! A point is an exact position in a slot's token history: the slot's appendable rows
 //! `[0, len)` are the point's (append-only, so they stay valid while the slot runs on), and its
 //! positional state at `len` is a [`KvSlot::Mark`]. Saving one is a device-side copy, never RAM
-//! traffic.
+//! traffic; a mark the device has no room for is skipped (the point is not saved).
+//!
+//! **No tax unless loaded.** A point stays on the device, uncopied, while nothing needs its
+//! memory; there is no count cap by default. The device evicts points only for an incoming
+//! request that does not fit:
+//!
+//! - **Memory** (`Pool::make_room`): an admission (a prefill, a restore, an in-place resume
+//!   growing its slot), a running request growing its reservation (`Pool::grow_active`) or the
+//!   image encoder's buffers need device memory the admission check does not find. Points are
+//!   evicted one at a time, least recently used first, wherever they live: a retained slot's
+//!   points and the marks of running and prefilling requests (`Pool::evict_point`), until the
+//!   check passes, and no further. The points the incoming request itself holds in hand (an
+//!   in-place resume's) are not candidates.
+//! - **A slot**: none is free, so the least recently used retained slot is evicted whole
+//!   (`Pool::take_free`); or a prompt resuming at an earlier point of a retained slot finds no
+//!   free slot that fits to fork into, so that slot rewinds in place and its later points go
+//!   (`Pool::admit`).
+//!
+//! An evicted point is stored to RAM first when the tier is on ([`HostCache::capture`]), then its
+//! mark is dropped, which frees its device memory; with the tier off it is only dropped. A
+//! retained slot left without points is freed. A running or prefilling request whose point is
+//! evicted runs on: only the snapshot goes, never its rows or its state.
+//!
+//! The victim is the RAM tier's (`crate::hostcache::victim`): the least recently used by
+//! `Point::last_use` (refreshed whenever a point serves a hit), at equal use a prompt point
+//! before a turn point; at a full tie a retained slot's point goes before a running or prefilling
+//! request's mark, since it frees at least as much (its mark, and its slot's rows when it is the
+//! slot's last point).
+//!
+//! An optional cap (`bank`, the design's `--prefix-cache-entries`; 0, none, by default) keeps
+//! each bank, prompt and turn, within that many device points loaded or not: the oldest point of
+//! an overflowing bank goes to RAM (`Pool::enforce_banks`, the source's bank overflow).
 //!
 //! Every point is indexed by its tokens in a [`RadixIndex`] (the source scanned every retained
 //! slot's history). Points of running requests are indexed too: a new prompt that extends a
@@ -20,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::copy::CopyIndex;
-use crate::hostcache::{HostCache, Kind};
+use crate::hostcache::{victim, HostCache, Kind};
 use crate::model::{ImageSpan, KvSlot, ModelForward, Token};
 use crate::radix::RadixIndex;
 use crate::sampling::{After, Sampling};
@@ -119,10 +148,66 @@ pub struct PoolStats {
     /// Prompt tokens whose appendable KV existed (in whole granules) past the resume point:
     /// prefill a periodic checkpoint would have saved.
     pub branch_gap_tokens: u64,
-    /// Retained slots evicted under pressure.
+    /// Retained slots freed by eviction under pressure: evicted whole for a slot, or with their
+    /// last point for memory.
     pub evictions: u64,
+    /// Points evicted from the device because an incoming request needed their memory or their
+    /// slot, each stored to RAM first when the tier is on.
+    pub evicted_points: u64,
+    /// Of those, marks of running or prefilling requests (the requests ran on).
+    pub evicted_in_flight: u64,
+    /// Points a bank cap moved to RAM whatever the load (`SchedulerConfig::bank`; 0 without one).
+    pub bank_overflows: u64,
     /// Points saved.
     pub points: u64,
+}
+
+/// What an incoming request needs room for: the reason eviction logs, and the refusal when the
+/// room cannot be found.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Want {
+    /// Admission of a `prompt`-token prompt into a slot reserved for `rows` tokens (a prefill, a
+    /// restore, or an in-place resume growing its slot).
+    Admit { prompt: usize, rows: usize },
+    /// A running request's reservation growing to `rows` tokens.
+    Grow { rows: usize },
+    /// The image encoder's buffers for a `prompt`-token prompt.
+    Images { prompt: usize },
+}
+
+impl std::fmt::Display for Want {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Want::Admit { prompt, rows } => write!(f, "a {prompt}-token prompt reserving {rows} tokens"),
+            Want::Grow { rows } => write!(f, "a running request growing to {rows} tokens"),
+            Want::Images { prompt } => write!(f, "the image encoder of a {prompt}-token prompt"),
+        }
+    }
+}
+
+impl Want {
+    /// The refusal when `need` bytes are wanted and `free` are free with nothing left to evict.
+    fn refusal(&self, need: usize, free: usize) -> String {
+        match *self {
+            Want::Admit { rows, .. } | Want::Grow { rows } => kv_refusal(rows, need, free),
+            Want::Images { .. } => {
+                format!("the image encoder needs {} MiB of GPU memory; {} MiB is free", need >> 20, free >> 20)
+            }
+        }
+    }
+}
+
+fn kv_refusal(rows: usize, need: usize, free: usize) -> String {
+    format!(
+        "KV pool: a {rows}-token request needs {:.2} GiB of GPU memory, {:.2} GiB is free; retry when other requests \
+         finish",
+        need as f64 / (1u64 << 30) as f64,
+        free as f64 / (1u64 << 30) as f64
+    )
+}
+
+fn mib(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64)
 }
 
 /// The slots, retained points and the RAM tier.
@@ -131,7 +216,8 @@ pub(crate) struct Pool<S: KvSlot> {
     pub(crate) retained: Vec<Retained<S>>,
     pub(crate) cache: Option<HostCache>,
     clock: u64,
-    /// Points kept on the device per bank (the design's `--prefix-cache-entries`).
+    /// The most points each bank keeps on the device, past which the oldest goes to RAM whatever
+    /// the load (the design's `--prefix-cache-entries`); 0: no cap.
     bank: usize,
     /// Snapshots shorter than this are neither retained nor stored.
     pub(crate) min_retain: usize,
@@ -146,12 +232,7 @@ pub(crate) fn admit_check<M: ModelForward>(model: &M, slot: &M::Slot, rows: usiz
     let need = slot.need_bytes(rows);
     let free = model.free_bytes()?;
     if need > free {
-        return Err(format!(
-            "KV pool: a {rows}-token request needs {:.2} GiB of GPU memory, {:.2} GiB is free; retry when other \
-             requests finish",
-            need as f64 / (1u64 << 30) as f64,
-            free as f64 / (1u64 << 30) as f64
-        ));
+        return Err(kv_refusal(rows, need, free));
     }
     Ok(())
 }
@@ -203,19 +284,29 @@ impl<S: KvSlot> Pool<S> {
 
     /// Drop points (their slot's history `hist`) from the index.
     pub(crate) fn forget(&mut self, hist: &[Token], points: &[Point<S::Mark>]) {
+        Self::unindex(&mut self.index, hist, points);
+    }
+
+    fn unindex(index: &mut RadixIndex<u64>, hist: &[Token], points: &[Point<S::Mark>]) {
         for p in points {
-            let removed = self.index.remove(&hist[..p.len], |&x| x == p.id);
+            let removed = index.remove(&hist[..p.len], |&x| x == p.id);
             debug_assert!(removed.is_some(), "point {} not indexed", p.id);
         }
     }
 
-    /// Store point `p` of `slot` (holding `hist`) to RAM, when the RAM tier is on.
-    fn store(cache: &mut Option<HostCache>, slot: &S, hist: &[Token], p: &Point<S::Mark>) {
+    /// Store point `p` of `slot` (holding `hist`) to RAM, when the RAM tier is on; `why` goes on
+    /// the tier's log line.
+    fn store(cache: &mut Option<HostCache>, slot: &S, hist: &[Token], p: &Point<S::Mark>, why: &str) {
         if let Some(c) = cache.as_mut() {
-            if let Err(e) = c.capture(slot, &hist[..p.len], &p.after, p.kind, &p.mark) {
+            if let Err(e) = c.capture_for(slot, &hist[..p.len], &p.after, p.kind, &p.mark, why) {
                 eprintln!("[hostcache] store failed: {e}");
             }
         }
+    }
+
+    /// Where an evicted point goes, for the log.
+    fn destination(&self) -> &'static str {
+        if self.cache.is_some() { "to RAM" } else { "dropped (no RAM tier)" }
     }
 
     /// Give a slot back: every row dropped, memory grown past its base returned.
@@ -236,26 +327,29 @@ impl<S: KvSlot> Pool<S> {
         self.retained.push(r);
     }
 
-    /// Evict the least recently used retained slot: its points to RAM, its slot back to the
+    /// Evict the least recently used retained slot whole, for `want`, which needs a slot and
+    /// finds none free: its points stored to RAM first when the tier is on, the slot back to the
     /// free list. False when none is left.
-    pub(crate) fn evict_lru(&mut self) -> bool {
+    fn evict_lru(&mut self, want: Want) -> bool {
         let Some(i) = (0..self.retained.len()).min_by_key(|&i| self.retained[i].last_use()) else { return false };
         let r = self.retained.swap_remove(i);
-        eprintln!("[coordinator] device pressure: evicting a retained {}-token slot ({} snapshots) to RAM",
-            r.slot.tokens(), r.points.len());
+        eprintln!("[coordinator] slot pressure: {want} needs a slot, none is free: evicting the least recently used \
+            retained slot ({} tokens, {} snapshots), {}", r.slot.tokens(), r.points.len(), self.destination());
+        let why = format!("a retained slot's, evicted for {want}");
         for p in &r.points {
-            Self::store(&mut self.cache, &r.slot, &r.hist, p);
+            Self::store(&mut self.cache, &r.slot, &r.hist, p, &why);
         }
         self.forget(&r.hist, &r.points);
         self.stats.evictions += 1;
+        self.stats.evicted_points += r.points.len() as u64;
         self.release(r.slot);
         true
     }
 
-    /// A clean slot: a free one, else the least recently used retained one.
-    pub(crate) fn take_free(&mut self) -> Option<S> {
+    /// A clean slot for `want`: a free one, else the least recently used retained one, evicted.
+    pub(crate) fn take_free(&mut self, want: Want) -> Option<S> {
         if self.free.is_empty() {
-            self.evict_lru();
+            self.evict_lru(want);
         }
         self.free.pop().map(|mut s| {
             s.reset();
@@ -263,33 +357,98 @@ impl<S: KvSlot> Pool<S> {
         })
     }
 
-    /// Room on the device for `slot` to hold `rows` tokens, evicting retained slots (least
-    /// recently used first) while it does not fit.
-    pub(crate) fn make_room<M: ModelForward<Slot = S>>(&mut self, model: &M, slot: &S, rows: usize) -> Result<(), String> {
+    /// Room on the device for `need` more bytes, which `want` needs: points evicted one at a time
+    /// ([`Self::evict_point`], least recently used first wherever they live) until the device has
+    /// them free, and no further. `Err` (the refusal) when no point is left to evict.
+    pub(crate) fn make_room<M: ModelForward<Slot = S>>(
+        &mut self,
+        model: &M,
+        need: usize,
+        want: Want,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+    ) -> Result<(), String> {
         loop {
-            match admit_check(model, slot, rows) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if !self.evict_lru() {
-                        return Err(e);
-                    }
-                }
+            let free = model.free_bytes()?;
+            if need <= free {
+                return Ok(());
+            }
+            let pressure = format!("{want} needs {}, {} is free", mib(need), mib(free));
+            if !self.evict_point(active, prefilling, want, &pressure) {
+                return Err(want.refusal(need, free));
             }
         }
     }
 
-    /// `bytes` of free device memory, evicting retained slots (least recently used first)
-    /// while there is not (mimo26f-afd perf reset V2: an image encoder's transient buffers).
-    pub(crate) fn make_room_bytes<M: ModelForward<Slot = S>>(&mut self, model: &M, bytes: usize) -> Result<(), String> {
-        loop {
-            let free = model.free_bytes()?;
-            if free >= bytes {
-                return Ok(());
-            }
-            if !self.evict_lru() {
-                return Err(format!("the image encoder needs {} MiB of GPU memory; {} MiB is free", bytes >> 20, free >> 20));
-            }
+    /// Evict one device point for `want`'s room (`pressure`: its need, for the log): the least
+    /// recently used, wherever it lives (the module documentation's victim rule). It is stored to
+    /// RAM first when the tier is on, then its mark is dropped; a retained slot left without
+    /// points is freed; a running or prefilling request keeps its slot and runs on. False when no
+    /// point is left.
+    pub(crate) fn evict_point(
+        &mut self,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+        want: Want,
+        pressure: &str,
+    ) -> bool {
+        // Every point, retained slots' first (`victim` keeps the first of equals).
+        let mut every: Vec<(Owner, usize)> = Vec::new();
+        for (i, r) in self.retained.iter().enumerate() {
+            every.extend((0..r.points.len()).map(|pi| (Owner::Retained(i), pi)));
         }
+        for (i, a) in active.iter().enumerate() {
+            every.extend((0..a.points.len()).map(|pi| (Owner::Active(i), pi)));
+        }
+        for (i, p) in prefilling.iter().enumerate() {
+            every.extend((0..p.points.len()).map(|pi| (Owner::Prefilling(i), pi)));
+        }
+        let Some(k) = victim(every.iter().map(|&at| {
+            let p = self.point(active, prefilling, at);
+            (p.kind, p.last_use)
+        })) else {
+            return false;
+        };
+        let (owner, pi) = every[k];
+        let to = self.destination();
+        let (holder, slot, hist, points) = match owner {
+            Owner::Retained(i) => {
+                let r = &mut self.retained[i];
+                ("a retained slot's", &r.slot, r.hist.as_slice(), &mut r.points)
+            }
+            Owner::Active(i) => {
+                let a = &mut active[i];
+                ("a running request's", &a.slot, a.hist.as_slice(), &mut a.points)
+            }
+            Owner::Prefilling(i) => {
+                let p = &mut prefilling[i];
+                ("a prefilling request's", &p.slot, p.ids.as_slice(), &mut p.points)
+            }
+        };
+        let p = points.swap_remove(pi);
+        let emptied = points.is_empty();
+        let freed = if emptied && matches!(owner, Owner::Retained(_)) {
+            format!("; its slot ({} tokens) freed", slot.tokens())
+        } else {
+            String::new()
+        };
+        eprintln!("[coordinator] device pressure: {pressure}: evicting {holder} {:?} snapshot of {} tokens, {to}{freed}",
+            p.kind, p.len);
+        Self::store(&mut self.cache, slot, hist, &p, &format!("{holder}, evicted for {want}"));
+        Self::unindex(&mut self.index, hist, std::slice::from_ref(&p));
+        // The mark goes: its device memory is free.
+        drop(p);
+        self.stats.evicted_points += 1;
+        match owner {
+            Owner::Retained(i) if emptied => {
+                let r = self.retained.swap_remove(i);
+                self.stats.evictions += 1;
+                self.release(r.slot);
+            }
+            Owner::Retained(_) => {}
+            Owner::Active(_) | Owner::Prefilling(_) => self.stats.evicted_in_flight += 1,
+        }
+        true
     }
 
     /// Where point `id` lives.
@@ -346,16 +505,20 @@ impl<S: KvSlot> Pool<S> {
     /// without evicting anything (the source's copy-on-write sharing; [`KvSlot::fork`]);
     /// otherwise a retained slot rewinds to the point ([`KvSlot::rewind`]) and its later points
     /// go to RAM, and a running request's point is not used.
+    ///
+    /// Room is made by eviction (the module documentation): points of `active` and `prefilling`
+    /// requests are candidates too, and stay with their requests otherwise.
     pub(crate) fn admit<M: ModelForward<Slot = S>>(
         &mut self,
         model: &M,
-        active: &[Active<S>],
-        prefilling: &VecDeque<Prefilling<S>>,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
         ids: &[Token],
         rows: usize,
         sampled: bool,
     ) -> Result<Admitted<S>, String> {
         let now = self.now();
+        let want = Want::Admit { prompt: ids.len(), rows };
         let (dev, shared_dev) = self.device_hit(active, prefilling, ids, sampled);
         let shared = shared_dev.max(self.cache.as_ref().map_or(0, |c| c.shared(ids)));
         let dev_len = dev.map_or(0, |at| self.point(active, prefilling, at).len);
@@ -384,21 +547,16 @@ impl<S: KvSlot> Pool<S> {
                             .is_ok()
                     };
                     if forked {
-                        let after = match at.0 {
-                            Owner::Retained(i) => {
-                                let p = &mut self.retained[i].points[at.1];
-                                p.last_use = now;
-                                eprintln!("[coordinator] device hit: {dev_len} of {} prompt tokens ({:?} snapshot, forked)",
-                                    ids.len(), p.kind);
-                                p.after.clone()
-                            }
-                            _ => {
-                                let p = self.point(active, prefilling, at);
-                                eprintln!("[coordinator] device hit: {dev_len} of {} prompt tokens (a running request's \
-                                    {:?} snapshot, forked)", ids.len(), p.kind);
-                                p.after.clone()
-                            }
+                        // The point served a hit: used now, wherever it lives (the victim order).
+                        let (p, whose) = match at.0 {
+                            Owner::Retained(i) => (&mut self.retained[i].points[at.1], ""),
+                            Owner::Active(i) => (&mut active[i].points[at.1], "a running request's "),
+                            Owner::Prefilling(i) => (&mut prefilling[i].points[at.1], "a running request's "),
                         };
+                        p.last_use = now;
+                        eprintln!("[coordinator] device hit: {dev_len} of {} prompt tokens ({whose}{:?} snapshot, forked)",
+                            ids.len(), p.kind);
+                        let after = p.after.clone();
                         self.stats.device_hits += 1;
                         self.stats.forks += 1;
                         resumed(self, dev_len);
@@ -414,14 +572,22 @@ impl<S: KvSlot> Pool<S> {
                 x.last_use = now;
                 let (after, kind) = (x.after.clone(), x.kind);
                 let (keep, later): (Vec<_>, Vec<_>) = r.points.into_iter().partition(|p| p.len <= dev_len);
-                for p in &later {
-                    Self::store(&mut self.cache, &r.slot, &r.hist, p);
+                if !later.is_empty() {
+                    // No free slot to fork into, or none that fits: the slot's later points go.
+                    eprintln!("[coordinator] slot pressure: {want} resumes a retained slot in place at {dev_len} \
+                        tokens: its {} later snapshots {}", later.len(), self.destination());
+                    let why = format!("a retained slot's, rewound in place to {dev_len} tokens for {want}");
+                    for p in &later {
+                        Self::store(&mut self.cache, &r.slot, &r.hist, p, &why);
+                    }
+                    self.stats.evicted_points += later.len() as u64;
                 }
                 self.forget(&r.hist, &later);
                 drop(later);
                 let mut slot = r.slot;
+                let need = slot.need_bytes(rows);
                 let placed = self
-                    .make_room(model, &slot, rows)
+                    .make_room(model, need, want, active, prefilling)
                     .and_then(|_| slot.reserve(rows))
                     .and_then(|_| {
                         let p = keep.iter().find(|p| p.len == dev_len).expect("the hit point");
@@ -441,9 +607,11 @@ impl<S: KvSlot> Pool<S> {
                     Err(e) if self.cache.is_some() => {
                         eprintln!("[coordinator] cannot grow a retained {}-token slot in place ({e}); relocating it \
                             through RAM", slot.tokens());
+                        let why = format!("a retained slot's, relocated through RAM for {want}");
                         for p in &keep {
-                            Self::store(&mut self.cache, &slot, &r.hist, p);
+                            Self::store(&mut self.cache, &slot, &r.hist, p, &why);
                         }
+                        self.stats.evicted_points += keep.len() as u64;
                         self.forget(&r.hist, &keep);
                         drop(keep);
                         self.release(slot);
@@ -459,8 +627,9 @@ impl<S: KvSlot> Pool<S> {
         }
         // A clean slot (evicting the least recently used retained slot if none is free), then the
         // RAM tier: looked up again, since making room stores to it.
-        let mut slot = self.take_free().ok_or("no KV slot")?;
-        if let Err(e) = self.make_room(model, &slot, rows).and_then(|_| slot.reserve(rows)) {
+        let mut slot = self.take_free(want).ok_or("no KV slot")?;
+        let need = slot.need_bytes(rows);
+        if let Err(e) = self.make_room(model, need, want, active, prefilling).and_then(|_| slot.reserve(rows)) {
             self.release(slot);
             return Err(e);
         }
@@ -543,10 +712,13 @@ impl<S: KvSlot> Pool<S> {
         self.keep(Retained { slot, hist: ids, points });
     }
 
-    /// Keep each bank within `bank` points on the device: the oldest point of an overflowing
-    /// bank goes to RAM (the design's bank overflow). A retained slot left without points is
-    /// freed.
+    /// With a cap (`bank` above 0): keep each bank within `bank` points on the device, loaded or
+    /// not; the oldest point of an overflowing bank goes to RAM (the design's bank overflow). A
+    /// retained slot left without points is freed. Without a cap, the default, nothing.
     pub(crate) fn enforce_banks(&mut self, active: &mut [Active<S>]) {
+        if self.bank == 0 {
+            return;
+        }
         for kind in [Kind::Prompt, Kind::Turn] {
             loop {
                 let mut count = 0;
@@ -565,16 +737,21 @@ impl<S: KvSlot> Pool<S> {
                     break;
                 }
                 let (_, running, oi, pi) = oldest.expect("a point to evict");
+                let why = format!("the {kind:?} bank over its cap of {}", self.bank);
+                let to = self.destination();
+                self.stats.bank_overflows += 1;
                 if running {
                     let a = &mut active[oi];
                     let p = a.points.swap_remove(pi);
-                    Self::store(&mut self.cache, &a.slot, &a.hist, &p);
+                    eprintln!("[coordinator] bank cap: {why}: a running request's snapshot of {} tokens, {to}", p.len);
+                    Self::store(&mut self.cache, &a.slot, &a.hist, &p, &why);
                     self.forget(&a.hist, std::slice::from_ref(&p));
                 } else {
                     let ri = oi - active.len();
                     let p = self.retained[ri].points.swap_remove(pi);
                     let r = &self.retained[ri];
-                    Self::store(&mut self.cache, &r.slot, &r.hist, &p);
+                    eprintln!("[coordinator] bank cap: {why}: a retained slot's snapshot of {} tokens, {to}", p.len);
+                    Self::store(&mut self.cache, &r.slot, &r.hist, &p, &why);
                     let hist = std::mem::take(&mut self.retained[ri].hist);
                     self.forget(&hist, std::slice::from_ref(&p));
                     self.retained[ri].hist = hist;
@@ -588,16 +765,26 @@ impl<S: KvSlot> Pool<S> {
     }
 
     /// Before a decode step: a request about to outgrow its reservation grows now, with room
-    /// made first (a running request is not failed for pool pressure while retained slots can be
-    /// evicted). `drafts`: the most rows a step may add beyond one.
-    pub(crate) fn grow_active<M: ModelForward<Slot = S>>(&mut self, model: &M, active: &mut [Active<S>], drafts: usize) {
-        for a in active.iter_mut() {
-            let cap = a.slot.capacity();
-            if a.slot.tokens() + 2 * drafts + 2 < cap {
+    /// made first (a running request is not failed for pool pressure while snapshot points can
+    /// be evicted, its own included). `drafts`: the most rows a step may add beyond one.
+    pub(crate) fn grow_active<M: ModelForward<Slot = S>>(
+        &mut self,
+        model: &M,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+        drafts: usize,
+    ) {
+        for i in 0..active.len() {
+            let cap = active[i].slot.capacity();
+            if active[i].slot.tokens() + 2 * drafts + 2 < cap {
                 continue;
             }
             let target = cap + (cap / 8).max(4096);
-            if let Err(e) = self.make_room(model, &a.slot, target).and_then(|_| a.slot.reserve(target)) {
+            let need = active[i].slot.need_bytes(target);
+            let grown = self
+                .make_room(model, need, Want::Grow { rows: target }, active, prefilling)
+                .and_then(|_| active[i].slot.reserve(target));
+            if let Err(e) = grown {
                 eprintln!("[coordinator] KV growth to {target} tokens failed: {e}");
             }
         }

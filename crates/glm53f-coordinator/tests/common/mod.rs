@@ -535,7 +535,9 @@ impl Default for Setup {
 }
 
 /// Small-scale knobs: snapshots from 16 tokens, 16-token segment quanta, 20 ms segments at the
-/// mock's 0.25 ms per row, admission allowances of 8..32 tokens.
+/// mock's 0.25 ms per row, admission allowances of 8..32 tokens. `GLM53F_PREFIX_CACHE_ENTRIES=N`
+/// runs every test that does not set its own under a bank cap of N (the daemon reads it too):
+/// `GLM53F_PREFIX_CACHE_ENTRIES=24` is the source's configuration.
 pub fn test_config(eos: Vec<Token>, clock: Clock) -> SchedulerConfig {
     let mut c = SchedulerConfig::new(eos);
     c.min_retain = 16;
@@ -547,6 +549,9 @@ pub fn test_config(eos: Vec<Token>, clock: Clock) -> SchedulerConfig {
     c.out_slack = 8;
     c.granularity = 4;
     c.clock = clock;
+    if let Some(n) = std::env::var("GLM53F_PREFIX_CACHE_ENTRIES").ok().and_then(|v| v.parse().ok()) {
+        c.bank = n;
+    }
     c
 }
 

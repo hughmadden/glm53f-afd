@@ -220,7 +220,11 @@ to about C1 throughput. This design rules that out.
   - One is saved at the end of each prompt and of each completed turn.
   - A match resumes from the longest snapshot that lies within the match.
   - Optional periodic checkpoints (D4) cover divergent branches.
-- **Eviction.** Least recently used, over retained entries only. Evicted pages and
+- **Eviction.** No tax unless loaded: snapshots stay on the device, uncopied,
+  until an incoming request needs their memory or a slot, and no count caps them
+  by default. Then they go least recently used first, one at a time until the
+  request fits, over every snapshot on the device: finished conversations' and
+  the running requests' own, which run on without them. Evicted pages and
   snapshots move to a page-locked host RAM tier, and exact or extending repeats
   restore from it.
 - **Memory plan.** Computed at start-up: weights, drafter, per-slot state,

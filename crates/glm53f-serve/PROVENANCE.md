@@ -19,6 +19,7 @@ wires this repository's crates together.
 | src/main.rs (start-up memory) | The allocation order (the experts' and the forward's buffers before the KV pool, the pool from what is left) and the memory plan logged at start-up; the prefill lanes and the lane trace (`GLM53F_PROFILE`) | 2026-09-28 |
 | tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
 | src/lib.rs, src/main.rs (copy windows) | `--copy-windows on\|off` (`GLM53F_COPY_WINDOWS`), on by default, handed to the scheduler (`SchedulerConfig::copy_windows`); its documentation and test | 2026-09-29 |
+| src/lib.rs, src/main.rs (snapshots) | `GLM53F_PREFIX_CACHE_ENTRIES` documented as an optional cap (none by default) and the rule snapshots follow without it; the start-up memory line gives a mark's pages and the cap, if any, instead of the banks' size at 24 | 2026-09-29 |
 | Cargo.toml | The manifest | 2026-09-28 |
 
 ## Test data

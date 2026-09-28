@@ -62,8 +62,10 @@
 //! Admission reserves a request's prompt plus an output allowance ([`KvSlot::reserve`]), never
 //! the model's whole context. [`KvSlot::need_bytes`] says what a reservation would cost and
 //! [`ModelForward::free_bytes`] what the device has; when it does not fit the pool evicts
-//! retained slots (least recently used first) and, if nothing is left to evict, the request
-//! waits for running requests to finish.
+//! snapshot points, least recently used first, wherever they live (retained slots', and running
+//! requests' marks, which the requests do without), each stored to the host RAM tier first when
+//! it is on, until it fits; if nothing is left to evict, the request waits for running requests
+//! to finish. Nothing is evicted while nothing needs the memory.
 //!
 //! # Selection
 //!
@@ -359,7 +361,7 @@ pub trait ModelForward {
 
     /// Device bytes the model needs free to encode `images` during a prefill (a vision tower's
     /// transient weights and buffers; 0 for images it has encoded already, e.g. rows it keeps
-    /// per slot across a prompt's segments). The scheduler evicts retained slots until they are
+    /// per slot across a prompt's segments). The scheduler evicts snapshot points until they are
     /// free before each segment that reaches an image. Default: 0.
     fn image_bytes(&self, images: &[ImageSpan]) -> usize {
         let _ = images;

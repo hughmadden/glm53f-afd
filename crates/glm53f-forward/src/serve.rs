@@ -244,7 +244,8 @@ impl ModelForward for ServedForward {
     /// allocated up front ([`KvSlot::need_bytes`] counts pages), and snapshot marks take pages of
     /// it too, so the device's free memory does not measure room for a request. Less any
     /// shortfall of the device's free memory below `margin` (allocations outside the pool and
-    /// the forward's buffers); admission then evicts retained slots, which frees pages.
+    /// the forward's buffers); admission then evicts snapshot points (their marks' pages, and a
+    /// retained slot's pages with its last point), which frees pages.
     fn free_bytes(&self) -> Result<usize, String> {
         let (free, _) = s(device::mem_info())?;
         let kv = &self.fwd.kv;

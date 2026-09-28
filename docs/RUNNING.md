@@ -127,11 +127,12 @@ describes each.
 - **Memory.** Nothing a pass, a draft or an append to the drafter's context uses is allocated
   after start-up. Snapshot marks (the KDA states
   of a prompt or turn end, 141 MiB) take pages of the KV pool, which admission counts, so a
-  short pool evicts retained snapshots, skips a snapshot or refuses a request; it never runs the
+  short pool evicts snapshots ([KV snapshots and the RAM tier](#kv-snapshots-and-the-ram-tier)),
+  skips a snapshot or refuses a request; it never runs the
   device out of memory in a pass. The start-up log's `device memory` lines list the weights, the
   forward's buffers (each lane, verify, workspaces, GEMM), the drafter's weights, tap buffer,
-  working memory and per-slot ring, the expert exchange, the slots' state, the pool (with what
-  the snapshot banks would take of it if full) and what was left free.
+  working memory and per-slot ring, the expert exchange, the slots' state, the pool (with the
+  pages a snapshot mark takes) and what was left free.
 - **Decode lanes.** `--decode-lanes MIN[-MAX]` runs decode and verify passes of MIN to MAX rows
   (over two requests or more) in the prefill's first two lanes, cut between requests (it needs
   `--prefill-lanes` 2 or more); `2-16` by default. Each
@@ -183,6 +184,34 @@ describes each.
   built from the GPU into the page-locked request body, and returns read from the page-locked
   receive buffers (summed in place at decode sizes). Each has an off switch for comparisons;
   the results do not depend on them (`crates/glm53f-forward/src/remote.rs`).
+
+### KV snapshots and the RAM tier
+
+Every prompt end and completion end of 512 tokens or more stays on the GPU as a snapshot: the
+request's KV rows, plus a copy of its KDA state (141 MiB, 376 pool pages; 73 MiB and 195 pages with
+`--kda-state-bf16`) made on the GPU. A later prompt that starts with a snapshot's tokens resumes
+there instead of prefilling them. The rule is **no tax unless loaded**:
+
+- **No load.** A snapshot stays on the GPU, uncopied, however many there are. Nothing is copied to
+  RAM while nothing needs the memory.
+- **Load.** When an incoming request needs pool pages the pool does not have (a prompt being
+  admitted or restored, a running request's growing reservation), snapshots are evicted one at a
+  time, least recently used first, wherever they are: finished conversations' and running or
+  prefilling requests' own. Each is copied to the RAM tier first, then its pages are freed.
+  Eviction stops as soon as the request fits. A request whose snapshot is evicted runs on; only
+  the snapshot moves. When a request needs a slot and none is free, the least recently used
+  finished conversation's slot is evicted whole.
+- **Restore.** A prompt that misses the GPU but matches a RAM snapshot restores from it instead of
+  prefilling.
+- `GLM53F_HOST_CACHE_GB` sizes the RAM tier. With `GLM53F_HOST_CACHE_GB=0` evicted snapshots are
+  dropped.
+- `GLM53F_PREFIX_CACHE_ENTRIES=N` caps the snapshots on the GPU at N per bank (prompt ends, turn
+  ends) and moves the oldest to RAM past it, loaded or not. It is unset by default: no cap
+  (mimo26f-afd's default was 24).
+- **Log.** `[coordinator] device pressure: <request> needs <MiB>, <MiB> is free: evicting <whose>
+  <bank> snapshot of <n> tokens, to RAM` names each eviction and the request it made room for
+  (`slot pressure:` when a slot was needed). `[hostcache] store ... (<whose>, evicted for
+  <request>)` is its copy to RAM and what it cost; `[hostcache] restore ...` a restore.
 
 ### Copy windows
 
@@ -322,7 +351,10 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the
 smaller of 32 GiB and 40% of the available RAM), `GLM53F_PREFILL_SEGMENT_MS`,
-`GLM53F_PREFIX_CACHE_ENTRIES`, and `GLM53F_SPEC`, `GLM53F_SPEC_POLICY`, `GLM53F_SPEC_TAU`,
+`GLM53F_PREFIX_CACHE_ENTRIES` (a cap on the KV snapshots kept on the GPU per bank, past which the
+oldest go to RAM whatever the load; unset or 0, the default: no cap, and snapshots go to RAM only
+when an incoming request needs their memory; [KV snapshots and the RAM
+tier](#kv-snapshots-and-the-ram-tier)), and `GLM53F_SPEC`, `GLM53F_SPEC_POLICY`, `GLM53F_SPEC_TAU`,
 `GLM53F_SPEC_COST_A`, `GLM53F_SPEC_COST_B`, `GLM53F_SPEC_MAX_ROWS` (speculation, with
 `--drafter`; the last caps a step's verify rows, 256 by default, 0 for no cap, and sizes the
 verify pass); the daemon reads `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft with the

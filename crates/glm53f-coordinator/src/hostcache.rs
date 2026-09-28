@@ -1,13 +1,14 @@
 //! The host RAM tier (mimo26f-afd perf reset K3; the DS41RT host snapshot cache design in its
-//! `on-evict` store mode): the RAM home of retained snapshots the device had to evict.
+//! `on-evict` store mode): the RAM home of the snapshots the device had to evict.
 //!
 //! Retained snapshots live on the device first (`crate::pool`: a snapshot is a *point* in a
 //! slot's history, with a [`KvSlot::Mark`] of its positional state): with no pressure nothing
-//! is copied to RAM. When the device evicts a point (a bank over its size, or a slot or its
-//! memory needed), the scheduler stores it here; a returning conversation that misses the
-//! device restores from here instead of prefilling. RAM eviction deletes the least recently
-//! used snapshot first; at equal use a prompt snapshot goes before a turn snapshot
-//! (`victim`).
+//! is copied to RAM, however many there are. When the device evicts a point (an incoming request
+//! needs its memory or its slot, least recently used first, a running request's own included;
+//! or a bank over an optional cap), the scheduler stores it here, then frees it on the device; a
+//! returning conversation that misses the device restores from here instead of prefilling. RAM
+//! eviction deletes the least recently used snapshot first; at equal use a prompt snapshot goes
+//! before a turn snapshot (`victim`, the device's order too).
 //!
 //! That departs from an older order, every prompt snapshot before any turn snapshot, which
 //! mimo26f-afd v1.1.1 fixed. A prompt snapshot shares its pages with its conversation's turn
@@ -366,6 +367,19 @@ impl HostCache {
     /// an identical snapshot already held is refreshed instead.
     pub fn capture<S: KvSlot>(&mut self, slot: &S, tokens: &[Token], after: &After, kind: Kind, mark: &S::Mark)
         -> Result<(), String> {
+        self.capture_for(slot, tokens, after, kind, mark, "")
+    }
+
+    /// [`Self::capture`], its log line saying why the snapshot is stored (`why`; empty: nothing).
+    pub(crate) fn capture_for<S: KvSlot>(
+        &mut self,
+        slot: &S,
+        tokens: &[Token],
+        after: &After,
+        kind: Kind,
+        mark: &S::Mark,
+        why: &str,
+    ) -> Result<(), String> {
         let n = tokens.len();
         if n < self.cfg.min_tokens || slot.tokens() < n {
             return Ok(());
@@ -452,8 +466,10 @@ impl HostCache {
         });
         self.stats.captures += 1;
         self.stats.pages_written += written;
-        eprintln!("[hostcache] store {kind:?} snapshot {n} tokens: {written} new of {} pages, {:.1} ms ({} snapshots, \
-            {} pages held)", chain.len(), t0.elapsed().as_secs_f64() * 1e3, self.snaps.len(), self.page_map.len());
+        let why = if why.is_empty() { String::new() } else { format!(" ({why})") };
+        eprintln!("[hostcache] store {kind:?} snapshot {n} tokens{why}: {written} new of {} pages, {:.1} ms ({} \
+            snapshots, {} pages held)", chain.len(), t0.elapsed().as_secs_f64() * 1e3, self.snaps.len(),
+            self.page_map.len());
         Ok(())
     }
 
@@ -505,9 +521,10 @@ impl HostCache {
 }
 
 /// The snapshot RAM deletes next: the least recently used; at equal use a prompt snapshot before a
-/// turn snapshot. (A conversation's prompt snapshot is stored just before its turn snapshot, so the
-/// pair goes prompt first; across conversations age decides.)
-fn victim(snaps: impl Iterator<Item = (Kind, u64)>) -> Option<usize> {
+/// turn snapshot; at a full tie the first. (A conversation's prompt snapshot is stored just before
+/// its turn snapshot, so the pair goes prompt first; across conversations age decides.) The device
+/// evicts its points by the same rule (`crate::pool`).
+pub(crate) fn victim(snaps: impl Iterator<Item = (Kind, u64)>) -> Option<usize> {
     snaps.enumerate().min_by_key(|&(_, (kind, last))| (last, kind == Kind::Turn)).map(|(i, _)| i)
 }
 

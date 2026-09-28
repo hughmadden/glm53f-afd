@@ -9,7 +9,8 @@
 //!   that arrive together prefill in one pass; every running request takes one batched step, a
 //!   decode or a speculative verify window.
 //! - [`pool`]: the slots, the device snapshot points (prompt end, turn end, abandoned prefill)
-//!   and their banks; resuming a prompt in place or by a fork; eviction under pressure.
+//!   and their banks; resuming a prompt in place or by a fork; eviction only under pressure,
+//!   least recently used first, running requests' points included.
 //! - [`radix`]: the prefix index over token ids (image identities included) that finds a
 //!   prompt's longest snapshot point, and how much of it exists in whole pools.
 //! - [`hostcache`]: the host RAM tier behind the device, least recently used first, over the
