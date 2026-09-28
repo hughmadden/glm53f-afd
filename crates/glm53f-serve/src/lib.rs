@@ -45,18 +45,22 @@
 //! | `--reserve-gib G` | | 1 | Device memory left free after everything is allocated (kernel modules loaded on first use, the sampler, allocator slack) |
 //! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 4096 | Rows of one prefill pass, both lanes together (at most 4,096 per lane: the wire's request cap) |
 //! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 2 | Lanes of a prefill pass: 2 overlaps one lane's attention with the other's experts on the ranks, 1 runs the pass serially |
+//! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | off | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (needs `--prefill-lanes 2`); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
 //! `GLM53F_HOST_CACHE_GB` (the host RAM tier, 0 for none), `GLM53F_PREFILL_SEGMENT_MS`,
 //! `GLM53F_PREFIX_CACHE_ENTRIES`; with a drafter `GLM53F_SPEC` (0: decode one token a step),
-//! `GLM53F_SPEC_POLICY` (`fixed`, `conf`, else the chain cut at `GLM53F_SPEC_TAU`) and
-//! `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft greedily too); the wire client
+//! `GLM53F_SPEC_POLICY` (`fixed`, `conf`, else the chain cut at `GLM53F_SPEC_TAU`),
+//! `GLM53F_SPEC_MAX_ROWS` (the most verify rows a step holds, the most likely drafts first; 256
+//! by default, 0 for none; it also sizes the verify pass, see [Device memory](#device-memory))
+//! and `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft greedily too); the wire client
 //! `GLM53F_RDMA=1` (an `rdma` build) with
 //! `GLM53F_WIRE_NOCRC=1` (which the ranks must set too), `GLM53F_WIRE_MIN_GBPS`,
 //! `GLM53F_WIRE_INFLIGHT` (1 holds RDMA to one exchange in flight), `GLM53F_TIMELINE`,
-//! `GLM53F_PROFILE` (with the forward's lane trace).
+//! `GLM53F_PROFILE` (the forward's lane trace: a `PIPE` line per prefill pass, a `STEP` line per
+//! decode step, see `glm53f-forward`'s `LaneTrace::step_summary`).
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
 //! reached through an address without a RoCE v2 device at the floor rate. `GLM53F_WIRE_ALLOW_LAN=1`
@@ -93,7 +97,39 @@
 //! a prompt or turn end, 141 MiB each) take pages of the pool (376 each), so admission, which
 //! counts free pages, counts them too: under pressure it evicts retained snapshots to the host
 //! tier, and a mark the pool has no room for is refused (that snapshot is skipped) instead of
-//! running the device out of memory. The start-up log lists what was allocated for what.
+//! running the device out of memory. The start-up log lists what was allocated for what, and
+//! the largest request the pool admits: when that is less than `--max-context` (the model's
+//! 1,048,576 tokens by default), it says so.
+//!
+//! **Slots.** Each slot holds 181 MiB whatever its length (the KDA states and conv windows, and
+//! with the drafter its 40 MiB context ring). With the drafter a verify pass holds every slot's
+//! window of up to 8 rows, capped by the step's row budget (`GLM53F_SPEC_MAX_ROWS`, 256): its
+//! saved inputs and logits take about 4.9 MiB a row. The drafter's working memory grows with the
+//! slots too (152, 267 and 383 MiB for 16, 32 and 48). All of it comes out of the page pool. On
+//! the target's coordinator (31.4 GiB, the drafter on, the defaults otherwise), from its measured
+//! 16-slot plan and the buffers of the other counts:
+//!
+//! | Slots | Verify rows | Slots' state | Verify buffers | KV pool | Tokens |
+//! |---:|---:|---:|---:|---:|---:|
+//! | 16 | 128 | 2.83 GiB | 0.61 GiB | 7.56 GiB (measured) | 1.32 M |
+//! | 32 | 256 | 5.66 GiB | 1.22 GiB | 4.01 GiB | 0.70 M |
+//! | 48 | 256 | 8.48 GiB | 1.22 GiB | 1.06 GiB | 0.18 M |
+//!
+//! A request of the model's full 1,048,576 tokens needs 6.03 GiB of pages, so above 16 slots it
+//! does not fit, and the start-up log says so; many shorter requests do. `--prefill-rows 2048`
+//! (lanes of 1,024 rows) frees 1.6 GiB of lane buffers, tap buffer and exchange buffers: 5.65 GiB
+//! (0.98 M tokens) at 32 slots, 2.71 GiB (0.47 M tokens) at 48, at some cost in prefill rate.
+//! 64 slots leave at most 0.37 GiB (`--prefill-rows 2048` and a budget of 128 rows).
+//!
+//! # Decode lanes
+//!
+//! `--decode-lanes` runs a decode or verify pass in the prefill's two lanes, cut between
+//! requests (`glm53f-forward`'s `ForwardConfig::decode_lane_rows`): one lane's attention on this
+//! GPU overlaps the other lane's routed experts on the ranks, exactly as the two passes over the
+//! lanes' requests would compute them. It is off by default because it pays only where the
+//! coordinator's work per layer is comparable with the ranks': each lane reads the coordinator's
+//! weights once, and the ranks read the experts each lane's rows name, so two lanes of many rows
+//! read most of the 288 experts twice. A run on the target hardware decides the range.
 //!
 //! # Development mode
 //!
@@ -115,7 +151,7 @@ pub const USAGE: &str = "usage:
 options:
   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
-  --prefill-rows <r>  --prefill-lanes 1|2
+  --prefill-rows <r>  --prefill-lanes 1|2  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
@@ -151,6 +187,8 @@ pub struct Options {
     /// Rows of one prefill pass (every lane's together), and its lanes.
     pub prefill_rows: usize,
     pub prefill_lanes: usize,
+    /// Decode and verify passes of `.0 ..= .1` rows run in two lanes (`.0` 0: never).
+    pub decode_lanes: (usize, usize),
     /// The DFlash2 drafter's directory (none: no speculative decoding).
     pub drafter: Option<PathBuf>,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
@@ -171,6 +209,29 @@ pub fn parse_dev_layers(s: &str) -> Result<usize, String> {
         ));
     }
     Ok(b + 1)
+}
+
+/// `off` or `0`: decode and verify passes in one lane; `MIN`: two lanes from MIN rows; `MIN-MAX`:
+/// from MIN to MAX rows. MIN is at least 2 (a lane holds whole requests).
+pub fn parse_decode_lanes(s: &str) -> Result<(usize, usize), String> {
+    let s = s.trim();
+    if s == "off" || s == "0" {
+        return Ok((0, usize::MAX));
+    }
+    let bad = || format!("--decode-lanes {s:?}: expected off, MIN or MIN-MAX (rows, MIN >= 2)");
+    let (a, b) = match s.split_once('-') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let min: usize = a.trim().parse().map_err(|_| bad())?;
+    let max: usize = match b {
+        Some(b) => b.trim().parse().map_err(|_| bad())?,
+        None => usize::MAX,
+    };
+    if min < 2 || max < min {
+        return Err(bad());
+    }
+    Ok((min, max))
 }
 
 fn parse_ranks(s: &str) -> Result<Vec<String>, String> {
@@ -225,6 +286,10 @@ impl Options {
             Some(v) => number("GLM53F_PREFILL_LANES", &v)?,
             None => 2,
         };
+        let mut decode_lanes = match env("GLM53F_DECODE_LANES") {
+            Some(v) => parse_decode_lanes(&v)?,
+            None => (0, usize::MAX),
+        };
         let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
         let mut it = args.iter();
@@ -245,6 +310,7 @@ impl Options {
                 "--reserve-gib" => reserve_gib = number(k, &val()?)?,
                 "--prefill-rows" => prefill_rows = number(k, &val()?)?,
                 "--prefill-lanes" => prefill_lanes = number(k, &val()?)?,
+                "--decode-lanes" => decode_lanes = parse_decode_lanes(&val()?)?,
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
@@ -268,6 +334,12 @@ impl Options {
         }
         if !matches!(prefill_lanes, 1 | 2) {
             return Err(format!("--prefill-lanes {prefill_lanes}: 1 or 2"));
+        }
+        if decode_lanes.0 > 0 && prefill_lanes != 2 {
+            return Err(
+                "--decode-lanes needs --prefill-lanes 2 (the decode lanes are the prefill's)"
+                    .into(),
+            );
         }
         if !(1..=prefill_lanes * MAX_LANE_ROWS).contains(&prefill_rows) {
             return Err(format!(
@@ -299,9 +371,51 @@ impl Options {
             reserve_gib,
             prefill_rows,
             prefill_lanes,
+            decode_lanes,
             drafter,
             dev_layers,
         })
+    }
+}
+
+/// Rows one verify pass holds with a drafter: every slot's window of `block` rows, capped by the
+/// step's row budget (`budget`, 0 for none; `glm53f_coordinator::SchedulerConfig::spec_max_rows`),
+/// and never fewer than one row a slot (the budget keeps every window's first row).
+pub fn verify_rows(slots: usize, block: usize, budget: usize) -> usize {
+    let all = slots * block;
+    if budget == 0 {
+        all
+    } else {
+        all.min(budget.max(slots))
+    }
+}
+
+/// The start-up line on the largest request a pool of `pages` pages (`page_tokens` tokens and
+/// `page_bytes` bytes each) admits, against `max_context`: whether a request of `max_context`
+/// tokens fits, and if not, what does.
+pub fn admission_line(
+    pages: usize,
+    page_tokens: usize,
+    page_bytes: usize,
+    max_context: usize,
+) -> String {
+    let tokens = pages * page_tokens;
+    let need = max_context.div_ceil(page_tokens) * page_bytes;
+    let g = |b: usize| b as f64 / GIB;
+    if tokens >= max_context {
+        format!(
+            "a request of the full {max_context} tokens fits the pool: its pages take {:.2} GiB",
+            g(need)
+        )
+    } else {
+        format!(
+            "NOTE: a request of {max_context} tokens (--max-context) does NOT fit: its pages \
+             would take {:.2} GiB and the pool has {:.2} GiB. The largest request admitted is \
+             {tokens} tokens (prompt and output allowance together). Fewer slots, a smaller \
+             --reserve-gib or --max-context {tokens} make this consistent",
+            g(need),
+            g(pages * page_bytes)
+        )
     }
 }
 
@@ -409,6 +523,57 @@ mod tests {
         assert_eq!((o.prefill_rows, o.prefill_lanes), (2048, 1));
         let o = Options::parse(&args("--prefill-rows 8192 --prefill-lanes 2"), &env2).unwrap();
         assert_eq!((o.prefill_rows, o.prefill_lanes), (8192, 2));
+        // Decode lanes: off by default; from the environment, and the flag over it.
+        assert_eq!(o.decode_lanes, (0, usize::MAX));
+        let env3 = |k: &str| match k {
+            "GLM53F_DECODE_LANES" => Some("4-64".to_string()),
+            _ => env(k),
+        };
+        assert_eq!(Options::parse(&[], &env3).unwrap().decode_lanes, (4, 64));
+        let o = Options::parse(&args("--decode-lanes 2"), &env3).unwrap();
+        assert_eq!(o.decode_lanes, (2, usize::MAX));
+        let o = Options::parse(&args("--decode-lanes off"), &env3).unwrap();
+        assert_eq!(o.decode_lanes, (0, usize::MAX));
+    }
+
+    #[test]
+    fn decode_lanes_and_the_verify_pass() {
+        assert_eq!(parse_decode_lanes("0"), Ok((0, usize::MAX)));
+        assert_eq!(parse_decode_lanes("8-32"), Ok((8, 32)));
+        for bad in ["1", "8-4", "x", "4-", "-4", "2-x"] {
+            assert!(parse_decode_lanes(bad).is_err(), "{bad:?} was accepted");
+        }
+        // Two lanes need lane B's buffers: the prefill's second lane.
+        let e = Options::parse(
+            &args("--checkpoint /c --experts local --prefill-lanes 1 --decode-lanes 4"),
+            &no_env,
+        )
+        .unwrap_err();
+        assert!(e.contains("--prefill-lanes 2"), "{e}");
+        // Every slot's window of 8 rows, capped by the step's budget, one row a slot at least.
+        assert_eq!(verify_rows(16, 8, 256), 128);
+        assert_eq!(verify_rows(32, 8, 256), 256);
+        assert_eq!(verify_rows(48, 8, 256), 256);
+        assert_eq!(verify_rows(48, 8, 0), 384);
+        assert_eq!(verify_rows(48, 8, 16), 48);
+    }
+
+    #[test]
+    fn the_largest_admitted_request_is_stated() {
+        let page = 394_944;
+        // The measured 16-slot pool (20,550 pages) holds a 1M-token request.
+        let fits = admission_line(20_550, 64, page, 1 << 20);
+        assert!(
+            fits.starts_with("a request of the full 1048576 tokens fits"),
+            "{fits}"
+        );
+        // A pool of 4,000 pages does not: it says so, and what fits.
+        let short = admission_line(4_000, 64, page, 1 << 20);
+        assert!(
+            short.starts_with("NOTE:") && short.contains("does NOT fit"),
+            "{short}"
+        );
+        assert!(short.contains("256000 tokens"), "{short}");
     }
 
     #[test]

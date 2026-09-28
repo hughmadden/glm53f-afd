@@ -128,6 +128,18 @@ describes each.
   forward's buffers (each lane, verify, workspaces, GEMM), the drafter's weights, tap buffer,
   working memory and per-slot ring, the expert exchange, the slots' state, the pool (with what
   the snapshot banks would take of it if full) and what was left free.
+- **Decode lanes.** `--decode-lanes MIN[-MAX]` runs decode and verify passes of MIN to MAX rows
+  (over two requests or more) in the same two lanes, cut between requests; off by default. Each
+  lane is exactly a pass over its own requests (`crates/glm53f-forward/tests/decode_lanes.rs`),
+  so it changes timing only. It overlaps one lane's coordinator work with the other's routed
+  experts, but each lane reads the coordinator's weights and the ranks read the experts each
+  lane's rows name, so two lanes of many rows read most experts twice: measure it.
+- **Slots.** `--slots` (16 by default) sizes each slot's fixed state (181 MiB with the drafter)
+  and, with the drafter, the verify pass: every slot's window of 8 rows, capped by the step's row
+  budget `GLM53F_SPEC_MAX_ROWS` (256 by default; the most likely drafts first), about 4.9 MiB a
+  row. Both come out of the KV pool. The start-up log states the largest request the pool admits
+  and says plainly when a request of `--max-context` tokens (1,048,576 by default) does not fit.
+  `crates/glm53f-serve/src/lib.rs` gives the plan at 16, 32 and 48 slots.
 - **Tracing a pass.** With `GLM53F_PROFILE=1` each prefill pass prints a `PIPE` line: per MoE
   layer (median), the wall time, each lane's GPU time for its attention and its shared expert,
   the host's time waiting for the routes, in `submit` and in `finish` (blocked on the ranks,
@@ -137,6 +149,11 @@ describes each.
   return path (row slices, four planes) the exchanges and the medians of the host's time in
   `submit` (of it, waiting for the device's copies), in `finish` waiting for the returns, and
   placing them. The ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
+- **Tracing a decode step.** With `GLM53F_PROFILE=1` each decode step prints a `STEP` line: the
+  mode (decode, or verify with its drafts and commit), the requests per lane, the host times of
+  the step (the gap since the forward's last call, the drafts, the pass, the commit), the MoE
+  layers' totals (wall, GPU busy, and the host blocked in `finish` waiting for the experts), then
+  the same per-layer medians and wire record as a `PIPE` line.
 - **The expert exchange's paths.** Prefill exchanges from `GLM53F_ROW_SHARDED_MIN_ROWS` rows
   are reduce-scattered by the ranks (each returns its quarter of the rows, summed; needs
   `--peers` on the ranks); decode and verify windows keep the four-plane return. Requests are
@@ -190,6 +207,11 @@ GLM53F_RANK_DIRS=<rank-0>,<rank-1>,<rank-2>,<rank-3> \
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test lanes --test admission -- --nocapture --test-threads=1
 
+# Two-lane decode and verify against the same requests as two passes (bit for bit, the drafter's
+# rings included), and speculation lossless with it.
+GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
+  cargo test --release -p glm53f-forward --features coordinator --test decode_lanes --test draft_lossless -- --nocapture --test-threads=1
+
 # One streamed chat completion through glm53f-serve in development mode.
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
@@ -217,13 +239,16 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 4,096) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 or 2 (default 2) |
+| `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off` (default), `MIN` or `MIN-MAX` (needs `--prefill-lanes 2`) |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the
 smaller of 32 GiB and 40% of the available RAM), `GLM53F_PREFILL_SEGMENT_MS`,
 `GLM53F_PREFIX_CACHE_ENTRIES`, and `GLM53F_SPEC`, `GLM53F_SPEC_POLICY`, `GLM53F_SPEC_TAU`,
-`GLM53F_SPEC_COST_A`, `GLM53F_SPEC_COST_B` (speculation, with `--drafter`); the daemon reads
-`GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft with the greedy walk too).
+`GLM53F_SPEC_COST_A`, `GLM53F_SPEC_COST_B`, `GLM53F_SPEC_MAX_ROWS` (speculation, with
+`--drafter`; the last caps a step's verify rows, 256 by default, 0 for no cap, and sizes the
+verify pass); the daemon reads `GLM53F_DFLASH_SAMPLED_WALK` (0: sampled requests draft with the
+greedy walk too).
 
 **Expert wire:** `GLM53F_RDMA=1` (coordinator: RDMA RC, in an `rdma` build; the ranks follow the
 coordinator's handshake), `GLM53F_WIRE_NOCRC=1` (frames without CRC32C; both sides must agree;
@@ -231,7 +256,7 @@ RDMA requires it), `GLM53F_WIRE_MIN_GBPS` (the fabric's floor rate, default 100)
 `GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_WIRE_INFLIGHT=1` (one
 exchange in flight over RDMA too, instead of two: the prefill lanes then take turns on the wire),
 `GLM53F_TIMELINE=1` (cross-host timeline events), `GLM53F_PROFILE=1` (per-exchange timings on the
-coordinator, and a `PIPE` line per prefill pass). The return path: `GLM53F_ROW_SHARDED_MIN_ROWS=N`
+coordinator, a `PIPE` line per prefill pass and a `STEP` line per decode step). The return path: `GLM53F_ROW_SHARDED_MIN_ROWS=N`
 (exchanges of N rows and more, at least 4, reduce-scattered by the ranks; unset or 0: four planes
 always; the design's value is 16) with `GLM53F_EXCHANGE_DTYPE` (`bf16`, the default, or `fp8`,
 which needs the KL gate). The coordinator's fast paths, on by default:

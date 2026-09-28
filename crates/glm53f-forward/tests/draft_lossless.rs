@@ -25,9 +25,12 @@
 //! The acceptance printed for the real drafter measures nothing about quality: repeated layer
 //! weights and zero experts for 40 of 42 MoE layers.
 //!
-//! The whole test runs twice: with one-lane prefill, and with two-lane prefill
+//! The whole test runs three times: with one-lane prefill; with two-lane prefill
 //! (`ForwardConfig::lanes`, every prompt of 16 tokens or more cut into two lanes, whose rows
-//! reach the drafter's context lane by lane).
+//! reach the drafter's context lane by lane); and with two-lane prefill and two-lane decode
+//! (`ForwardConfig::decode_lane_rows` 2: the two requests at once decode and verify one lane
+//! each, in the plain run and the speculative one, and their windows of at most 4 rows keep each
+//! lane within the row-independent 8 rows).
 #![cfg(feature = "coordinator")]
 
 mod common;
@@ -292,6 +295,21 @@ fn speculative_decoding_changes_no_token_with_two_lane_prefill() {
     });
 }
 
+/// The same with two-lane decode as well: every decode or verify pass of two requests (the pair
+/// below) in two lanes of one request each.
+#[test]
+fn speculative_decoding_changes_no_token_with_two_lane_decode() {
+    lossless(ForwardConfig {
+        max_rows: 128,
+        lanes: 2,
+        min_lane_rows: 8,
+        decode_lane_rows: 2,
+        max_verify_rows: 16,
+        max_requests: 3,
+        ..ForwardConfig::default()
+    });
+}
+
 fn lossless(cfg: ForwardConfig) {
     let Some(mut fwd) = drafted_forward(cfg, 3, 16, 48, 2.0) else {
         return;
@@ -330,6 +348,7 @@ fn lossless(cfg: ForwardConfig) {
     // Two greedy requests at once, 3 drafts a step: verify passes of at most 8 rows.
     m.max_drafts = 3;
     let pair = vec![vec![(ids(21, 9), 32, None), (ids(22, 17), 32, None)]];
+    let lanes0 = m.fwd.decode_lane_passes();
     let (pair_out, _, ds) = same(
         &mut m,
         "two greedy requests at once, 3 drafts a step",
@@ -341,11 +360,17 @@ fn lossless(cfg: ForwardConfig) {
     let ss = with_oracle(&mut m, &pair[0], &pair_out);
     let accepted = (ss.drafts_accepted, ss.drafts_verified);
     assert!(accepted.0 > 0 && accepted.0 < accepted.1, "{ss:?}");
+    let lanes = m.fwd.decode_lane_passes() - lanes0;
     eprintln!(
         "two greedy requests at once with oracle drafts: tokens equal in {} steps, {} of {} drafts \
-         accepted",
+         accepted; decode and verify passes in two lanes over the pair's runs: {lanes}",
         ss.spec_steps, accepted.0, accepted.1
     );
+    if cfg.decode_lane_rows > 0 {
+        assert!(lanes > 0, "the pair never decoded in two lanes");
+    } else {
+        assert_eq!(lanes, 0);
+    }
     m.max_drafts = 7;
 
     // A sampled request with a fixed seed: the target's own draws, speculation or not, and the

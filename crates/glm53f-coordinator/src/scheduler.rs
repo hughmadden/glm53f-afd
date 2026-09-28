@@ -25,7 +25,10 @@
 //! target pass per step; a draft is accepted while it equals the target's own pick at that
 //! row (the argmax, or the request's seeded draw at that row's emitted position), and the first
 //! mismatch emits the target's pick. The slot then commits exactly the rows of the tokens it
-//! delivered ([`crate::model::ModelForward::commit`]).
+//! delivered ([`crate::model::ModelForward::commit`]). Each request's drafts are cut by the
+//! policy ([`SpecPolicy`]), and the step's rows are held to a budget
+//! ([`SchedulerConfig::spec_max_rows`], [`crate::spec::budget`]): under load the rows go to the
+//! drafts most likely to be kept.
 //!
 //! Every row type joins the same step: greedy, sampled and (with masks) constrained rows carry
 //! their own [`Pick`].
@@ -98,6 +101,10 @@ pub struct SchedulerConfig {
     /// Speculate when the model has a drafter.
     pub spec: bool,
     pub policy: SpecPolicy,
+    /// The most verify rows a speculative step holds, every request's window together
+    /// (`crate::spec::budget`: past it the least likely drafts are dropped); 0 for no budget. A
+    /// forward's verify pass must hold this many (or the slots' windows, if fewer).
+    pub spec_max_rows: usize,
     /// Granularity of the prefix index's shared-prefix count (4: GLM-5.3-Flash's indexer pool).
     pub granularity: usize,
     pub clock: Clock,
@@ -118,13 +125,15 @@ impl SchedulerConfig {
             out_slack: 64,
             spec: true,
             policy: SpecPolicy::default(),
+            spec_max_rows: crate::spec::MAX_VERIFY_ROWS,
             granularity: 4,
             clock: wall_clock(),
         }
     }
 
     /// [`Self::new`] with `GLM53F_PREFILL_SEGMENT_MS`, `GLM53F_SPEC` (0: off),
-    /// `GLM53F_PREFIX_CACHE_ENTRIES` and the speculation policy ([`SpecPolicy::from_env`]).
+    /// `GLM53F_PREFIX_CACHE_ENTRIES`, the speculation policy ([`SpecPolicy::from_env`]) and its
+    /// row budget (`GLM53F_SPEC_MAX_ROWS`, 0 for none).
     pub fn from_env(eos: Vec<Token>) -> Self {
         let mut c = Self::new(eos);
         let var = |k: &str| std::env::var(k).ok();
@@ -136,6 +145,9 @@ impl SchedulerConfig {
             c.bank = v;
         }
         c.policy = SpecPolicy::from_env();
+        if let Some(v) = var("GLM53F_SPEC_MAX_ROWS").and_then(|v| v.parse().ok()) {
+            c.spec_max_rows = v;
+        }
         c
     }
 
@@ -631,7 +643,8 @@ impl<M: ModelForward> Scheduler<M> {
             Err(e) => return self.fail_active("draft", e),
         };
         let probs: Vec<Vec<f32>> = drafts.iter().map(|d| d.probs.clone()).collect();
-        let ks = self.cfg.policy.lengths(&probs, &caps);
+        // The policy's lengths, then the step's row budget (the most likely drafts first).
+        let ks = crate::spec::budget(&probs, &self.cfg.policy.lengths(&probs, &caps), self.cfg.spec_max_rows);
         let blocks: Vec<Vec<Token>> = self
             .active
             .iter()

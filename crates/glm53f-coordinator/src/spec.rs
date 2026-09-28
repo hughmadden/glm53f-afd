@@ -45,6 +45,61 @@ impl SpecPolicy {
     }
 }
 
+/// The default of [`crate::scheduler::SchedulerConfig::spec_max_rows`] (`GLM53F_SPEC_MAX_ROWS`):
+/// the most verify rows one step holds, every request's window together.
+///
+/// Why 256. The expert ranks' cost stops growing with the rows at about 128: a rank reads each
+/// expert its rows name once per group of up to 32 of its rows (the measured 0.87 ms for 8 rows
+/// over 58 experts and 16.9 ms for 4,096 rows both come to about 15 us per group, the second
+/// counting uniform routes), and by 128 rows most of the 288 experts are named, each by fewer
+/// than 32 rows, as at 256. Past that a row costs the coordinator's and the wire's per-row work,
+/// about 10 us per MoE layer (the prefill trace: 34.6 ms of coordinator work and 8.6 ms of
+/// transfer per 4,096 rows), about 0.45 ms a step, against at least 0.7 expected tokens for a
+/// draft the chain cut keeps. So the budget should not bind below a few hundred rows: at 16 and
+/// 32 slots it never does (8 rows a slot at most); at 48 it caps the pass at 256 of 384 rows, and
+/// with it the verify buffers (about 4.3 MiB of saved inputs and 0.6 MiB of logits a row) at
+/// 1.2 GiB instead of 1.8 GiB of the KV pool's memory.
+pub const MAX_VERIFY_ROWS: usize = 256;
+
+/// At most `max_rows` verify rows in all (each request's window is its last token plus its
+/// drafts): when the policy's lengths `ks` (drafts per request) come to more, drafts are dropped
+/// from the least likely up, likelihood being the product of the drafter's probabilities through
+/// the draft (the chain cut's own estimate that it is kept), so the rows go to the drafts most
+/// likely to be kept. A request always keeps its first row, and its rows stay a prefix. At or
+/// under the budget (and with `max_rows` 0) the lengths are unchanged.
+pub fn budget(probs: &[Vec<f32>], ks: &[usize], max_rows: usize) -> Vec<usize> {
+    let rows: usize = ks.iter().map(|k| k + 1).sum();
+    if max_rows == 0 || rows <= max_rows {
+        return ks.to_vec();
+    }
+    // Every draft the lengths verify: (P(kept through it), depth, request).
+    let mut cand: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, &k) in ks.iter().enumerate() {
+        let mut q = 1.0f64;
+        for j in 0..k {
+            let pj = probs.get(i).and_then(|p| p.get(j)).copied().unwrap_or(0.0);
+            q *= f64::from(pj).clamp(0.0, 1.0);
+            cand.push((q, j + 1, i));
+        }
+    }
+    // The least likely first; on a tie the deeper draft, then the later request. A request's
+    // own drafts come deepest first (the product never grows with depth), so each drop is the
+    // last row of its window.
+    cand.sort_by(|x, y| x.0.total_cmp(&y.0).then(y.1.cmp(&x.1)).then(y.2.cmp(&x.2)));
+    let mut out = ks.to_vec();
+    let mut over = rows - max_rows.max(ks.len());
+    for (_, depth, i) in cand {
+        if over == 0 {
+            break;
+        }
+        if depth == out[i] {
+            out[i] -= 1;
+            over -= 1;
+        }
+    }
+    out
+}
+
 /// [`SpecPolicy::Chain`]'s choice for one request (at most `cap` drafts).
 pub fn chain_length(p: &[f32], cap: usize, tau: f64) -> usize {
     let cap = cap.min(p.len());
@@ -124,5 +179,43 @@ mod tests {
         assert_eq!(ks, vec![3, 5]);
         // The default tau (0.7) keeps the first two (0.9, 0.72).
         assert_eq!(SpecPolicy::default().lengths(&[p.to_vec()], &[7]), vec![2]);
+    }
+
+    #[test]
+    fn the_budget_keeps_the_most_likely_drafts() {
+        let hi = vec![0.99f32, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93];
+        let mid = vec![0.9f32, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+        let lo = vec![0.8f32, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let probs = [hi.clone(), mid.clone(), lo.clone()];
+        let ks = [7usize, 7, 7];
+        // At or under the budget, and without one, nothing changes.
+        assert_eq!(budget(&probs, &ks, 24), ks.to_vec());
+        assert_eq!(budget(&probs, &ks, 100), ks.to_vec());
+        assert_eq!(budget(&probs, &ks, 0), ks.to_vec());
+        // One row over: the least likely draft goes (lo's 7th, 0.8 x 0.5^6).
+        assert_eq!(budget(&probs, &ks, 23), vec![7, 7, 6]);
+        // lo's drafts after its first are the least likely (0.4 and below), then mid's from the
+        // back (0.9^7 = 0.48 < 0.9^6 < ...), while hi keeps all 7 (0.99 ... 0.83 through 7).
+        assert_eq!(budget(&probs, &ks, 18), vec![7, 7, 1]);
+        assert_eq!(budget(&probs, &ks, 16), vec![7, 5, 1]);
+        // Down to the anchors: every request keeps its first row, however small the budget.
+        assert_eq!(budget(&probs, &ks, 3), vec![0, 0, 0]);
+        assert_eq!(budget(&probs, &ks, 1), vec![0, 0, 0]);
+        // Each request's rows stay a prefix, and the lengths never grow.
+        for max in 1..=24 {
+            let b = budget(&probs, &ks, max);
+            let rows: usize = b.iter().map(|k| k + 1).sum();
+            assert!(rows <= max.max(3) && b.iter().zip(&ks).all(|(x, y)| x <= y), "{max}: {b:?}");
+        }
+        // Ties: the deeper draft goes first, then the later request.
+        assert_eq!(budget(&[mid.clone(), mid.clone()], &[2, 2], 5), vec![2, 1]);
+        assert_eq!(budget(&[vec![1.0; 3], vec![1.0; 3]], &[3, 3], 6), vec![2, 2]);
+        // The chain cut, then the budget: a light step is the chain's own.
+        let chain = SpecPolicy::default().lengths(&probs, &ks);
+        assert_eq!(chain, vec![7, 3, 1]);
+        assert_eq!(budget(&probs, &chain, MAX_VERIFY_ROWS), chain);
+        // 14 rows into 8: mid's 3rd (0.729), hi's 7th (0.750), lo's 1st (0.800), hi's 6th
+        // (0.807), mid's 2nd (0.810) and hi's 5th (0.858) go.
+        assert_eq!(budget(&probs, &chain, 8), vec![4, 1, 0]);
     }
 }

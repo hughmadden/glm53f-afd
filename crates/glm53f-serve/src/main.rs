@@ -53,7 +53,7 @@ mod daemon {
     use glm53f_forward::serve::{ServedForward, DRAFTS};
     use glm53f_forward::shape::{ModelShape, SAMPLE_VOCAB};
     use glm53f_forward::weights::{open_checkpoint, DeviceModel};
-    use glm53f_serve::{dev_banner, kv_pages, Experts, Options};
+    use glm53f_serve::{admission_line, dev_banner, kv_pages, verify_rows, Experts, Options};
 
     const GIB: f64 = (1u64 << 30) as f64;
     const MIB: f64 = (1u64 << 20) as f64;
@@ -131,15 +131,19 @@ mod daemon {
         };
 
         // 3. The routed experts, with their buffers for one lane's exchange. With a drafter, one
-        //    verify pass holds every slot's window.
+        //    verify pass holds every slot's window, up to the step's row budget.
         let mut fcfg = ForwardConfig {
             max_rows: o.prefill_rows,
             lanes: o.prefill_lanes,
+            decode_lane_rows: o.decode_lanes.0,
+            decode_lane_max_rows: o.decode_lanes.1,
             max_requests: o.slots,
             ..ForwardConfig::default()
         };
         if drafter.is_some() {
-            fcfg.max_verify_rows = fcfg.max_verify_rows.max(o.slots * (DRAFTS + 1));
+            fcfg.max_verify_rows =
+                fcfg.max_verify_rows
+                    .max(verify_rows(o.slots, DRAFTS + 1, sched.spec_max_rows));
         }
         let rows = fcfg.lane_rows().max(fcfg.max_verify_rows);
         let (experts, experts_bytes, experts_what): (Box<dyn ExpertBackend>, usize, String) =
@@ -256,16 +260,29 @@ mod daemon {
             eprintln!(
                 "[coordinator]   drafter: weights {}, tap buffer {} ({} rows), working memory {} \
                  (drafts of up to {} requests), a context ring of {} in each slot's state; up to \
-                 {DRAFTS} drafts a step, verify passes of up to {} rows",
+                 {DRAFTS} drafts a step, verify passes of up to {} rows (the step's row budget, \
+                 GLM53F_SPEC_MAX_ROWS: {})",
                 gib(drafter_weights),
                 mib(drafter_bytes.0),
                 fwd.pass_rows(),
                 mib(drafter_bytes.1),
                 o.slots,
                 mib(layout.draft_kv_bytes),
-                fcfg.max_verify_rows
+                fcfg.max_verify_rows,
+                match sched.spec_max_rows {
+                    0 => "none".to_string(),
+                    n => n.to_string(),
+                }
             );
         }
+        eprintln!(
+            "[coordinator]   decode and verify passes: {}",
+            match o.decode_lanes {
+                (0, _) => "one lane".to_string(),
+                (a, usize::MAX) => format!("two lanes from {a} rows over two requests or more"),
+                (a, b) => format!("two lanes from {a} to {b} rows over two requests or more"),
+            }
+        );
         eprintln!(
             "[coordinator]   {} {}; {} slots x {} of positional state and page tables = {}",
             experts_what,
@@ -287,6 +304,10 @@ mod daemon {
             gib(2 * sched.bank * mark)
         );
         eprintln!(
+            "[coordinator]   {}",
+            admission_line(pages, PAGE, layout.page_bytes, max_context)
+        );
+        eprintln!(
             "[coordinator]   left free: {} measured ({} reserved by --reserve-gib for kernel \
              modules, the sampler and allocator slack{})",
             gib(left),
@@ -300,7 +321,8 @@ mod daemon {
         let mut model = ServedForward::new(fwd)?;
         model.sampled_walk = std::env::var("GLM53F_DFLASH_SAMPLED_WALK").map_or(true, |v| v != "0");
         if std::env::var_os("GLM53F_PROFILE").is_some() {
-            // Per prefill pass: each lane's GPU and host time per MoE layer (`PIPE` lines).
+            // Per prefill pass and per decode step: each lane's GPU and host time per MoE layer
+            // (`PIPE` and `STEP` lines).
             model.fwd.set_lane_trace(true, true);
         }
         let slots = (0..o.slots)

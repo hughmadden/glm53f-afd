@@ -60,12 +60,31 @@
 //! is collected before lane B is sent (lane B's attention still overlaps lane A's exchange).
 //! Each lane has its own buffers (its `Scratch`, swapped in as the active one); the attention
 //! workspaces are shared, since the lanes' kernels run one after another on the one stream.
-//! Decode and verify passes, `run_layers`, passes with a test tap ([`GlmForward::set_tap`]) and
-//! prefill passes under two lanes of [`ForwardConfig::min_lane_rows`] run in one lane. Two lanes
-//! change the row counts of the tensor-core GEMMs, so a prefill's results move within rounding
-//! (deterministically: two lanes give the bits of the same rows run as two passes, lane A's then
-//! lane B's); decode's row independence is untouched. [`GlmForward::set_lane_trace`] times each
-//! lane per layer.
+//! `run_layers`, passes with a test tap ([`GlmForward::set_tap`]) and prefill passes under two
+//! lanes of [`ForwardConfig::min_lane_rows`] run in one lane. Two lanes change the row counts of
+//! the tensor-core GEMMs, so a prefill's results move within rounding (deterministically: two
+//! lanes give the bits of the same rows run as two passes, lane A's then lane B's); decode's row
+//! independence is untouched. [`GlmForward::set_lane_trace`] times each lane per layer.
+//!
+//! # Two lanes (decode and verify)
+//!
+//! A decode or verify pass of [`ForwardConfig::decode_lane_rows`] to
+//! [`ForwardConfig::decode_lane_max_rows`] rows, over two requests or more, runs in the same two
+//! lanes, cut between requests (the cut that splits the rows most evenly, lane A the larger on a
+//! tie): a request's rows never straddle the lanes, and requests do not read each other's state,
+//! so a lane is exactly a pass over its own requests. Each lane runs its own head over its own
+//! rows (the final mean and RMSNorm, then the LM head GEMM of the lane's rows alone), into its
+//! rows of lane A's logits, once its last layer is complete: lane A's head runs while lane B's
+//! last routed experts are out. A verify pass keeps each lane's replay inputs, projection rows
+//! and raw index keys at the lane's rows of the verify buffers, so the commit reads the pass's
+//! rows as one pass wrote them; it appends lane A's kept rows to the drafter's contexts, then
+//! lane B's. Two lanes give the bits of the two passes over the lanes' requests (lane A's, then
+//! lane B's) in everything they leave: logits and picks, KDA states, conv windows, pages, tails,
+//! the drafter's taps and rings (`tests/decode_lanes.rs`).
+//!
+//! Whether it pays depends on the load: each lane reads the coordinator's weights once and the
+//! ranks read the routed experts each lane's rows name, so two lanes of many rows read most
+//! experts twice. It is off by default (`decode_lane_rows` 0).
 //!
 //! **The drafter in two lanes.** Each lane captures the drafter's taps for its own rows, into
 //! those rows of the tap buffer (a lane's rows are a contiguous slice of the pass). After the
@@ -123,6 +142,12 @@ pub struct ForwardConfig {
     /// The fewest rows worth a second lane: a prefill pass under twice this runs in one lane
     /// (if it fits in one).
     pub min_lane_rows: usize,
+    /// Decode and verify passes of at least this many rows, and of two requests or more, run in
+    /// two lanes cut between requests (module documentation, "Two lanes (decode and verify)");
+    /// 0 keeps them in one lane. Needs lane B's buffers (`lanes` 2).
+    pub decode_lane_rows: usize,
+    /// Decode and verify passes of more rows than this run in one lane.
+    pub decode_lane_max_rows: usize,
     /// Rows of one verify pass, all windows together.
     pub max_verify_rows: usize,
     /// Requests in one pass.
@@ -157,6 +182,8 @@ impl Default for ForwardConfig {
             max_rows: 256,
             lanes: 1,
             min_lane_rows: 64,
+            decode_lane_rows: 0,
+            decode_lane_max_rows: usize::MAX,
             max_verify_rows: 64,
             max_requests: 16,
             policy: GemmPolicy::default(),
@@ -775,6 +802,7 @@ impl ForwardBuffers {
         if cfg.max_rows == 0
             || !matches!(cfg.lanes, 1 | 2)
             || cfg.min_lane_rows == 0
+            || (cfg.decode_lane_rows > 0 && cfg.lanes != 2)
             || cfg.max_verify_rows == 0
             || cfg.max_requests == 0
             || !(1..=64).contains(&cfg.decode_splits)
@@ -930,12 +958,14 @@ fn cut(reqs: &[Req], at: usize) -> (Vec<Req>, Vec<Req>, Option<usize>) {
     (a, b, split)
 }
 
-/// Pipeline timings of the last prefill pass (with [`GlmForward::set_lane_trace`] on): per MoE
+/// Pipeline timings of the last traced pass (with [`GlmForward::set_lane_trace`] on): per MoE
 /// layer and lane, GPU time from events on the stream and host time from the wall clock.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LaneTrace {
-    /// Rows per lane, and the backend's calls in flight at most.
+    pub mode: Mode,
+    /// Rows and requests per lane, and the backend's calls in flight at most.
     pub rows: Vec<usize>,
+    pub requests: Vec<usize>,
     pub depth: usize,
     /// Host time of the layer loop.
     pub loop_ms: f64,
@@ -943,6 +973,23 @@ pub struct LaneTrace {
     /// The expert backend's own record of the pass's calls (`ExpertBackend::trace_end`: the
     /// remote experts' return paths and host times), when it keeps one.
     pub wire: Option<String>,
+    /// Decode and verify passes: the step around the pass.
+    pub step: StepTimes,
+}
+
+/// Host times of the decode step around a traced decode or verify pass, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepTimes {
+    /// From the end of the forward's last call (a pass or a commit) to the step's first (its
+    /// drafts, or the pass): the scheduler's and the sampler's work in between.
+    pub gap_ms: f64,
+    /// The drafter's proposals before a verify pass (0 before a decode pass).
+    pub draft_ms: f64,
+    /// The pass, from its call to the picks on the host (a decode pass's appends to the
+    /// drafter's contexts included).
+    pub pass_ms: f64,
+    /// A verify round's commit (0 for a decode pass).
+    pub commit_ms: f64,
 }
 
 /// One MoE layer of a traced pass; the vectors are per lane.
@@ -1013,6 +1060,34 @@ impl LaneTrace {
             None => line,
         }
     }
+
+    /// A decode or verify pass's line (`STEP`): its requests, the step's host times, the MoE
+    /// layers' totals (host wall, GPU busy, and the host blocked in `finish` waiting for the
+    /// experts), then [`LaneTrace::summary`].
+    pub fn step_summary(&self) -> String {
+        let s = &self.step;
+        let sum = |f: &dyn Fn(&LayerTrace) -> f64| self.layers.iter().map(f).sum::<f64>();
+        let reqs: Vec<String> = self.requests.iter().map(|r| r.to_string()).collect();
+        format!(
+            concat!(
+                "{:?}, {} requests ({}); step: gap {:.2} ms, draft {:.2} ms, pass {:.2} ms, ",
+                "commit {:.2} ms; {} MoE layers: wall {:.1} ms, GPU busy {:.1} ms, host in finish ",
+                "{:.1} ms; {}"
+            ),
+            self.mode,
+            self.requests.iter().sum::<usize>(),
+            reqs.join(" + "),
+            s.gap_ms,
+            s.draft_ms,
+            s.pass_ms,
+            s.commit_ms,
+            self.layers.len(),
+            sum(&|t| t.wall_ms),
+            sum(&|t| t.gpu_attn_ms.iter().chain(&t.gpu_shared_ms).sum::<f64>()),
+            sum(&|t| t.finish_ms.iter().sum::<f64>()),
+            self.summary()
+        )
+    }
 }
 
 /// Where a lane's trace event is recorded in a layer.
@@ -1037,10 +1112,12 @@ struct TraceRec {
 
 /// The trace being recorded, and the last pass's.
 struct Tracer {
-    /// Print each traced pass's summary to stderr.
+    /// Print each traced pass's summary to stderr (`PIPE` for prefill, `STEP` for decode and
+    /// verify).
     print: bool,
-    /// Recording the current pass (a prefill pass).
+    /// Recording the current pass, and its mode.
     active: bool,
+    mode: Mode,
     events: Vec<Event>,
     used: usize,
     /// `[layer][lane]` records of the current pass.
@@ -1049,7 +1126,23 @@ struct Tracer {
     starts: Vec<(usize, Instant)>,
     loop_start: Instant,
     loop_end: Instant,
+    /// The last prefill pass's trace, and the last decode or verify pass's.
     last: Option<LaneTrace>,
+    last_step: Option<LaneTrace>,
+    /// The decode step being traced: its host times so far (the drafts' once drafted), and
+    /// whether `last_step` is its verify pass waiting for the commit.
+    step: Option<StepTimes>,
+    verify_open: bool,
+    /// When the forward's last pass or commit ended.
+    idle_since: Option<Instant>,
+}
+
+impl Tracer {
+    /// Milliseconds from the end of the forward's last call to `t`.
+    fn gap_ms(&self, t: Instant) -> f64 {
+        self.idle_since
+            .map_or(0.0, |i| t.saturating_duration_since(i).as_secs_f64() * 1e3)
+    }
 }
 
 /// One request's rows in a pass.
@@ -1084,6 +1177,9 @@ struct Meta {
 struct Pending {
     reqs: Vec<Req>,
     rows: usize,
+    /// Two lanes: lane A's requests (the commit appends each lane's rows to the drafter's
+    /// contexts in a call of its own, as two passes would).
+    split: Option<usize>,
 }
 
 /// The GLM-5.3-Flash forward over decoder layers `0 .. model.shape.layers`.
@@ -1112,6 +1208,8 @@ pub struct GlmForward {
     /// The first row of lane B in the last pass, when it ran in two lanes (where
     /// [`GlmForward::score`] finds a row's head output).
     lane_b: Option<usize>,
+    /// Decode and verify passes run in two lanes so far.
+    decode_lane_passes: u64,
 }
 
 fn pack<T: Copy>(bytes: &mut Vec<u8>, v: &[T]) -> usize {
@@ -1198,6 +1296,7 @@ impl GlmForward {
             trace: None,
             draft: None,
             lane_b: None,
+            decode_lane_passes: 0,
         })
     }
 
@@ -1219,12 +1318,15 @@ impl GlmForward {
             + self.gemm.bytes()
     }
 
-    /// Record [`LaneTrace`]s of later prefill passes ([`GlmForward::take_lane_trace`]), and with
-    /// `print`, write each one's summary to stderr (`PIPE ...`).
+    /// Record [`LaneTrace`]s of later passes ([`GlmForward::take_lane_trace`] for prefill,
+    /// [`GlmForward::take_step_trace`] for decode and verify), and with `print`, write each one's
+    /// summary to stderr: `PIPE ...` per prefill pass, `STEP ...` per decode step (a decode pass,
+    /// or a verify pass with its drafts and its commit).
     pub fn set_lane_trace(&mut self, on: bool, print: bool) {
         self.trace = on.then(|| Tracer {
             print,
             active: false,
+            mode: Mode::Prefill,
             events: Vec::new(),
             used: 0,
             recs: Vec::new(),
@@ -1232,12 +1334,30 @@ impl GlmForward {
             loop_start: Instant::now(),
             loop_end: Instant::now(),
             last: None,
+            last_step: None,
+            step: None,
+            verify_open: false,
+            idle_since: None,
         });
+    }
+
+    /// Decode and verify passes run in two lanes so far ([`ForwardConfig::decode_lane_rows`]).
+    pub fn decode_lane_passes(&self) -> u64 {
+        self.decode_lane_passes
     }
 
     /// The last traced prefill pass's timings.
     pub fn take_lane_trace(&mut self) -> Option<LaneTrace> {
         self.trace.as_mut().and_then(|t| t.last.take())
+    }
+
+    /// The last traced decode or verify pass's timings, with its step's (a verify pass's are
+    /// complete after its commit).
+    pub fn take_step_trace(&mut self) -> Option<LaneTrace> {
+        self.trace.as_mut().and_then(|t| {
+            t.verify_open = false;
+            t.last_step.take()
+        })
     }
 
     /// Replace the expert backend (returns the old one).
@@ -1354,11 +1474,21 @@ impl GlmForward {
     /// The drafter's proposals for `reqs` (each slot at its committed length), `block - 1` per
     /// request. Slots and the target's state do not change.
     pub fn draft(&mut self, reqs: &[DraftReq<'_>]) -> Result<Vec<glm53f_dflash::seam::Proposal>> {
+        let t0 = Instant::now();
         let d = self
             .draft
             .as_mut()
             .ok_or_else(|| invalid!("no drafter attached"))?;
-        d.draft(reqs, &self.embed)
+        let r = d.draft(reqs, &self.embed);
+        if let Some(t) = self.trace.as_mut() {
+            // A decode step with drafts starts here (the lane trace's `STEP` line).
+            t.step = Some(StepTimes {
+                gap_ms: t.gap_ms(t0),
+                draft_ms: t0.elapsed().as_secs_f64() * 1e3,
+                ..StepTimes::default()
+            });
+        }
+        r
     }
 
     // ---- Public passes ---------------------------------------------------------------------
@@ -1488,6 +1618,7 @@ impl GlmForward {
     /// Keep the first `keep[i]` pending rows of `slots[i]` (the slots of the last verify, in
     /// its order).
     pub fn commit(&mut self, slots: &mut [&mut GlmKv], keep: &[usize]) -> Result<()> {
+        let t0 = Instant::now();
         let pending = self
             .pending
             .take()
@@ -1598,7 +1729,9 @@ impl GlmForward {
             kv.pending = 0;
         }
         self.mark(usize::MAX, "commit")?;
-        // The kept rows (the anchor and the accepted drafts) become drafter context.
+        // The kept rows (the anchor and the accepted drafts) become drafter context; after a
+        // verify in two lanes, lane A's requests and then lane B's, the calls the commits of two
+        // passes make.
         if let Some(d) = self.draft.as_mut() {
             let rows: Vec<(usize, usize)> = pending
                 .reqs
@@ -1606,8 +1739,25 @@ impl GlmForward {
                 .zip(keep)
                 .map(|(r, &k)| (r.row0, k))
                 .collect();
-            d.append(slots, &rows)?;
+            let k = pending.split.unwrap_or(rows.len());
+            let (a, b) = slots.split_at_mut(k);
+            d.append(a, &rows[..k])?;
+            if !b.is_empty() {
+                d.append(b, &rows[k..])?;
+            }
             self.mark(usize::MAX, "draft_append")?;
+        }
+        if let Some(t) = self.trace.as_mut() {
+            let now = Instant::now();
+            if std::mem::take(&mut t.verify_open) {
+                if let Some(tr) = t.last_step.as_mut() {
+                    tr.step.commit_ms = (now - t0).as_secs_f64() * 1e3;
+                    if t.print {
+                        eprintln!("STEP {}", tr.step_summary());
+                    }
+                }
+            }
+            t.idle_since = Some(now);
         }
         Ok(())
     }
@@ -1945,11 +2095,36 @@ impl GlmForward {
         head: bool,
         logits: bool,
     ) -> Result<Vec<u32>> {
+        let t0 = Instant::now();
         let r = self.pass_lanes(mode, kvs, rows, input, layers, head, logits);
         // Between passes (a failed one too) lane A's buffers are the active ones.
         self.use_lane(0);
         if let Some(t) = self.trace.as_mut() {
             t.active = false;
+            let now = Instant::now();
+            // A decode step's times: its drafts' (if drafted), then the pass; a verify pass's
+            // line waits for its commit.
+            let step = t.step.take();
+            if let Some(tr) = t
+                .last_step
+                .as_mut()
+                .filter(|_| r.is_ok() && head && mode != Mode::Prefill)
+            {
+                tr.step = StepTimes {
+                    pass_ms: (now - t0).as_secs_f64() * 1e3,
+                    ..step.unwrap_or(StepTimes {
+                        gap_ms: t
+                            .idle_since
+                            .map_or(0.0, |i| t0.saturating_duration_since(i).as_secs_f64() * 1e3),
+                        ..StepTimes::default()
+                    })
+                };
+                t.verify_open = mode == Mode::Verify;
+                if t.print && mode == Mode::Decode {
+                    eprintln!("STEP {}", tr.step_summary());
+                }
+            }
+            t.idle_since = Some(now);
         }
         r
     }
@@ -1963,6 +2138,36 @@ impl GlmForward {
             && self.tap.is_none()
             && matches!(input, Input::Tokens(_))
             && (total > self.s.rows || total >= 2 * self.cfg.min_lane_rows)
+    }
+
+    /// Where a decode or verify pass of `rows[i]` rows per request cuts its two lanes (module
+    /// documentation, "Two lanes (decode and verify)"): the first row of lane B, the boundary
+    /// between requests that splits the rows most evenly (lane A the larger on a tie). None runs
+    /// the pass in one lane: a prefill; fewer than two requests; a pass outside
+    /// [`ForwardConfig::decode_lane_rows`] to [`ForwardConfig::decode_lane_max_rows`] rows; no
+    /// lane B; a tap; input streams; or a lane its buffers do not hold.
+    fn decode_cut(&self, mode: Mode, input: &Input<'_>, rows: &[usize]) -> Option<usize> {
+        let total: usize = rows.iter().sum();
+        let lane_b = self.s2.as_ref()?;
+        if mode == Mode::Prefill
+            || self.cfg.lanes != 2
+            || self.cfg.decode_lane_rows == 0
+            || !(self.cfg.decode_lane_rows..=self.cfg.decode_lane_max_rows).contains(&total)
+            || rows.len() < 2
+            || self.tap.is_some()
+            || matches!(input, Input::Streams(_))
+        {
+            return None;
+        }
+        let off = |at: usize| (2 * at).abs_diff(total);
+        let (mut at, mut best) = (0, 0);
+        for &r in &rows[..rows.len() - 1] {
+            at += r;
+            if best == 0 || off(at) <= off(best) {
+                best = at;
+            }
+        }
+        (best <= self.s.rows && total - best <= lane_b.rows).then_some(best)
     }
 
     /// Make lane `i`'s buffers the active ones (`s`); the other lane's wait in `s2`.
@@ -1987,6 +2192,8 @@ impl GlmForward {
     ) -> Result<Vec<u32>> {
         let total: usize = rows.iter().sum();
         let two = self.two_lanes(mode, &input, total);
+        // Decode and verify: two lanes of whole requests.
+        let decode_at = self.decode_cut(mode, &input, rows);
         let cap = if mode == Mode::Verify {
             self.v.rows
         } else if two {
@@ -2044,7 +2251,8 @@ impl GlmForward {
             _ => None,
         };
         // The lanes: the two halves of the rows (a request across the middle is split, lane B
-        // continuing it), or one lane of every row.
+        // continuing it); a decode or verify pass's requests in two (cut between requests); or
+        // one lane of every row.
         let parts = if two {
             let at = total.div_ceil(2);
             let (a, b, split) = cut(&reqs, at);
@@ -2054,6 +2262,10 @@ impl GlmForward {
                 (a, 0, 0..at, None, split),
                 (b, first_b, at..total, split.map(|k| (k, na)), None),
             ]
+        } else if let Some(at) = decode_at {
+            let (a, b, _) = cut(&reqs, at);
+            let na = a.len();
+            vec![(a, 0, 0..at, None, None), (b, na, at..total, None, None)]
         } else {
             vec![(reqs.clone(), 0, 0..total, None, None)]
         };
@@ -2095,7 +2307,7 @@ impl GlmForward {
                 }?,
                 Input::DeviceIds(ids) => unsafe {
                     self.embed.gather(
-                        *ids,
+                        ids.wrapping_add(span.start),
                         n,
                         self.s.streams[0].ptr(0),
                         core::ptr::null_mut(),
@@ -2126,7 +2338,11 @@ impl GlmForward {
         self.mark(usize::MAX, "embed")?;
         // Every pass through the head captures the drafter's taps (`crate::draft`).
         let taps = head && self.draft.is_some();
-        self.run_lanes(mode, &mut lanes, layers, taps)?;
+        // Decode and verify lanes: each lane's head over its own rows, as soon as its last layer
+        // is done (lane A's while lane B's last experts are out).
+        let heads = head && logits && decode_at.is_some();
+        self.run_lanes(mode, &mut lanes, layers, taps, heads)?;
+        self.decode_lane_passes += u64::from(decode_at.is_some());
         // Tails of prefill and decode passes were committed in the layers: back to the slots,
         // lane A's first (a split request's final tail is lane B's).
         if mode != Mode::Verify {
@@ -2135,7 +2351,9 @@ impl GlmForward {
                 self.scatter_tails(&lane.reqs, &lane.meta)?;
             }
         }
-        let picks = if head {
+        let picks = if heads {
+            self.argmax(total)?
+        } else if head {
             self.head(&lanes, total, logits)?
         } else {
             if self.tap.is_none() {
@@ -2151,7 +2369,12 @@ impl GlmForward {
             for (kv, &r) in kvs.iter_mut().zip(rows) {
                 kv.pending = r;
             }
-            self.pending = Some(Pending { reqs, rows: total });
+            let split = decode_at.map(|_| lanes[0].reqs.len());
+            self.pending = Some(Pending {
+                reqs,
+                rows: total,
+                split,
+            });
             return Ok(picks);
         }
         // Commit the positions, lane by lane, and with a drafter append each lane's rows to its
@@ -2181,26 +2404,29 @@ impl GlmForward {
     /// An MoE FFN's routed experts go to the backend (`submit`) and are collected later
     /// (`finish`): a lane's next attention waits for its own, at most the backend's depth are
     /// out at once, and the oldest is collected first. With two lanes, one lane's attention
-    /// runs while the other's experts are out.
+    /// runs while the other's experts are out. With `heads` (decode and verify lanes), each
+    /// lane's head runs once its last layer is complete, lane A's while lane B's last call is
+    /// out.
     fn run_lanes(
         &mut self,
         mode: Mode,
         lanes: &mut [Lane],
         layers: Range<usize>,
         taps: bool,
+        heads: bool,
     ) -> Result<()> {
         let depth = self.experts.depth().clamp(1, 2);
         let mut flight: VecDeque<usize> = VecDeque::new();
         let model = self.model.clone();
         if let Some(t) = self.trace.as_mut() {
-            t.active = mode == Mode::Prefill;
+            t.active = true;
+            t.mode = mode;
             t.used = 0;
             t.recs = vec![Default::default(); model.shape.layers];
             t.starts.clear();
             t.loop_start = Instant::now();
-            if t.active {
-                self.experts.trace_begin();
-            }
+            // The backend's own record of the pass's calls (`LaneTrace::wire`).
+            self.experts.trace_begin();
         }
         for l in layers {
             let lw = &model.layers[l];
@@ -2256,6 +2482,15 @@ impl GlmForward {
                 }
             }
         }
+        if heads {
+            for x in 0..lanes.len() {
+                while lanes[x].exchange.is_some() {
+                    let y = flight.pop_front().expect("a call in flight");
+                    self.finish_lane(&mut lanes[y], y, mode)?;
+                }
+                self.lane_head(&lanes[x], x)?;
+            }
+        }
         while let Some(y) = flight.pop_front() {
             self.finish_lane(&mut lanes[y], y, mode)?;
         }
@@ -2300,12 +2535,12 @@ impl GlmForward {
         }
         self.mark(l, "attn_hc")?;
         match &lw.attn {
-            AttnW::Kda(w) => self.kda(l, mode, lane.rows, &lane.reqs, &lane.meta, w)?,
+            AttnW::Kda(w) => self.kda(l, mode, lane.rows, lane.base, &lane.reqs, &lane.meta, w)?,
             AttnW::Dsa(w) => {
                 if let Some((k, n)) = lane.continues {
                     self.continue_tail(l, k, n, lane.reqs.len())?;
                 }
-                self.dsa(l, mode, lane.rows, &lane.reqs, &lane.meta, w)?
+                self.dsa(l, mode, lane.rows, lane.base, &lane.reqs, &lane.meta, w)?
             }
         }
         self.tap(l, TapPoint::AttnDone, mode, lane.rows, lane.cur)?;
@@ -2455,6 +2690,65 @@ impl GlmForward {
             )
         }?;
         self.mark(usize::MAX, "lm_head")?;
+        self.argmax(lr)
+    }
+
+    /// Decode and verify lanes: lane `i`'s head over its rows (every one a logit row), into its
+    /// rows of lane A's logits: the final mean and RMSNorm, then the LM head over the lane's rows
+    /// alone, as a pass over the lane's requests runs it.
+    fn lane_head(&mut self, lane: &Lane, i: usize) -> Result<()> {
+        self.use_lane(i);
+        let st = self.stream.clone();
+        let (bo, bo2, post, comb) = lane.prev.expect("the last layer's output");
+        // SAFETY: scratch buffers sized for the lane's rows.
+        launched(
+            unsafe {
+                lffi::glm53f_hc_head(
+                    self.s.streams[lane.cur].ptr(0),
+                    bo,
+                    bo2,
+                    post,
+                    comb,
+                    self.model.head.norm.ptr(0),
+                    self.s.head_out.ptr(0),
+                    lane.rows as i32,
+                    HIDDEN as i32,
+                    st.raw().cast(),
+                )
+            },
+            "glm53f_hc_head",
+        )?;
+        self.mark(usize::MAX, "head_hc")?;
+        let a = if i == 0 {
+            &self.s
+        } else {
+            self.s2.as_ref().expect("lane A's buffers")
+        };
+        // Lane A's logit rows hold every row of the pass (checked before the pass).
+        let out: *mut f32 = a.logits.ptr(lane.logit_base * VOCAB);
+        let lm = self.model.head.lm_head.mat();
+        unsafe {
+            self.gemm.bf16(
+                self.s.head_out.ptr(0),
+                HIDDEN,
+                0,
+                &lm,
+                lane.rows,
+                out.cast(),
+                VOCAB,
+                0,
+                true,
+                &st,
+            )
+        }?;
+        self.mark(usize::MAX, "lm_head")
+    }
+
+    /// The greedy picks of the pass's first `lr` logit rows (lane A's buffers, which the pass's
+    /// end leaves active).
+    fn argmax(&mut self, lr: usize) -> Result<Vec<u32>> {
+        self.use_lane(0);
+        let st = self.stream.clone();
         // SAFETY: logits [lr][VOCAB]; next holds lr ids.
         launched(
             unsafe {
@@ -2480,7 +2774,7 @@ impl GlmForward {
 
     // ---- Lane trace ----------------------------------------------------------------------------
 
-    /// Record a trace event on the stream (tracing a prefill pass).
+    /// Record a trace event on the stream (tracing a pass).
     fn trace_event(&mut self, layer: usize, lane: usize, at: At) -> Result<()> {
         if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
             if t.used == t.events.len() {
@@ -2493,7 +2787,7 @@ impl GlmForward {
         Ok(())
     }
 
-    /// Add the host time since `since` to a lane's layer record (tracing a prefill pass).
+    /// Add the host time since `since` to a lane's layer record (tracing a pass).
     fn trace_host(
         &mut self,
         layer: usize,
@@ -2506,7 +2800,7 @@ impl GlmForward {
         }
     }
 
-    /// Close a traced prefill pass: its per-layer record, from the events (waits for the stream).
+    /// Close a traced pass: its per-layer record, from the events (waits for the stream).
     fn finish_trace(&mut self, lanes: &[Lane]) -> Result<()> {
         let Some(t) = self.trace.as_mut().filter(|t| t.active) else {
             return Ok(());
@@ -2545,16 +2839,25 @@ impl GlmForward {
             });
         }
         let trace = LaneTrace {
+            mode: t.mode,
             rows: lanes.iter().map(|l| l.rows).collect(),
+            requests: lanes.iter().map(|l| l.reqs.len()).collect(),
             depth: self.experts.depth().clamp(1, 2),
             loop_ms: (t.loop_end - t.loop_start).as_secs_f64() * 1e3,
             layers,
             wire: self.experts.trace_end(),
+            step: StepTimes::default(),
         };
-        if t.print {
-            eprintln!("PIPE {}", trace.summary());
+        // Decode and verify passes print their step's line once it is complete (`pass`,
+        // `commit`).
+        if t.mode == Mode::Prefill {
+            if t.print {
+                eprintln!("PIPE {}", trace.summary());
+            }
+            t.last = Some(trace);
+        } else {
+            t.last_step = Some(trace);
         }
-        t.last = Some(trace);
         Ok(())
     }
 
@@ -2743,12 +3046,15 @@ impl GlmForward {
 
     // ---- Attention ---------------------------------------------------------------------------
 
+    /// A KDA layer over `rows` rows. A verify pass keeps each layer's projection rows and replay
+    /// inputs for the commit at the pass's rows `base ..` (a lane's rows).
     #[allow(clippy::too_many_arguments)]
     fn kda(
         &mut self,
         l: usize,
         mode: Mode,
         rows: usize,
+        base: usize,
         reqs: &[Req],
         meta: &Meta,
         w: &KdaW,
@@ -2759,7 +3065,7 @@ impl GlmForward {
         let vr = self.v.rows;
         // Projection rows: per layer for a verify round (the commit's conv shift reads them).
         let p: *mut u16 = if verify {
-            self.v.p.ptr(j * vr * KDA_P_COLS)
+            self.v.p.ptr((j * vr + base) * KDA_P_COLS)
         } else {
             self.s.p.ptr(0)
         };
@@ -2812,7 +3118,7 @@ impl GlmForward {
                 &st,
                 0,
                 &self.v.p,
-                j * vr * KDA_P_COLS * 2,
+                (j * vr + base) * KDA_P_COLS * 2,
                 rows * KDA_P_COLS * 2,
             )?;
         }
@@ -2826,10 +3132,10 @@ impl GlmForward {
         let conv: *mut u16 = pool.conv.ptr(j * cn);
         let (ks, vs, gs, bs): (*mut f32, *mut u16, *mut f32, *mut f32) = if verify {
             (
-                self.v.k.ptr(j * vr * KDA_WIDTH),
-                self.v.v.ptr(j * vr * KDA_WIDTH),
-                self.v.g.ptr(j * vr * KDA_WIDTH),
-                self.v.b.ptr(j * vr * KDA_HEADS),
+                self.v.k.ptr((j * vr + base) * KDA_WIDTH),
+                self.v.v.ptr((j * vr + base) * KDA_WIDTH),
+                self.v.g.ptr((j * vr + base) * KDA_WIDTH),
+                self.v.b.ptr((j * vr + base) * KDA_HEADS),
             )
         } else {
             (
@@ -2985,12 +3291,15 @@ impl GlmForward {
         Ok(())
     }
 
+    /// A DSA layer over `rows` rows. A verify pass keeps each layer's raw index keys and gates for
+    /// the commit at the pass's rows `base ..` (a lane's rows).
     #[allow(clippy::too_many_arguments)]
     fn dsa(
         &mut self,
         l: usize,
         mode: Mode,
         rows: usize,
+        base: usize,
         reqs: &[Req],
         meta: &Meta,
         w: &DsaW,
@@ -3095,8 +3404,8 @@ impl GlmForward {
         let vr = self.v.rows;
         let (k_raw, gate): (*mut f32, *mut f32) = if verify {
             (
-                self.v.k_raw.ptr(j * vr * INDEX_DIM),
-                self.v.gate.ptr(j * vr * INDEX_DIM),
+                self.v.k_raw.ptr((j * vr + base) * INDEX_DIM),
+                self.v.gate.ptr((j * vr + base) * INDEX_DIM),
             )
         } else {
             (s.k_raw.ptr(0), s.gate.ptr(0))

@@ -139,6 +139,39 @@ fn verify_windows_with_partial_accepts_equal_serial_decoding() {
     assert_eq!(st.decode_steps, 0, "every step speculative");
 }
 
+/// The step's verify-row budget (`SchedulerConfig::spec_max_rows`): four requests draft 3 each a
+/// step (the mock's drafts at probability 0.9 under the chain cut: 0.9, 0.81, 0.73), 16 rows. A
+/// budget of 10 holds every verify pass to 10 rows, dropping the least likely drafts (the third
+/// ones, then the later requests' second ones), and the tokens stay serial decoding's; a budget of
+/// 16, or none, runs the very same passes.
+#[test]
+fn the_verify_row_budget_bounds_every_step() {
+    let reqs = [prompt(40, 30), prompt(41, 25), prompt(42, 20), prompt(43, 28)];
+    let run = |tweak: fn(&mut glm53f_coordinator::SchedulerConfig)| {
+        let mut h = harness(Setup { block: 8, tweak, ..Setup::default() });
+        let rxs: Vec<_> = reqs.iter().map(|p| h.submit(p, 24, None)).collect();
+        h.run();
+        for (p, rx) in reqs.iter().zip(&rxs) {
+            assert_eq!(tokens(rx).unwrap(), greedy(&h, p, 24));
+        }
+        let verifies: Vec<Vec<(usize, usize)>> =
+            h.calls().iter().filter_map(|c| if let Call::Verify(v) = c { Some(v.clone()) } else { None }).collect();
+        (verifies, h.sched.stats)
+    };
+    let (free, _) = run(|c| c.spec_max_rows = 0);
+    let (at16, _) = run(|c| c.spec_max_rows = 16);
+    let (at10, st10) = run(|c| c.spec_max_rows = 10);
+    let rows = |v: &[(usize, usize)]| v.iter().map(|w| w.1).sum::<usize>();
+    assert_eq!(free, at16, "a budget the steps fit changed them");
+    assert!(free.iter().any(|v| v.len() == 4 && rows(v) == 16), "{free:?}");
+    assert!(at10.iter().all(|v| rows(v) <= 10), "{at10:?}");
+    // Four requests at once: the budget's windows, the least likely drafts dropped.
+    let full: Vec<&Vec<(usize, usize)>> = at10.iter().filter(|v| v.len() == 4).collect();
+    assert!(!full.is_empty());
+    assert!(full.iter().any(|v| v.iter().map(|w| w.1).collect::<Vec<_>>() == [3, 3, 2, 2]), "{full:?}");
+    assert!(st10.spec_steps > 0 && st10.drafts_accepted > 0);
+}
+
 /// A request that stops inside an accepted run (its budget, or an end-of-sequence token) commits
 /// only the rows of the tokens it delivered, so its slot holds exactly its history: the next turn
 /// of the conversation resumes at the turn point in place, with no prefill of the old tokens.
