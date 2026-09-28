@@ -38,5 +38,12 @@ authors under their own terms.
 ## TensorFold: MIT
 
 - **Source:** <https://github.com/ashhart/TensorFold> @ `bb4b4a3`. Copyright (c) 2026 TensorFold contributors (as in its licence).
-- **What was taken:** the fused KDA chain, replay and conv-shift kernels for GLM-5.3-Flash (`crates/glm53f-kda/kernels/`), ported to a C ABI with batching; the source file is kept verbatim for a bitwise parity test.
-- **Licence text:** `crates/glm53f-kda/LICENSE.tensorfold`.
+- **What was taken:**
+  - the fused KDA chain, replay and conv-shift kernels for GLM-5.3-Flash (`crates/glm53f-kda/kernels/`), ported to a C ABI with batching; the source file is kept verbatim for a bitwise parity test;
+  - the EXL3 trellis tile decoder, fragment MMA and Hadamard butterfly (`crates/glm53f-rank/kernels/exl3_rank.cu`), and the EXL3 reference decoder, ported to Rust (`crates/glm53f-rank/src/exl3.rs`).
+- **Licence text:** `crates/glm53f-kda/LICENSE.tensorfold`, `crates/glm53f-rank/LICENSE.tensorfold`.
+
+## ExLlamaV3: MIT
+
+- **Source:** <https://github.com/turboderp-org/exllamav3>.
+- **What was taken:** nothing is copied. The EXL3 trellis format, codebook and Hadamard scheme that the rank's kernels read originate there, through TensorFold's implementation.

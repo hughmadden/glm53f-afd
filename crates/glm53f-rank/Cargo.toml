@@ -1,0 +1,49 @@
+# glm53f-rank: the expert-rank daemon of glm53f-afd. One DGX Spark serves a
+# quarter (512 of 2,048 intermediate channels) of every routed expert of
+# GLM-5.3-Flash's 42 MoE layers, stored as EXL3 K4 (ExLlamaV3 trellis, "mcg"
+# codebook). See README.md for the design and PROVENANCE.md for what was copied.
+#
+# The serving shell (transport, server loop, boot identity readback, residency,
+# device buffers, timeline) is ported from mimo26f-afd v1.2.0 `crates/mimo26-spark`.
+# The expert kernel (kernels/exl3_rank.cu) starts from TensorFold's
+# `families/glm5_next/cuda/exl3.cu`.
+#
+#   cargo test -p glm53f-rank --release                    CPU gate (no nvcc, no GPU)
+#   cargo test -p glm53f-rank --release --features cuda    kernel against the CPU reference
+#
+# No external Rust crates.
+[package]
+name = "glm53f-rank"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Expert-rank daemon for glm53f-afd: EXL3 K4 routed experts at TP4, DS41RTE3 v3 wire serving, FP8 prefill reduce-scatter design"
+publish = false
+
+[lib]
+name = "glm53f_rank"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glm53f-rank"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compile and link the EXL3 expert kernels (build.rs runs nvcc). Off by default
+# so `cargo test --workspace` needs no CUDA toolkit. GLM53F_CUDA_ARCH picks the
+# target: sm_89 (default, an RTX 4090 used as a development proxy) or sm_121
+# (DGX Spark, built on the Spark with CUDA 13).
+cuda = []
+# Build the RDMA RC transport's native shim (libibverbs). The rank binary on a
+# Spark is built with `--features cuda,rdma`.
+rdma = ["glm53f-rdma/rdma"]
+
+[dependencies]
+glm53f-model = { path = "../glm53f-model" }
+glm53f-rdma = { path = "../glm53f-rdma" }
+glm53f-wire = { path = "../glm53f-wire" }
+
+[[example]]
+name = "exl3_bench"
+required-features = ["cuda"]

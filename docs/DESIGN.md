@@ -81,7 +81,7 @@ no deployment-specific details in it.
 | Part | Take from | What changes for GLM-5.3-Flash | New work |
 |---|---|---|---|
 | RDMA transport and wire frames | **M** (`DS41RTE3` v3 frames, RC rings, RoCE-only guard; design from **D**) | Frame dimensions: hidden 4,096; top-8 of 288 | — |
-| Prefill return path | **G** (Spark-side FP8 row reduce-scatter above 16 rows) | Ported into M's rank daemon | The coordinator receives one plane instead of four. This prevents 4→1 incast on switches without priority flow control. |
+| Prefill return path | **G** (Spark-side row reduce-scatter above 16 rows) | Ported into M's rank daemon. The ranks exchange **BF16** partials, not G's FP8: in simulation, BF16 is 2.2e-3 from the four-plane sum and FP8 1.9e-2, while rank egress stays at today's 8 KB per row | The coordinator receives one plane instead of four. This prevents 4→1 incast on switches without priority flow control. |
 | Spark rank daemon | **M** (mapped-frame input, output written into the send slot, packed route upload) plus **D**'s single-CTA decode route planner | Expert shape 4,096 × 512 per rank; 288 experts | — |
 | Spark expert kernel, EXL3 K4 | **T** `exl3.cu` (208–220 GB/s at 1–8 rows on GB10) or **S** W4A16 trellis fused MoE (about 230 GB/s marginal, as **G** uses it) | Written for GLM-Flash (**T**); new AOT export for 4,096 × 512 (**S**) | Choose by measurement (§5) |
 | Spark expert kernel, NVFP4 | **S** NVFP4 MoE kernels (recent commits target E = 288, K = 4,096) or **M**'s B1 W4A8 with NVFP4 block scales | E4M3 scales per 16 values instead of E8M0 per 32 | Only if D6 picks NVFP4 |
@@ -129,6 +129,12 @@ and the `tr3-4bpw` model card.
   0.0115–0.0127.
 - **KV format:** the K4 row used an FP8 MLA cache. With an NVFP4 cache, the same
   checkpoint scored 0.0548 and failed that card's quality gate, which supports D1.
+
+**Channel order differs between formats.** The EXL3 checkpoint permutes each expert's 2,048
+intermediate channels relative to the official FP8 checkpoint: each EXL3 channel matches exactly
+one official channel, at cosine ≥ 0.996. Every expert is consistent within itself, so the TP4
+split stays exact, but a rank's 512 channels are not the same channels in the two formats. All
+four ranks must therefore always load the same checkpoint.
 
 **Choice (D6).**
 - **EXL3 K4 by default.** It is already the format the Sparks can load, it is the
