@@ -4,7 +4,7 @@
 //! * Without weights: the indexer's scoring and selection are checked from the
 //!   fixtures alone (index queries, head weights and pooled keys in; scores and
 //!   top-k rows out), including the `index_topk = 16` variant that drops pools.
-//! * With `GLM53F_CHECKPOINT` (and `--release`): the whole layer from its input
+//! * With `GLM53F_CHECKPOINT_DIR` (and `--release`): the whole layer from its input
 //!   (`attn_norm`) in both MLA forms, for the prompt and the eight decode steps.
 //!
 //! Every test skips when its fixtures are missing. `synthetic_fixture_round_trip`
@@ -192,7 +192,7 @@ fn layer3_whole_path_from_fixtures() {
         return;
     }
     let Some(ck) = glm53f_dsa::weights::checkpoint_from_env() else {
-        eprintln!("skipping: GLM53F_CHECKPOINT not set");
+        eprintln!("skipping: GLM53F_CHECKPOINT_DIR not set");
         return;
     };
     let cfg = DsaConfig::glm53_flash();

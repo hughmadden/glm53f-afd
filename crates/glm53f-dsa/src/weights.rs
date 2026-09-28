@@ -91,8 +91,9 @@ pub fn load_dsa_layer(ck: &Checkpoint, cfg: &DsaConfig, l: usize) -> Result<DsaL
     Ok(out)
 }
 
-/// The checkpoint directory from `GLM53F_CHECKPOINT`, if set and readable.
+/// The checkpoint directory from `GLM53F_CHECKPOINT_DIR` (the name every crate's tests use), or
+/// the older `GLM53F_CHECKPOINT`, if set and readable.
 pub fn checkpoint_from_env() -> Option<Checkpoint> {
-    let dir = std::env::var_os("GLM53F_CHECKPOINT")?;
+    let dir = std::env::var_os("GLM53F_CHECKPOINT_DIR").or_else(|| std::env::var_os("GLM53F_CHECKPOINT"))?;
     Checkpoint::open_dir(std::path::Path::new(&dir)).ok()
 }

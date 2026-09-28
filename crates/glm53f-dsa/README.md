@@ -323,10 +323,10 @@ cargo test -p glm53f-dsa
 cargo test --release -p glm53f-dsa --features cuda --test gpu
 
 # Real weights (layer 3 of the official checkpoint; skips without the variable)
-GLM53F_CHECKPOINT=/path/to/checkpoint cargo test --release -p glm53f-dsa --test real_data -- --nocapture
+GLM53F_CHECKPOINT_DIR=/path/to/checkpoint cargo test --release -p glm53f-dsa --test real_data -- --nocapture
 
 # Oracle fixtures (oracle/goldens/layer03-*; skip when absent)
-GLM53F_CHECKPOINT=/path/to/checkpoint cargo test --release -p glm53f-dsa --test goldens -- --nocapture
+GLM53F_CHECKPOINT_DIR=/path/to/checkpoint cargo test --release -p glm53f-dsa --test goldens -- --nocapture
 
 # Kernel timings; before/after of the decode path
 cargo run --release -p glm53f-dsa --features cuda --example dsa_bench

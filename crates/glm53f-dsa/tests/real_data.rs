@@ -2,11 +2,11 @@
 //! the f32 reference (latent and pooled index key), the selection change the
 //! FP8 pooled keys cause, and the attention/layer output error.
 //!
-//! Needs `GLM53F_CHECKPOINT` (a directory of the official checkpoint's
+//! Needs `GLM53F_CHECKPOINT_DIR` (a directory of the official checkpoint's
 //! safetensors, or a subset holding layer 3's attention tensors and the token
 //! embedding) and a release build; skips otherwise:
 //!
-//!   GLM53F_CHECKPOINT=/path/to/GLM-5.3-Flash cargo test --release --test real_data -- --nocapture
+//!   GLM53F_CHECKPOINT_DIR=/path/to/GLM-5.3-Flash cargo test --release --test real_data -- --nocapture
 //!
 //! Inputs: when oracle goldens exist, their real layer-3 inputs are used for a
 //! short-context check. The long-context measurement uses **proxy inputs**:
@@ -37,11 +37,11 @@ fn setup() -> Option<(Checkpoint, DsaConfig, DsaLayerWeights)> {
         return None;
     }
     let Some(ck) = weights::checkpoint_from_env() else {
-        eprintln!("skipping: GLM53F_CHECKPOINT not set or unreadable");
+        eprintln!("skipping: GLM53F_CHECKPOINT_DIR not set or unreadable");
         return None;
     };
     if !weights::layer_available(&ck, 3) {
-        eprintln!("skipping: layer 3 tensors not present in GLM53F_CHECKPOINT");
+        eprintln!("skipping: layer 3 tensors not present in GLM53F_CHECKPOINT_DIR");
         return None;
     }
     let cfg = DsaConfig::glm53_flash();

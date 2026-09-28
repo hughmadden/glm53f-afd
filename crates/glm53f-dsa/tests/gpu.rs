@@ -1069,7 +1069,7 @@ mod common;
 /// `kv_b_proj`, attention over the fixture's selections, un-absorbed, and
 /// compared with the fixture's per-head output (f32, unquantized latents).
 ///
-/// Needs `GLM53F_CHECKPOINT` and `--release`. Without `layer03-prefill`
+/// Needs `GLM53F_CHECKPOINT_DIR` and `--release`. Without `layer03-prefill`
 /// fixtures, a stand-in set is written from the CPU reference on the real
 /// weights and proxy inputs (embedding rows through layer 3's input norm).
 #[test]
@@ -1082,7 +1082,7 @@ fn layer3_gpu_against_fixtures() {
         return;
     }
     let Some(ck) = glm53f_dsa::weights::checkpoint_from_env() else {
-        eprintln!("skipping: GLM53F_CHECKPOINT not set");
+        eprintln!("skipping: GLM53F_CHECKPOINT_DIR not set");
         return;
     };
     let cfg = DsaConfig::glm53_flash();
