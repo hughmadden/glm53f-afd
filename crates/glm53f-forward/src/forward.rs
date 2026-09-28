@@ -940,6 +940,9 @@ pub struct LaneTrace {
     /// Host time of the layer loop.
     pub loop_ms: f64,
     pub layers: Vec<LayerTrace>,
+    /// The expert backend's own record of the pass's calls (`ExpertBackend::trace_end`: the
+    /// remote experts' return paths and host times), when it keeps one.
+    pub wire: Option<String>,
 }
 
 /// One MoE layer of a traced pass; the vectors are per lane.
@@ -986,7 +989,7 @@ impl LaneTrace {
         let wall = med(&|t| t.wall_ms);
         let busy = med(&|t| (0..n).map(|x| t.gpu_attn_ms[x] + t.gpu_shared_ms[x]).sum());
         let rows: Vec<String> = self.rows.iter().map(|r| r.to_string()).collect();
-        format!(
+        let line = format!(
             concat!(
                 "lanes {} rows (depth {}): layer loop {:.1} ms; per MoE layer, median of {}: ",
                 "wall {wall:.2} ms; GPU {}, {} (busy {busy:.2} ms, {:.0}%); host {}, {}, {}; {}"
@@ -1004,7 +1007,11 @@ impl LaneTrace {
             per("exchange out", &|t, x| t.out_ms[x]),
             wall = wall,
             busy = busy,
-        )
+        );
+        match &self.wire {
+            Some(w) => format!("{line}; {w}"),
+            None => line,
+        }
     }
 }
 
@@ -2191,6 +2198,9 @@ impl GlmForward {
             t.recs = vec![Default::default(); model.shape.layers];
             t.starts.clear();
             t.loop_start = Instant::now();
+            if t.active {
+                self.experts.trace_begin();
+            }
         }
         for l in layers {
             let lw = &model.layers[l];
@@ -2539,6 +2549,7 @@ impl GlmForward {
             depth: self.experts.depth().clamp(1, 2),
             loop_ms: (t.loop_end - t.loop_start).as_secs_f64() * 1e3,
             layers,
+            wire: self.experts.trace_end(),
         };
         if t.print {
             eprintln!("PIPE {}", trace.summary());

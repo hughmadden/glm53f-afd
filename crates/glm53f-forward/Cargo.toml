@@ -58,3 +58,7 @@ required-features = ["cuda"]
 [[example]]
 name = "decode_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "wire_paths"
+required-features = ["coordinator"]

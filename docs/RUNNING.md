@@ -73,12 +73,15 @@ Each binary runs only on the architecture it was built for; the rank checks this
 1. Each rank, on its fabric address:
 
    ```sh
-   GLM53F_WIRE_NOCRC=1 glm53f-rank serve --rank 0 --dir <rank-dir> --listen 192.0.2.10:8600   # ranks 1-3: .11, .12, .13
+   GLM53F_WIRE_NOCRC=1 glm53f-rank serve --rank 0 --dir <rank-dir> --listen 192.0.2.10:8600 \
+     --peers 192.0.2.10:8601,192.0.2.11:8601,192.0.2.12:8601,192.0.2.13:8601   # ranks 1-3: .11, .12, .13
    ```
 
    It verifies every image (size and SHA-256), loads them onto the GPU and prints
    `listening on ...`. `GLM53F_WIRE_NOCRC=1` sends frames without their CRC32C; both sides must
-   agree, and the coordinator's RDMA transport requires it.
+   agree, and the coordinator's RDMA transport requires it. `--peers` (the same list on every
+   rank) joins the ranks' mesh for the prefill reduce-scatter; `GLM53F_RDMA=1` on the ranks makes
+   the mesh RDMA RC, TCP otherwise (`crates/glm53f-rank/README.md`).
 
 2. The coordinator:
 
@@ -128,9 +131,18 @@ describes each.
 - **Tracing a pass.** With `GLM53F_PROFILE=1` each prefill pass prints a `PIPE` line: per MoE
   layer (median), the wall time, each lane's GPU time for its attention and its shared expert,
   the host's time waiting for the routes, in `submit` and in `finish` (blocked on the ranks,
-  then the planes uploaded), and each lane's exchange as the coordinator sees it (`submit`
-  returned to `finish` returned: about the other lane's work when the exchange is hidden). The
-  ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
+  then the returns placed), and each lane's exchange as the coordinator sees it (`submit`
+  returned to `finish` returned: about the other lane's work when the exchange is hidden). It
+  ends with the wire's record of the pass: which request and return paths served, and per
+  return path (row slices, four planes) the exchanges and the medians of the host's time in
+  `submit` (of it, waiting for the device's copies), in `finish` waiting for the returns, and
+  placing them. The ranks' own time per request comes from `GLM53F_RANK_TRACE=1` on the ranks.
+- **The expert exchange's paths.** Prefill exchanges from `GLM53F_ROW_SHARDED_MIN_ROWS` rows
+  are reduce-scattered by the ranks (each returns its quarter of the rows, summed; needs
+  `--peers` on the ranks); decode and verify windows keep the four-plane return. Requests are
+  built from the GPU into the page-locked request body, and returns read from the page-locked
+  receive buffers (summed in place at decode sizes). Each has an off switch for comparisons;
+  the results do not depend on them (`crates/glm53f-forward/src/remote.rs`).
 
 ## The KL gate
 
@@ -167,7 +179,8 @@ logits are meaningless.
 The tests that do this themselves:
 
 ```sh
-# RemoteExperts against the oracle and the local FP8 experts, on four rank daemons.
+# RemoteExperts against the oracle and the local FP8 experts, on four rank daemons; the row-sharded
+# return and the fast paths against four planes and the host paths, per call and in two-lane prefill.
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_RANK_BIN=.../glm53f-rank \
 GLM53F_RANK_DIRS=<rank-0>,<rank-1>,<rank-2>,<rank-3> \
   cargo test --release -p glm53f-forward --features coordinator --test remote_experts -- --nocapture --test-threads=1
@@ -218,7 +231,15 @@ RDMA requires it), `GLM53F_WIRE_MIN_GBPS` (the fabric's floor rate, default 100)
 `GLM53F_WIRE_ALLOW_LAN=1` (admit a non-fabric network: tests only), `GLM53F_WIRE_INFLIGHT=1` (one
 exchange in flight over RDMA too, instead of two: the prefill lanes then take turns on the wire),
 `GLM53F_TIMELINE=1` (cross-host timeline events), `GLM53F_PROFILE=1` (per-exchange timings on the
-coordinator, and a `PIPE` line per prefill pass).
+coordinator, and a `PIPE` line per prefill pass). The return path: `GLM53F_ROW_SHARDED_MIN_ROWS=N`
+(exchanges of N rows and more, at least 4, reduce-scattered by the ranks; unset or 0: four planes
+always; the design's value is 16) with `GLM53F_EXCHANGE_DTYPE` (`bf16`, the default, or `fp8`,
+which needs the KL gate). The coordinator's fast paths, on by default:
+`GLM53F_WIRE_DEVICE_ENCODE=0` (requests encoded on the host instead of copied from the GPU into
+the request body), `GLM53F_WIRE_ZERO_COPY=0` (returns uploaded from pageable memory instead of
+read from the page-locked receive buffers), `GLM53F_WIRE_FILL_ROWS=N` (requests of up to N rows
+written by the frame-fill kernel instead of the copies; default 0) and
+`GLM53F_WIRE_MAPPED_ROWS=N` (four-plane returns of up to N rows summed in place; default 64).
 
 **Rank:** `GLM53F_RANK_TRACE=1` (a timing line per request), `GLM53F_RANK_DUMP_FRAME=<path>`
 with `GLM53F_RANK_DUMP_LAYER` (write one request frame for offline replay).

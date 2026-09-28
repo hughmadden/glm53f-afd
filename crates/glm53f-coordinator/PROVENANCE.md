@@ -182,11 +182,19 @@ DS41RT code is copied here.
 6. Request ids start at a random base per connection (they started at 1): the ranks' peer mesh
    keys exchange frames by request id and layer, so a stale frame of an earlier connection can
    never match a new exchange. The host-sum path also checks each return's request and layer.
+7. The in-place sends and the receive buffers work over TCP too (the source's were RDMA only):
+   `send_buffers` allocates a staging body laid out as the RDMA one, `moe_send_mapped` and
+   `moe_send_device` build the frame in it and write each rank's frame from it (its executor
+   id, that connection's sequence and, unless disabled, its CRC32C), one exchange in flight;
+   `plane_buffers` also hands out the connections' receive buffers, grown once to a whole
+   receive slot so that they never move (the source's grew with each larger return). A
+   caller's device paths then run on one machine; over TCP they save nothing.
 
 ## Tests
 
-- **CPU** (`cargo test -p glm53f-coordinator`): 41 unit tests (sampling, radix, host tier, queue,
-  spec, streaming, wire over four mock ranks, E4M3, engine helpers) and 24 integration tests:
+- **CPU** (`cargo test -p glm53f-coordinator`): 44 unit tests (sampling, radix, host tier, queue,
+  spec, streaming, wire over four mock ranks with the in-place sends' frames byte for byte, E4M3,
+  engine helpers) and 24 integration tests:
   `tests/scheduler.rs` (11: batched decode, mixed greedy and sampled rows, admission waiting and
   refusal, prefill segments between decode steps, verify windows with partial accepts, stops
   inside an accepted run, radix reuse exact / extending / divergent with the branch gap, a

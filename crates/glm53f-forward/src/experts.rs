@@ -64,6 +64,13 @@ pub trait ExpertBackend: Send {
     fn depth(&self) -> usize {
         1
     }
+    /// Start recording the calls of a traced pass (the forward's lane trace).
+    fn trace_begin(&mut self) {}
+    /// What the backend recorded since [`ExpertBackend::trace_begin`], as text for the pass's
+    /// `PIPE` line (`None`: nothing to add).
+    fn trace_end(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Routed output of zeros.

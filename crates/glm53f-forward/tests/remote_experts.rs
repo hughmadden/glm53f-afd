@@ -1,9 +1,11 @@
 //! `RemoteExperts`: the routed experts on four expert ranks over the wire (feature
 //! `coordinator`).
 //!
-//! 1. **Against four mock ranks** (a GPU, no data): the wire rows the ranks receive are the wire
-//!    client's host quantizer applied to the widened BF16 input, the routes are the call's, and
-//!    the routed output is the BF16 rounding of the four planes added in rank order in f32.
+//! 1. **Against four mock ranks** (a GPU, no data), by every request and return path (the host
+//!    paths, the fast paths, the frame fill, DMA copies only): the frames the ranks receive are
+//!    the host encoder's byte for byte, with the wire client's host quantizer applied to the
+//!    widened BF16 input and the call's routes, and the routed output is the BF16 rounding of
+//!    the four planes added in rank order in f32.
 //! 2. **Layers 0-4 on four real rank daemons** over TCP loopback: the EXL3 shares of layers 3
 //!    and 4 cut by `glm53f-rank slice`, served by `glm53f-rank serve` on this GPU. Each MoE layer
 //!    fed its golden input streams, with the golden routes, against the oracle's routed output
@@ -18,8 +20,14 @@
 //!    turns on the wire, one exchange in flight), and as one pass (the same tokens but on near
 //!    ties, logits within the chain's bound); with the lane trace of each pass (a shared GPU, so
 //!    it shows the schedule, not the overlap of separate machines).
+//! 4. **Return paths and fast paths on the four rank daemons** (with their peer mesh): the
+//!    row-sharded return against four planes, and the fast paths against the host paths, call
+//!    by call on layers 3 and 4 (the oracle's MoE inputs) and through two-lane prefill of layers
+//!    0-4 (the forward's own routing). The fast paths change no bit; row slices stay within the
+//!    bound of the four-plane sum and pick the same tokens on every decided row; decode stays
+//!    four planes, bit for bit.
 //!
-//! Tests 2 and 3 need, besides the variables of `tests/common/mod.rs`:
+//! Tests 2 to 4 need, besides the variables of `tests/common/mod.rs`:
 //!
 //! - `GLM53F_RANK_BIN`: a `glm53f-rank` binary (`--features cuda` for GPU ranks);
 //! - `GLM53F_RANK_DIRS`: the four rank directories, comma-separated in rank order, each cut
@@ -46,14 +54,18 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use common::*;
+use glm53f_coordinator::wire::{Collected, ReturnPath, WireClient, WireConfig};
 use glm53f_forward::device::{DeviceBuffer, Stream};
 use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts, ZeroExperts};
 use glm53f_forward::forward::{ForwardConfig, GlmForward, Tap, TapBuf, TapPoint};
 use glm53f_forward::gemm::Fp8Act;
-use glm53f_forward::remote::{RemoteExperts, WireTimes, RANKS};
+use glm53f_forward::remote::{FastPaths, RemoteExperts, WireTimes, RANKS};
 use glm53f_forward::shape::{HC, HIDDEN, SAMPLE_VOCAB, TOP_K, VOCAB};
-use glm53f_wire::frame::{Frame, RequestFrame, ReturnFrame, ReturnRow};
+use glm53f_wire::frame::{
+    Frame, HiddenRow, RequestFrame, ReturnFrame, ReturnRow, RouteEntry, RowDescriptor,
+};
 use glm53f_wire::l4::{StreamReceiver, StreamSender};
+use glm53f_wire::row_shard::{row_partition, ExchangeDtype};
 use glm53f_wire::WireNaive;
 
 // ---- 1. Mock ranks ------------------------------------------------------------------------------
@@ -72,11 +84,15 @@ fn read_frame(s: &mut TcpStream) -> Vec<u8> {
 
 /// Four mock ranks on one listener (the client connects rank 0 to 3 in order). Each answers
 /// `exchanges` requests, rank `r` returning `value(r, row, column)` rounded to BF16, and every
-/// request is handed back when the server ends, in (exchange, rank) order.
+/// request is handed back when the server ends, decoded and as received, in (exchange, rank)
+/// order.
 fn mock_ranks(
     exchanges: usize,
     value: fn(usize, usize, usize) -> f32,
-) -> (String, std::thread::JoinHandle<Vec<RequestFrame>>) {
+) -> (
+    String,
+    std::thread::JoinHandle<Vec<(RequestFrame, Vec<u8>)>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let server = std::thread::spawn(move || {
@@ -90,7 +106,8 @@ fn mock_ranks(
         let mut seen = Vec::new();
         for _ in 0..exchanges {
             for (r, s) in conns.iter_mut().enumerate() {
-                let Frame::Request(req) = rx[r].accept(&read_frame(s)).expect("L4 accept") else {
+                let bytes = read_frame(s);
+                let Frame::Request(req) = rx[r].accept(&bytes).expect("L4 accept") else {
                     panic!("rank {r}: expected a request frame");
                 };
                 let n = req.rows.len();
@@ -119,7 +136,7 @@ fn mock_ranks(
                 };
                 s.write_all(&tx[r].encode_return(&ret).expect("encode return"))
                     .expect("send return");
-                seen.push(req);
+                seen.push((req, bytes));
             }
         }
         seen
@@ -153,87 +170,165 @@ fn input_rows(rows: usize) -> Vec<u16> {
     narrow(&v)
 }
 
+/// The frame the host encoder writes for `req` as received (its request id, executor and
+/// sequence), with the wire rows `rows` and the routes `ids`, `w`: what every path must send.
+fn host_frame(req: &RequestFrame, rows: Vec<HiddenRow>, ids: &[i32], w: &[f32]) -> Vec<u8> {
+    let n = rows.len();
+    let f = RequestFrame {
+        request_id: req.request_id,
+        placement_version: 1,
+        layer_id: req.layer_id,
+        executor_id: req.executor_id,
+        source_kind: glm53f_wire::SourceKind::Decode,
+        token_position: 0,
+        flags: req.flags,
+        seq: req.seq,
+        rows: (0..n)
+            .map(|t| RowDescriptor {
+                row_id: t as u64,
+                source_kind: glm53f_wire::SourceKind::Decode,
+                source_request_id: req.request_id,
+                token_position: t as u64,
+                route_offset: (t * TOP_K) as u32,
+                route_count: TOP_K as u32,
+            })
+            .collect(),
+        routes: (0..ids.len())
+            .map(|i| RouteEntry {
+                row_index: (i / TOP_K) as u32,
+                expert_id: ids[i] as u32,
+                gate_weight: w[i],
+            })
+            .collect(),
+        hidden_rows: rows,
+    };
+    glm53f_wire::frame::encode_request_seq(&f, req.seq, WireNaive::NONE).unwrap()
+}
+
+/// Every request and return form against four mock ranks: the host paths; the fast paths as
+/// they default (the DMA copies into the request body, the in-place sum up to 64 rows and DMA
+/// copies of the returns above); the frame fill up to 64 rows; and the DMA copies at every size.
+/// What the ranks receive is the host encoder's frame byte for byte (the wire rows are the host
+/// quantizer's), and the routed output the BF16 rounding of the four planes added in rank order
+/// in f32, bit for bit.
 #[test]
 fn remote_experts_against_four_mock_ranks() {
     if !gpu_with(0.5) {
         return;
     }
-    let passes = [1usize, 5, 16];
-    let (addr, server) = mock_ranks(passes.len(), plane_value);
-    let mut remote = RemoteExperts::connect(&vec![addr; RANKS], 16).expect("connect");
-    let times = remote.times();
-    let stream = Stream::new().unwrap();
-    let mut sent: Vec<(Vec<u16>, Vec<i32>, Vec<f32>)> = Vec::new();
-    for (k, &rows) in passes.iter().enumerate() {
-        let x = input_rows(rows);
-        // On the stream the backend runs on: a synchronous copy from pageable memory can return
-        // before its data lands, and the stream does not wait for the legacy stream.
-        let xd = DeviceBuffer::alloc(rows * HIDDEN * 2).unwrap();
-        xd.upload_async(&stream, 0, &x).unwrap();
-        let out = DeviceBuffer::alloc(rows * HIDDEN * 2).unwrap();
-        // Distinct experts per row (37 is prime to 288), past 255 included.
-        let ids: Vec<i32> = (0..rows * TOP_K)
-            .map(|i| ((i * 37 + 250) % 288) as i32)
-            .collect();
-        let w: Vec<f32> = (0..rows * TOP_K)
-            .map(|i| 2.5 * (1 + i % TOP_K) as f32 / 36.0)
-            .collect();
-        let call = ExpertCall {
-            layer: 3 + k,
-            rows,
-            x: xd.ptr(0),
-            x_q: core::ptr::null(),
-            x_scales: core::ptr::null(),
-            ids: core::ptr::null(),
-            weights: core::ptr::null(),
-            host_ids: &ids,
-            host_weights: &w,
-            out: out.ptr(0),
-        };
-        remote.submit(&call, &stream).expect("submit");
-        remote.finish(&call, &stream).expect("finish");
-        stream.synchronize().unwrap();
-        let got: Vec<u16> = out.download(rows * HIDDEN).unwrap();
-        let want: Vec<f32> = (0..rows * HIDDEN)
-            .map(|i| {
-                let mut s = 0f32;
-                for r in 0..RANKS {
-                    s += glm53f_layers::bf16::round(plane_value(r, i / HIDDEN, i % HIDDEN));
-                }
-                s
-            })
-            .collect();
-        assert_eq!(got, narrow(&want), "{rows} rows: the rank sum");
-        sent.push((x, ids, w));
-    }
-    let frames = server.join().expect("mock ranks");
-    assert_eq!(frames.len(), passes.len() * RANKS);
-    for (f, req) in frames.iter().enumerate() {
-        let (k, r) = (f / RANKS, f % RANKS);
-        let (x, ids, w) = &sent[k];
+    let passes = [1usize, 5, 16, 80];
+    let max = 80;
+    let variants = [
+        ("host paths", FastPaths::OFF),
+        ("fast paths", FastPaths::ON),
+        (
+            "frame fill up to 64 rows",
+            FastPaths {
+                fill_rows: 64,
+                ..FastPaths::ON
+            },
+        ),
+        (
+            "DMA copies only",
+            FastPaths {
+                mapped_rows: 0,
+                ..FastPaths::ON
+            },
+        ),
+    ];
+    let mut outputs: Vec<Vec<Vec<u16>>> = Vec::new();
+    for (name, fast) in variants {
+        let (addr, server) = mock_ranks(passes.len(), plane_value);
+        let mut remote =
+            RemoteExperts::connect_with(&vec![addr; RANKS], max, WireConfig::glm53_flash(), fast)
+                .expect("connect");
         assert_eq!(
-            (req.layer_id, req.executor_id, req.rows.len()),
-            ((3 + k) as u32, r as u64, passes[k])
+            remote.fast_paths(),
+            fast,
+            "{name}: every buffer page-locked"
         );
-        let want = glm53f_coordinator::wire::quantize_hidden_batched(&widen(x)).unwrap();
-        assert_eq!(req.hidden_rows, want, "pass {k}, rank {r}: the wire rows");
-        let routes: Vec<(u32, u32, f32)> = req
-            .routes
-            .iter()
-            .map(|e| (e.row_index, e.expert_id, e.gate_weight))
-            .collect();
-        let expect: Vec<(u32, u32, f32)> = (0..ids.len())
-            .map(|i| ((i / TOP_K) as u32, ids[i] as u32, w[i]))
-            .collect();
-        assert_eq!(routes, expect, "pass {k}, rank {r}: the routes");
+        let times = remote.times();
+        let stream = Stream::new().unwrap();
+        let mut sent: Vec<(Vec<u16>, Vec<i32>, Vec<f32>)> = Vec::new();
+        let mut outs = Vec::new();
+        for (k, &rows) in passes.iter().enumerate() {
+            let x = input_rows(rows);
+            // On the stream the backend runs on: a synchronous copy from pageable memory can
+            // return before its data lands, and the stream does not wait for the legacy stream.
+            let xd = DeviceBuffer::alloc(rows * HIDDEN * 2).unwrap();
+            xd.upload_async(&stream, 0, &x).unwrap();
+            let out = DeviceBuffer::alloc(rows * HIDDEN * 2).unwrap();
+            // Distinct experts per row (37 is prime to 288), past 255 included.
+            let ids: Vec<i32> = (0..rows * TOP_K)
+                .map(|i| ((i * 37 + 250) % 288) as i32)
+                .collect();
+            let w: Vec<f32> = (0..rows * TOP_K)
+                .map(|i| 2.5 * (1 + i % TOP_K) as f32 / 36.0)
+                .collect();
+            // The routes on the device too, as the forward's router leaves them (the frame fill
+            // reads them there).
+            let (di, dw) = (
+                DeviceBuffer::alloc(rows * TOP_K * 4).unwrap(),
+                DeviceBuffer::alloc(rows * TOP_K * 4).unwrap(),
+            );
+            di.upload_async(&stream, 0, &ids).unwrap();
+            dw.upload_async(&stream, 0, &w).unwrap();
+            let call = ExpertCall {
+                layer: 3 + k,
+                rows,
+                x: xd.ptr(0),
+                x_q: core::ptr::null(),
+                x_scales: core::ptr::null(),
+                ids: di.ptr(0),
+                weights: dw.ptr(0),
+                host_ids: &ids,
+                host_weights: &w,
+                out: out.ptr(0),
+            };
+            remote.submit(&call, &stream).expect("submit");
+            remote.finish(&call, &stream).expect("finish");
+            stream.synchronize().unwrap();
+            let got: Vec<u16> = out.download(rows * HIDDEN).unwrap();
+            let want: Vec<f32> = (0..rows * HIDDEN)
+                .map(|i| {
+                    let mut s = 0f32;
+                    for r in 0..RANKS {
+                        s += glm53f_layers::bf16::round(plane_value(r, i / HIDDEN, i % HIDDEN));
+                    }
+                    s
+                })
+                .collect();
+            assert_eq!(got, narrow(&want), "{name}, {rows} rows: the rank sum");
+            outs.push(got);
+            sent.push((x, ids, w));
+        }
+        drop(remote);
+        let frames = server.join().expect("mock ranks");
+        assert_eq!(frames.len(), passes.len() * RANKS);
+        for (f, (req, bytes)) in frames.iter().enumerate() {
+            let (k, r) = (f / RANKS, f % RANKS);
+            let (x, ids, w) = &sent[k];
+            assert_eq!(
+                (req.layer_id, req.executor_id, req.rows.len(), req.flags),
+                ((3 + k) as u32, r as u64, passes[k], 0)
+            );
+            let rows = glm53f_coordinator::wire::quantize_hidden_batched(&widen(x)).unwrap();
+            assert!(
+                *bytes == host_frame(req, rows, ids, w),
+                "{name}, pass {k} ({} rows), rank {r}: not the host encoder's frame",
+                passes[k]
+            );
+        }
+        let t = times.lock().unwrap();
+        assert_eq!(t.len(), passes.len());
+        assert!(t.values().all(|x| x.count == 1 && !x.row_sharded));
+        eprintln!(
+            "RemoteExperts against four mock ranks, {name}: {} passes of {passes:?} rows, the frames the host encoder's byte for byte, the rank sums exact",
+            passes.len()
+        );
+        outputs.push(outs);
     }
-    let t = times.lock().unwrap();
-    assert_eq!(t.len(), passes.len());
-    assert!(t.values().all(|x| x.count == 1));
-    eprintln!(
-        "RemoteExperts against four mock ranks: {} passes of {passes:?} rows, wire rows, routes and rank sums exact",
-        passes.len()
-    );
+    assert!(outputs.iter().all(|o| *o == outputs[0]));
 }
 
 // ---- 2. Real ranks --------------------------------------------------------------------------------
@@ -275,17 +370,29 @@ fn rank_setup() -> Option<(PathBuf, Vec<PathBuf>)> {
     Some((bin, dirs))
 }
 
-/// Start the four daemons on loopback; returns them and their addresses in rank order.
+/// Start the four daemons on loopback, with their peer mesh (for the row-sharded return);
+/// returns them and their addresses in rank order.
 fn spawn_ranks(bin: &PathBuf, dirs: &[PathBuf]) -> (Daemons, Vec<String>) {
     let mut d = Daemons {
         children: Vec::new(),
         _out: Vec::new(),
     };
+    // Four free loopback ports for the mesh (bound, noted, released).
+    let peers: Vec<String> = (0..RANKS)
+        .map(|_| {
+            TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
     for (r, dir) in dirs.iter().enumerate() {
         let child = Command::new(bin)
             .args(["serve", "--rank", &r.to_string(), "--dir"])
             .arg(dir)
             .args(["--listen", "127.0.0.1:0", "--allow-partial"])
+            .args(["--peers", &peers.join(",")])
             .env("GLM53F_WIRE_ALLOW_LAN", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -325,6 +432,12 @@ impl<B: ExpertBackend> ExpertBackend for Shared<B> {
     }
     fn depth(&self) -> usize {
         self.0.lock().unwrap().depth()
+    }
+    fn trace_begin(&mut self) {
+        self.0.lock().unwrap().trace_begin()
+    }
+    fn trace_end(&mut self) -> Option<String> {
+        self.0.lock().unwrap().trace_end()
     }
 }
 
@@ -904,6 +1017,422 @@ fn two_lanes_on_four_rank_daemons() {
         (agree, bagree),
         (decided, bdecided),
         "two lanes pick other tokens than one pass"
+    );
+    assert!(
+        decided >= 6 && bdecided >= 6,
+        "rows decided: {decided}, {bdecided}"
+    );
+}
+
+// ---- 4. Return paths and fast paths on the rank daemons -------------------------------------
+
+/// The four-plane configuration, and the row-sharded one (from 16 rows, BF16 exchange).
+fn wire_configs() -> (WireConfig, WireConfig) {
+    let four = WireConfig::glm53_flash();
+    let rs = WireConfig {
+        return_path: ReturnPath::RowSharded {
+            min_rows: 16,
+            exchange: ExchangeDtype::Bf16,
+        },
+        ..four
+    };
+    (four, rs)
+}
+
+fn bf16s(b: &[u8]) -> Vec<u16> {
+    b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// Row slices against the four planes `planes` (BF16, rank order) of the same FP8 rows, whose
+/// f32 sum is `s`: every element within the bound glm53f-rank's README derives for the BF16
+/// exchange (for a row owned by rank q: half a BF16 step of q's own partial, which travels
+/// unrounded in one path and rounded in the other; half a BF16 step of the row-sharded sum; the
+/// f32 additions of both paths). Returns (RMS of the difference / RMS of the sum, the worst
+/// difference / its bound).
+fn within_bound(rs: &[f32], s: &[f32], planes: &[Vec<u16>]) -> (f64, f64) {
+    let rows = rs.len() / HIDDEN;
+    let (mut d2, mut s2, mut worst) = (0f64, 0f64, 0f64);
+    for t in 0..rows {
+        let q = (0..RANKS)
+            .find(|&r| {
+                let (f, c) = row_partition(rows, RANKS, r);
+                (f..f + c).contains(&t)
+            })
+            .unwrap();
+        for i in 0..HIDDEN {
+            let e = t * HIDDEN + i;
+            let b: Vec<f64> = planes.iter().map(|p| widen(&[p[e]])[0] as f64).collect();
+            let sv = s[e] as f64;
+            let own = b[q].abs() * 2f64.powi(-8);
+            let fp32 = 8.0 * 2f64.powi(-24) * b.iter().map(|v| v.abs()).sum::<f64>();
+            let bound = own + (sv.abs() + own) * 2f64.powi(-8) + fp32 + 1e-30;
+            let d = (rs[e] as f64 - sv).abs();
+            assert!(
+                d <= bound,
+                "row {t} element {i}: row-sharded {} against four planes {sv} (bound {bound:.3e})",
+                rs[e]
+            );
+            worst = worst.max(d / bound);
+            d2 += d * d;
+            s2 += sv * sv;
+        }
+    }
+    ((d2 / s2).sqrt(), worst)
+}
+
+/// One routed-experts call through `remote` on `stream`: its BF16 output.
+fn call_remote(
+    remote: &mut RemoteExperts,
+    stream: &Stream,
+    layer: usize,
+    x: &[u16],
+    ids: &[i32],
+    w: &[f32],
+) -> Vec<u16> {
+    let rows = x.len() / HIDDEN;
+    let xd = DeviceBuffer::alloc(x.len() * 2).unwrap();
+    xd.upload_async(stream, 0, x).unwrap();
+    let (di, dw) = (
+        DeviceBuffer::alloc(ids.len() * 4).unwrap(),
+        DeviceBuffer::alloc(w.len() * 4).unwrap(),
+    );
+    di.upload_async(stream, 0, ids).unwrap();
+    dw.upload_async(stream, 0, w).unwrap();
+    let out = DeviceBuffer::alloc(x.len() * 2).unwrap();
+    let call = ExpertCall {
+        layer,
+        rows,
+        x: xd.ptr(0),
+        x_q: core::ptr::null(),
+        x_scales: core::ptr::null(),
+        ids: di.ptr(0),
+        weights: dw.ptr(0),
+        host_ids: ids,
+        host_weights: w,
+        out: out.ptr(0),
+    };
+    remote.submit(&call, stream).expect("submit");
+    remote.finish(&call, stream).expect("finish");
+    stream.synchronize().unwrap();
+    out.download(rows * HIDDEN).unwrap()
+}
+
+fn report_modes(name: &str, t: &WireTimes) {
+    for ((l, rows), x) in t {
+        let n = x.count.max(1) as f64;
+        eprintln!(
+            "  {name}: layer {l}, {rows:>2} rows, {}: {} exchanges, {:.3} ms mean (waiting in finish {:.3}); host: send {:.3} (on the device {:.3}), placing the returns {:.3}",
+            if x.row_sharded { "row slices" } else { "four planes" },
+            x.count,
+            x.mean_ms(),
+            x.wait_ms / n,
+            x.send_ms / n,
+            x.send_wait_ms / n,
+            x.upload_ms / n
+        );
+    }
+}
+
+/// The return paths and the fast paths through `RemoteExperts` on the four rank daemons (with
+/// their peer mesh): layers 3 and 4, each fed the oracle's MoE input as the forward holds it
+/// (BF16) with the golden routes, the prompt's 33 rows and the 8 decode rows, four ways (four
+/// planes or row slices, host or fast paths).
+///
+/// - Four planes: the fast paths give the host paths' bits, and both are the BF16 rounding of the
+///   planes a plain wire client collects for the same FP8 rows, added in rank order.
+/// - Row slices: the prompt's rows within the bound of the four-plane sum, the fast paths giving
+///   the host paths' bits; the decode rows stay four planes, the four-plane path's bits.
+/// - Both against the oracle's routed output; the exchange times per return path (loopback, a
+///   shared GPU: they show the paths, not the target hardware).
+#[test]
+fn return_paths_and_fast_paths_on_four_rank_daemons() {
+    let names = [
+        "layer03-prefill",
+        "layer03-decode",
+        "layer04-prefill",
+        "layer04-decode",
+    ];
+    let Some(g) = Goldens::load(&names) else {
+        return;
+    };
+    let Some((bin, dirs)) = rank_setup() else {
+        return;
+    };
+    if !gpu_with(10.0) {
+        return;
+    }
+    // Per layer, the prompt's rows then the decode rows: (layer, input BF16, ids, weights, the
+    // oracle's routed output).
+    type Input = (usize, Vec<u16>, Vec<i32>, Vec<f32>, Vec<f32>);
+    let mut inputs: Vec<Input> = Vec::new();
+    for l in [3usize, 4] {
+        for (set, pre) in [
+            (format!("layer{l:02}-prefill"), "prefill"),
+            (format!("layer{l:02}-decode"), "decode"),
+        ] {
+            inputs.push((
+                l,
+                narrow(&g.f32(&set, &format!("{pre}.ffn_norm"))),
+                g.i64(&set, &format!("{pre}.moe.topk_ids"))
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .collect(),
+                g.f32(&set, &format!("{pre}.moe.topk_weights")),
+                g.f32(&set, &format!("{pre}.moe.routed_out")),
+            ));
+        }
+    }
+    let (daemons, addrs) = spawn_ranks(&bin, &dirs);
+    let (four, rs) = wire_configs();
+    let stream = Stream::new().unwrap();
+    // One backend at a time: a rank serves one coordinator connection at a time.
+    let run = |cfg: WireConfig, fast: FastPaths| -> (Vec<Vec<u16>>, WireTimes) {
+        let mut remote = RemoteExperts::connect_with(&addrs, 64, cfg, fast).expect("connect");
+        assert_eq!(remote.fast_paths(), fast);
+        let times = remote.times();
+        let outs = inputs
+            .iter()
+            .map(|(l, x, ids, w, _)| call_remote(&mut remote, &stream, *l, x, ids, w))
+            .collect();
+        drop(remote);
+        let t = times.lock().unwrap().clone();
+        (outs, t)
+    };
+    // The four-plane fast paths with the frame fill (every call here has at most 64 rows), the
+    // row-sharded ones as they default (the DMA copies).
+    let fill = FastPaths {
+        fill_rows: 64,
+        ..FastPaths::ON
+    };
+    let runs = [
+        ("four planes, host paths", run(four, FastPaths::OFF)),
+        ("four planes, fast paths (frame fill)", run(four, fill)),
+        ("row slices, host paths", run(rs, FastPaths::OFF)),
+        ("row slices, fast paths", run(rs, FastPaths::ON)),
+    ];
+    let [a, b, c, d] = [&runs[0].1 .0, &runs[1].1 .0, &runs[2].1 .0, &runs[3].1 .0];
+    let mut client = WireClient::connect(&addrs, four).expect("connect");
+    for (k, (l, x, ids, w, want)) in inputs.iter().enumerate() {
+        let rows = x.len() / HIDDEN;
+        assert!(
+            a[k] == b[k],
+            "layer {l}, {rows} rows: the fast paths change the four-plane bits"
+        );
+        // The planes of the same FP8 rows, through a plain wire client.
+        let q = glm53f_coordinator::wire::quantize_hidden_batched(&widen(x)).unwrap();
+        let payload: Vec<u8> = q.iter().flat_map(|h| h.payload.iter().copied()).collect();
+        let scales: Vec<u8> = q.iter().flat_map(|h| h.scales.iter().copied()).collect();
+        let routes: Vec<(u32, f32)> = ids.iter().zip(w).map(|(&e, &g)| (e as u32, g)).collect();
+        client
+            .moe_send_raw(*l as u32, &payload, &scales, &routes, TOP_K)
+            .unwrap();
+        client.moe_recv_raw().unwrap();
+        let Some(Collected::Planes(p)) = client.collected() else {
+            panic!("four planes expected");
+        };
+        let planes: Vec<Vec<u16>> = p.iter().map(|b| bf16s(b)).collect();
+        let s: Vec<f32> = (0..rows * HIDDEN)
+            .map(|i| planes.iter().fold(0f32, |acc, pl| acc + widen(&[pl[i]])[0]))
+            .collect();
+        assert!(
+            a[k] == narrow(&s),
+            "layer {l}, {rows} rows: not the planes' sum"
+        );
+        let cos = |v: &[u16]| {
+            let v = widen(v);
+            (0..rows)
+                .map(|r| {
+                    let (x, y) = (
+                        &v[r * HIDDEN..(r + 1) * HIDDEN],
+                        &want[r * HIDDEN..(r + 1) * HIDDEN],
+                    );
+                    cos(x, y)
+                })
+                .fold(1f64, f64::min)
+        };
+        if rows < 16 {
+            assert!(
+                c[k] == a[k] && d[k] == a[k],
+                "layer {l}, {rows} rows (decode): not the four-plane bits"
+            );
+            eprintln!(
+                "layer {l}, {rows} rows (decode): four planes under every configuration, bit for bit; cosine against the oracle >= {:.4}",
+                cos(&a[k])
+            );
+            continue;
+        }
+        assert!(
+            c[k] == d[k],
+            "layer {l}, {rows} rows: the fast paths change the row-slice bits"
+        );
+        let (rel, worst) = within_bound(&widen(&c[k]), &s, &planes);
+        let (cf, cr) = (cos(&a[k]), cos(&c[k]));
+        eprintln!(
+            "layer {l}, {rows} rows (prompt): row slices against four planes: RMS {rel:.2e} of the sum's, worst {worst:.2} of the bound; cosine against the oracle >= {cf:.4} (four planes), {cr:.4} (row slices); the fast paths bit for bit both ways"
+        );
+        assert!(
+            cf > 0.98 && cr > 0.98,
+            "layer {l}: against the oracle's routed output"
+        );
+    }
+    drop(client);
+    drop(daemons);
+    eprintln!("wire exchanges (TCP loopback, four daemons and the coordinator on one GPU):");
+    for (name, (_, t)) in &runs {
+        report_modes(name, t);
+    }
+    for (name, (_, t)) in &runs[2..] {
+        let modes: Vec<(usize, bool)> = t.iter().map(|((_, r), x)| (*r, x.row_sharded)).collect();
+        assert!(
+            modes.iter().all(|&(r, s)| s == (r >= 16)),
+            "{name}: row slices from 16 rows: {modes:?}"
+        );
+    }
+}
+
+/// Two-lane prefill (the serving path: the forward's own routing) on the four rank daemons, four
+/// ways: four planes or row slices, host or fast paths. The oracle's prompt (lanes of 17 and 16
+/// rows) and its 8 fixed decode tokens; two prompts batched across the cut (lanes of 181 and 180
+/// rows), then 4 decode steps fed the same tokens.
+///
+/// - The fast paths give the host paths' bits, for four planes and for row slices, prefill and
+///   decode.
+/// - Row slices against four planes: the logits within the chain's bound, the same picks on every
+///   row whose best two logits are 0.25 apart; the oracle's prompt against the golden logits as
+///   the ranks' chain is held (`layers_0_to_4_on_four_rank_daemons`).
+/// - The lane trace carries the wire's record: every MoE call of a prefill pass row-sharded under
+///   the row-sharded configuration, none under the four-plane one.
+#[test]
+fn row_sharded_two_lane_prefill_on_four_rank_daemons() {
+    let Some(g) = Goldens::load(&["layer00-prefill", "head"]) else {
+        return;
+    };
+    let Some((bin, dirs)) = rank_setup() else {
+        return;
+    };
+    if !gpu_with(13.0) {
+        return;
+    }
+    let (n1, n2) = (150usize, 211usize);
+    let cfg = ForwardConfig {
+        max_rows: 2 * (n1 + n2),
+        lanes: 2,
+        min_lane_rows: 8,
+        max_verify_rows: 8,
+        max_requests: 4,
+        ..ForwardConfig::default()
+    };
+    let (daemons, addrs) = spawn_ranks(&bin, &dirs);
+    let rows = cfg.lane_rows().max(cfg.max_verify_rows);
+    let (four, rs) = wire_configs();
+    let connect = |c: WireConfig, fast: FastPaths| {
+        RemoteExperts::connect_with(&addrs, rows, c, fast).expect("connect to the ranks")
+    };
+    let Some(mut fwd) = forward_with(5, cfg, |_| Box::new(ZeroExperts), 8, 256, 16) else {
+        return;
+    };
+    fwd.set_lane_trace(true, false);
+    let (prompt, steps) = g.token_ids("layer00-prefill");
+    let gl = g.f32("head", "head.logits");
+    let prompts = [prompt_ids(1, n1), prompt_ids(2, n2)];
+    let batch: Vec<&[u32]> = prompts.iter().map(|p| &p[..]).collect();
+    let chain = |fwd: &mut GlmForward| -> (Vec<f32>, Vec<u32>) {
+        let mut kv = fwd.kv.slot().unwrap();
+        kv.reserve(PROMPT + STEPS).unwrap();
+        let mut picks = fwd.prefill(&mut [(&mut kv, &prompt[..])]).unwrap();
+        let mut logits = fwd.logits(1).unwrap();
+        for &t in &steps {
+            picks.extend(fwd.decode(&mut [(&mut kv, t)]).unwrap());
+            logits.extend(fwd.logits(1).unwrap());
+        }
+        (logits, picks)
+    };
+    let ways = [
+        ("four planes, host paths", four, FastPaths::OFF),
+        ("four planes, fast paths", four, FastPaths::ON),
+        ("row slices, fast paths", rs, FastPaths::ON),
+        ("row slices, host paths", rs, FastPaths::OFF),
+    ];
+    type Way = ((Vec<f32>, Vec<u32>), (Vec<f32>, Vec<u32>), String, String);
+    let mut runs: Vec<Way> = Vec::new();
+    let mut feed: Option<Vec<u32>> = None;
+    for (name, c, fast) in ways {
+        // One backend at a time: a rank serves one coordinator connection at a time.
+        drop(fwd.set_experts(Box::new(ZeroExperts)));
+        fwd.set_experts(Box::new(connect(c, fast)));
+        let one = chain(&mut fwd);
+        let t_one = fwd.take_lane_trace().unwrap();
+        let two = run_prompts(&mut fwd, &batch, 4, None, feed.as_deref());
+        let t_two = fwd.take_lane_trace().unwrap();
+        feed.get_or_insert_with(|| two.1[..8].to_vec());
+        assert_eq!(t_one.rows, vec![17, 16]);
+        assert_eq!(t_two.rows, vec![(n1 + n2).div_ceil(2), (n1 + n2) / 2]);
+        eprintln!(
+            "{name}: lane trace (loopback, the ranks on this GPU), two prompts: {}",
+            t_two.summary()
+        );
+        let wire = |t: &glm53f_forward::forward::LaneTrace| t.wire.clone().unwrap_or_default();
+        runs.push((one, two, wire(&t_one), wire(&t_two)));
+    }
+    drop(fwd.set_experts(Box::new(ZeroExperts)));
+    drop(fwd);
+    drop(daemons);
+
+    let same = |x: &(Vec<f32>, Vec<u32>), y: &(Vec<f32>, Vec<u32>)| bits(&x.0, &y.0) && x.1 == y.1;
+    assert!(
+        same(&runs[1].0, &runs[0].0) && same(&runs[1].1, &runs[0].1),
+        "four planes: the fast paths change the chain"
+    );
+    assert!(
+        same(&runs[3].0, &runs[2].0) && same(&runs[3].1, &runs[2].1),
+        "row slices: the fast paths change the chain"
+    );
+    for (k, (_, _, w_one, w_two)) in runs.iter().enumerate() {
+        let (want, none) = if k < 2 {
+            ("four planes 4:", "row slices 0")
+        } else {
+            ("row slices 4:", "four planes 0")
+        };
+        for w in [w_one, w_two] {
+            assert!(
+                w.contains(want) && w.contains(none),
+                "{}: the trace's wire record: {w}",
+                ways[k].0
+            );
+        }
+    }
+    let (four_run, rs_run) = (&runs[0], &runs[2]);
+    let (rel, worst, decided, agree) =
+        lane_cmp(&rs_run.0 .0, &four_run.0 .0, &rs_run.0 .1, &four_run.0 .1);
+    let (brel, bworst, bdecided, bagree) =
+        lane_cmp(&rs_run.1 .0, &four_run.1 .0, &rs_run.1 .1, &four_run.1 .1);
+    let e = err(&rs_run.0 .0, &gl).rel_rms;
+    let a = (0..=STEPS)
+        .filter(|&k| {
+            argmax(&rs_run.0 .0[k * VOCAB..(k + 1) * VOCAB])
+                == argmax(&gl[k * VOCAB..(k + 1) * VOCAB])
+        })
+        .count();
+    eprintln!(
+        "row slices against four planes, two lanes on four rank daemons: the oracle's prompt and 8 steps: \
+         logits relative RMS {rel:.3e} (worst row {worst:.3e}), picks {agree}/{decided} of the rows decided by 0.25; \
+         against the golden logits {e:.3e}, argmax {a}/9; two prompts of {n1} and {n2} tokens and 4 steps: \
+         {brel:.3e} (worst row {bworst:.3e}), picks {bagree}/{bdecided} decided; the fast paths bit for bit both ways"
+    );
+    assert!(
+        e < 0.08 && a >= 8,
+        "row slices against the golden: {e:.3e}, {a}/9"
+    );
+    assert!(
+        worst < 0.08 && bworst < 0.08,
+        "row slices against four planes: {worst:.3e}, {bworst:.3e}"
+    );
+    assert_eq!(
+        (agree, bagree),
+        (decided, bdecided),
+        "row slices pick other tokens than four planes"
     );
     assert!(
         decided >= 6 && bdecided >= 6,

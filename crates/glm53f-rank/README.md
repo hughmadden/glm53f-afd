@@ -27,12 +27,14 @@ themselves instead, and each returns a quarter of the rows
   mesh, on the development GPU over loopback TCP, return the oracle's layers 3
   and 4 row-sharded, within the derived bound of the four-plane return
   ([Prefill reduce-scatter](#prefill-reduce-scatter)).
+- The forward uses it (glm53f-forward's `RemoteExperts`, from
+  `GLM53F_ROW_SHARDED_MIN_ROWS` rows): two-lane prefill of layers 0-4 on the
+  four daemons over loopback picks the four-plane path's tokens on every
+  decided row (glm53f-forward `tests/remote_experts.rs`).
 - Not yet done:
   - running on a Spark (`sm_121`);
   - the RDMA path, for the coordinator's link and the peer mesh (built, but
-    untested without a fabric);
-  - the forward's use of the row-sharded return (the coordinator's wire client
-    has it; `RemoteExperts` does not use it yet).
+    untested without a fabric).
 
 Contents:
 
@@ -705,10 +707,10 @@ bandwidth turns out to be the limit and the KL gate allows it.
 4. **Batch invariance.** Prefill-size calls (above 64 rows) use another K
    split than decode-size calls. A row is bitwise batch-invariant within each
    regime, not across them.
-5. **The reduce-scatter** runs over TCP on one machine. Still to do: the
-   peer mesh over RDMA on the target hardware (built, untested), its timings
-   there against the four-plane return, and the forward's use of the
-   row-sharded return (glm53f-forward's `RemoteExperts`).
+5. **The reduce-scatter** runs over TCP on one machine, through the forward
+   too (glm53f-forward's `RemoteExperts`). Still to do: the peer mesh over
+   RDMA on the target hardware (built, untested), and its timings there
+   against the four-plane return.
 6. **Performance** is not tuned beyond the split sweep. Candidates:
    - graphs for the fixed decode shapes;
    - double-buffered rotation tiles;

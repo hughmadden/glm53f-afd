@@ -22,6 +22,12 @@
 //!   [`WireClient::collected`] gives each exchange's returns in their layout.
 //! - **Request ids start at a random base per connection**, so a rank's peer mesh can never
 //!   match a stale exchange frame of an earlier connection to a new exchange.
+//! - **The in-place sends and the receive buffers work over TCP too** (perf resets P6 and P9 are
+//!   RDMA paths): [`WireClient::send_buffers`] gives a staging body laid out as the RDMA one, from
+//!   which [`WireClient::moe_send_mapped`] and [`WireClient::moe_send_device`] write each rank's
+//!   frame, and [`WireClient::plane_buffers`] the connections' receive buffers, which then never
+//!   move. A caller's device paths run the same way on both transports, so tests on one machine
+//!   exercise them; over TCP they save nothing.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -355,8 +361,10 @@ struct SparkConn {
     tx: StreamSender,
     rx: StreamReceiver,
     rank: usize,
-    /// Reused receive buffer of the zero-copy return path (perf reset R2).
-    buf: Vec<u8>,
+    /// Reused receive buffer of the zero-copy return path over TCP (perf reset R2). Page-aligned
+    /// and, once it holds a return, at least [`RET_SLOT`] bytes, so it never moves again: a
+    /// caller may page-lock it ([`WireClient::plane_buffers`]).
+    buf: glm53f_rdma::AlignedBuf,
     /// RDMA mode (perf reset R2 part 2); `None` = TCP.
     rdma: Option<RdmaConn>,
 }
@@ -377,9 +385,17 @@ impl SparkConn {
             tx: StreamSender::new(WireNaive::NONE),
             rx: StreamReceiver::new(WireNaive::NONE),
             rank,
-            buf: Vec::new(),
+            buf: glm53f_rdma::AlignedBuf::new(0),
             rdma: None,
         })
+    }
+
+    /// Grow the TCP receive buffer to hold `want` bytes: straight to a whole receive slot
+    /// ([`RET_SLOT`], the largest return of a 4,096-row exchange), so it moves at most once.
+    fn reserve_buf(&mut self, want: usize) {
+        if self.buf.len() < want {
+            self.buf = glm53f_rdma::AlignedBuf::new(want.max(RET_SLOT));
+        }
     }
 
     /// Serialize one request frame (advances this connection's L4 sequence).
@@ -505,22 +521,20 @@ impl SparkConn {
             .map_err(|e| format!("spark set_read_timeout: {e}"))?;
         let rows = rank_rows(tokens, self.rank, sharded).1;
         let want = glm53f_wire::HEADER_LEN + rows * glm53f_wire::layout::RETURN_ROW_BYTES;
-        if self.buf.len() < want {
-            self.buf.resize(want, 0);
-        }
+        self.reserve_buf(want);
         let r = (|| {
             self.stream
-                .read_exact(&mut self.buf[..glm53f_wire::HEADER_LEN])
+                .read_exact(&mut self.buf.as_mut_slice()[..glm53f_wire::HEADER_LEN])
                 .map_err(|e| format!("spark read header: {e}"))?;
-            let h = &self.buf[..glm53f_wire::HEADER_LEN];
+            let h = &self.buf.as_slice()[..glm53f_wire::HEADER_LEN];
             let seq = validate_return_header(h, self.rank, layer_id, request_id, tokens, sharded)?;
             self.stream
-                .read_exact(&mut self.buf[glm53f_wire::HEADER_LEN..want])
+                .read_exact(&mut self.buf.as_mut_slice()[glm53f_wire::HEADER_LEN..want])
                 .map_err(|e| format!("spark read body: {e}"))?;
             if glm53f_wire::frame::crc_disabled() {
                 self.rx.accept_seq(seq).map_err(|e| e.to_string())
             } else {
-                match self.rx.accept(&self.buf[..want]).map_err(|e| e.to_string())? {
+                match self.rx.accept(&self.buf.as_slice()[..want]).map_err(|e| e.to_string())? {
                     Frame::Return(_) => Ok(()),
                     Frame::Request(_) => Err("wire: unexpected request frame from Spark".to_string()),
                 }
@@ -607,8 +621,11 @@ pub struct WireClient {
     inflight: std::collections::VecDeque<Inflight>,
     /// The exchange whose returns the receive buffers hold (the last one collected).
     last: Option<Last>,
-    /// The body half the next RDMA request is built in (perf reset P6).
+    /// The body half the next in-place request is built in (perf reset P6).
     send_half: usize,
+    /// TCP: the staging body of the in-place sends ([`WireClient::send_buffers`] allocates it),
+    /// laid out as the RDMA body; each rank's frame is written from it.
+    tcp_body: Option<glm53f_rdma::AlignedBuf>,
     cfg: WireConfig,
 }
 
@@ -650,8 +667,18 @@ impl WireClient {
             inflight: Default::default(),
             last: None,
             send_half: 0,
+            tcp_body: None,
             cfg,
         })
+    }
+
+    /// Exchanges that may be in flight at once: 2 over RDMA, 1 over TCP ([`WireClient::pipelined`]).
+    fn limit(&self) -> usize {
+        if self.pipelined() {
+            2
+        } else {
+            1
+        }
     }
 
     /// The request flags of a `tokens`-row exchange: a reduce-scatter with the configured
@@ -680,18 +707,40 @@ impl WireClient {
         Ok(())
     }
 
-    /// The RDMA request body (both halves), for page-locking so the GPU can copy
-    /// hidden rows straight into it ([`WireClient::moe_send_mapped`]).
+    /// The request body the in-place sends build their frames in ([`WireClient::moe_send_mapped`],
+    /// [`WireClient::moe_send_device`]), both halves, for page-locking so the GPU can copy (or
+    /// write) the rows straight into it: the RDMA body the NIC sends from, or over TCP a staging
+    /// body allocated by the first call, from which each rank's frame is written (a copy per
+    /// rank: the TCP form serves tests and fallbacks). It stays where it is for the client's life.
     pub fn send_buffers(&mut self) -> Vec<(*mut u8, usize)> {
-        self.rdma_body.as_mut().map(|b| vec![(b.as_mut_slice().as_mut_ptr(), b.len())]).unwrap_or_default()
+        let body = match self.rdma_body.as_mut() {
+            Some(b) => b,
+            None => self.tcp_body.get_or_insert_with(|| glm53f_rdma::AlignedBuf::new(2 * REQ_HALF)),
+        };
+        vec![(body.as_mut_slice().as_mut_ptr(), body.len())]
+    }
+
+    /// Half `half` of the in-place request body.
+    fn body_half(&mut self, half: usize) -> Result<&mut [u8], String> {
+        let body = match self.rdma_body.as_mut() {
+            Some(b) => b,
+            None => self
+                .tcp_body
+                .as_mut()
+                .ok_or("wire: the in-place sends need the request body (RDMA, or send_buffers() over TCP)")?,
+        };
+        Ok(&mut body.as_mut_slice()[half * REQ_HALF..(half + 1) * REQ_HALF])
     }
 
     /// Take the next request half, first reaping every rank's send that still
     /// reads it (RC completions are in order: with two halves, at most one older
-    /// send per rank may stay outstanding).
+    /// send per rank may stay outstanding). A TCP write is complete when it returns.
     fn claim_half(&mut self) -> Result<usize, String> {
         let half = self.send_half;
         self.send_half ^= 1;
+        if self.rdma_body.is_none() {
+            return Ok(half);
+        }
         for conn in self.conns.iter_mut() {
             let rc = conn.rdma.as_mut().ok_or("rdma: connection not set up")?;
             while rc.sends_out >= 2 {
@@ -700,6 +749,35 @@ impl WireClient {
             }
         }
         Ok(half)
+    }
+
+    /// Send the request built in body half `half`: posted over RDMA ([`WireClient::post_half`]);
+    /// over TCP each rank's frame (its executor id, that connection's next L4 sequence and,
+    /// unless disabled, its CRC32C) is assembled from the staging body and written.
+    fn post(&mut self, half: usize, header: &[u8], blen: usize, layer_id: u32, tokens: usize) -> Result<(), String> {
+        use glm53f_wire::layout::hdr;
+        if self.rdma_body.is_some() {
+            return self.post_half(half, header, blen);
+        }
+        let h = glm53f_wire::HEADER_LEN;
+        let family = glm53f_wire::crc32c::family_for(self.conns[0].tx.naive());
+        let body = self.tcp_body.as_ref().ok_or("wire: no request body")?;
+        let body = &body.as_slice()[half * REQ_HALF..half * REQ_HALF + blen];
+        let mut frames = Vec::with_capacity(SPARKS);
+        for (r, conn) in self.conns.iter_mut().enumerate() {
+            let mut f = Vec::with_capacity(h + blen);
+            f.extend_from_slice(&header[..h]);
+            f[hdr::EXECUTOR_ID..hdr::EXECUTOR_ID + 8].copy_from_slice(&(r as u64).to_le_bytes());
+            f[hdr::SEQ..hdr::SEQ + 8].copy_from_slice(&conn.tx.take_seq().to_le_bytes());
+            f.extend_from_slice(body);
+            if !glm53f_wire::frame::crc_disabled() {
+                // The header's CRC field is zero here, as the encoder's seal expects.
+                let crc = glm53f_wire::crc32c::crc32c_zeroed(family, &f, hdr::CRC32C);
+                f[hdr::CRC32C..hdr::CRC32C + 4].copy_from_slice(&crc.to_le_bytes());
+            }
+            frames.push(f);
+        }
+        self.write_frames(layer_id, frames, tokens > 1)
     }
 
     /// Post the request in body half `half` (`blen` bytes after its header) to
@@ -724,12 +802,26 @@ impl WireClient {
         Ok(())
     }
 
-    /// RDMA fast path, device-filled (perf reset P9): as [`WireClient::moe_send_mapped`],
+    /// Refuse an in-place send without a request body, or past the exchanges in flight.
+    fn check_in_place(&self) -> Result<(), String> {
+        if self.rdma_body.is_none() && self.tcp_body.is_none() {
+            return Err("wire: the in-place sends need the request body (RDMA, or send_buffers() over TCP)".into());
+        }
+        let limit = self.limit();
+        if self.inflight.len() >= limit {
+            return Err(format!("wire: {} exchanges already in flight (limit {limit})", self.inflight.len()));
+        }
+        Ok(())
+    }
+
+    /// Fast path, device-filled (perf reset P9): as [`WireClient::moe_send_mapped`],
     /// but `fill(routes_dst, hidden_dst, pitch)` writes the `tokens * topk` 12-B
     /// route entries as well as the hidden rows, so the router output never
     /// comes to the host (`glm53f_coord_frame_fill`). Only the row descriptors and
     /// headers are host-written. The router must produce expert ids below
-    /// [`WireConfig::experts`]; nothing on this path can check them.
+    /// [`WireConfig::experts`]; nothing on this path can check them (the ranks
+    /// refuse an id past their experts). `fill` must have finished writing when it
+    /// returns. Over TCP it needs [`WireClient::send_buffers`] first.
     pub fn moe_send_device(
         &mut self,
         layer_id: u32,
@@ -737,12 +829,7 @@ impl WireClient {
         topk: usize,
         fill: impl FnOnce(*mut u8, *mut u8, usize) -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.rdma_body.is_none() {
-            return Err("wire: moe_send_device needs the RDMA transport".into());
-        }
-        if self.inflight.len() >= 2 {
-            return Err(format!("wire: {} exchanges already in flight (limit 2)", self.inflight.len()));
-        }
+        self.check_in_place()?;
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let naive = self.conns[0].tx.naive();
@@ -750,8 +837,7 @@ impl WireClient {
         // Sending re-posts the receive slots the last returns lie in.
         self.last = None;
         let half = self.claim_half()?;
-        let body = self.rdma_body.as_mut().expect("rdma body");
-        let dst = &mut body.as_mut_slice()[half * REQ_HALF..(half + 1) * REQ_HALF];
+        let dst = self.body_half(half)?;
         let (mut header, routes_off, hidden_off, blen) =
             glm53f_wire::frame::encode_request_desc_into(dst, request_id, layer_id, 0, 0, tokens, topk, naive)
                 .map_err(|e| format!("wire: {e}"))?;
@@ -760,18 +846,19 @@ impl WireClient {
         // SAFETY: both offsets lie inside `dst` (checked by the encoder against blen).
         let (routes, hidden) = unsafe { (base.add(routes_off), base.add(hidden_off)) };
         fill(routes, hidden, glm53f_wire::layout::HIDDEN_ROW_BYTES)?;
-        self.post_half(half, &header, blen)?;
+        self.post(half, &header, blen, layer_id, tokens)?;
         self.inflight.push_back(Inflight { request_id, layer_id, tokens, sharded: flags != 0 });
         Ok(())
     }
 
-    /// RDMA fast path (perf reset P6): send one MoE exchange whose hidden rows
+    /// Fast path (perf reset P6): send one MoE exchange whose hidden rows
     /// are written straight into the registered request body. The descriptors
     /// and routes are encoded in place; `fill(dst, pitch)` must then write the
     /// `routes.len() / topk` hidden rows (payload then scales, `pitch` = 4,224 B
-    /// per row) at `dst`, e.g. a device-to-host copy from the GPU. The frame is
-    /// byte-identical to [`WireClient::moe_send_raw`]'s. Collect it with
-    /// [`WireClient::moe_recv_raw`].
+    /// per row) at `dst`, e.g. a device-to-host copy from the GPU, and have
+    /// finished when it returns. The frame is byte-identical to
+    /// [`WireClient::moe_send_raw`]'s. Collect it with [`WireClient::moe_recv_raw`].
+    /// Over TCP it needs [`WireClient::send_buffers`] first.
     pub fn moe_send_mapped(
         &mut self,
         layer_id: u32,
@@ -779,14 +866,9 @@ impl WireClient {
         topk: usize,
         fill: impl FnOnce(*mut u8, usize) -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.rdma_body.is_none() {
-            return Err("wire: moe_send_mapped needs the RDMA transport".into());
-        }
         self.check_routes(routes, topk)?;
         let tokens = routes.len() / topk;
-        if self.inflight.len() >= 2 {
-            return Err(format!("wire: {} exchanges already in flight (limit 2)", self.inflight.len()));
-        }
+        self.check_in_place()?;
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let naive = self.conns[0].tx.naive();
@@ -794,8 +876,7 @@ impl WireClient {
         // Sending re-posts the receive slots the last returns lie in.
         self.last = None;
         let half = self.claim_half()?;
-        let body = self.rdma_body.as_mut().expect("rdma body");
-        let dst = &mut body.as_mut_slice()[half * REQ_HALF..(half + 1) * REQ_HALF];
+        let dst = self.body_half(half)?;
         let (mut header, hidden_off, blen) =
             glm53f_wire::frame::encode_request_meta_into(dst, request_id, layer_id, 0, 0, routes, topk, naive)
                 .map_err(|e| format!("wire: {e}"))?;
@@ -804,7 +885,7 @@ impl WireClient {
             return Err(format!("wire: mapped frame layout {hidden_off} + {tokens} rows != {blen}"));
         }
         fill(dst[hidden_off..].as_mut_ptr(), glm53f_wire::layout::HIDDEN_ROW_BYTES)?;
-        self.post_half(half, &header, blen)?;
+        self.post(half, &header, blen, layer_id, tokens)?;
         self.inflight.push_back(Inflight { request_id, layer_id, tokens, sharded: flags != 0 });
         Ok(())
     }
@@ -901,7 +982,7 @@ impl WireClient {
                 scales.len()
             ));
         }
-        let limit = if self.pipelined() { 2 } else { 1 };
+        let limit = self.limit();
         if self.inflight.len() >= limit {
             return Err(format!("wire: {} exchanges already in flight (limit {limit})", self.inflight.len()));
         }
@@ -1020,13 +1101,25 @@ impl WireClient {
             let base = slot as usize * rc.ep.slot_len() + glm53f_wire::HEADER_LEN;
             return &rc.recv.as_slice()[base..base + plane];
         }
-        &c.buf[glm53f_wire::HEADER_LEN..glm53f_wire::HEADER_LEN + plane]
+        &c.buf.as_slice()[glm53f_wire::HEADER_LEN..glm53f_wire::HEADER_LEN + plane]
     }
 
-    /// The host receive buffers the return planes land in (the RDMA rings), so
-    /// the caller can page-lock them for fast device uploads.
-    pub fn plane_buffers(&self) -> Vec<(*mut u8, usize)> {
-        self.conns.iter().filter_map(|c| c.rdma.as_ref().map(|r| (r.recv.as_ptr(), r.recv.len()))).collect()
+    /// The host receive buffers the returns land in, one per rank, so the caller can page-lock
+    /// them for fast device uploads, or map them and read the returns in place: the RDMA rings,
+    /// or over TCP the connections' receive buffers, grown here to a whole receive slot (the
+    /// largest return of a 4,096-row exchange) so that they never move again. They live as long
+    /// as the client.
+    pub fn plane_buffers(&mut self) -> Vec<(*mut u8, usize)> {
+        self.conns
+            .iter_mut()
+            .map(|c| match c.rdma.as_ref() {
+                Some(r) => (r.recv.as_ptr(), r.recv.len()),
+                None => {
+                    c.reserve_buf(RET_SLOT);
+                    (c.buf.as_ptr(), c.buf.len())
+                }
+            })
+            .collect()
     }
 
     /// Build, encode and write one quantized MoE layer to the four ranks;
@@ -1143,6 +1236,20 @@ impl WireClient {
         }
         tl("encode_done", Some(layer_id), None);
         let t_encode = std::time::Instant::now();
+        self.write_frames(layer_id, encoded, parallel)?;
+        if prof {
+            eprintln!(
+                "PROFILE wire_encode {:.3} wire_write {:.3}",
+                (t_encode - ts).as_secs_f64() * 1e3,
+                t_encode.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(request_id)
+    }
+
+    /// TCP: write each rank's frame (`encoded[r]` to rank `r`), in parallel threads when
+    /// `parallel` so all four drive the link at once.
+    fn write_frames(&mut self, layer_id: u32, encoded: Vec<Vec<u8>>, parallel: bool) -> Result<(), String> {
         if parallel {
             let conns = std::mem::take(&mut self.conns);
             let handles: Vec<_> = conns
@@ -1167,14 +1274,7 @@ impl WireClient {
                 conn.write_blocking(layer_id, &bytes)?;
             }
         }
-        if prof {
-            eprintln!(
-                "PROFILE wire_encode {:.3} wire_write {:.3}",
-                (t_encode - ts).as_secs_f64() * 1e3,
-                t_encode.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        Ok(request_id)
+        Ok(())
     }
 
     fn exchange(
@@ -1331,6 +1431,18 @@ mod tests {
         go: Option<std::sync::mpsc::Receiver<()>>,
         planes_always: bool,
     ) -> (String, std::thread::JoinHandle<()>) {
+        mock_ranks_raw(exchanges, value, seen, go, planes_always, None)
+    }
+
+    /// [`mock_ranks_with`], also reporting each request's bytes as received on `raw`.
+    fn mock_ranks_raw(
+        exchanges: usize,
+        value: fn(usize) -> f32,
+        seen: std::sync::mpsc::Sender<(usize, RequestFrame)>,
+        go: Option<std::sync::mpsc::Receiver<()>>,
+        planes_always: bool,
+        raw: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr").to_string();
@@ -1346,6 +1458,9 @@ mod tests {
                 let mut reqs = Vec::new();
                 for (rank, s) in streams.iter_mut().enumerate() {
                     let bytes = read_frame_blocking(s);
+                    if let Some(raw) = raw.as_ref() {
+                        raw.send((rank, bytes.clone())).expect("report bytes");
+                    }
                     let req = match rxs[rank].accept(&bytes).expect("accept request") {
                         Frame::Request(r) => r,
                         Frame::Return(_) => panic!("expected request"),
@@ -1570,5 +1685,121 @@ mod tests {
         assert!(client.check_routes(&routes[..7], 8).is_err(), "a partial row");
         drop(client);
         server.join().expect("server join");
+    }
+
+    /// Rows `payload` / `scales` written at `dst`, `pitch` bytes apart (what a device copy into
+    /// the request body writes).
+    fn write_rows(dst: *mut u8, pitch: usize, payload: &[u8], scales: &[u8]) {
+        let s = HIDDEN / 32;
+        for t in 0..payload.len() / HIDDEN {
+            // SAFETY: the wire client hands out room for every row at `pitch`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload[t * HIDDEN..].as_ptr(), dst.add(t * pitch), HIDDEN);
+                std::ptr::copy_nonoverlapping(scales[t * s..].as_ptr(), dst.add(t * pitch + HIDDEN), s);
+            }
+        }
+    }
+
+    /// The in-place sends over TCP, from the staging body `send_buffers` hands out: what each
+    /// rank receives is the host encoder's frame byte for byte (that request's id, the
+    /// connection's sequence, the CRC32C), filled as the device copies fill it
+    /// (`moe_send_mapped`) or as the frame-fill kernel does (`moe_send_device`), for four-plane
+    /// and reduce-scattered exchanges; the returns land in the receive buffers `plane_buffers`
+    /// handed out, which stay put.
+    #[test]
+    fn the_in_place_sends_write_the_host_encoders_frames_over_tcp() {
+        use glm53f_wire::layout::hdr;
+        for cfg in [config(1.0), sharded(16, ExchangeDtype::Bf16, 1.0)] {
+            let sizes = [3usize, 20];
+            let (seen_tx, _seen) = std::sync::mpsc::channel();
+            let (raw_tx, raw) = std::sync::mpsc::channel();
+            let (addr, server) = mock_ranks_raw(3 * sizes.len(), |r| (r + 1) as f32, seen_tx, None, false, Some(raw_tx));
+            let mut client = WireClient::connect(&vec![addr; SPARKS], cfg).expect("connect");
+            let e = client.moe_send_device(3, 4, 8, |_, _, _| Ok(())).unwrap_err();
+            assert!(e.contains("request body"), "{e}");
+            let body = client.send_buffers();
+            assert!(body.len() == 1 && body[0].1 == 2 * REQ_HALF && body[0].0 as usize % 4096 == 0);
+            assert_eq!(client.send_buffers(), body, "one staging body");
+            let rings = client.plane_buffers();
+            assert!(rings.len() == SPARKS && rings.iter().all(|&(p, n)| n >= RET_SLOT && p as usize % 4096 == 0));
+            let within = |r: usize, b: &[u8]| {
+                let (p, n) = (rings[r].0 as usize, rings[r].1);
+                b.as_ptr() as usize >= p && b.as_ptr() as usize + b.len() <= p + n
+            };
+            for tokens in sizes {
+                let (payload, scales, routes) = prequant(tokens);
+                for way in ["host", "mapped", "device"] {
+                    match way {
+                        "host" => client.moe_send_raw(7, &payload, &scales, &routes, 8),
+                        "mapped" => client.moe_send_mapped(7, &routes, 8, |dst, pitch| {
+                            write_rows(dst, pitch, &payload, &scales);
+                            Ok(())
+                        }),
+                        _ => client.moe_send_device(7, tokens, 8, |r, h, pitch| {
+                            for (i, &(e, w)) in routes.iter().enumerate() {
+                                let mut entry = [0u8; 12];
+                                entry[..4].copy_from_slice(&((i / 8) as u32).to_le_bytes());
+                                entry[4..8].copy_from_slice(&e.to_le_bytes());
+                                entry[8..].copy_from_slice(&w.to_le_bytes());
+                                // SAFETY: room for tokens x 8 entries of 12 bytes at `r`.
+                                unsafe { std::ptr::copy_nonoverlapping(entry.as_ptr(), r.add(i * 12), 12) };
+                            }
+                            write_rows(h, pitch, &payload, &scales);
+                            Ok(())
+                        }),
+                    }
+                    .expect("send");
+                    let e = client.moe_send_device(7, tokens, 8, |_, _, _| Ok(())).unwrap_err();
+                    assert!(e.contains("in flight"), "TCP takes one exchange at a time: {e}");
+                    assert_eq!(client.moe_recv_raw().expect("recv"), (7, tokens));
+                    let flags = client.config().row_sharded(tokens).map_or(0, |d| d.request_flags());
+                    match client.collected().expect("collected") {
+                        Collected::Planes(p) => assert!(flags == 0 && (0..SPARKS).all(|r| within(r, p[r]))),
+                        Collected::RowSlices(s) => assert!(flags != 0 && (0..SPARKS).all(|r| within(r, s[r].bytes))),
+                    }
+                    for _ in 0..SPARKS {
+                        let (rank, bytes) = raw.recv().expect("a request");
+                        let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+                        let (request_id, seq) = (u64_at(hdr::REQUEST_ID), u64_at(hdr::SEQ));
+                        let frame = RequestFrame {
+                            request_id,
+                            placement_version: 1,
+                            layer_id: 7,
+                            executor_id: rank as u64,
+                            source_kind: SourceKind::Decode,
+                            token_position: 0,
+                            flags,
+                            seq,
+                            rows: (0..tokens)
+                                .map(|t| RowDescriptor {
+                                    row_id: t as u64,
+                                    source_kind: SourceKind::Decode,
+                                    source_request_id: request_id,
+                                    token_position: t as u64,
+                                    route_offset: (t * 8) as u32,
+                                    route_count: 8,
+                                })
+                                .collect(),
+                            routes: routes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &(expert_id, gate_weight))| RouteEntry { row_index: (i / 8) as u32, expert_id, gate_weight })
+                                .collect(),
+                            hidden_rows: (0..tokens)
+                                .map(|t| HiddenRow {
+                                    payload: payload[t * HIDDEN..(t + 1) * HIDDEN].to_vec(),
+                                    scales: scales[t * (HIDDEN / 32)..(t + 1) * (HIDDEN / 32)].to_vec(),
+                                })
+                                .collect(),
+                        };
+                        let want = glm53f_wire::frame::encode_request_seq(&frame, seq, WireNaive::NONE).unwrap();
+                        assert!(bytes == want, "{way}, {tokens} rows, rank {rank}: not the host encoder's frame");
+                    }
+                }
+            }
+            assert_eq!(client.plane_buffers(), rings, "the receive buffers did not move");
+            drop(client);
+            server.join().expect("server join");
+        }
     }
 }
