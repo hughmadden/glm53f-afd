@@ -162,11 +162,11 @@ Each rank holds a quarter of every routed expert, split over the expert's
 
 | # | Decision | Options | Proposal |
 |---|---|---|---|
-| D1 | KV precision | FP8 528-B record · BF16 · (NVFP4) | **FP8.** 1M on every layout and twice the capacity. Published: 4-bit experts with an FP8 MLA cache score a KLD of 0.0246. With an NVFP4 cache they score 0.0548 and fail a quality gate, so NVFP4 is out. Gate: KL against BF16, plus a needle ladder to 1M. |
+| D1 | KV precision | FP8 528-B record · BF16 · (NVFP4) | **FP8.** 1M on every layout and twice the capacity. Published, on one window: 4-bit experts with an FP8 MLA cache score a KLD of 0.0246; with an NVFP4 cache 0.0548, a configuration that failed the card's task-level test, so NVFP4 is out. Gate: the engine's own 25-window KL against BF16 ([KL-GATE.md](KL-GATE.md)), plus a needle ladder to 1M. |
 | D2 | KDA projection weights | BF16 as shipped · our own FP8 | **Start BF16.** Measure FP8: +4.4 GiB of pool and about −2.7 ms per decode step, but the official checkpoint deliberately keeps these in BF16. |
 | D3 | Slots | 16 (2 lanes × 8) · 8 | **16**, as in the engines this borrows from. |
 | D4 | KDA snapshot cadence | prompt and turn only · plus every 32K | **Prompt and turn first.** Add periodic checkpoints if branch reuse shows up in real traffic. |
 | D5 | Request cap on the API | 1,048,576 · lower default | **1M,** with admission reserving prompt plus output allowance. |
-| D6 | Expert format on the Sparks | EXL3 K4 · EXL3 K6 · NVFP4 · FP8 | **EXL3 K4.** Published KLD is 0.0246 against 0.0206 for official FP8, at half the bytes. K6 (0.0137) is the upgrade path; see [DESIGN.md](DESIGN.md) §5. |
+| D6 | Expert format on the Sparks | EXL3 K4 · EXL3 K6 · NVFP4 · FP8 | **EXL3 K4.** Published KLD is 0.0246 against 0.0206 for official FP8 (25 windows, offline, no KV-cache quantization), at half the bytes. K6 (0.0137) is the upgrade path; see [DESIGN.md](DESIGN.md) §5. |
 | D7 | Embedding table | GPU · host RAM | **Host RAM** (+1.18 GiB of pool). It costs a gather of M rows × 8 KB per step. |
 | D8 | KDA state precision | FP32 (reference) · BF16 | **FP32.** BF16 saves only 68 MiB per slot. |

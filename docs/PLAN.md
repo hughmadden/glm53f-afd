@@ -13,12 +13,15 @@ indexer), not the serving shell.
   with digests.
 - Expert format (D6): **largely answered by published measurements** (DESIGN §5).
   EXL3 K4 scores a KLD of 0.0246 against BF16, official FP8 scores 0.0206, both on
-  the same 25-window panel. The engine uses EXL3 K4 by default. No separate
-  bake-off is needed.
+  the same 25-window panel, measured offline with no KV-cache quantization. The
+  engine uses EXL3 K4 by default. No separate bake-off is needed.
 - The engine's end-to-end KL gate scores on that **same public panel**. It uses the
-  BF16 teacher logits of `brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits`: the
-  `logits/` set, about 32 GB, fetched when the engine first produces logits. The
-  engine's number is then directly comparable with the published 0.0246.
+  BF16 teacher logits of `brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits` (the
+  `logits/` set is about 32 GB; the gate scores a fixed subset of 189 rows per
+  window, fetched by range). The method, the harness (`harness/klgate.py`) and the
+  engine interface are in [KL-GATE.md](KL-GATE.md). The engine's number includes
+  its own FP8 KV cache, FP8 wire rows and kernels on top of the expert format, so
+  it is comparable with, not equal in scope to, the published 0.0246.
 - **Gate:** decisions recorded; goldens reproducible.
 
 ## Phase 1: the Spark ranks (2–4 days)

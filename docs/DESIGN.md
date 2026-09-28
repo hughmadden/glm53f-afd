@@ -127,8 +127,16 @@ quality against decode speed:
 and the `tr3-4bpw` model card.
 - **Noise floor:** the same BF16 model run on two different stacks scores
   0.0115–0.0127.
-- **KV format:** the K4 row used an FP8 MLA cache. With an NVFP4 cache, the same
-  checkpoint scored 0.0548 and failed that card's quality gate, which supports D1.
+- **Scope of the rows:** the 25-window figures (K4 0.024555, FP8 0.020615, K6 0.013723) were
+  measured offline in `transformers` with **no KV-cache quantization**.
+- **KV format, one window only:** on window `final-0000` alone, the K4 checkpoint scored 0.024611
+  with an FP8 MLA cache and 0.054757 with an NVFP4 cache. The NVFP4 configuration failed that
+  card's task-level test (LAVD), not its KLD threshold of 0.06. This supports D1 (FP8 KV) on one
+  window's evidence; the engine's own gate ([KL-GATE.md](KL-GATE.md)) measures its whole
+  configuration, FP8 KV included, on all 25 windows.
+- *Correction of record (28 September 2026):* this section first said the 25-window K4 row used
+  an FP8 MLA cache and that NVFP4 failed the card's quality gate. Both mixed the one-window and
+  25-window scopes; see [KL-GATE.md](KL-GATE.md) for the pinned sources.
 
 **Channel order differs between formats.** The EXL3 checkpoint permutes each expert's 2,048
 intermediate channels relative to the official FP8 checkpoint: each EXL3 channel matches exactly
