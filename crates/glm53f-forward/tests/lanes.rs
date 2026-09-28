@@ -26,6 +26,13 @@
 //!    pooled index key across the cut, the DSA tails), then 4 decode steps each; two-lane passes
 //!    repeat bit for bit; no pass allocates device memory; a segment longer than a pass runs in
 //!    two-lane chunks; the lane trace.
+//! 3. **The drafter in two lanes** (all 45 decoder layers with the DFlash2 drafter attached,
+//!    `drafting`): a prompt of 50 tokens (lanes of 25, the cut inside an indexer pool) and two
+//!    prompts of 20 and 33 (lanes of 27 and 26, the second prompt split 7 rows in) prefilled in
+//!    two lanes leave the drafter's taps, contexts and rings bit for bit as the same rows in two
+//!    one-lane passes, and draft the same; 3 decode steps after, still the same (routed experts
+//!    of zeros). With the drafter's memory reserved first (`Dflash::reserve`), nothing
+//!    allocates: the forward's counter and the drafter's working memory do not move.
 //!
 //! ```sh
 //! GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
@@ -34,12 +41,14 @@
 #![cfg(feature = "cuda")]
 
 mod common;
+mod drafting;
 
 use std::collections::{HashMap, VecDeque};
 
 use common::*;
 use glm53f_dsa::cache::{decode_index_key, PAGE_POOL_CODES_OFFSET, PAGE_POOL_SCALES_OFFSET};
 use glm53f_forward::device;
+use glm53f_forward::draft::{DraftReq, TAP_WIDTH};
 use glm53f_forward::experts::{LocalFp8Experts, ZeroExperts};
 use glm53f_forward::forward::{ForwardConfig, GlmForward};
 use glm53f_forward::gemm::Fp8Act;
@@ -453,4 +462,195 @@ fn two_prompts_batched_across_the_cut() {
     assert!(tail < 2e-2, "the tails: {tail:.3e}");
     assert_eq!(chunk.rows.iter().sum::<usize>(), 900 - cfg.max_rows);
     assert_eq!(trace.layers.len(), 2, "two MoE layers traced");
+}
+
+/// Prefill `prompts` into fresh slots: in one call (`cut` None), or as two one-lane passes cut at
+/// pass row `cut` (the rows before it, then the rest), with each pass's taps downloaded after it.
+/// Returns the slots, each prompt's pick, and the taps (one buffer, or the two passes' in order).
+fn prefill_drafted(
+    fwd: &mut GlmForward,
+    prompts: &[Vec<u32>],
+    cut: Option<usize>,
+) -> (Vec<GlmKv>, Vec<u32>, Vec<u16>) {
+    let mut kvs: Vec<GlmKv> = prompts
+        .iter()
+        .map(|p| {
+            let mut kv = fwd.kv.slot().unwrap();
+            kv.reserve(p.len() + 8).unwrap();
+            kv
+        })
+        .collect();
+    let total: usize = prompts.iter().map(|p| p.len()).sum();
+    let Some(at) = cut else {
+        let picks = {
+            let mut segs: Vec<(&mut GlmKv, &[u32])> = kvs
+                .iter_mut()
+                .zip(prompts)
+                .map(|(k, p)| (k, &p[..]))
+                .collect();
+            fwd.prefill(&mut segs).unwrap()
+        };
+        let taps = fwd.drafter().unwrap().taps(total).unwrap();
+        return (kvs, picks, taps);
+    };
+    // The requests of the first pass (the last one possibly in part), then the rest.
+    let (mut first, mut row) = (Vec::new(), 0);
+    for (i, p) in prompts.iter().enumerate() {
+        if row < at {
+            first.push((i, p.len().min(at - row)));
+        }
+        row += p.len();
+    }
+    let (split, n) = *first.last().unwrap();
+    let whole = n == prompts[split].len();
+    let mut picks = {
+        let mut segs: Vec<(&mut GlmKv, &[u32])> = kvs
+            .iter_mut()
+            .zip(prompts)
+            .zip(&first)
+            .map(|((k, p), &(_, n))| (k, &p[..n]))
+            .collect();
+        fwd.prefill(&mut segs).unwrap()
+    };
+    let mut taps = fwd.drafter().unwrap().taps(at).unwrap();
+    if !whole {
+        // Not a prompt's last row.
+        picks.pop();
+    }
+    let second = {
+        let rest = std::iter::once(&prompts[split][n..])
+            .chain(prompts[split + 1..].iter().map(|p| &p[..]));
+        let mut segs: Vec<(&mut GlmKv, &[u32])> = kvs[split..]
+            .iter_mut()
+            .zip(rest)
+            .filter(|(_, p)| !p.is_empty())
+            .collect();
+        fwd.prefill(&mut segs).unwrap()
+    };
+    picks.extend(second);
+    taps.extend(fwd.drafter().unwrap().taps(total - at).unwrap());
+    (kvs, picks, taps)
+}
+
+/// Every stored ring row of two slots' contexts (positions `0 .. len`, the drafter's five
+/// layers, keys and values) equal bit for bit, and their lengths and lowest positions.
+fn same_context(fwd: &GlmForward, a: &GlmKv, b: &GlmKv) -> bool {
+    let (x, y) = (a.draft_slot().unwrap(), b.draft_slot().unwrap());
+    if (x.len(), x.lo(), x.context_rows()) != (y.len(), y.lo(), y.context_rows()) {
+        return false;
+    }
+    let d = fwd.drafter().unwrap();
+    (0..5).all(|l| {
+        (x.lo()..x.len()).all(|p| d.ring_row(a, l, p).unwrap() == d.ring_row(b, l, p).unwrap())
+    })
+}
+
+fn greedy_draft(fwd: &mut GlmForward, kv: &GlmKv, anchor: u32) -> glm53f_dflash::seam::Proposal {
+    fwd.draft(&[DraftReq {
+        kv,
+        anchor,
+        temperature: 0.0,
+        uniforms: &[],
+    }])
+    .unwrap()
+    .remove(0)
+}
+
+#[test]
+fn the_drafter_in_two_lanes() {
+    let cfg = ForwardConfig {
+        max_rows: 128,
+        lanes: 2,
+        min_lane_rows: 8,
+        max_verify_rows: 16,
+        max_requests: 4,
+        ..ForwardConfig::default()
+    };
+    let Some(mut fwd) = drafting::drafted_forward(cfg, 8, 8, 64, 0.25) else {
+        return;
+    };
+    // Routed outputs of zeros: the local experts' cache loads experts on demand, which would
+    // hide the forward's own allocations (none) among its.
+    fwd.set_experts(Box::new(ZeroExperts));
+    // Everything the drafter uses while serving, allocated now.
+    let rows = fwd.pass_rows();
+    let (tap_bytes, scratch) = fwd
+        .drafter_mut()
+        .unwrap()
+        .reserve(rows, cfg.max_requests)
+        .unwrap();
+    let allocs = device::allocations();
+    let cases = [
+        vec![drafting::ids(1, 50)],
+        vec![drafting::ids(2, 20), drafting::ids(3, 33)],
+    ];
+    for prompts in &cases {
+        let total: usize = prompts.iter().map(|p| p.len()).sum();
+        let at = total.div_ceil(2);
+        fwd.set_lane_trace(true, false);
+        fwd.cfg.lanes = 2;
+        let (two, p2, t2) = prefill_drafted(&mut fwd, prompts, None);
+        let trace = fwd.take_lane_trace().expect("a traced prefill");
+        fwd.cfg.lanes = 1;
+        let (one, p1, t1) = prefill_drafted(&mut fwd, prompts, Some(at));
+        assert_eq!(trace.rows, vec![at, total - at], "two lanes");
+        let taps = t2.len() == total * TAP_WIDTH && t2 == t1;
+        let contexts = two.iter().zip(&one).all(|(a, b)| same_context(&fwd, a, b));
+        let drafts = two
+            .iter()
+            .zip(&one)
+            .all(|(a, b)| greedy_draft(&mut fwd, a, 777) == greedy_draft(&mut fwd, b, 777));
+        // Three decode steps after, both fed the one-pass run's picks.
+        let (mut two, mut one) = (two, one);
+        let mut feed = p1.clone();
+        let mut after = true;
+        for _ in 0..3 {
+            let a = {
+                let mut rows: Vec<(&mut GlmKv, u32)> =
+                    two.iter_mut().zip(&feed).map(|(k, &t)| (k, t)).collect();
+                fwd.decode(&mut rows).unwrap()
+            };
+            let b = {
+                let mut rows: Vec<(&mut GlmKv, u32)> =
+                    one.iter_mut().zip(&feed).map(|(k, &t)| (k, t)).collect();
+                fwd.decode(&mut rows).unwrap()
+            };
+            after &= a == b;
+            feed = b;
+        }
+        let after = after && two.iter().zip(&one).all(|(a, b)| same_context(&fwd, a, b));
+        let lens: Vec<usize> = two.iter().map(|k| k.draft_slot().unwrap().len()).collect();
+        eprintln!(
+            "the drafter in two lanes, prompts of {:?} tokens (lanes of {at} and {}): against two \
+             one-lane passes of the same rows, picks {}, taps {taps}, contexts and rings \
+             {contexts} (lengths {lens:?}), greedy drafts {drafts}; 3 decode steps after: tokens \
+             and rings {after}",
+            prompts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            total - at,
+            if p2 == p1 { "equal" } else { "differ" },
+        );
+        assert_eq!(p2, p1, "two lanes pick other tokens than two passes");
+        assert!(taps, "the taps differ from two passes'");
+        assert!(contexts, "the drafter's contexts differ from two passes'");
+        assert!(drafts, "the drafts differ from two passes'");
+        assert!(after, "the decode steps after differ");
+    }
+    let d = fwd.drafter().unwrap();
+    assert_eq!(
+        device::allocations(),
+        allocs,
+        "a pass allocated device memory"
+    );
+    assert_eq!(
+        d.scratch_bytes(),
+        scratch,
+        "the drafter's working memory grew"
+    );
+    assert_eq!(d.tap_bytes(), tap_bytes);
+    eprintln!(
+        "drafter memory reserved up front: taps {:.1} MiB for {rows} rows, working memory {:.1} \
+         MiB; no allocation in the passes, drafts and appends above",
+        tap_bytes as f64 / (1u64 << 20) as f64,
+        scratch as f64 / (1u64 << 20) as f64
+    );
 }

@@ -24,6 +24,10 @@
 //!
 //! The acceptance printed for the real drafter measures nothing about quality: repeated layer
 //! weights and zero experts for 40 of 42 MoE layers.
+//!
+//! The whole test runs twice: with one-lane prefill, and with two-lane prefill
+//! (`ForwardConfig::lanes`, every prompt of 16 tokens or more cut into two lanes, whose rows
+//! reach the drafter's context lane by lane).
 #![cfg(feature = "coordinator")]
 
 mod common;
@@ -266,15 +270,38 @@ fn with_oracle(m: &mut ServedForward, wave: &[Req], want: &[Vec<Token>]) -> Sche
 
 #[test]
 fn speculative_decoding_changes_no_token() {
-    let cfg = ForwardConfig {
+    lossless(ForwardConfig {
         max_rows: 128,
         max_verify_rows: 16,
         max_requests: 3,
         ..ForwardConfig::default()
-    };
-    let Some(fwd) = drafted_forward(cfg, 3, 16, 48, 2.0) else {
+    });
+}
+
+/// The same with two-lane prefill: passes of up to 128 rows in two lanes of 64, and every prompt
+/// of 16 tokens or more in two lanes (the 150-token prompt in passes of 128 and 22).
+#[test]
+fn speculative_decoding_changes_no_token_with_two_lane_prefill() {
+    lossless(ForwardConfig {
+        max_rows: 128,
+        lanes: 2,
+        min_lane_rows: 8,
+        max_verify_rows: 16,
+        max_requests: 3,
+        ..ForwardConfig::default()
+    });
+}
+
+fn lossless(cfg: ForwardConfig) {
+    let Some(mut fwd) = drafted_forward(cfg, 3, 16, 48, 2.0) else {
         return;
     };
+    fwd.set_lane_trace(true, false);
+    eprintln!(
+        "prefill in {} lane(s) of up to {} rows",
+        cfg.lanes,
+        cfg.lane_rows()
+    );
     let mut m = ServedForward::new(fwd).unwrap();
     assert_eq!(m.limits().block, 8);
     let never = usize::MAX;
@@ -290,6 +317,13 @@ fn speculative_decoding_changes_no_token() {
     ];
     let (greedy_out, _, ds) = same(&mut m, "greedy, one request at a time", never, &singles);
     assert!(ds.proposed >= ds.verified && ds.windows == ds.rounds);
+    // The last prompt (48 tokens) prefilled in the configured lanes.
+    let lanes = m.fwd.take_lane_trace().expect("a traced prefill").rows;
+    assert_eq!(
+        lanes.len(),
+        cfg.lanes,
+        "the last prefill ran in lanes of {lanes:?}"
+    );
     // The real drafter's counters over its own runs (not the oracle runs below).
     let mut real = ds;
 

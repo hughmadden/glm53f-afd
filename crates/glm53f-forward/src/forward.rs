@@ -1328,6 +1328,11 @@ impl GlmForward {
         self.draft.as_ref()
     }
 
+    /// The attached drafter, to reserve its memory ([`Dflash::reserve`]) or read its counters.
+    pub fn drafter_mut(&mut self) -> Option<&mut Dflash> {
+        self.draft.as_mut()
+    }
+
     /// The drafter's proposals for `reqs` (each slot at its committed length), `block - 1` per
     /// request. Slots and the target's state do not change.
     pub fn draft(&mut self, reqs: &[DraftReq<'_>]) -> Result<Vec<glm53f_dflash::seam::Proposal>> {

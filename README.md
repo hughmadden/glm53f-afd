@@ -20,7 +20,7 @@ anything that matters yet.
 | `glm53f-kda` | Kimi delta attention: fused decode chain and replay, chunked prefill |
 | `glm53f-dsa` | DeepSeek sparse attention: indexer, top-k selection, sparse MLA over an FP8 latent cache |
 | `glm53f-layers` | mHC hyper-connections, router, dense and shared MLPs, FP8 GEMMs |
-| `glm53f-forward` | The model on the coordinator GPU: weights, KV pages, prefill, decode, verify and commit; remote experts |
+| `glm53f-forward` | The model on the coordinator GPU: weights, KV pages, prefill (in two lanes that overlap the ranks' work), decode, verify and commit; remote experts |
 | `glm53f-coordinator` | Serving shell: scheduler, slot pool, prefix index, host RAM tier, sampler, expert wire client |
 | `glm53f-dflash` | The DFlash2 speculative drafter (wired into the forward: `glm53f-serve --drafter`) |
 | `glm53f-serve` | The coordinator daemon |
