@@ -40,12 +40,33 @@ the rank kernel 0.168 ms, the wire about 33 µs beyond the rank's compute.
 The model expected 350–480 tok/s at C16 (§4). At 16 requests the verify passes reach 128 rows, and
 nothing yet overlaps the drafter with the forward or the coordinator with the ranks in decode.
 
-**Prefill** is a **MISS** against the 4.5–6K tok/s of §5:
-- about 1.1K tok/s with 256-row passes and 1.7K tok/s with 4,096-row passes, flat from 4K to 79K tokens;
-- traced per MoE layer at 4,096 rows: the coordinator 34.6 ms, the rank kernel 16.8 ms, the transfer 8.6 ms, all serial.
+**Prefill**, with two-lane pipelining (the coordinator computes one half of a pass while the ranks
+serve the other; 4,096-row passes in two lanes of 2,048):
 
-Two-lane pipelining (the coordinator computing one half of a pass while the ranks serve the other)
-is the first fix; it models at about 2.8K tok/s.
+| Prompt | 4K | 19K | 79K |
+|---|---:|---:|---:|
+| Two lanes (default) | 2,717 tok/s | 2,964 tok/s | 2,899 tok/s |
+| One lane | 1,633 tok/s | 1,725 tok/s | 1,715 tok/s |
+
+- A 79K-token prompt takes 27 s.
+- This is still a **MISS** against the 4.5–6K tok/s of §5.
+- 8,192-row passes reach about 3.1K, but take 3 GiB more buffers, which shrinks the pool below a 1M-token request.
+- Per MoE layer the GPU is busy 66% of a 27.5 ms layer. The rest is the host's per-lane encode (1.5 ms) and the upload and sum of four returned planes (3.2 ms).
+- The reduce-scatter return and the RDMA fast paths address that host work.
+
+**Against a vLLM recipe on the same four Sparks without a coordinator GPU**
+([tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark), TP4, NVFP4 experts, its README's figures):
+
+| Metric | That recipe | This engine |
+|---|---|---|
+| Single stream | ~55 tok/s | 108–128 on code and counting, 60 on prose |
+| Aggregate | **530 tok/s at 48 streams** | 292 tok/s at 16 streams (16 slots) |
+| Prefill, short prompts | **3.5–4.1K tok/s** (warmed, ~9K) | 2.7–3.0K |
+| Prefill, 114K prompt | 1.9K tok/s | 2.9K at 79K |
+
+This engine leads at one stream and on long prompts, and trails on aggregate throughput and
+short-prompt prefill. The levers: two-lane decode, more slots and speculation that adapts to load
+for the aggregate; the host path above for prefill.
 
 **Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
 in 44–49 s (§6).
