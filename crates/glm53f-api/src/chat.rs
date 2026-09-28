@@ -10,6 +10,13 @@ use crate::http::{self, json_response, Response};
 use crate::json::{self, Json};
 use crate::types::{self, ApiError, ChatRequest, Tool, ToolCall, MODEL_ID};
 
+/// The response field that carries reasoning, in both modes: the non-streamed
+/// `message.reasoning_content` and every streamed `delta.reasoning_content`. This is the DeepSeek
+/// convention, which vLLM, SGLang and LiteLLM read and clients send back in the history. The
+/// source streamed `delta.reasoning` beside a non-streamed `reasoning_content`, so a client that
+/// reads one name lost the reasoning of the other mode.
+pub const REASONING_FIELD: &str = "reasoning_content";
+
 pub fn handle<E: Engine + Send + Sync + 'static>(
     engine: Arc<E>,
     dialect: Arc<dyn Dialect>,
@@ -133,7 +140,7 @@ fn non_stream_json(
     let mut message = vec![("role".to_string(), Json::Str("assistant".to_string()))];
     message.push(("content".to_string(), message_content(parsed)));
     if !parsed.reasoning.is_empty() {
-        message.push(("reasoning_content".to_string(), Json::Str(parsed.reasoning.join(""))));
+        message.push((REASONING_FIELD.to_string(), Json::Str(parsed.reasoning.join(""))));
     }
     if !parsed.calls.is_empty() {
         message.push(("tool_calls".to_string(), Json::Array(tool_calls_json(&parsed.calls))));
@@ -160,91 +167,83 @@ fn sse_event(obj: &Json) -> String {
     s
 }
 
-fn role_event(id: &str, created: u64) -> String {
-    sse_event(&types::obj(vec![
-        ("id", types::s(id)),
-        ("object", types::s("chat.completion.chunk")),
-        ("created", Json::Num(created as f64)),
-        ("model", types::s(MODEL_ID)),
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![("role", types::s("assistant"))])),
-            ("finish_reason", Json::Null),
-        ])])),
-    ]))
+/// What every streamed chunk carries besides its choices, as OpenAI's chunk objects do: the
+/// completion's `id`, `object`, `created` and `model`. The source sent them on the role chunk
+/// only, so a client that decodes each chunk into a type with these fields required failed on
+/// the second chunk.
+#[derive(Debug, Clone)]
+struct ChunkHead {
+    id: String,
+    created: u64,
 }
 
-fn reasoning_event(r: &str) -> String {
-    sse_event(&types::obj(vec![
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![("reasoning", types::s(r))])),
-            ("finish_reason", Json::Null),
-        ])])),
-    ]))
-}
+impl ChunkHead {
+    /// One chunk: the head fields, then `rest` (the choices, and the usage on the usage chunk).
+    fn event(&self, rest: Vec<(&str, Json)>) -> String {
+        let mut pairs = vec![
+            ("id", types::s(&self.id)),
+            ("object", types::s("chat.completion.chunk")),
+            ("created", Json::Num(self.created as f64)),
+            ("model", types::s(MODEL_ID)),
+        ];
+        pairs.extend(rest);
+        sse_event(&types::obj(pairs))
+    }
 
-fn content_event(d: &str) -> String {
-    sse_event(&types::obj(vec![
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![("content", types::s(d))])),
-            ("finish_reason", Json::Null),
-        ])])),
-    ]))
-}
+    /// A chunk of the one choice: its `delta` and `finish_reason`.
+    fn choice_event(&self, delta: Json, finish_reason: Json) -> String {
+        self.event(vec![(
+            "choices",
+            types::arr(vec![types::obj(vec![
+                ("index", Json::Num(0.0)),
+                ("delta", delta),
+                ("finish_reason", finish_reason),
+            ])]),
+        )])
+    }
 
-fn tool_call_header_event(i: usize, c: &ParsedCall) -> String {
-    sse_event(&types::obj(vec![
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![
-                ("tool_calls", types::arr(vec![types::obj(vec![
-                    ("index", Json::Num(i as f64)),
-                    ("id", types::s(&format!("call_{i}"))),
-                    ("type", types::s("function")),
-                    ("function", types::obj(vec![
-                        ("name", types::s(&c.name)),
-                        ("arguments", types::s("")),
-                    ])),
-                ])])),
-            ])),
-            ("finish_reason", Json::Null),
-        ])])),
-    ]))
-}
+    fn role_event(&self) -> String {
+        self.choice_event(types::obj(vec![("role", types::s("assistant"))]), Json::Null)
+    }
 
-fn tool_call_args_event(i: usize, c: &ParsedCall) -> String {
-    let args = json::serialize(&c.arguments);
-    sse_event(&types::obj(vec![
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![
-                ("tool_calls", types::arr(vec![types::obj(vec![
-                    ("index", Json::Num(i as f64)),
-                    ("function", types::obj(vec![("arguments", types::s(&args))])),
-                ])])),
-            ])),
-            ("finish_reason", Json::Null),
-        ])])),
-    ]))
-}
+    fn reasoning_event(&self, r: &str) -> String {
+        self.choice_event(types::obj(vec![(REASONING_FIELD, types::s(r))]), Json::Null)
+    }
 
-fn finish_event(finish_reason: &str) -> String {
-    sse_event(&types::obj(vec![
-        ("choices", types::arr(vec![types::obj(vec![
-            ("index", Json::Num(0.0)),
-            ("delta", types::obj(vec![])),
-            ("finish_reason", types::s(finish_reason)),
-        ])])),
-    ]))
-}
+    fn content_event(&self, d: &str) -> String {
+        self.choice_event(types::obj(vec![("content", types::s(d))]), Json::Null)
+    }
 
-fn usage_event(prompt_tokens: usize, completion_tokens: usize) -> String {
-    sse_event(&types::obj(vec![
-        ("choices", Json::Array(vec![])),
-        ("usage", types::usage_json(prompt_tokens as u64, completion_tokens as u64)),
-    ]))
+    fn tool_call_header_event(&self, i: usize, c: &ParsedCall) -> String {
+        let call = types::obj(vec![
+            ("index", Json::Num(i as f64)),
+            ("id", types::s(&format!("call_{i}"))),
+            ("type", types::s("function")),
+            ("function", types::obj(vec![("name", types::s(&c.name)), ("arguments", types::s(""))])),
+        ]);
+        self.choice_event(types::obj(vec![("tool_calls", types::arr(vec![call]))]), Json::Null)
+    }
+
+    fn tool_call_args_event(&self, i: usize, c: &ParsedCall) -> String {
+        let args = json::serialize(&c.arguments);
+        let call = types::obj(vec![
+            ("index", Json::Num(i as f64)),
+            ("function", types::obj(vec![("arguments", types::s(&args))])),
+        ]);
+        self.choice_event(types::obj(vec![("tool_calls", types::arr(vec![call]))]), Json::Null)
+    }
+
+    fn finish_event(&self, finish_reason: &str) -> String {
+        self.choice_event(types::obj(vec![]), types::s(finish_reason))
+    }
+
+    /// The `include_usage` chunk: no choices, and the usage block.
+    fn usage_event(&self, prompt_tokens: usize, completion_tokens: usize) -> String {
+        self.event(vec![
+            ("choices", Json::Array(vec![])),
+            ("usage", types::usage_json(prompt_tokens as u64, completion_tokens as u64)),
+        ])
+    }
 }
 
 /// Where the streamed completion currently is, in the dialect parser's terms.
@@ -270,14 +269,15 @@ struct StreamSplit {
     /// Think blocks already streamed live; the post-parse pass sends the rest.
     think_blocks: usize,
     tags: StreamTags,
+    head: ChunkHead,
 }
 
 impl StreamSplit {
-    fn new(tags: StreamTags, reasoning_first: bool) -> Self {
+    fn new(tags: StreamTags, reasoning_first: bool, head: ChunkHead) -> Self {
         if reasoning_first {
-            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, tags }
+            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, tags, head }
         } else {
-            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, tags }
+            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, tags, head }
         }
     }
 
@@ -290,14 +290,14 @@ impl StreamSplit {
                 Span::Think => {
                     if let Some(p) = self.hold.find(think_close) {
                         if p > 0 {
-                            http::write_chunk(stream, reasoning_event(&self.hold[..p]).as_bytes())?;
+                            http::write_chunk(stream, self.head.reasoning_event(&self.hold[..p]).as_bytes())?;
                         }
                         self.hold.drain(..p + think_close.len());
                         self.span = Span::Content;
                     } else {
                         let flush = self.hold.len() - held_suffix(&self.hold, &[think_close]);
                         if flush > 0 {
-                            http::write_chunk(stream, reasoning_event(&self.hold[..flush]).as_bytes())?;
+                            http::write_chunk(stream, self.head.reasoning_event(&self.hold[..flush]).as_bytes())?;
                             self.hold.drain(..flush);
                         }
                         return Ok(());
@@ -309,7 +309,7 @@ impl StreamSplit {
                     match (think, tool) {
                         (Some(p), t) if t.is_none_or(|t| p < t) => {
                             if p > 0 {
-                                http::write_chunk(stream, content_event(&self.hold[..p]).as_bytes())?;
+                                http::write_chunk(stream, self.head.content_event(&self.hold[..p]).as_bytes())?;
                             }
                             self.hold.drain(..p + think_open.len());
                             self.span = Span::Think;
@@ -319,7 +319,7 @@ impl StreamSplit {
                             // A tool call starts here: stream the content before it,
                             // then hold the markup (and anything after) back.
                             if p > 0 {
-                                http::write_chunk(stream, content_event(&self.hold[..p]).as_bytes())?;
+                                http::write_chunk(stream, self.head.content_event(&self.hold[..p]).as_bytes())?;
                             }
                             self.hold.drain(..p);
                             self.span = Span::Tool;
@@ -328,7 +328,7 @@ impl StreamSplit {
                             // No tag yet (the first arm takes a think tag with no tool tag).
                             let flush = self.hold.len() - held_suffix(&self.hold, &[think_open, tool_open]);
                             if flush > 0 {
-                                http::write_chunk(stream, content_event(&self.hold[..flush]).as_bytes())?;
+                                http::write_chunk(stream, self.head.content_event(&self.hold[..flush]).as_bytes())?;
                                 self.hold.drain(..flush);
                             }
                             return Ok(());
@@ -345,8 +345,8 @@ impl StreamSplit {
     fn finish(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
         if !self.hold.is_empty() {
             match self.span {
-                Span::Content => http::write_chunk(stream, content_event(&self.hold).as_bytes())?,
-                Span::Think => http::write_chunk(stream, reasoning_event(&self.hold).as_bytes())?,
+                Span::Content => http::write_chunk(stream, self.head.content_event(&self.hold).as_bytes())?,
+                Span::Think => http::write_chunk(stream, self.head.reasoning_event(&self.hold).as_bytes())?,
                 Span::Tool => {}
             }
         }
@@ -377,7 +377,8 @@ fn held_suffix(hold: &str, tags: &[&str]) -> usize {
 /// Stream the SSE response directly to the socket: the role first, then each
 /// content or reasoning delta as the engine produces it (flushed per event, with
 /// the markup held back), then the post-parse tool-call/finish/usage events and
-/// `data: [DONE]`.
+/// `data: [DONE]`. Every chunk carries the completion's id, `created` and model
+/// ([`ChunkHead`]).
 #[allow(clippy::too_many_arguments)]
 fn stream_events<E: Engine>(
     engine: &E,
@@ -391,11 +392,12 @@ fn stream_events<E: Engine>(
     id: &str,
     created: u64,
 ) -> std::io::Result<()> {
+    let head = ChunkHead { id: id.to_string(), created };
     // 1. role delta, sent before generation so the client sees the stream start.
-    http::write_chunk(stream, role_event(id, created).as_bytes())?;
+    http::write_chunk(stream, head.role_event().as_bytes())?;
 
     // 2. generate, streaming content and reasoning deltas (markup held back).
-    let mut split = StreamSplit::new(dialect.stream_tags(), dialect.reasoning_first(params.thinking));
+    let mut split = StreamSplit::new(dialect.stream_tags(), dialect.reasoning_first(params.thinking), head.clone());
     // An empty delta is the engine's keepalive while a long prompt prefills: an
     // SSE comment keeps the client and any proxy from timing out. A failed write
     // means the client is gone: tell the engine to stop (perf reset Q2).
@@ -415,7 +417,7 @@ fn stream_events<E: Engine>(
         Ok(o) => o,
         Err(_) => {
             // The head is already sent; end the stream cleanly on engine error.
-            http::write_chunk(stream, finish_event("error").as_bytes())?;
+            http::write_chunk(stream, head.finish_event("error").as_bytes())?;
             http::write_chunk(stream, b"data: [DONE]\n\n")?;
             return Ok(());
         }
@@ -427,7 +429,7 @@ fn stream_events<E: Engine>(
     let cap = 0;
     let parsed = dialect.parse(&outcome.text, tools, params.thinking, cap);
     if parsed.error.is_some() {
-        http::write_chunk(stream, finish_event("error").as_bytes())?;
+        http::write_chunk(stream, head.finish_event("error").as_bytes())?;
         http::write_chunk(stream, b"data: [DONE]\n\n")?;
         return Ok(());
     }
@@ -439,21 +441,21 @@ fn stream_events<E: Engine>(
 
     // 4. reasoning deltas for think blocks not streamed live (after a tool call).
     for r in parsed.reasoning.iter().skip(split.think_blocks) {
-        http::write_chunk(stream, reasoning_event(r).as_bytes())?;
+        http::write_chunk(stream, head.reasoning_event(r).as_bytes())?;
     }
 
     // 5. tool-call deltas (header then arguments).
     for (i, c) in parsed.calls.iter().enumerate() {
-        http::write_chunk(stream, tool_call_header_event(i, c).as_bytes())?;
-        http::write_chunk(stream, tool_call_args_event(i, c).as_bytes())?;
+        http::write_chunk(stream, head.tool_call_header_event(i, c).as_bytes())?;
+        http::write_chunk(stream, head.tool_call_args_event(i, c).as_bytes())?;
     }
 
     // 6. finish.
-    http::write_chunk(stream, finish_event(&finish_reason).as_bytes())?;
+    http::write_chunk(stream, head.finish_event(&finish_reason).as_bytes())?;
 
     // 7. usage (only when requested).
     if include_usage {
-        http::write_chunk(stream, usage_event(prompt_tokens, outcome.completion_tokens).as_bytes())?;
+        http::write_chunk(stream, head.usage_event(prompt_tokens, outcome.completion_tokens).as_bytes())?;
     }
 
     // 8. done.

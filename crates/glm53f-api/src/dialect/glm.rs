@@ -599,12 +599,17 @@ mod tests {
 
     // --- through the HTTP server --------------------------------------------------------------
 
-    /// A stub engine: records the prompt options it is given and streams `text` in `chunk`-byte
-    /// deltas.
+    /// A stub engine: records the prompt options it is given (to render the prompt, and to count
+    /// its tokens) and streams `text` in `chunk`-byte deltas.
     struct Stub {
         text: String,
         chunk: usize,
         seen: Mutex<Vec<PromptOptions>>,
+        counted: Mutex<Vec<PromptOptions>>,
+    }
+
+    fn stub(text: &str, chunk: usize) -> Arc<Stub> {
+        Arc::new(Stub { text: text.into(), chunk, seen: Mutex::new(Vec::new()), counted: Mutex::new(Vec::new()) })
     }
 
     impl Engine for Stub {
@@ -613,6 +618,10 @@ mod tests {
         }
         fn render_chat(&self, _: &[ChatMessage], _: &[Tool], _: bool) -> String {
             "prompt".into()
+        }
+        fn tokenize_prompt(&self, _: &[ChatMessage], _: &[Tool], opts: &PromptOptions) -> usize {
+            self.counted.lock().unwrap().push(opts.clone());
+            8
         }
         fn render_prompt(&self, _: &[ChatMessage], _: &[Tool], opts: &PromptOptions) -> String {
             self.seen.lock().unwrap().push(opts.clone());
@@ -665,7 +674,7 @@ mod tests {
             call_text("get_weather", &[("city", "Rome")])
         );
         for chunk in [1, 3, 5, 7] {
-            let stub = Arc::new(Stub { text: text.clone(), chunk, seen: Mutex::new(Vec::new()) });
+            let stub = stub(&text, chunk);
             let base = serve(stub.clone());
             let body = format!(r#"{{"messages":[{{"role":"user","content":"weather?"}}],{TOOLS},"stream":true}}"#);
             let raw = post(&base, &body);
@@ -680,7 +689,8 @@ mod tests {
                     finish = Some(f.to_string());
                 }
                 let Some(d) = ch.get("delta") else { continue };
-                if let Some(r) = d.get("reasoning").and_then(|r| r.as_str()) {
+                assert!(d.get("reasoning").is_none(), "reasoning under a second name: {line}");
+                if let Some(r) = d.get("reasoning_content").and_then(|r| r.as_str()) {
                     reasoning.push_str(r);
                 }
                 if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
@@ -704,6 +714,7 @@ mod tests {
             let whole = json::parse(&post(&base, &body.replace(r#","stream":true"#, ""))).unwrap();
             let msg = whole.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
             assert_eq!(msg.get("reasoning_content").and_then(|r| r.as_str()), Some(reasoning.as_str()));
+            assert!(msg.get("reasoning").is_none());
             let whole_calls: Vec<(String, String)> = msg.get("tool_calls").and_then(|t| t.as_array()).unwrap().iter()
                 .map(|t| {
                     let f = t.get("function").unwrap();
@@ -719,18 +730,107 @@ mod tests {
         }
     }
 
-    /// Thinking off end to end: the engine is told, and the completion is read as content.
+    /// A streamed response's deltas, joined: (reasoning, content). Reasoning must come under
+    /// `reasoning_content` only.
+    fn streamed_text(raw: &str) -> (String, String) {
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in raw.lines().filter_map(|l| l.trim().strip_prefix("data: ")) {
+            if line == "[DONE]" {
+                continue;
+            }
+            let v = json::parse(line).unwrap();
+            for ch in v.get("choices").and_then(|c| c.as_array()).unwrap_or(&[]) {
+                let Some(d) = ch.get("delta") else { continue };
+                assert!(d.get("reasoning").is_none(), "reasoning under a second name: {line}");
+                if let Some(r) = d.get("reasoning_content").and_then(|r| r.as_str()) {
+                    reasoning.push_str(r);
+                }
+                if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
+                    content.push_str(c);
+                }
+            }
+        }
+        (reasoning, content)
+    }
+
+    /// Thinking off end to end: the engine is told (to render the prompt and to count it), and
+    /// the completion is read as content, whole and streamed.
     #[test]
     fn thinking_off_reaches_the_engine_and_the_parse() {
-        let stub = Arc::new(Stub { text: "Just the answer.".into(), chunk: 4, seen: Mutex::new(Vec::new()) });
+        let stub = stub("Just the answer.", 4);
         let base = serve(stub.clone());
         let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"reasoning_effort":"low"}"#;
         let v = json::parse(&post(&base, body)).unwrap();
         let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
         assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Just the answer."));
-        assert!(msg.get("reasoning_content").is_none());
-        let seen = stub.seen.lock().unwrap();
-        assert_eq!(seen.as_slice(), [PromptOptions { thinking: false, reasoning_effort: Some("low".into()), clear_thinking: None }]);
+        assert!(msg.get("reasoning_content").is_none() && msg.get("reasoning").is_none());
+        let streamed = body.replace(r#""reasoning_effort":"low""#, r#""reasoning_effort":"low","stream":true"#);
+        assert_eq!(streamed_text(&post(&base, &streamed)), (String::new(), "Just the answer.".to_string()));
+        let off = PromptOptions { thinking: false, reasoning_effort: Some("low".into()), clear_thinking: None };
+        assert_eq!(stub.seen.lock().unwrap().as_slice(), [off.clone(), off.clone()]);
+        assert_eq!(stub.counted.lock().unwrap().as_slice(), [off.clone(), off]);
+    }
+
+    /// Every form of the thinking switch, and their precedence, reaches the engine: the same
+    /// options to render the prompt and to count its tokens. `reasoning_effort` and
+    /// `clear_thinking` travel with it; `clear_thinking` is off unless a request sends it.
+    #[test]
+    fn the_thinking_switch_forms_and_their_precedence_reach_the_engine() {
+        let opts = |thinking: bool, effort: Option<&str>, clear: Option<bool>| PromptOptions {
+            thinking,
+            reasoning_effort: effort.map(str::to_string),
+            clear_thinking: clear,
+        };
+        let cases = [
+            // No switch: GLM-5.3-Flash's template thinks.
+            ("", opts(true, None, None)),
+            // vLLM and SGLang.
+            (r#""chat_template_kwargs":{"enable_thinking":false}"#, opts(false, None, None)),
+            (r#""chat_template_kwargs":{"enable_thinking":true}"#, opts(true, None, None)),
+            (r#""enable_thinking":false"#, opts(false, None, None)),
+            // GLM and Anthropic.
+            (r#""thinking":{"type":"disabled"}"#, opts(false, None, None)),
+            (r#""thinking":{"type":"enabled","budget_tokens":1024}"#, opts(true, None, None)),
+            // OpenAI's effort: "none" turns thinking off; every value goes to the template as sent.
+            (r#""reasoning_effort":"none""#, opts(false, Some("none"), None)),
+            (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(false, Some("none"), None)),
+            (r#""reasoning_effort":"low""#, opts(true, Some("low"), None)),
+            (r#""reasoning_effort":"low","chat_template_kwargs":{"reasoning_effort":"high"}"#, opts(true, Some("low"), None)),
+            // Precedence: chat_template_kwargs, top-level enable_thinking, thinking.type, effort "none".
+            (r#""chat_template_kwargs":{"enable_thinking":true},"thinking":{"type":"disabled"},"reasoning_effort":"none""#,
+                opts(true, Some("none"), None)),
+            (r#""enable_thinking":true,"thinking":{"type":"disabled"}"#, opts(true, None, None)),
+            (r#""thinking":{"type":"enabled"},"reasoning_effort":"none""#, opts(true, Some("none"), None)),
+            (r#""thinking":{"type":"disabled"},"reasoning_effort":"high""#, opts(false, Some("high"), None)),
+            // clear_thinking: chat_template_kwargs, then thinking.
+            (r#""chat_template_kwargs":{"clear_thinking":true}"#, opts(true, None, Some(true))),
+            (r#""thinking":{"type":"enabled","clear_thinking":true}"#, opts(true, None, Some(true))),
+            (r#""chat_template_kwargs":{"clear_thinking":false},"thinking":{"type":"enabled","clear_thinking":true}"#,
+                opts(true, None, Some(false))),
+        ];
+        let stub = stub("Answer.", 4);
+        let base = serve(stub.clone());
+        for (extra, want) in cases {
+            let sep = if extra.is_empty() { "" } else { "," };
+            post(&base, &format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{sep}{extra}}}"#));
+            let got = (stub.seen.lock().unwrap().pop(), stub.counted.lock().unwrap().pop());
+            assert_eq!(got, (Some(want.clone()), Some(want)), "{extra}");
+        }
+    }
+
+    /// Reasoning goes out under `reasoning_content` from both places the stream sends it (live, and
+    /// after generation for a think block behind a tool call) and adds up to the whole response's.
+    #[test]
+    fn reasoning_after_a_tool_call_streams_under_the_same_field() {
+        let text = format!("Plan.{TH_END}Checking.{}{TH}Recheck.{TH_END}", call_text("get_weather", &[("city", "Paris")]));
+        let base = serve(stub(&text, 3));
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"weather?"}}],{TOOLS},"stream":true}}"#);
+        let (reasoning, content) = streamed_text(&post(&base, &body));
+        assert_eq!((reasoning.as_str(), content.as_str()), ("Plan.Recheck.", "Checking."));
+        let whole = json::parse(&post(&base, &body.replace(r#","stream":true"#, ""))).unwrap();
+        let msg = whole.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
+        assert_eq!(msg.get("reasoning_content").and_then(|r| r.as_str()), Some("Plan.Recheck."));
+        assert!(msg.get("reasoning").is_none());
     }
 
     /// This file spells no complete think or tool-call tag, and keeps to ASCII, so a decoded

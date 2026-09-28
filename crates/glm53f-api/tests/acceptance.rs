@@ -4,7 +4,9 @@
 //! `replay_exact`, `mimobench`) plus the L5 ladder runner driven against the
 //! loopback server. Those tools and the ladder come from the harness directory
 //! (`harness/`, or `GLM53F_HARNESS`); the tests that need them are skipped with
-//! a message while it is absent.
+//! a message while it is absent. The last section serves the GLM dialect over a
+//! scripted stand-in: one reasoning field in both modes, the chunk head on every
+//! chunk, and the API contract rows (`harness/api_contract.py`).
 
 use std::io::Read;
 use std::net::TcpListener;
@@ -12,8 +14,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-use glm53f_api::dialect::{Dialect, MimoDialect};
-use glm53f_api::engine::{Engine, GenerateOutcome, GenerateParams};
+use glm53f_api::dialect::{Dialect, GlmDialect, MimoDialect};
+use glm53f_api::engine::{Engine, GenerateOutcome, GenerateParams, PromptOptions};
 use glm53f_api::types::{ChatMessage, Tool};
 use glm53f_api::{self, MODEL_ID};
 
@@ -833,7 +835,8 @@ fn streaming_think_block_is_reasoning_only_and_matches_non_stream() {
                 assert!(!c.contains("think"), "content delta leaked think markup: {c:?}");
                 content.push_str(c);
             }
-            if let Some(r) = delta.get("reasoning").and_then(|r| r.as_str()) {
+            assert!(delta.get("reasoning").is_none(), "reasoning under a second name: {payload}");
+            if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
                 reasoning.push_str(r);
             }
         }
@@ -1127,7 +1130,8 @@ fn reasoning_opened_by_the_prompt_streams_as_reasoning() {
             if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                 content.push_str(c);
             }
-            if let Some(r) = delta.get("reasoning").and_then(|r| r.as_str()) {
+            assert!(delta.get("reasoning").is_none(), "reasoning under a second name: {payload}");
+            if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
                 reasoning.push_str(r);
             }
         }
@@ -1142,4 +1146,227 @@ fn reasoning_opened_by_the_prompt_streams_as_reasoning() {
     let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
     assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some(content.as_str()), "stream content = non-stream: {resp}");
     assert_eq!(msg.get("reasoning_content").and_then(|c| c.as_str()), Some(reasoning.as_str()), "{resp}");
+}
+
+// ---------------------------------------------------------------------------
+// The response contract with the GLM dialect (added in glm53f-afd): one reasoning field in both
+// modes, the chunk head on every chunk, and harness/api_contract.py against a scripted stand-in.
+// ---------------------------------------------------------------------------
+
+const GLM_THINK: &str = concat!("<", "think", ">");
+const GLM_THINK_END: &str = concat!("<", "/think", ">");
+
+/// GLM-5.3-Flash's markup for one tool call with one argument.
+fn glm_call(name: &str, key: &str, value: &str) -> String {
+    format!(
+        concat!("<", "tool_call", ">{}<", "arg_key", ">{}<", "/arg_key", "><", "arg_value", ">{}<", "/arg_value", "><", "/tool_call", ">"),
+        name, key, value
+    )
+}
+
+/// A scripted stand-in for GLM-5.3-Flash behind the GLM dialect. Its prompt is a small GLM-like
+/// rendering of the request: the first tool's name and parameter, each message by role, an
+/// assistant turn's reasoning unless `clear_thinking` drops it, and a generation prompt that
+/// opens the think block (or, with thinking off, closes it). A prompt's token count is its
+/// length in characters, so `usage.prompt_tokens` shows the switches and the decoded text. It
+/// answers the contract harness's prompts correctly, starts inside the think block when the
+/// prompt opened it, and streams three characters per delta, so tags and multi-byte characters
+/// split across deltas.
+struct GlmScript;
+
+fn glm_script_prompt(messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> String {
+    let mut s = String::new();
+    if let Some(t) = tools.first() {
+        let props = t.function.parameters.as_ref().and_then(|p| p.get("properties")).and_then(|p| p.as_object());
+        let param = props.and_then(|p| p.first()).map_or("", |(k, _)| k.as_str());
+        s.push_str(&format!("[tools]{}({param})", t.function.name));
+    }
+    let last_user = messages.iter().rposition(|m| m.role == "user");
+    for (i, m) in messages.iter().enumerate() {
+        s.push_str(&format!("[{}]", m.role));
+        if m.role == "assistant" {
+            let keep = !opts.clear_thinking.unwrap_or(false) || last_user.is_none_or(|u| i > u);
+            s.push_str(GLM_THINK);
+            if keep {
+                s.push_str(m.reasoning_content.as_deref().unwrap_or(""));
+            }
+            s.push_str(GLM_THINK_END);
+        }
+        s.push_str(&m.content);
+    }
+    s.push_str("[assistant]");
+    s.push_str(GLM_THINK);
+    if !opts.thinking {
+        s.push_str(GLM_THINK_END);
+    }
+    s
+}
+
+/// The script's completion for a prompt: reasoning first when the prompt opened the think block.
+fn glm_script_completion(prompt: &str) -> String {
+    let question = prompt.rsplit("[user]").next().and_then(|q| q.rsplit_once("[assistant]")).map_or("", |(q, _)| q);
+    let tool = prompt.strip_prefix("[tools]").and_then(|t| t.split_once('(')).map(|(n, rest)| (n, rest.split(')').next().unwrap_or("")));
+    let (reasoning, answer) = if let Some((name, param)) = tool {
+        ("The file has to be read first.", format!("I will read it.{}", glm_call(name, param, "src/theme/palette.js")))
+    } else if let Some(text) = question.strip_prefix("Repeat exactly this text and nothing else: ") {
+        ("An echo.", text.to_string())
+    } else if question.starts_with("Reply exactly: OK") || question.starts_with("The secret word is") {
+        ("A fixed reply.", "OK".to_string())
+    } else if question.starts_with("What is the secret word") {
+        ("There is no earlier message.", "NONE".to_string())
+    } else if question.contains("2 + 2") {
+        ("Two and two.", "4".to_string())
+    } else {
+        ("Let me think about it.", "The answer is 42.".to_string())
+    };
+    if prompt.ends_with(GLM_THINK) {
+        format!("{reasoning}{GLM_THINK_END}{answer}")
+    } else {
+        answer
+    }
+}
+
+impl Engine for GlmScript {
+    fn tokenize(&self, messages: &[ChatMessage], tools: &[Tool], thinking: bool) -> usize {
+        self.tokenize_prompt(messages, tools, &PromptOptions { thinking, ..Default::default() })
+    }
+    fn render_chat(&self, messages: &[ChatMessage], tools: &[Tool], thinking: bool) -> String {
+        self.render_prompt(messages, tools, &PromptOptions { thinking, ..Default::default() })
+    }
+    fn tokenize_prompt(&self, messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> usize {
+        glm_script_prompt(messages, tools, opts).chars().count()
+    }
+    fn render_prompt(&self, messages: &[ChatMessage], tools: &[Tool], opts: &PromptOptions) -> String {
+        glm_script_prompt(messages, tools, opts)
+    }
+    fn generate(
+        &self,
+        prompt: &str,
+        params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let chars: Vec<char> = glm_script_completion(prompt).chars().collect();
+        let pieces: Vec<String> = chars.chunks(3).take(params.max_tokens).map(|c| c.iter().collect()).collect();
+        for p in &pieces {
+            on_delta(p);
+        }
+        let finish = if pieces.len() * 3 < chars.len() { "length" } else { "stop" };
+        Ok(GenerateOutcome { text: pieces.concat(), finish_reason: finish.into(), completion_tokens: pieces.len() })
+    }
+}
+
+/// The data events of an SSE body, parsed (without `[DONE]`).
+fn sse_events(raw: &str) -> Vec<glm53f_api::json::Json> {
+    sse_data_payloads(raw)
+        .iter()
+        .filter(|p| p.as_str() != "[DONE]")
+        .map(|p| glm53f_api::json::parse(p).unwrap_or_else(|e| panic!("bad event {p}: {e}")))
+        .collect()
+}
+
+/// Reasoning is `reasoning_content` in both modes: streamed live in pieces and whole, never under
+/// `reasoning`, never in content. The source streamed `delta.reasoning` beside a non-streamed
+/// `reasoning_content`.
+#[test]
+fn reasoning_is_reasoning_content_whole_and_streamed() {
+    let srv = start_engine_with(GlmScript, Arc::new(GlmDialect));
+    let body = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"What is 17 + 25?"}],"stream":true}"#;
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), body);
+    assert_eq!(status, 200, "{resp}");
+    let (mut reasoning, mut content, mut pieces) = (String::new(), String::new(), 0);
+    for ev in sse_events(&resp) {
+        for ch in ev.get("choices").and_then(|c| c.as_array()).unwrap_or(&[]) {
+            let Some(delta) = ch.get("delta") else { continue };
+            assert!(delta.get("reasoning").is_none(), "reasoning under a second name: {resp}");
+            if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                reasoning.push_str(r);
+                pieces += 1;
+            }
+            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                content.push_str(c);
+            }
+        }
+    }
+    assert_eq!((reasoning.as_str(), content.as_str()), ("Let me think about it.", "The answer is 42."), "{resp}");
+    assert!(pieces > 1, "reasoning streams live, in pieces: {resp}");
+
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body.replace(r#","stream":true"#, ""));
+    assert_eq!(status, 200, "{resp}");
+    let v = glm53f_api::json::parse(&resp).unwrap();
+    let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
+    assert_eq!(msg.get("reasoning_content").and_then(|r| r.as_str()), Some(reasoning.as_str()), "{resp}");
+    assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some(content.as_str()), "{resp}");
+    assert!(msg.get("reasoning").is_none(), "{resp}");
+}
+
+/// Every streamed chunk carries the completion's `id`, `object`, `created` and `model`, with one
+/// `id` and one `created` throughout: the role, reasoning, content, tool-call, finish and usage
+/// chunks alike (the source sent them on the role chunk only). `created` is integer Unix
+/// seconds, as in the non-streamed reply.
+#[test]
+fn every_chunk_carries_the_completion_head() {
+    let srv = start_engine_with(GlmScript, Arc::new(GlmDialect));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let body = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Read src/theme/palette.js."}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}}],"stream":true,"stream_options":{"include_usage":true}}"#;
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), body);
+    assert_eq!(status, 200, "{resp}");
+    let events = sse_events(&resp);
+    let delta_has = |k: &str| {
+        events.iter().any(|ev| {
+            ev.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("delta")).is_some_and(|d| d.get(k).is_some())
+        })
+    };
+    for k in ["role", "reasoning_content", "content", "tool_calls"] {
+        assert!(delta_has(k), "no {k} chunk: {resp}");
+    }
+    let usage = events.last().unwrap();
+    assert!(usage.get("usage").is_some() && usage.get("choices").and_then(|c| c.as_array()).is_some_and(|c| c.is_empty()), "{resp}");
+    let id = events[0].get("id").and_then(|x| x.as_str()).unwrap().to_string();
+    let created = events[0].get("created").and_then(|x| x.as_f64()).unwrap();
+    assert!(created.fract() == 0.0 && (created - now).abs() < 60.0, "created {created}, now {now}");
+    for ev in &events {
+        assert_eq!(ev.get("id").and_then(|x| x.as_str()), Some(id.as_str()), "{resp}");
+        assert_eq!(ev.get("object").and_then(|x| x.as_str()), Some("chat.completion.chunk"), "{resp}");
+        assert_eq!(ev.get("created").and_then(|x| x.as_f64()), Some(created), "{resp}");
+        assert_eq!(ev.get("model").and_then(|x| x.as_str()), Some(MODEL_ID), "{resp}");
+    }
+    // On the wire, `created` is an integer.
+    for p in sse_data_payloads(&resp).iter().filter(|p| p.as_str() != "[DONE]") {
+        assert!(p.contains(&format!(r#""created":{created},"#)), "{p}");
+    }
+
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body.replace(r#","stream":true"#, ""));
+    assert_eq!(status, 200, "{resp}");
+    let v = glm53f_api::json::parse(&resp).unwrap();
+    assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("chat.completion"), "{resp}");
+    assert!(v.get("id").and_then(|x| x.as_str()).is_some_and(|i| i.starts_with("chatcmpl-")), "{resp}");
+    assert_eq!(v.get("model").and_then(|x| x.as_str()), Some(MODEL_ID), "{resp}");
+    let c = v.get("created").and_then(|x| x.as_f64()).unwrap();
+    assert!(c.fract() == 0.0 && (c - now).abs() < 60.0 && resp.contains(&format!(r#""created":{c},"#)), "{resp}");
+}
+
+/// harness/api_contract.py, every row, against the API serving the GLM dialect over the scripted
+/// stand-in: all PASS (the script answers the model rows correctly too).
+#[test]
+fn api_contract_harness_passes_against_the_glm_script() {
+    let py = python();
+    if Command::new(&py).arg("--version").output().is_err() {
+        eprintln!("SKIP: python3 not available");
+        return;
+    }
+    let Some(harness) = harness_file("api_contract.py") else { return };
+    let srv = start_engine_with(GlmScript, Arc::new(GlmDialect));
+    let out = Command::new(&py)
+        .arg(&harness)
+        .arg("--base").arg(&srv.base)
+        .arg("--timeout").arg("60")
+        .output().expect("run api_contract.py");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "api_contract FAILED:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let rows = ["LIVE", "CREATED", "JSON", "STREAM-MARKUP", "USAGE", "UTF8-esc", "UTF8-raw", "TOOLS-json", "TOOLS-stream",
+        "THINK-OFF", "CLEAR-THINKING", "ISO"];
+    for row in rows {
+        assert!(stdout.lines().any(|l| l.split_whitespace().take(2).eq([row, "PASS"])), "{row} did not pass:\n{stdout}");
+    }
+    assert!(stdout.contains("RESULT: PASS api contract"), "{stdout}");
 }

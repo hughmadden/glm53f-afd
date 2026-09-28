@@ -8,6 +8,29 @@
 //! `tool_choice` with a 400. The model itself is behind the [`Engine`] trait,
 //! which the coordinator implements; the tests drive the server with a stub
 //! engine.
+//!
+//! # Reasoning and the thinking switch
+//!
+//! Reasoning goes out under one name in both modes, [`chat::REASONING_FIELD`]
+//! (`reasoning_content`): the non-streamed `message.reasoning_content` and each
+//! streamed `delta.reasoning_content`, never in `content`. Every streamed chunk
+//! carries the completion's `id`, `object`, `created` (Unix seconds) and `model`.
+//!
+//! A request sets thinking with the first of these it carries:
+//!
+//! 1. `chat_template_kwargs.enable_thinking` (vLLM and SGLang);
+//! 2. a top-level `enable_thinking`;
+//! 3. `thinking.type` (GLM and Anthropic): `"disabled"` is off, any other type on;
+//! 4. `reasoning_effort: "none"` (top level, else in `chat_template_kwargs`): off.
+//!
+//! Otherwise the dialect's default applies ([`Dialect::default_thinking`]; on for
+//! GLM-5.3-Flash). The engine gets the switch with `reasoning_effort` as sent (top
+//! level, else in `chat_template_kwargs`; the chat template decides what a value
+//! means) and `clear_thinking` (`chat_template_kwargs`, else `thinking`; off unless
+//! sent), which drops the reasoning of assistant turns before the last user
+//! message. An assistant turn's reasoning in the history is read from
+//! `reasoning_content`, else `reasoning`. `harness/api_contract.py` checks all of
+//! this against a running server.
 
 pub mod chat;
 pub mod dialect;
