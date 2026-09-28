@@ -1,0 +1,693 @@
+{
+ "format": 1,
+ "set": "layer03-prefill",
+ "source": {
+  "model": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+  },
+  "reference": {
+   "package": "transformers",
+   "version": "5.17.0",
+   "wheel_sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+   "modeling_file": "transformers/models/glm5_next/modeling_glm5_next.py",
+   "modeling_file_sha256": "5a885692edc74056f370d70af10ba746c0b12d59d245fb782c8ec8964059ea6e",
+   "attn_implementation": "eager",
+   "experts_implementation": "eager",
+   "kernels": "pure-PyTorch reference paths (no kernels hub, fla or causal-conv1d installed)"
+  },
+  "runtime": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu132",
+   "numpy": "2.5.2",
+   "mkl": "2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+   "device": "cpu",
+   "cpu_capability": "AVX2",
+   "threads": 16,
+   "env": {
+    "ATEN_CPU_CAPABILITY": "avx2",
+    "MKL_CBWR": "AVX2,STRICT",
+    "ONEDNN_MAX_CPU_ISA": "AVX2"
+   },
+   "deterministic_algorithms": true
+  },
+  "script_sha256": "b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3",
+  "prompt": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Briefly, in two sentences: why does the sky look blue during the day but red at sunset?"
+    }
+   ],
+   "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Briefly, in two sentences: why does the sky look blue during the day but red at sunset?<|assistant|><think>",
+   "token_ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    85276,
+    398,
+    11,
+    304,
+    1378,
+    22809,
+    25,
+    3170,
+    1558,
+    279,
+    12877,
+    1401,
+    6303,
+    2337,
+    279,
+    1899,
+    714,
+    2518,
+    518,
+    42739,
+    30,
+    154828,
+    154841
+   ],
+   "files_sha256": {
+    "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    "chat_template.jinja": "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5"
+   },
+   "decode_text": "Sunlight scatters off air molecules, and blue light scatters more",
+   "decode_token_ids": [
+    29975,
+    4145,
+    1136,
+    10170,
+    1007,
+    3720,
+    34445,
+    11
+   ]
+  },
+  "chain_layers": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "record_layers": [
+   0,
+   3,
+   4
+  ],
+  "dtype_policy": "fp32",
+  "weights_sha256": "48759e25393d25337d4e6c0b1c8c57908a0ffc9de4f3e3d257c024cd204cbebe"
+ },
+ "notes": {
+  "layer": 3,
+  "attention": "dsa",
+  "mlp": "moe",
+  "dtype_policy": "fp32: FP8 weights dequantised with transformers' Fp8Dequantize to FP32, BF16/F32 tensors upcast; every parameter and activation FP32 on CPU",
+  "prompt_tokens": 33,
+  "decode_steps": 8,
+  "prefill": "the whole prompt in one forward (KDA uses the reference's chunked path)",
+  "decode": "one token per forward with the reference cache, continuing from the prompt (KDA recurrent path); decode.<name> tensors are stacked over steps, decode.sN.<name> are per step. The state before step 0 is in the matching -prefill set.",
+  "index_layout": "idx.topk rows hold min(512, pools) selected pools x 4 tokens in descending score order (tokens of pools not yet complete or visible are -1), then the tail slots (index_kpool - 1 = 3, -1 where unused), then -1 padding to 2051",
+  "variant": "k16.*: the same attention module and weights with index_topk=16 (4 pools + tail), fed prefill/decode attn_norm; not the model's configuration",
+  "experts_used": [
+   2,
+   4,
+   6,
+   7,
+   9,
+   10,
+   12,
+   13,
+   14,
+   16,
+   17,
+   19,
+   21,
+   22,
+   23,
+   24,
+   26,
+   27,
+   31,
+   34,
+   35,
+   42,
+   44,
+   45,
+   47,
+   50,
+   51,
+   53,
+   56,
+   58,
+   59,
+   61,
+   63,
+   64,
+   67,
+   71,
+   73,
+   74,
+   75,
+   77,
+   78,
+   79,
+   80,
+   81,
+   86,
+   87,
+   89,
+   91,
+   93,
+   96,
+   97,
+   99,
+   100,
+   101,
+   102,
+   106,
+   107,
+   108,
+   109,
+   110,
+   113,
+   114,
+   115,
+   116,
+   118,
+   121,
+   122,
+   124,
+   125,
+   126,
+   129,
+   131,
+   132,
+   133,
+   134,
+   135,
+   136,
+   137,
+   140,
+   141,
+   142,
+   143,
+   144,
+   148,
+   149,
+   150,
+   152,
+   154,
+   156,
+   157,
+   158,
+   160,
+   161,
+   162,
+   163,
+   164,
+   166,
+   169,
+   170,
+   172,
+   173,
+   174,
+   176,
+   179,
+   180,
+   181,
+   184,
+   186,
+   187,
+   188,
+   190,
+   192,
+   194,
+   196,
+   202,
+   203,
+   204,
+   205,
+   208,
+   209,
+   210,
+   211,
+   212,
+   218,
+   221,
+   222,
+   223,
+   225,
+   226,
+   227,
+   228,
+   230,
+   237,
+   238,
+   239,
+   242,
+   245,
+   246,
+   247,
+   248,
+   249,
+   250,
+   251,
+   252,
+   253,
+   254,
+   255,
+   256,
+   259,
+   260,
+   263,
+   265,
+   266,
+   267,
+   269,
+   270,
+   272,
+   273,
+   275,
+   276,
+   277,
+   278,
+   279,
+   280,
+   281,
+   285,
+   287
+  ],
+  "phase": "prefill"
+ },
+ "tensors": {
+  "prefill.in_streams": {
+   "file": "prefill.in_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "6b527db511f70842fd95be727eeed4cbb52a40c1bd5c5e12376f361e5eb54206",
+   "desc": "decoder layer input: the 4 mHC residual streams [tokens, hc, hidden]"
+  },
+  "prefill.attn_hc.pre": {
+   "file": "prefill.attn_hc.pre.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "437db0531a6c29b63a8c1474c5616043ea91998714d3cb428e5f00715103ed48",
+   "desc": "attention-site mHC pre weights (sigmoid + eps) that collapse the streams"
+  },
+  "prefill.attn_hc.post": {
+   "file": "prefill.attn_hc.post.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "e1450ecf862cf0731d5adf8b7925e87c527c7d99dda5c182fc59ce34eb0749d1",
+   "desc": "attention-site mHC post weights (2*sigmoid) that expand the block output"
+  },
+  "prefill.attn_hc.comb": {
+   "file": "prefill.attn_hc.comb.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4
+   ],
+   "sha256": "2708dc13ae81a48590fc86e3a5ded03d06fe09db60d632602bc88880e6be2e9c",
+   "desc": "attention-site mHC comb matrix after Sinkhorn; new_stream[i] = sum_j comb[j,i]*stream[j] + post[i]*block_out"
+  },
+  "prefill.attn_hc.collapsed": {
+   "file": "prefill.attn_hc.collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "9d03e40c2711ca8f92c38a515e4d40f56e4bb92430d893e50c556182a0aee5b4",
+   "desc": "attention-site collapsed input sum_i pre[i]*stream[i] (before input_layernorm)"
+  },
+  "prefill.attn_norm": {
+   "file": "prefill.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "2f2b9a1367a48bdb587eefdc85373a42e344a32968add06da33c446f4183fc80",
+   "desc": "input_layernorm output (attention block input)"
+  },
+  "prefill.mla.q_resid": {
+   "file": "prefill.mla.q_resid.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    1536
+   ],
+   "sha256": "692e7e9e5c314952cdd844c4aedbd9be77a7bf74c11bc1ac7d6f03cf5997ba54",
+   "desc": "q_a_layernorm(q_a_proj(x)): MLA query latent, also the indexer's query input"
+  },
+  "prefill.mla.q": {
+   "file": "prefill.mla.q.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    256
+   ],
+   "sha256": "5c2c8e65e41a7a46a5d8fb196a773b1c7394eb37825d63a3c96f8b6ecb2ca77f",
+   "desc": "MLA query q_b_proj(q_resid) [tokens, heads, 256] (NoPE)"
+  },
+  "prefill.mla.kv_a": {
+   "file": "prefill.mla.kv_a.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    512
+   ],
+   "sha256": "a1549554281727fab6856a6cadd4b238efdc4cb00b1a8f0d2d3fdd1ed55ae831",
+   "desc": "kv_a_proj_with_mqa(x), before kv_a_layernorm [tokens, 512]"
+  },
+  "prefill.mla.latent": {
+   "file": "prefill.mla.latent.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    512
+   ],
+   "sha256": "4db5ae2fdd36046f8f945d1ae78b7f38ab8b60f225f6219b58be695ffff2e5ec",
+   "desc": "kv_a_layernorm output: the 512-dim MLA latent that the KV cache holds per token"
+  },
+  "prefill.idx.q": {
+   "file": "prefill.idx.q.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    32,
+    128
+   ],
+   "sha256": "9e0cfd7316b97a3e3352fd31cc3a581dd318e105189e52b3ce8e69df4080c81d",
+   "desc": "indexer query wq_b(q_resid) [tokens, index_heads, 128]"
+  },
+  "prefill.idx.k": {
+   "file": "prefill.idx.k.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    128
+   ],
+   "sha256": "37689ef0cbd3b35d786a9374dbd02a37e351e204d1c934b798850d96d7bfadc2",
+   "desc": "indexer key k_norm(wk(x)) (LayerNorm) [tokens, 128]"
+  },
+  "prefill.idx.pool_keys": {
+   "file": "prefill.idx.pool_keys.bin",
+   "dtype": "f32",
+   "shape": [
+    8,
+    128
+   ],
+   "sha256": "c8bc463d432fa4aafc4f71550409f3c13c16a7e05c2cc0f215c2563db9e998e4",
+   "desc": "pooled keys of the complete pools (softmax(gate_scores + ape) over each pool's 4 tokens) [pools, 128]"
+  },
+  "prefill.idx.pool_indices": {
+   "file": "prefill.idx.pool_indices.bin",
+   "dtype": "i32",
+   "shape": [
+    8,
+    4
+   ],
+   "sha256": "afbc67011b6f94a508935ad8edcbdd3c9b56c4db336f8d3847a8a1815183828f",
+   "desc": "token indices of each complete pool [pools, 4]"
+  },
+  "prefill.idx.weights": {
+   "file": "prefill.idx.weights.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    32
+   ],
+   "sha256": "18ab31539dff4c84205cc6c84ba0be9be3086de07b27efcbc80d77f222bd34ca",
+   "desc": "indexer head weights weights_proj(x), before the n_heads^-0.5 scale [tokens, index_heads]"
+  },
+  "prefill.idx.scores": {
+   "file": "prefill.idx.scores.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "74f4486b36fb0185bf8dc682ae8f883023c3d130c58de351da5d7f0091718876",
+   "desc": "index scores per query and complete pool, invisible pools set to float32 min [queries, pools]"
+  },
+  "prefill.idx.gate_scores": {
+   "file": "prefill.idx.gate_scores.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    128
+   ],
+   "sha256": "8ebd73303a6ec0df61d49f0f6b5ff5ee9cbf04e4771c4e75c63332f0b059fba1",
+   "desc": "k-pool compression gate x @ index_kpool_compress_gate^T [tokens, 128]"
+  },
+  "prefill.idx.topk": {
+   "file": "prefill.idx.topk.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    2051
+   ],
+   "sha256": "c730327588dfde82d78f99298fa83ac1eb01465d6db94d427215faad5fb76123",
+   "desc": "selected raw token indices: selected pools' tokens in score order, then the visible tail (<=3), then -1 padding"
+  },
+  "prefill.mla.out": {
+   "file": "prefill.mla.out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    256
+   ],
+   "sha256": "9c0db70901b478ecb952d1563ba8c464b13609741e8d7256b3271423f7366ba3",
+   "desc": "sparse MLA output per head, before o_proj [tokens, heads, 256]"
+  },
+  "prefill.attn_out": {
+   "file": "prefill.attn_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "b5b01508357847f359f879ca6fb451c6c2fa6af9283f512ad0bdd023656317fd",
+   "desc": "attention block output after o_proj"
+  },
+  "prefill.mla.probs": {
+   "file": "prefill.mla.probs.bin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    33,
+    33
+   ],
+   "sha256": "427c2690991b5aa4ce202565866bf2d2762a57bc6096625ecbf0916260963329",
+   "desc": "sparse attention probabilities (eager softmax) [heads, queries, keys]"
+  },
+  "prefill.mid_streams": {
+   "file": "prefill.mid_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "28b8b372c6b56234a4b1a8d660b1dbc1b01fdfafaf0892f3c24e1d4c373bec86",
+   "desc": "streams after the attention site's mHC update (input of ffn_hc)"
+  },
+  "prefill.ffn_hc.pre": {
+   "file": "prefill.ffn_hc.pre.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "4458922d6d97d1fe02ea86e099a7d57f0514376feed7dd43578bf6fa4b668f46",
+   "desc": "FFN-site mHC pre weights"
+  },
+  "prefill.ffn_hc.post": {
+   "file": "prefill.ffn_hc.post.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "daabb826846f8951d6505c2da2a320301dd6685ea8500c34449f895fa59ff412",
+   "desc": "FFN-site mHC post weights"
+  },
+  "prefill.ffn_hc.comb": {
+   "file": "prefill.ffn_hc.comb.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4
+   ],
+   "sha256": "bd3cceb521e5eb8ce8285e7781474fd16f5721393ce95a54cd2eb9d625943f73",
+   "desc": "FFN-site mHC comb matrix after Sinkhorn"
+  },
+  "prefill.ffn_hc.collapsed": {
+   "file": "prefill.ffn_hc.collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "338e1483bcfd6f98cb59bbb344be62ad9766834ebad0b5593bb616c59efa9d8e",
+   "desc": "FFN-site collapsed input (before post_attention_layernorm)"
+  },
+  "prefill.ffn_norm": {
+   "file": "prefill.ffn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "a12c6edd8deee14e4acc282617035d9452f0142169f7be2ee3fe623115514882",
+   "desc": "post_attention_layernorm output (MLP/MoE input; the routed rows sent to the experts)"
+  },
+  "prefill.moe.router_logits": {
+   "file": "prefill.moe.router_logits.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    288
+   ],
+   "sha256": "630ff683a118e83b3632e1dda3898c03bb2288055f8852dfa557e15425ce974f",
+   "desc": "router logits x @ gate^T in FP32 [tokens, experts]"
+  },
+  "prefill.moe.topk_ids": {
+   "file": "prefill.moe.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "77bec67accc7b3e225890574d94edf12b237f09193335cbeef650aa14383f0fc",
+   "desc": "router top-8 expert ids as the reference returns them (torch.topk sorted=False)"
+  },
+  "prefill.moe.topk_weights": {
+   "file": "prefill.moe.topk_weights.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "bf1e21c87b00ae7f81df61416e138324826192eaa054e27eeb553d63d0e630c6",
+   "desc": "router weights for topk_ids: sigmoid scores normalised over the 8, times 2.5"
+  },
+  "prefill.moe.topk_ids_sorted": {
+   "file": "prefill.moe.topk_ids_sorted.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "fe660378f8dc61f0d40f09b71c648c5665bdcdc9a854b15a58e70398c2b64a57",
+   "desc": "router top-8 expert ids sorted ascending"
+  },
+  "prefill.moe.topk_weights_sorted": {
+   "file": "prefill.moe.topk_weights_sorted.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "40e9d79300a3af4fa1c30da0e0165a29667b6aeed2117f99291cdf16d123db92",
+   "desc": "router weights in the order of topk_ids_sorted"
+  },
+  "prefill.moe.routed_out": {
+   "file": "prefill.moe.routed_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "639edf5ab20389b56702ab82fb7ed074936d3a345e3707fc3ca7e452dff774fc",
+   "desc": "sum over the 8 routed experts of weight * expert(x) (reference accumulation order: by expert id)"
+  },
+  "prefill.moe.shared_out": {
+   "file": "prefill.moe.shared_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "049c5a33fcc9aa8137a3dc3f0f2d973633f7e82e9442a06dccf509005cefd95f",
+   "desc": "shared expert output"
+  },
+  "prefill.mlp_out": {
+   "file": "prefill.mlp_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "e7563f8ae1587e7ad1754c123ea61f852d6679cfc6b76093cf867f5a18eba7bf",
+   "desc": "MLP or MoE block output (routed + shared for MoE)"
+  },
+  "prefill.out_streams": {
+   "file": "prefill.out_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "779ccbcbebe5f4e4c4b262e4ccd3f310f4066c59f5d7e5e45c8b80a341e8d429",
+   "desc": "decoder layer output: the 4 mHC residual streams"
+  },
+  "prefill.k16.idx.topk": {
+   "file": "prefill.k16.idx.topk.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    19
+   ],
+   "sha256": "35636ad3e0f239a01460c25f8751b80e073c591e8b9008d1b89b21fc2f39c0c0",
+   "desc": "index_topk=16 variant: selected raw token indices: selected pools' tokens in score order, then the visible tail (<=3), then -1 padding"
+  },
+  "prefill.k16.mla.out": {
+   "file": "prefill.k16.mla.out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    256
+   ],
+   "sha256": "79f84729be45a3471a6364de710b128d1e7162e52ab31f8468332a11ea19429c",
+   "desc": "index_topk=16 variant: sparse MLA output per head, before o_proj [tokens, heads, 256]"
+  },
+  "prefill.k16.attn_out": {
+   "file": "prefill.k16.attn_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "201f524b28067f7c4eee7273b726afede9c516a948328c26aa8130f69c670630",
+   "desc": "index_topk=16 variant: attention block output after o_proj"
+  }
+ }
+}

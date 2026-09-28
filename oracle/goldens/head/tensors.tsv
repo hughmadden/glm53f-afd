@@ -1,0 +1,6 @@
+# name	file	dtype	shape	sha256
+embed.rows	embed.rows.bin	f32	41,4096	d0d499ad5ab6ef2078e97d4910033439a1d5d608a1d184d904ec06c91ce4d105
+head.in_streams	head.in_streams.bin	f32	9,4,4096	ec38e6b62b751b7ee21c48a56a101191ad2388860dec26c62b9f8008668fa3af
+head.collapsed	head.collapsed.bin	f32	9,4096	dca85412a7f064a776a0690de97edaeeac1cf2706250a1bad0f09caf33dd5565
+head.norm	head.norm.bin	f32	9,4096	8bd98672e619b8c22b671ac35e46f63ff091273a695afce0d5d4961b25c1a4f2
+head.logits	head.logits.bin	f32	9,154880	faafa442aaabe4c0cc139b4e3335521b49023a1bc11c1f0e6ea1504a48583b62

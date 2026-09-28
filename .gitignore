@@ -21,3 +21,6 @@
 *.env
 .venv/
 __pycache__/
+
+# oracle golden payloads: regenerated deterministically by oracle/golden_layers.py; manifests (with sha256) stay tracked
+oracle/goldens/**/*.bin

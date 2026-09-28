@@ -1,0 +1,736 @@
+{
+ "format": 1,
+ "set": "layer04-prefill",
+ "source": {
+  "model": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+  },
+  "reference": {
+   "package": "transformers",
+   "version": "5.17.0",
+   "wheel_sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+   "modeling_file": "transformers/models/glm5_next/modeling_glm5_next.py",
+   "modeling_file_sha256": "5a885692edc74056f370d70af10ba746c0b12d59d245fb782c8ec8964059ea6e",
+   "attn_implementation": "eager",
+   "experts_implementation": "eager",
+   "kernels": "pure-PyTorch reference paths (no kernels hub, fla or causal-conv1d installed)"
+  },
+  "runtime": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu132",
+   "numpy": "2.5.2",
+   "mkl": "2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+   "device": "cpu",
+   "cpu_capability": "AVX2",
+   "threads": 16,
+   "env": {
+    "ATEN_CPU_CAPABILITY": "avx2",
+    "MKL_CBWR": "AVX2,STRICT",
+    "ONEDNN_MAX_CPU_ISA": "AVX2"
+   },
+   "deterministic_algorithms": true
+  },
+  "script_sha256": "b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3",
+  "prompt": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Briefly, in two sentences: why does the sky look blue during the day but red at sunset?"
+    }
+   ],
+   "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Briefly, in two sentences: why does the sky look blue during the day but red at sunset?<|assistant|><think>",
+   "token_ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    85276,
+    398,
+    11,
+    304,
+    1378,
+    22809,
+    25,
+    3170,
+    1558,
+    279,
+    12877,
+    1401,
+    6303,
+    2337,
+    279,
+    1899,
+    714,
+    2518,
+    518,
+    42739,
+    30,
+    154828,
+    154841
+   ],
+   "files_sha256": {
+    "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    "chat_template.jinja": "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5"
+   },
+   "decode_text": "Sunlight scatters off air molecules, and blue light scatters more",
+   "decode_token_ids": [
+    29975,
+    4145,
+    1136,
+    10170,
+    1007,
+    3720,
+    34445,
+    11
+   ]
+  },
+  "chain_layers": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "record_layers": [
+   0,
+   3,
+   4
+  ],
+  "dtype_policy": "fp32",
+  "weights_sha256": "04a7d3a32911c632c5e9d77c9e210e3bd49645b55f1c35e97dcef2022c78ea7c"
+ },
+ "notes": {
+  "layer": 4,
+  "attention": "kda",
+  "mlp": "moe",
+  "dtype_policy": "fp32: FP8 weights dequantised with transformers' Fp8Dequantize to FP32, BF16/F32 tensors upcast; every parameter and activation FP32 on CPU",
+  "prompt_tokens": 33,
+  "decode_steps": 8,
+  "prefill": "the whole prompt in one forward (KDA uses the reference's chunked path)",
+  "decode": "one token per forward with the reference cache, continuing from the prompt (KDA recurrent path); decode.<name> tensors are stacked over steps, decode.sN.<name> are per step. The state before step 0 is in the matching -prefill set.",
+  "state_heads": [
+   0,
+   21,
+   42,
+   63
+  ],
+  "weights": "weights.*: the layer's small KDA tensors as the checkpoint stores them (exact); the FP32 goldens use them upcast. The projections (q/k/v/o, f_a/f_b, g_a/g_b, b_proj) are read from the checkpoint",
+  "conv_rounding": "the reference's short conv is the unfused PyTorch fallback: natively (BF16 weights and inputs) F.conv1d rounds its output to BF16, then SiLU rounds again. A fused conv + SiLU that rounds once differs from it by about 1 BF16 ulp on a fifth of the outputs (native notes.diff_vs_fp32: LNN.conv_fused_vs_reference). The FP32 goldens run the same code in FP32",
+  "experts_used": [
+   6,
+   7,
+   8,
+   9,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   18,
+   19,
+   20,
+   22,
+   24,
+   28,
+   29,
+   30,
+   32,
+   33,
+   36,
+   38,
+   40,
+   43,
+   45,
+   46,
+   47,
+   49,
+   50,
+   51,
+   52,
+   53,
+   55,
+   57,
+   58,
+   60,
+   61,
+   62,
+   64,
+   66,
+   67,
+   68,
+   71,
+   72,
+   74,
+   76,
+   77,
+   78,
+   79,
+   80,
+   81,
+   82,
+   83,
+   84,
+   87,
+   89,
+   90,
+   92,
+   94,
+   95,
+   97,
+   100,
+   101,
+   102,
+   103,
+   104,
+   105,
+   106,
+   107,
+   109,
+   110,
+   113,
+   115,
+   119,
+   123,
+   124,
+   126,
+   128,
+   129,
+   130,
+   132,
+   133,
+   134,
+   136,
+   139,
+   140,
+   144,
+   145,
+   146,
+   147,
+   149,
+   150,
+   152,
+   154,
+   155,
+   159,
+   160,
+   163,
+   165,
+   166,
+   169,
+   170,
+   171,
+   175,
+   178,
+   179,
+   180,
+   182,
+   184,
+   185,
+   187,
+   189,
+   190,
+   194,
+   199,
+   200,
+   203,
+   207,
+   208,
+   209,
+   211,
+   212,
+   213,
+   215,
+   216,
+   217,
+   218,
+   219,
+   224,
+   225,
+   228,
+   230,
+   231,
+   232,
+   233,
+   236,
+   237,
+   238,
+   239,
+   242,
+   244,
+   246,
+   247,
+   248,
+   249,
+   250,
+   251,
+   252,
+   255,
+   256,
+   257,
+   258,
+   259,
+   263,
+   264,
+   265,
+   267,
+   270,
+   271,
+   273,
+   275,
+   276,
+   277,
+   278,
+   280,
+   281,
+   282,
+   284,
+   285,
+   286,
+   287
+  ],
+  "phase": "prefill"
+ },
+ "tensors": {
+  "prefill.in_streams": {
+   "file": "prefill.in_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "779ccbcbebe5f4e4c4b262e4ccd3f310f4066c59f5d7e5e45c8b80a341e8d429",
+   "desc": "decoder layer input: the 4 mHC residual streams [tokens, hc, hidden]"
+  },
+  "prefill.attn_hc.pre": {
+   "file": "prefill.attn_hc.pre.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "a8c4bcbd233b82dd8da455182cd69e5ca42522ca7b8ce8ed077f8df0aedc84aa",
+   "desc": "attention-site mHC pre weights (sigmoid + eps) that collapse the streams"
+  },
+  "prefill.attn_hc.post": {
+   "file": "prefill.attn_hc.post.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "80dbf376e2532ad353a904b3190107c8375fa9775a3ecd0d99da0d721ffcc421",
+   "desc": "attention-site mHC post weights (2*sigmoid) that expand the block output"
+  },
+  "prefill.attn_hc.comb": {
+   "file": "prefill.attn_hc.comb.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4
+   ],
+   "sha256": "dc1dba17ee0da768323d4129331b08bd794eb78b777fa9a20001c46d5e936351",
+   "desc": "attention-site mHC comb matrix after Sinkhorn; new_stream[i] = sum_j comb[j,i]*stream[j] + post[i]*block_out"
+  },
+  "prefill.attn_hc.collapsed": {
+   "file": "prefill.attn_hc.collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "819b97cb71fa81a71c2438a55ad0ad452c6abeeeb21762c4b1cbdceb6e7ad11d",
+   "desc": "attention-site collapsed input sum_i pre[i]*stream[i] (before input_layernorm)"
+  },
+  "prefill.attn_norm": {
+   "file": "prefill.attn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "3bb7037658ec5f91b646ad18b7519ba79f56ab6d5f80e8f532127dc4f648c952",
+   "desc": "input_layernorm output (attention block input)"
+  },
+  "prefill.kda.f_proj": {
+   "file": "prefill.kda.f_proj.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "9b6632a1fe098f9e5a3dd1e994560e8e3e55fd451e16da33811029eb39fcff55",
+   "desc": "forget-gate projection f_b_proj(f_a_proj(x)), before dt_bias [tokens, heads, dim]"
+  },
+  "prefill.kda.b_logits": {
+   "file": "prefill.kda.b_logits.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64
+   ],
+   "sha256": "42dafef0fcef8ee73fa7c2c4fbfd3dbee39b3c71000548687c5219c44370d01a",
+   "desc": "b_proj(x), before the sigmoid that gives beta [tokens, heads]"
+  },
+  "prefill.kda.path": {
+   "file": "prefill.kda.path.bin",
+   "dtype": "i32",
+   "shape": [
+    1
+   ],
+   "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+   "desc": "reference KDA path: 0 = chunked (64-token chunks), 1 = recurrent single step"
+  },
+  "prefill.kda.q": {
+   "file": "prefill.kda.q.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "459c4c3520dce15c4cc382271185ab1589fd899f4c83dc3c11731a4c3da917a5",
+   "desc": "KDA query after short conv + SiLU, before the L2 norm [tokens, heads, dim]"
+  },
+  "prefill.kda.k": {
+   "file": "prefill.kda.k.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "cb69a69ae4029c3058843ee42e7b9031480edb15a13be1f89e405a1b3b5c84e1",
+   "desc": "KDA key after short conv + SiLU, before the L2 norm"
+  },
+  "prefill.kda.v": {
+   "file": "prefill.kda.v.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "5d90e26180873446f760e600d0b121ddcbc5672e803b5738a1bf37ccebf86bf5",
+   "desc": "KDA value after short conv + SiLU"
+  },
+  "prefill.kda.g": {
+   "file": "prefill.kda.g.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "74fdacbdcd8e45d5a77070c62a44ca687380e635df38113ab47893b7951480b2",
+   "desc": "KDA forget gate (log decay per channel): -5*sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias))"
+  },
+  "prefill.kda.beta": {
+   "file": "prefill.kda.beta.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64
+   ],
+   "sha256": "45365c3af53bad107cc49245ff9fb609676a19d82671ac9d7c22559a71328e22",
+   "desc": "KDA beta = sigmoid(b_proj(x)) [tokens, heads]"
+  },
+  "prefill.kda.core_out": {
+   "file": "prefill.kda.core_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "4381da213fda91a4376d284d6c105a03848dce816359dc32adb4774c3c1bb3f6",
+   "desc": "KDA recurrence output before the gated RMSNorm [tokens, heads, dim]"
+  },
+  "prefill.kda.state": {
+   "file": "prefill.kda.state.bin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    128,
+    128
+   ],
+   "sha256": "480f8ae89e5b9974b100f94bc85e072823efe7394ca666ebef39885dfc12cbf7",
+   "desc": "KDA recurrent state after the phase, FP32 [heads, k_dim, v_dim] (S[k, v]; out = q^T S)"
+  },
+  "prefill.kda.gate": {
+   "file": "prefill.kda.gate.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "828c78f33e4dcf73d5d2077bebbe0bffb2c1b96df6aac823dd9322ebdb6c06ad",
+   "desc": "output gate g_b_proj(g_a_proj(x)) for the gated RMSNorm, before sigmoid [tokens, heads, dim]"
+  },
+  "prefill.kda.norm_out": {
+   "file": "prefill.kda.norm_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    64,
+    128
+   ],
+   "sha256": "cd7b51e014ff650090e8a39792f540d3a7a89b2a83747824357cc54b26caf5df",
+   "desc": "gated RMSNorm output o_norm(core_out, gate): the o_proj input [tokens, heads, dim]"
+  },
+  "prefill.attn_out": {
+   "file": "prefill.attn_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "325471541bcacce90da32e76503d2ccea5d465a8ac9ee9f1f0f00e8e2f88b44c",
+   "desc": "attention block output after o_proj"
+  },
+  "prefill.mid_streams": {
+   "file": "prefill.mid_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "03c54bbfcb97450bea19851969d37b5033e7783869d53c168f2fbbe48af26c5c",
+   "desc": "streams after the attention site's mHC update (input of ffn_hc)"
+  },
+  "prefill.ffn_hc.pre": {
+   "file": "prefill.ffn_hc.pre.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "a8c946993499a2ba40e1f2f4f24e922da1fdadb6c08a54e01562ef9095041908",
+   "desc": "FFN-site mHC pre weights"
+  },
+  "prefill.ffn_hc.post": {
+   "file": "prefill.ffn_hc.post.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4
+   ],
+   "sha256": "0f5c5abcb14a38a233cc3a84dac8d10fcf8a29955d455bae4db8206cc4da88ec",
+   "desc": "FFN-site mHC post weights"
+  },
+  "prefill.ffn_hc.comb": {
+   "file": "prefill.ffn_hc.comb.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4
+   ],
+   "sha256": "372847ce8cb28cf29b7dee231d9244055c0894b18ea4f94f3e34d847716a6776",
+   "desc": "FFN-site mHC comb matrix after Sinkhorn"
+  },
+  "prefill.ffn_hc.collapsed": {
+   "file": "prefill.ffn_hc.collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "25834ebd3f4fa91e71219b5fc805df66d8d959c9feb2d776aa9c9d3fb2d14619",
+   "desc": "FFN-site collapsed input (before post_attention_layernorm)"
+  },
+  "prefill.ffn_norm": {
+   "file": "prefill.ffn_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "71c67b82641f66c0ddea43a3849dc1438e226f4640adc79484390e09ba529960",
+   "desc": "post_attention_layernorm output (MLP/MoE input; the routed rows sent to the experts)"
+  },
+  "prefill.moe.router_logits": {
+   "file": "prefill.moe.router_logits.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    288
+   ],
+   "sha256": "4eb6d63cfbba6df1cc317a695a55f40050803091feabcce10c4bd2743fff8f72",
+   "desc": "router logits x @ gate^T in FP32 [tokens, experts]"
+  },
+  "prefill.moe.topk_ids": {
+   "file": "prefill.moe.topk_ids.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "92436072e4a853ac2e73824366cf06cfb4034300ea22c087c18f953b0b55cde8",
+   "desc": "router top-8 expert ids as the reference returns them (torch.topk sorted=False)"
+  },
+  "prefill.moe.topk_weights": {
+   "file": "prefill.moe.topk_weights.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "7320bd9ed13c777d538b95cc5dd801554303a1ea037211854fb9e970d6acd360",
+   "desc": "router weights for topk_ids: sigmoid scores normalised over the 8, times 2.5"
+  },
+  "prefill.moe.topk_ids_sorted": {
+   "file": "prefill.moe.topk_ids_sorted.bin",
+   "dtype": "i32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "b59d5a5a9080f6b83321222c57c6947e330e4306aa3ab092260fe2708e8e37d9",
+   "desc": "router top-8 expert ids sorted ascending"
+  },
+  "prefill.moe.topk_weights_sorted": {
+   "file": "prefill.moe.topk_weights_sorted.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    8
+   ],
+   "sha256": "4b357f2c31db483bc3ab95af410d5f0cf04fd1d2d8889a1fc274d274cd075e3f",
+   "desc": "router weights in the order of topk_ids_sorted"
+  },
+  "prefill.moe.routed_out": {
+   "file": "prefill.moe.routed_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "940b4b47cdc46a9389b9a21127ee4a8a36c75016a107425e2d934133c4c63e2e",
+   "desc": "sum over the 8 routed experts of weight * expert(x) (reference accumulation order: by expert id)"
+  },
+  "prefill.moe.shared_out": {
+   "file": "prefill.moe.shared_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "4d76811d902d359d61afc3fb6f79e61068b005e9db74ce1b06aef6aa4037bab7",
+   "desc": "shared expert output"
+  },
+  "prefill.mlp_out": {
+   "file": "prefill.mlp_out.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4096
+   ],
+   "sha256": "6bcc61cbf87e58f3f4774078a03148221c51d4ed85a79a46f5d147d24c8ea71e",
+   "desc": "MLP or MoE block output (routed + shared for MoE)"
+  },
+  "prefill.out_streams": {
+   "file": "prefill.out_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    4,
+    4096
+   ],
+   "sha256": "8dbeb512a53402c37020864a392303b1c08094b864052d6f535795ab77fe226d",
+   "desc": "decoder layer output: the 4 mHC residual streams"
+  },
+  "prefill.kda.conv_state": {
+   "file": "prefill.kda.conv_state.bin",
+   "dtype": "f32",
+   "shape": [
+    24576,
+    4
+   ],
+   "sha256": "cd1e47e28c24e57badccf91c05e9df1dd76a1c8b90cb545696e9000c011b6ff8",
+   "desc": "short-conv cache after the phase: last 4 pre-conv inputs [channels q|k|v, 4], oldest first; column 0 never reaches an output"
+  },
+  "prefill.kda.qkv_preconv": {
+   "file": "prefill.kda.qkv_preconv.bin",
+   "dtype": "f32",
+   "shape": [
+    33,
+    24576
+   ],
+   "sha256": "670c870619999c100a88e9bc2abfa9e8bbae1e5b7a6d22c1c123303a60315fa2",
+   "desc": "KDA q|k|v projections before the short convolution, concatenated [tokens, 3*heads*dim]"
+  },
+  "weights.self_attn.q_conv1d.weight": {
+   "file": "weights.self_attn.q_conv1d.weight.bin",
+   "dtype": "bf16",
+   "shape": [
+    8192,
+    1,
+    4
+   ],
+   "sha256": "78880c12518d8f66c21ba300ef838c84c63611faec7f558d531f333c8534b080",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.q_conv1d.weight as stored (bfloat16); the module's conv1d weight is cat(q, k, v conv weights) along dim 0"
+  },
+  "weights.self_attn.k_conv1d.weight": {
+   "file": "weights.self_attn.k_conv1d.weight.bin",
+   "dtype": "bf16",
+   "shape": [
+    8192,
+    1,
+    4
+   ],
+   "sha256": "88b5a382ea41b73ad465868565b2a624501ecb45388b448820460fd3b86f1697",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.k_conv1d.weight as stored (bfloat16); the module's conv1d weight is cat(q, k, v conv weights) along dim 0"
+  },
+  "weights.self_attn.v_conv1d.weight": {
+   "file": "weights.self_attn.v_conv1d.weight.bin",
+   "dtype": "bf16",
+   "shape": [
+    8192,
+    1,
+    4
+   ],
+   "sha256": "471d17f303ea7c5dc5f602a5853717d0054b5e8b609db77eca1b37b6153f4600",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.v_conv1d.weight as stored (bfloat16); the module's conv1d weight is cat(q, k, v conv weights) along dim 0"
+  },
+  "weights.self_attn.A_log": {
+   "file": "weights.self_attn.A_log.bin",
+   "dtype": "f32",
+   "shape": [
+    64
+   ],
+   "sha256": "8adf0409b30492cbfc46eada6201fcb255df992f3def616bee8da80fd7f48263",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.A_log as stored (float32)"
+  },
+  "weights.self_attn.dt_bias": {
+   "file": "weights.self_attn.dt_bias.bin",
+   "dtype": "f32",
+   "shape": [
+    8192
+   ],
+   "sha256": "cfd99b1acd937df8fd99781b463a56f437e4a281529a7c1d5df40c11f4e80246",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.dt_bias as stored (float32)"
+  },
+  "weights.self_attn.o_norm.weight": {
+   "file": "weights.self_attn.o_norm.weight.bin",
+   "dtype": "bf16",
+   "shape": [
+    128
+   ],
+   "sha256": "f043e7db801db5a4c169edfb000f42bc1fda6f7db0ad655bb8858770c0656e89",
+   "desc": "checkpoint tensor model.language_model.layers.4.self_attn.o_norm.weight as stored (bfloat16)"
+  }
+ }
+}

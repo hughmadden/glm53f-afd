@@ -1,0 +1,601 @@
+{
+ "format": 1,
+ "set": "native",
+ "source": {
+  "model": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+  },
+  "reference": {
+   "package": "transformers",
+   "version": "5.17.0",
+   "wheel_sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+   "modeling_file": "transformers/models/glm5_next/modeling_glm5_next.py",
+   "modeling_file_sha256": "5a885692edc74056f370d70af10ba746c0b12d59d245fb782c8ec8964059ea6e",
+   "attn_implementation": "eager",
+   "experts_implementation": "eager",
+   "kernels": "pure-PyTorch reference paths (no kernels hub, fla or causal-conv1d installed)"
+  },
+  "runtime": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu132",
+   "numpy": "2.5.2",
+   "mkl": "2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+   "device": "cpu",
+   "cpu_capability": "AVX2",
+   "threads": 16,
+   "env": {
+    "ATEN_CPU_CAPABILITY": "avx2",
+    "MKL_CBWR": "AVX2,STRICT",
+    "ONEDNN_MAX_CPU_ISA": "AVX2"
+   },
+   "deterministic_algorithms": true
+  },
+  "script_sha256": "b019f636d09555d334fb009c612c8487e6b137f3b96d1d5064fcaa529fd8cad3",
+  "prompt": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Briefly, in two sentences: why does the sky look blue during the day but red at sunset?"
+    }
+   ],
+   "rendered": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Briefly, in two sentences: why does the sky look blue during the day but red at sunset?<|assistant|><think>",
+   "token_ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    85276,
+    398,
+    11,
+    304,
+    1378,
+    22809,
+    25,
+    3170,
+    1558,
+    279,
+    12877,
+    1401,
+    6303,
+    2337,
+    279,
+    1899,
+    714,
+    2518,
+    518,
+    42739,
+    30,
+    154828,
+    154841
+   ],
+   "files_sha256": {
+    "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    "chat_template.jinja": "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5"
+   },
+   "decode_text": "Sunlight scatters off air molecules, and blue light scatters more",
+   "decode_token_ids": [
+    29975,
+    4145,
+    1136,
+    10170,
+    1007,
+    3720,
+    34445,
+    11
+   ]
+  },
+  "chain_layers": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "record_layers": [
+   0,
+   3,
+   4
+  ],
+  "dtype_policy": "native",
+  "weights_sha256": "dc52aa8e8809ce0c87d12464f683c4326b5bb40cc1a820d5d98dd08587112178"
+ },
+ "notes": {
+  "dtype_policy": "native: the dtypes from_pretrained gives this checkpoint on a CPU (FP8 dequantised to BF16 by Fp8Dequantize; BF16 parameters and activations, including the short conv; F32 checkpoint tensors kept F32: A_log, dt_bias, mHC base and scale, router correction bias). Internal FP32 upcasts are the reference's own.",
+  "inputs": "each layer is fed its FP32 golden in_streams cast to BF16, with a fresh cache",
+  "conv_rounding": "the reference's short conv is the unfused PyTorch fallback: natively (BF16 weights and inputs) F.conv1d rounds its output to BF16, then SiLU rounds again. A fused conv + SiLU that rounds once differs from it by about 1 BF16 ulp on a fifth of the outputs (native notes.diff_vs_fp32: LNN.conv_fused_vs_reference). The FP32 goldens run the same code in FP32",
+  "layout": "LNN.<name>: prompt rows then decode rows; state_heads use heads [0, 21, 42, 63]",
+  "diff_vs_fp32": {
+   "L00.conv_fused_vs_reference": {
+    "outputs_differing": 0.2259,
+    "outputs_1_ulp": 0.2259,
+    "max_ulps": 3
+   },
+   "L00.out_streams": {
+    "max_abs": 0.000951171,
+    "rel_rms": 0.00578557
+   },
+   "L00.mlp_out": {
+    "max_abs": 0.000638204,
+    "rel_rms": 0.0102104
+   },
+   "L03.out_streams": {
+    "max_abs": 0.144048,
+    "rel_rms": 0.00554772
+   },
+   "L03.mlp_out": {
+    "max_abs": 0.237236,
+    "rel_rms": 0.0060709
+   },
+   "L03.router_rows_identical": "36/41",
+   "L04.conv_fused_vs_reference": {
+    "outputs_differing": 0.2435,
+    "outputs_1_ulp": 0.2435,
+    "max_ulps": 1
+   },
+   "L04.out_streams": {
+    "max_abs": 0.163391,
+    "rel_rms": 0.00314789
+   },
+   "L04.mlp_out": {
+    "max_abs": 0.0833149,
+    "rel_rms": 0.0381659
+   },
+   "L04.router_rows_identical": "39/41",
+   "head.logits": {
+    "max_abs": 0.0433378,
+    "rel_rms": 0.00350857
+   },
+   "head.argmax_identical": "9/9"
+  }
+ },
+ "tensors": {
+  "L00.prefill.kda.state_heads": {
+   "file": "L00.prefill.kda.state_heads.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    128,
+    128
+   ],
+   "sha256": "406d537f35cb14e8f7b5ea9fe54776fc2df3110754c344ce62ececb8971e841d",
+   "desc": "KDA state after the prompt, heads [0, 21, 42, 63], FP32 (native run)"
+  },
+  "L00.decode.kda.state_heads": {
+   "file": "L00.decode.kda.state_heads.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    128,
+    128
+   ],
+   "sha256": "43deeff0905ff2f4f7d3652dd689275b977f3b4765a75cf9753f6e8b40175c78",
+   "desc": "KDA state after the last decode step, heads [0, 21, 42, 63], FP32 (native run)"
+  },
+  "L00.out_streams": {
+   "file": "L00.out_streams.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4,
+    4096
+   ],
+   "sha256": "25327599ad525102dc4e146d2d2ed08a584313577c9eb74c0037c63ba571e65d",
+   "desc": "native run: decoder layer output: the 4 mHC residual streams (prompt rows, then decode rows)"
+  },
+  "L00.attn_out": {
+   "file": "L00.attn_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "a5d5dadcac563a660ce0317e6cb92c23122fbd988b99df6c224dbcd7ba222d0f",
+   "desc": "native run: attention block output after o_proj (prompt rows, then decode rows)"
+  },
+  "L00.mlp_out": {
+   "file": "L00.mlp_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "ec735e57384da60804905e805d78d33a42073622c371731c2d138825800669ab",
+   "desc": "native run: MLP or MoE block output (routed + shared for MoE) (prompt rows, then decode rows)"
+  },
+  "L00.kda.qkv_preconv": {
+   "file": "L00.kda.qkv_preconv.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    24576
+   ],
+   "sha256": "19182ea5a3347f0fa9e2b139f372ede86b71e546db5da4d5cb71b0255e01fff5",
+   "desc": "native run: KDA q|k|v projections before the short convolution, concatenated [tokens, 3*heads*dim] (prompt rows, then decode rows)"
+  },
+  "L00.kda.f_proj": {
+   "file": "L00.kda.f_proj.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "9d2f90d403b803547a3b688760ae402874386d0c323f9f17e432eef79762498a",
+   "desc": "native run: forget-gate projection f_b_proj(f_a_proj(x)), before dt_bias [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L00.kda.b_logits": {
+   "file": "L00.kda.b_logits.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64
+   ],
+   "sha256": "8c87720327b177acc3325cd76cb8004bef3376737eace28a5989900c8f3faf9b",
+   "desc": "native run: b_proj(x), before the sigmoid that gives beta [tokens, heads] (prompt rows, then decode rows)"
+  },
+  "L00.kda.gate": {
+   "file": "L00.kda.gate.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "9aec36cf56309dae988e3ee2b21a385810640c3525de66d0a60f8981c6266bb3",
+   "desc": "native run: output gate g_b_proj(g_a_proj(x)) for the gated RMSNorm, before sigmoid [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L00.kda.q": {
+   "file": "L00.kda.q.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "e75bf1967a57e01a97f709f111e78d7d3dc6a2604582596ce4f110ffdb6fca43",
+   "desc": "native run: KDA query after short conv + SiLU, before the L2 norm [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L00.kda.k": {
+   "file": "L00.kda.k.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "8a7b84426b5ed7071e6707ad9124984def45113a89199a81ee1fe69225b3bad6",
+   "desc": "native run: KDA key after short conv + SiLU, before the L2 norm (prompt rows, then decode rows)"
+  },
+  "L00.kda.v": {
+   "file": "L00.kda.v.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "16172c2e4ea0de6832a5574db9efe6f75316af33f6bc3366cac527fd97854e86",
+   "desc": "native run: KDA value after short conv + SiLU (prompt rows, then decode rows)"
+  },
+  "L00.kda.g": {
+   "file": "L00.kda.g.bin",
+   "dtype": "f32",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "71855a54e94c4762048a9440761fdccdf2bb5ca2243888ed629c00a5c527b950",
+   "desc": "native run: KDA forget gate (log decay per channel): -5*sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)) (prompt rows, then decode rows)"
+  },
+  "L00.kda.beta": {
+   "file": "L00.kda.beta.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64
+   ],
+   "sha256": "ce78b81d1fa82644d074ce5e00b46eb51276753781e67e62aac659b2f642b1e5",
+   "desc": "native run: KDA beta = sigmoid(b_proj(x)) [tokens, heads] (prompt rows, then decode rows)"
+  },
+  "L00.kda.core_out": {
+   "file": "L00.kda.core_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "80d8d0a511a3e32b0440455b9fed0be4c864fc9ce10b065ff40b17a728f9443b",
+   "desc": "native run: KDA recurrence output before the gated RMSNorm [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L03.out_streams": {
+   "file": "L03.out_streams.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4,
+    4096
+   ],
+   "sha256": "62d9eca366a727eb982c33c1435c459a21bc73ba7b0160139c03e6e2b0997fc4",
+   "desc": "native run: decoder layer output: the 4 mHC residual streams (prompt rows, then decode rows)"
+  },
+  "L03.attn_out": {
+   "file": "L03.attn_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "1390e5ebec9605c9ff56d5ab257fe5907bb3b77d1c8db095e30bc11f559e54e1",
+   "desc": "native run: attention block output after o_proj (prompt rows, then decode rows)"
+  },
+  "L03.mlp_out": {
+   "file": "L03.mlp_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "19d354247456b68665d3c448bfe820e7ebe49b0f271b19aa4519ece58d514615",
+   "desc": "native run: MLP or MoE block output (routed + shared for MoE) (prompt rows, then decode rows)"
+  },
+  "L03.idx.topk": {
+   "file": "L03.idx.topk.bin",
+   "dtype": "i32",
+   "shape": [
+    41,
+    2051
+   ],
+   "sha256": "40ee61852291dc1c04700ac8bff62df0536083b851052c5320da91e53208be61",
+   "desc": "native run: selected raw token indices: selected pools' tokens in score order, then the visible tail (<=3), then -1 padding (prompt rows, then decode rows)"
+  },
+  "L03.mla.latent": {
+   "file": "L03.mla.latent.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    512
+   ],
+   "sha256": "258c583bcb1455fd064b17929b1ef9d63ba30f96a3ab45e5572dad7c52db34b9",
+   "desc": "native run: kv_a_layernorm output: the 512-dim MLA latent that the KV cache holds per token (prompt rows, then decode rows)"
+  },
+  "L03.moe.topk_ids_sorted": {
+   "file": "L03.moe.topk_ids_sorted.bin",
+   "dtype": "i32",
+   "shape": [
+    41,
+    8
+   ],
+   "sha256": "523962aba7ece976ca08932fc9a4091e569d64c2e6771ae4b8babc412eb4791c",
+   "desc": "native run: router top-8 expert ids sorted ascending (prompt rows, then decode rows)"
+  },
+  "L03.moe.topk_weights_sorted": {
+   "file": "L03.moe.topk_weights_sorted.bin",
+   "dtype": "f32",
+   "shape": [
+    41,
+    8
+   ],
+   "sha256": "3698e68020d763f69fb5d90064ea3c67455546bf010781c38eb14521c15444bc",
+   "desc": "native run: router weights in the order of topk_ids_sorted (prompt rows, then decode rows)"
+  },
+  "L03.moe.routed_out": {
+   "file": "L03.moe.routed_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "7df6d055de3d513112c98cd663fecf885549e2a7c54f9112060ea3a9174ac911",
+   "desc": "native run: sum over the 8 routed experts of weight * expert(x) (reference accumulation order: by expert id) (prompt rows, then decode rows)"
+  },
+  "L04.prefill.kda.state_heads": {
+   "file": "L04.prefill.kda.state_heads.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    128,
+    128
+   ],
+   "sha256": "d7865a0b7f3e5b02979da4bc05cb0af83fce287bcd3e9746972fa124a46c45a9",
+   "desc": "KDA state after the prompt, heads [0, 21, 42, 63], FP32 (native run)"
+  },
+  "L04.decode.kda.state_heads": {
+   "file": "L04.decode.kda.state_heads.bin",
+   "dtype": "f32",
+   "shape": [
+    4,
+    128,
+    128
+   ],
+   "sha256": "e6d39675c2bd80f583fa74ee60a515753401cda5f68d57821eb70ac638a3f183",
+   "desc": "KDA state after the last decode step, heads [0, 21, 42, 63], FP32 (native run)"
+  },
+  "L04.out_streams": {
+   "file": "L04.out_streams.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4,
+    4096
+   ],
+   "sha256": "c9a4c4f92dfb249186ed5da4bbd74acb6b432a2004cd4725c5b94e34962e6772",
+   "desc": "native run: decoder layer output: the 4 mHC residual streams (prompt rows, then decode rows)"
+  },
+  "L04.attn_out": {
+   "file": "L04.attn_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "8fbf2ee2b9c68bb18751097c941f1a918054d802a9f3a6cf3230e4e6d3a1066f",
+   "desc": "native run: attention block output after o_proj (prompt rows, then decode rows)"
+  },
+  "L04.mlp_out": {
+   "file": "L04.mlp_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "775cfcdba2cacf5f649fb5cdc9a7b9f57d47ce9bf213a03b92c5f53f1659c1fe",
+   "desc": "native run: MLP or MoE block output (routed + shared for MoE) (prompt rows, then decode rows)"
+  },
+  "L04.kda.qkv_preconv": {
+   "file": "L04.kda.qkv_preconv.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    24576
+   ],
+   "sha256": "b2f7209ed74b2c1d60bf0ae1f1e4f037a7969ee40c3825d05938eb289caf420b",
+   "desc": "native run: KDA q|k|v projections before the short convolution, concatenated [tokens, 3*heads*dim] (prompt rows, then decode rows)"
+  },
+  "L04.kda.f_proj": {
+   "file": "L04.kda.f_proj.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "3613f760d762aab392040b1a36818f5f2d8253473eb1be8a2d016a88c32444f7",
+   "desc": "native run: forget-gate projection f_b_proj(f_a_proj(x)), before dt_bias [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L04.kda.b_logits": {
+   "file": "L04.kda.b_logits.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64
+   ],
+   "sha256": "f2c19d6dccc1ca568a9542dc302636a5d7666c885b140f0e0ba3618536e322ff",
+   "desc": "native run: b_proj(x), before the sigmoid that gives beta [tokens, heads] (prompt rows, then decode rows)"
+  },
+  "L04.kda.gate": {
+   "file": "L04.kda.gate.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "7911f00b600a7cf10ae035d721bd5efed031f86a5bd736eabfbee5f030d32c47",
+   "desc": "native run: output gate g_b_proj(g_a_proj(x)) for the gated RMSNorm, before sigmoid [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L04.kda.q": {
+   "file": "L04.kda.q.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "da5cd2de6a958953756ebc22ff298353e6aa4ad1a1b47e5574fc29ef5454122a",
+   "desc": "native run: KDA query after short conv + SiLU, before the L2 norm [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L04.kda.k": {
+   "file": "L04.kda.k.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "25041351f29fd4601b6f1a7a50fcc35ec48d91941e51128968183037f7d1bd64",
+   "desc": "native run: KDA key after short conv + SiLU, before the L2 norm (prompt rows, then decode rows)"
+  },
+  "L04.kda.v": {
+   "file": "L04.kda.v.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "a85c956a319dd744f37f48595fa3dc67c9ed0dbb91e10ec56a1b21b9d65de47c",
+   "desc": "native run: KDA value after short conv + SiLU (prompt rows, then decode rows)"
+  },
+  "L04.kda.g": {
+   "file": "L04.kda.g.bin",
+   "dtype": "f32",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "afe44ddff1ca6d1058351f6266d2a823a8a2965dd04ebe4e8e627b7907e1dca9",
+   "desc": "native run: KDA forget gate (log decay per channel): -5*sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)) (prompt rows, then decode rows)"
+  },
+  "L04.kda.beta": {
+   "file": "L04.kda.beta.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64
+   ],
+   "sha256": "f2f28e8072d27c6f799650154de92365fddfbea31fac140e8c0aa65ec40f22d5",
+   "desc": "native run: KDA beta = sigmoid(b_proj(x)) [tokens, heads] (prompt rows, then decode rows)"
+  },
+  "L04.kda.core_out": {
+   "file": "L04.kda.core_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    64,
+    128
+   ],
+   "sha256": "b1645fcc3528825fc8949d89c10c97d64924bcd6da6f9f4911d52dde3ecf4c6a",
+   "desc": "native run: KDA recurrence output before the gated RMSNorm [tokens, heads, dim] (prompt rows, then decode rows)"
+  },
+  "L04.moe.topk_ids_sorted": {
+   "file": "L04.moe.topk_ids_sorted.bin",
+   "dtype": "i32",
+   "shape": [
+    41,
+    8
+   ],
+   "sha256": "270f889dc8da22ed0c7e08756f0a7206a073f1534cae28fb56e5a510a1fca48b",
+   "desc": "native run: router top-8 expert ids sorted ascending (prompt rows, then decode rows)"
+  },
+  "L04.moe.topk_weights_sorted": {
+   "file": "L04.moe.topk_weights_sorted.bin",
+   "dtype": "f32",
+   "shape": [
+    41,
+    8
+   ],
+   "sha256": "973c7565b22478495ae104c65caef626b7379b9fdd9c545b78bb6ca9981dc1fb",
+   "desc": "native run: router weights in the order of topk_ids_sorted (prompt rows, then decode rows)"
+  },
+  "L04.moe.routed_out": {
+   "file": "L04.moe.routed_out.bin",
+   "dtype": "bf16",
+   "shape": [
+    41,
+    4096
+   ],
+   "sha256": "7d984fb8e8f85d1a1747b52d7ca32a0a186cae63e7ea622c3b7c197d70a51322",
+   "desc": "native run: sum over the 8 routed experts of weight * expert(x) (reference accumulation order: by expert id) (prompt rows, then decode rows)"
+  },
+  "head.logits": {
+   "file": "head.logits.bin",
+   "dtype": "bf16",
+   "shape": [
+    9,
+    154880
+   ],
+   "sha256": "69eb335ea31a0e893b9b1b7cc357d138d4829bbb83e90c6f699cdc9471e3bd0d",
+   "desc": "native run: LM head on the FP32 head.in_streams cast to BF16 [rows, vocab]"
+  }
+ }
+}
