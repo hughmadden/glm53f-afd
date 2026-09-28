@@ -1,0 +1,46 @@
+# glm53f-coordinator: the coordinator's serving shell, the model-agnostic half.
+#
+# The scheduler and slot pool (16 slots; admission sized to prompt plus output
+# allowance; requests that do not fit wait; segmented prefill interleaved with
+# batched decode; speculative verify windows), a radix prefix index, the
+# prompt-end and turn-end snapshot points, the host RAM tier, the GPU sampler
+# (DS41RT v15's sampling contract, per-row grammar masks), the bounded request
+# queue and the `glm53f_api::Engine` implementation, and the expert wire client.
+# The model plugs in through two traits, `KvSlot` and `ModelForward`
+# (src/model.rs).
+#
+# Ported from mimo26f-afd v1.2.0 `crates/mimo26-coordinator` (PROVENANCE.md).
+#
+#   cargo test -p glm53f-coordinator                   CPU only: no CUDA toolkit needed
+#   cargo test -p glm53f-coordinator --features cuda   plus the sampler, mask and wire kernels
+#
+# No external Rust crates.
+[package]
+name = "glm53f-coordinator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Coordinator serving shell: scheduler, slot pool, radix prefix index, host RAM tier, GPU sampler, bounded queue, API engine and expert wire client, behind the KvSlot and ModelForward traits"
+publish = false
+
+[lib]
+name = "glm53f_coordinator"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile and link the sampler, mask and wire kernels (build.rs; needs nvcc, and a GPU to
+# run them). Off by default, so `cargo test` needs no CUDA toolkit.
+cuda = []
+# Build the RDMA RC transport's native shim (libibverbs) for the wire client.
+rdma = ["glm53f-rdma/rdma"]
+
+[dependencies]
+glm53f-api = { path = "../glm53f-api" }
+glm53f-rdma = { path = "../glm53f-rdma" }
+glm53f-tokenizer = { path = "../glm53f-tokenizer" }
+glm53f-wire = { path = "../glm53f-wire" }
+
+[[example]]
+name = "sample_check"
+required-features = ["cuda"]
