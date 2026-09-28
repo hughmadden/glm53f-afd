@@ -1,9 +1,10 @@
 # Expected performance
 
-**Status: model, not measurement (28 September 2026).** Every figure below is
-derived from published or measured numbers of related engines on the same class
-of hardware. Each derivation is shown so it can be checked and replaced as real
-receipts arrive. Layout and format letters refer to [SIZING.md](SIZING.md).
+**Status: model, with the first measurements (28 September 2026).** The Spark
+expert kernel has been measured on GB10 (§1, §2, §3, §5, §6). Every other figure
+is still derived from published or measured numbers of related engines on the
+same class of hardware. Each derivation is shown so it can be checked and
+replaced as real receipts arrive. Layout and format letters refer to [SIZING.md](SIZING.md).
 
 ## 1. Anchors
 
@@ -13,6 +14,7 @@ receipts arrive. Layout and format letters refer to [SIZING.md](SIZING.md).
 | MiMo plain decode (no drafter) | about 24.5 ms per token over 47 MoE layers | the same engine, measured |
 | DS41RT one-row expert phase per layer | 328 µs, of which 157 µs is the kernel | [tpurtell/ds41rt](https://github.com/tpurtell/ds41rt) `docs/ds41-expert-boundary-breakdown.md` |
 | EXL3 K4 expert slice on GB10 | 20.5 µs marginal per 4.72 MB TP4 slice, about 230 GB/s | [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) v9 route-cost profile |
+| **This engine's rank kernel on GB10 (measured)** | One MoE layer on one rank: 1 row 0.145 ms (175 GB/s; about 26 µs of it is fixed: plan, epilogue, reduce); 8 rows over about 58 distinct experts 0.87 ms (215 GB/s); 4,096 rows 16.9 ms (243K rows/s) | `crates/glm53f-rank/examples/exl3_bench.rs --sweep`, default tiling, real layer slices |
 | DFlash2 on GLM-5.3 (the full model) | code replay 5.78 tokens per target cycle; 67.9% acceptance on an 8-type mix | glmrt v9 README |
 | GLM-5.3-Flash on 2 × RTX PRO 6000 (vLLM, EXL3 4 bpw + DFlash2, no Sparks) | C1 reasoning coding 140.9 tok/s; 128K prefill 4,984 tok/s; 1M six-needle retrieval 6/6 | [glm-5.3-flash-ext3-2x-rtx](https://github.com/tpurtell/glm-5.3-flash-ext3-2x-rtx) v0.8.0 |
 
@@ -25,31 +27,39 @@ coordinator: KDA projections in BF16, and 4 mHC streams.
 
 | Term | Derivation | Layout B, EXL3 K4 | Layout C (FP8 KDA) |
 |---|---|---:|---:|
-| Spark expert reads | 42 layers × 8 slices × 3.17 MB at 230 GB/s | 4.6 ms | 4.6 ms |
+| Spark expert kernel | 42 layers × 0.145 ms, **measured** on GB10 at one row. It includes the kernel's own fixed phases, about 26 µs per layer. (The model said 4.6 ms: 8 slices × 3.17 MB at 230 GB/s.) | 6.1 ms | 6.1 ms |
 | Coordinator weight reads | 13.96 GB (B) or 9.28 GB (C) at 85–90% of 1.79 TB/s | 8.7–9.2 ms | 5.8–6.1 ms |
-| Fixed cost per MoE layer | 0.20–0.27 ms × 42. Covers exchange, Spark fixed cost and per-layer launches. The range spans DS41RT to MiMo. | 8.4–11.3 ms | 8.4–11.3 ms |
+| Fixed cost per MoE layer | 0.20–0.27 ms × 42. Covers exchange, Spark fixed cost and per-layer launches. The range spans DS41RT to MiMo. Up to 26 µs per layer of it is now inside the kernel row, so the cycle subtracts 0–1.1 ms. | 8.4–11.3 ms | 8.4–11.3 ms |
 | KDA state, indexer, mHC | 0.3 GB of FP32 state per step; top-512 over n/4 pools; 90 mHC boundaries | 1.0–1.5 ms | 1.0–1.5 ms |
-| **M1 cycle** | | **22.7–26.6 ms** | **19.8–23.5 ms** |
-| **Target-only decode** | | **38–44 tok/s** | **43–51 tok/s** |
+| **M1 cycle** | | **23.1–28.1 ms** | **20.2–25.0 ms** |
+| **Target-only decode** | | **36–43 tok/s** | **40–49 tok/s** |
 
-NVFP4 experts add about 0.6 ms per cycle; FP8 experts add about 4.6 ms.
+- The one-row kernel misses its 200 GB/s target. Fusing its fixed phases is the
+  next kernel change.
+- NVFP4 experts would add about 0.6 ms per cycle and FP8 experts about 4.6 ms
+  (modelled at 230 GB/s, not measured).
 
 ## 3. Decode with DFlash2 (block of 8)
 
 - **Extra experts per verify row.** Each row routes to new experts. Scaled from
   GLM-5.3's measured unique-expert counts, 8 rows touch about 40 distinct experts
   per layer, against 8 for one row.
-- **Cost of 8 rows.** The extra experts cost (40 − 8) × 42 × 13.7 µs ≈ 18 ms on
-  the Sparks. Add about 1 ms of coordinator row work and 1.5–2.5 ms for the draft
-  pass (2.18 GiB of BF16 weights).
-- **Round length (layout B).** About 43–48 ms at 8 rows, 37–43 ms at 6 rows and
-  32–38 ms at 4 rows.
+- **Cost of 8 rows.** Measured on GB10, 8 rows over about 58 distinct experts
+  take 0.87 ms per layer, about 14.6 µs per expert beyond the fixed phases. At the
+  expected 40 experts that is about 0.60 ms per layer: 0.46 ms more than one row,
+  or about 19 ms per round over 42 layers (the model said 18 ms). Add about 1 ms of
+  coordinator row work and 1.5–2.5 ms for the draft pass (2.18 GiB of BF16
+  weights).
+- **Round length (layout B).** About 45–51 ms at 8 rows, 38–45 ms at 6 rows and
+  33–40 ms at 4 rows. These were 43–48, 37–43 and 32–38 ms before the kernel was
+  measured: each round gains the one-row cycle's 0.4–1.5 ms, and its extra experts
+  cost 6.6% more (14.6 µs each measured, against 13.7 µs modelled).
 
 | Workload | Tokens per round | Round | Expected C1 |
 |---|---:|---:|---:|
-| Code (high acceptance) | 5.5–5.8 | 43–48 ms | **115–135 tok/s** |
-| Weighted mix (code, maths, prose, JSON, short answers) | about 3.3 | 34–38 ms | **80–110 tok/s** |
-| Low-entropy text (counting, templated output) | about 6.5 | 43–48 ms | **135–150 tok/s** |
+| Code (high acceptance) | 5.5–5.8 | 45–51 ms | **110–130 tok/s** |
+| Weighted mix (code, maths, prose, JSON, short answers) | about 3.3 | 35–40 ms | **75–105 tok/s** |
+| Low-entropy text (counting, templated output) | about 6.5 | 45–51 ms | **125–145 tok/s** |
 
 - **Layout C** (FP8 KDA) adds about 5–8% to every row.
 - **Sampled requests** (temperature > 0) use the same drafter with sample-and-match
@@ -78,7 +88,7 @@ two lanes, so it runs at the slower side's rate.
 
 | Side | Work per token | Rate if it were the limit |
 |---|---|---|
-| **Sparks** | 42 × 8 × 25.2 M = 8.46 G MAC, 0.89× MiMo | MiMo's rate ÷ 0.89: about **5.4–5.8K tok/s** at 8K–32K |
+| **Sparks** | 42 × 8 × 25.2 M = 8.46 G MAC, 0.89× MiMo | MiMo's rate ÷ 0.89: about **5.4–5.8K tok/s** at 8K–32K. **Measured** kernel: 4,096 rows per layer in 16.9 ms on one rank (243K rows/s), so 42 layers bound a 4,096-token chunk at about 5.8K tok/s before any exchange cost |
 | **Coordinator, projections** | about 6.8 G MAC (13.6 GFLOP), most of it BF16 KDA | **7–14K tok/s** |
 
 **Context-dependent coordinator work** comes on top of the projections:
@@ -112,6 +122,10 @@ one port drop packets.
 ## 6. Start-up
 
 - **Sparks:** each rank loads its 38–43 GB expert quarter from local NVMe in parallel.
+  **Measured** for EXL3 K4 (38.39 GB per rank), with the images in the page cache:
+  44–49 s per rank from start to listening. That is the boot readback (size and
+  SHA-256 of 42 layer images, about 17–19 s) plus device preparation (26–31 s). A
+  cold read from NVMe adds its read time.
 - **Coordinator:** loads about 14 GB.
 - **Graphs:** captured lazily, per shape.
 - **Expected time to ready: 30–60 s.**
