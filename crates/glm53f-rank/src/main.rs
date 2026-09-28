@@ -2,7 +2,7 @@
 //! mimo26f-afd v1.2.0 `crates/mimo26-spark/src/main.rs`).
 //!
 //! ```text
-//! glm53f-rank serve  --rank R --dir DIR [--listen ADDR] [--lazy] [--allow-partial]
+//! glm53f-rank serve  --rank R --dir DIR [--listen ADDR] [--peers A0,A1,A2,A3] [--peer-timeout-ms MS] [--lazy] [--allow-partial]
 //! glm53f-rank slice  --checkpoint CKPT --rank R --out DIR [--layers 3-44] [--mtp] [--source TEXT]
 //! glm53f-rank verify --rank R --dir DIR [--allow-partial]
 //! ```
@@ -19,16 +19,24 @@
 //!    (`glm53f_rdma::fabric_port`), and serves `DS41RTE3` v3 request frames
 //!    with the L4 ladder: over RDMA the rows are read where the NIC landed
 //!    them and the BF16 return is written into the registered send buffer;
-//!    over TCP the frames are owned buffers.
+//!    over TCP the frames are owned buffers;
+//! 5. with `--peers` (the four ranks' peer-mesh addresses in rank order,
+//!    `GLM53F_RANK_PEERS`), joins the peer mesh ([`glm53f_rank::mesh`]) and
+//!    serves reduce-scattered requests (`DS41RTE3` v4): the partial is kept in
+//!    FP32, each peer gets its rows, and only this rank's partition returns,
+//!    summed. An exchange that misses a peer for `--peer-timeout-ms`
+//!    (`GLM53F_RANK_PEER_TIMEOUT_MS`, 10,000 by default) fails the request.
+//!    `GLM53F_RDMA=1` opens the links this rank dials as RDMA RC.
 //!
 //! `slice` cuts rank R's share of an EXL3 checkpoint into DIR (one image per
 //! layer and a manifest). `verify` runs the boot readback alone.
 //!
-//! Environment: `GLM53F_RANK_TRACE=1` (a line per request), `GLM53F_TIMELINE=1`
-//! (cross-host timeline events), `GLM53F_RANK_DUMP_FRAME=<path>` with
-//! `GLM53F_RANK_DUMP_LAYER=<id>` (default 3): write the first request frame of
-//! that layer to `<path>` for offline replay. `GLM53F_WIRE_ALLOW_LAN=1` admits
-//! connections off the RDMA fabric (tests only).
+//! Environment: `GLM53F_RANK_TRACE=1` (a line per request, and one per
+//! reduce-scattered exchange), `GLM53F_TIMELINE=1` (cross-host timeline
+//! events), `GLM53F_RANK_DUMP_FRAME=<path>` with `GLM53F_RANK_DUMP_LAYER=<id>`
+//! (default 3): write the first request frame of that layer to `<path>` for
+//! offline replay. `GLM53F_WIRE_ALLOW_LAN=1` admits connections off the RDMA
+//! fabric (tests only), from the coordinator and from peers.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -37,17 +45,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glm53f_rank::consts::{is_moe_layer, FIRST_MOE_LAYER, HIDDEN, LAST_MOE_LAYER, MTP_LAYER, RANK_WIDTH, WORLD};
 use glm53f_rank::kernel::ExpertKernel;
 use glm53f_rank::manifest::Expect;
+use glm53f_rank::mesh::{self, Mesh, MeshConfig};
 use glm53f_rank::resident::{write_rank_dir, Resident};
-use glm53f_rank::serve::{return_meta_view, serve_view, Layers, Timings};
+use glm53f_rank::serve::{return_meta_view, serve_view, serve_view_f32, Layers, Timings};
 use glm53f_rank::transport::{ByteTransport, RdmaTransport, TcpTransport};
 use glm53f_rank::{boot, timeline};
-use glm53f_wire::frame::{RequestView, ReturnFrame, ReturnRow};
+use glm53f_wire::frame::{RequestView, ReturnFrame, ReturnRow, FLAG_RETURN_REQUIRED, FLAG_ROW_SLICE};
 use glm53f_wire::l4::{StreamReceiver, StreamSender};
 use glm53f_wire::layout::Status;
 use glm53f_wire::WireNaive;
 
 const USAGE: &str = "usage:
-  glm53f-rank serve  --rank <0..3> --dir <rank-dir> [--listen <addr:port>] [--lazy] [--allow-partial]
+  glm53f-rank serve  --rank <0..3> --dir <rank-dir> [--listen <addr:port>] [--peers <a0,a1,a2,a3>] [--peer-timeout-ms <ms>] [--lazy] [--allow-partial]
   glm53f-rank slice  --checkpoint <exl3-checkpoint-dir> --rank <0..3> --out <rank-dir> [--layers 3-44] [--mtp] [--source <text>]
   glm53f-rank verify --rank <0..3> --dir <rank-dir> [--allow-partial]";
 
@@ -62,6 +71,9 @@ struct Args {
     out: Option<PathBuf>,
     layers: Vec<u32>,
     source: String,
+    /// The peer mesh, from `--peers` and `--peer-timeout-ms` or their
+    /// environment fallbacks.
+    mesh: Option<MeshConfig>,
 }
 
 fn parse_layers(s: &str) -> Result<Vec<u32>, String> {
@@ -94,14 +106,19 @@ fn parse_args() -> Result<Args, String> {
         out: None,
         layers: (FIRST_MOE_LAYER..=LAST_MOE_LAYER).collect(),
         source: "unspecified".into(),
+        mesh: None,
     };
     let mut mtp = false;
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let (mut peers, mut peer_timeout) = (env("GLM53F_RANK_PEERS"), env("GLM53F_RANK_PEER_TIMEOUT_MS"));
     while let Some(k) = it.next() {
         let mut val = || it.next().ok_or(format!("{k} needs a value"));
         match k.as_str() {
             "--rank" => a.rank = val()?.parse().map_err(|_| "bad --rank")?,
             "--dir" => a.dir = Some(PathBuf::from(val()?)),
             "--listen" => a.listen = val()?,
+            "--peers" => peers = Some(val()?),
+            "--peer-timeout-ms" => peer_timeout = Some(val()?),
             "--lazy" => a.lazy = true,
             "--allow-partial" => a.expect.all_layers = false,
             "--checkpoint" => a.checkpoint = Some(PathBuf::from(val()?)),
@@ -114,6 +131,13 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.rank >= WORLD {
         return Err(format!("--rank must be 0..{WORLD}"));
+    }
+    if let Some(p) = peers {
+        let timeout = match peer_timeout {
+            Some(t) => std::time::Duration::from_millis(t.parse().map_err(|_| format!("bad --peer-timeout-ms {t}"))?),
+            None => mesh::DEFAULT_TIMEOUT,
+        };
+        a.mesh = Some(MeshConfig::new(a.rank, &p, timeout, env("GLM53F_RDMA").as_deref() == Some("1"))?);
     }
     if mtp && !a.layers.contains(&MTP_LAYER) {
         a.layers.push(MTP_LAYER);
@@ -233,6 +257,19 @@ struct Rank<K: ExpertKernel> {
     kernel: K,
     layers: Layers<K::Layer>,
     resident: Resident,
+    /// A reduce-scattered request's FP32 partial [rows, 4096] (grow-only).
+    partial: Vec<f32>,
+}
+
+/// The BF16 rows of a return frame assembled in place: `frame` after its
+/// 128-byte header, `rows` x 8,192 bytes, 2-byte aligned.
+fn bf16_rows(frame: &mut [u8], rows: usize) -> Result<&mut [u16], String> {
+    let body = &mut frame[glm53f_wire::HEADER_LEN..];
+    if body.len() != rows * HIDDEN * 2 || !(body.as_ptr() as usize).is_multiple_of(2) {
+        return Err("return buffer is not rows x 8,192 aligned bytes".into());
+    }
+    // SAFETY: exact length and 2-byte alignment checked above.
+    Ok(unsafe { std::slice::from_raw_parts_mut(body.as_mut_ptr() as *mut u16, rows * HIDDEN) })
 }
 
 impl<K: ExpertKernel> Rank<K> {
@@ -250,15 +287,20 @@ impl<K: ExpertKernel> Rank<K> {
 
     /// Serve `view` into `frame` (header space, then `rows` BF16 rows).
     fn compute_into(&mut self, view: &RequestView<'_>, frame: &mut [u8], timings: &mut Timings) -> Result<(), String> {
-        let rows = view.rows;
-        let body = &mut frame[glm53f_wire::HEADER_LEN..];
-        if body.len() != rows * HIDDEN * 2 || !(body.as_ptr() as usize).is_multiple_of(2) {
-            return Err("return buffer is not rows x 8,192 aligned bytes".into());
-        }
-        // SAFETY: exact length and 2-byte alignment checked above.
-        let body16 = unsafe { std::slice::from_raw_parts_mut(body.as_mut_ptr() as *mut u16, rows * HIDDEN) };
+        let body16 = bf16_rows(frame, view.rows)?;
         let layer = self.layers.get(view.layer_id).ok_or_else(|| format!("layer {} is not prepared", view.layer_id))?;
         serve_view(view, &mut self.kernel, layer, timings, body16).map(|_| ())
+    }
+
+    /// Serve a reduce-scattered `view` into [`Rank::partial`]: all its rows,
+    /// in FP32, before the ranks add them.
+    fn compute_f32(&mut self, view: &RequestView<'_>, timings: &mut Timings) -> Result<(), String> {
+        let n = view.rows * HIDDEN;
+        if self.partial.len() < n {
+            self.partial.resize(n, 0.0);
+        }
+        let layer = self.layers.get(view.layer_id).ok_or_else(|| format!("layer {} is not prepared", view.layer_id))?;
+        serve_view_f32(view, &mut self.kernel, layer, timings, &mut self.partial[..n]).map(|_| ())
     }
 }
 
@@ -290,7 +332,7 @@ impl Drop for RingRegistration {
 }
 
 fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
-    let mut rank = Rank { kernel, layers: Layers::default(), resident };
+    let mut rank = Rank { kernel, layers: Layers::default(), resident, partial: Vec::new() };
     let with_mtp = rank.resident.files.contains_key(&MTP_LAYER);
     if !a.lazy {
         let t = Instant::now();
@@ -302,6 +344,26 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
         }
         println!("prepared {} layers in {:.1} s", rank.layers.len(), t.elapsed().as_secs_f64());
     }
+    // The peer mesh lives for the daemon's lifetime, across coordinator connections.
+    let mut mesh = match &a.mesh {
+        None => None,
+        Some(cfg) => match Mesh::start(cfg) {
+            Ok(m) => {
+                println!(
+                    "peer mesh: rank {} on {} ({}), exchange timeout {} ms",
+                    a.rank,
+                    m.local_addr(),
+                    if cfg.rdma { "dialling RDMA RC" } else { "TCP" },
+                    cfg.timeout.as_millis()
+                );
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 5;
+            }
+        },
+    };
     let listener = match std::net::TcpListener::bind(&a.listen) {
         Ok(l) => l,
         Err(e) => {
@@ -416,14 +478,31 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
                 }
             }
             let rows = view.rows;
-            let meta = return_meta_view(&view);
-            let len = glm53f_wire::HEADER_LEN + rows * glm53f_wire::RETURN_ROW_BYTES;
+            // A reduce-scattered request returns only this rank's partition, summed
+            // over the four ranks (version 4); any other returns every row.
+            let sharded = mesh::exchange_for(&view, a.rank);
+            let plain = return_meta_view(&view);
+            let (ret_rows, meta) = match sharded {
+                Some(x) => {
+                    let (first, count) = x.own();
+                    let slice = ReturnFrame { flags: FLAG_RETURN_REQUIRED | FLAG_ROW_SLICE, token_position: first as u64, ..plain.clone() };
+                    (count, slice)
+                }
+                None => (rows, plain.clone()),
+            };
+            let len = glm53f_wire::HEADER_LEN + ret_rows * glm53f_wire::RETURN_ROW_BYTES;
             let mut timings = Timings::default();
             // The return is assembled in place: in the transport's registered
             // send buffer (RDMA) or an owned frame (TCP).
             let mut owned_ret: Vec<u8> = Vec::new();
             let mut in_buffer = false;
             let computed = rank.ensure(layer).and_then(|load_ms| {
+                if sharded.is_some() {
+                    if mesh.is_none() {
+                        return Err("a reduce-scattered request, and this rank has no peer mesh (--peers)".into());
+                    }
+                    return rank.compute_f32(&view, &mut timings).map(|_| load_ms);
+                }
                 match transport.send_buffer() {
                     Some(b) if len > b.len() => Err(format!("return frame {len} B exceeds the send buffer")),
                     Some(b) => {
@@ -446,19 +525,45 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
                     break;
                 }
             }
+            // The reduce-scatter: the peers get their rows of the partial, and theirs of
+            // this rank's partition are summed with its own straight into the return.
+            let mut peer_times = None;
+            let computed = match (computed, sharded, mesh.as_mut()) {
+                (Ok(load_ms), Some(x), Some(m)) => {
+                    let frame = match transport.send_buffer() {
+                        Some(b) if len > b.len() => Err(format!("return frame {len} B exceeds the send buffer")),
+                        Some(b) => {
+                            in_buffer = true;
+                            Ok(&mut b[..len])
+                        }
+                        None => {
+                            owned_ret = vec![0u8; len];
+                            Ok(&mut owned_ret[..])
+                        }
+                    };
+                    frame
+                        .and_then(|f| bf16_rows(f, ret_rows))
+                        .and_then(|out| m.exchange(&x, &rank.partial[..rows * HIDDEN], out))
+                        .map(|t| {
+                            peer_times = Some(t);
+                            load_ms
+                        })
+                }
+                (c, _, _) => c,
+            };
             let load_ms = match computed {
                 Ok(ms) => ms,
                 Err(e) => {
                     // Fail the request, not the rank: an error return, then close
                     // this connection and keep listening.
                     eprintln!("serve layer {layer} failed: {e}");
-                    if let Ok(stamped) = tx.encode_return(&error_return_for(&meta, rows)) {
+                    if let Ok(stamped) = tx.encode_return(&error_return_for(&plain, rows)) {
                         let _ = transport.send(stamped);
                     }
                     break;
                 }
             };
-            let header = match glm53f_wire::frame::return_header_seq(&meta, rows, tx.take_seq(), naive) {
+            let header = match glm53f_wire::frame::return_header_seq(&meta, ret_rows, tx.take_seq(), naive) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("L4 header failed: {e}");
@@ -493,6 +598,16 @@ fn run<K: ExpertKernel>(a: &Args, resident: Resident, kernel: K) -> i32 {
                     "timing t={epoch_ms} layer={layer} rows={rows} recv={recv_ms:.3} load={load_ms:.3} plan={:.3} ffn={:.3} send={send_ms:.3} ms",
                     timings.plan_ms, timings.ffn_ms,
                 );
+                if let (Some(x), Some(t)) = (sharded, peer_times) {
+                    let (first, count) = x.own();
+                    eprintln!(
+                        "exchange t={epoch_ms} layer={layer} rows={rows} part={first}+{count} dtype={} send={:.3} wait={:.3} sum={:.3} return={send_ms:.3} ms",
+                        x.dtype.name(),
+                        t.send_ms,
+                        t.wait_ms,
+                        t.sum_ms
+                    );
+                }
             }
         }
     }

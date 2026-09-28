@@ -159,6 +159,31 @@ pub fn serve_view<K: ExpertKernel>(
     Ok(st)
 }
 
+/// [`serve_view`] with the rows left in FP32 (`out` [rows * 4096]): a
+/// reduce-scattered request's partial, before the ranks add it
+/// ([`ExpertKernel::ffn_f32`]).
+pub fn serve_view_f32<K: ExpertKernel>(
+    view: &RequestView<'_>,
+    kernel: &mut K,
+    layer: &K::Layer,
+    timings: &mut Timings,
+    out: &mut [f32],
+) -> Result<FfnStats, String> {
+    if view.row_stride != HIDDEN + SCALES_PER_ROW {
+        return Err(format!("serve: hidden row stride {} is not 4,096 E4M3 + 128 scales", view.row_stride));
+    }
+    let t = Instant::now();
+    let (ids, weights) = view_routes(view)?;
+    timings.plan_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    let rows = Rows::interleaved(view.hidden(), view.row_stride, view.rows)?;
+    let st = kernel.ffn_f32(layer, rows, &ids, &weights, out)?;
+    timings.ffn_ms = t.elapsed().as_secs_f64() * 1e3;
+    timings.reduce_ms = 0.0;
+    trace_line(view.layer_id, view.rows, timings, &st, "zero-copy, FP32 for the reduce-scatter");
+    Ok(st)
+}
+
 /// Serve a decoded request to an un-stamped compact return frame (the server
 /// stamps the L4 sequence before encoding).
 pub fn serve_return<K: ExpertKernel>(
@@ -213,7 +238,15 @@ pub(crate) mod tests {
         fn prepare_layer(&mut self, _image: &[u8]) -> Result<(), String> {
             Ok(())
         }
-        fn ffn(&mut self, _l: &(), rows: Rows<'_>, ids: &[i32], w: &[f32], out: &mut [u16]) -> Result<FfnStats, String> {
+        fn ffn(&mut self, l: &(), rows: Rows<'_>, ids: &[i32], w: &[f32], out: &mut [u16]) -> Result<FfnStats, String> {
+            let mut f = vec![0f32; out.len()];
+            let st = self.ffn_f32(l, rows, ids, w, &mut f)?;
+            for (o, &v) in out.iter_mut().zip(&f) {
+                *o = glm53f_wire::bf16::f32_to_bf16_rne(v);
+            }
+            Ok(st)
+        }
+        fn ffn_f32(&mut self, _l: &(), rows: Rows<'_>, ids: &[i32], w: &[f32], out: &mut [f32]) -> Result<FfnStats, String> {
             rows.check()?;
             check_routes(ids, w, rows.rows)?;
             self.calls += 1;
@@ -222,7 +255,7 @@ pub(crate) mod tests {
                 crate::fp8::decode_row(rows.payload(i), rows.scales(i), &mut x)?;
                 let k: f32 = (0..TOPK).map(|s| w[i * TOPK + s] * (ids[i * TOPK + s] + 1) as f32).sum();
                 for h in 0..HIDDEN {
-                    out[i * HIDDEN + h] = glm53f_wire::bf16::f32_to_bf16_rne(k * x[h]);
+                    out[i * HIDDEN + h] = k * x[h];
                 }
             }
             Ok(FfnStats::default())

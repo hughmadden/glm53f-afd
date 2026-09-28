@@ -15,6 +15,12 @@
 //! zeroed. The decode order is header parse (magic/version/kind/lengths) ->
 //! CRC verify -> body parse -> geometry checks, so protocol mismatches fail
 //! loud before corruption classification.
+//!
+//! Version 4 (the prefill reduce-scatter, [`crate::row_shard`]) is this codec
+//! with three flags: a request with [`FLAG_REDUCE_SCATTER`] and a return with
+//! [`FLAG_ROW_SLICE`] are written as version 4, everything else as version 3.
+//! Decoding checks the pairing both ways after the CRC, and the word at byte
+//! 124 must be zero in both versions.
 
 use crate::bf16;
 use crate::crc32c::{crc32c_with, crc32c_zeroed, family_for};
@@ -29,6 +35,18 @@ pub const FLAG_V41_COMPACT_BF16: u32 = 1 << 16;
 /// Every return frame must carry both bits or decode fails loud: an
 /// un-pre-summed return is the per-route FP32 wall (ADVISOR-I4 A6).
 pub const FLAG_RETURN_REQUIRED: u32 = FLAG_SPARK_REDUCTION | FLAG_V41_COMPACT_BF16;
+/// Version 4 (`crate::row_shard`): a return or exchange frame that carries one rank's
+/// partition of the request's rows, `token_position` being its first row. A return's rows are
+/// already summed over the four ranks.
+pub const FLAG_ROW_SLICE: u32 = 1 << 17;
+/// Version 4, requests: the ranks reduce-scatter the return among themselves, and each returns
+/// only its partition of the rows, summed (a row-slice return).
+pub const FLAG_REDUCE_SCATTER: u32 = 1 << 18;
+/// Version 4, requests with [`FLAG_REDUCE_SCATTER`]: the ranks exchange their rows as FP8 E4M3
+/// with one FP32 scale per row instead of BF16.
+pub const FLAG_EXCHANGE_FP8: u32 = 1 << 19;
+/// The flags only version 4 may carry.
+pub const FLAGS_ROW_SHARD: u32 = FLAG_ROW_SLICE | FLAG_REDUCE_SCATTER | FLAG_EXCHANGE_FP8;
 
 /// 40-B row descriptor (byte-exact ds41rt v3 layout).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,27 +133,85 @@ impl Frame {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct HeaderFields {
-    kind: u16,
-    request_id: u64,
-    placement_version: u64,
-    layer_id: u32,
-    row_count: u32,
-    dim: u32,
-    dtype: Dtype,
-    source_kind: SourceKind,
-    route_count: u32,
-    row_descriptor_bytes: u32,
-    route_bytes: u32,
-    payload_bytes: u64,
-    logical_payload_bytes: u64,
-    wire_bytes: u64,
-    flags: u32,
-    row_stride_bytes: u32,
-    status: Status,
-    executor_id: u64,
-    token_position: u64,
-    seq: u64,
+pub(crate) struct HeaderFields {
+    pub(crate) version: u16,
+    pub(crate) kind: u16,
+    pub(crate) request_id: u64,
+    pub(crate) placement_version: u64,
+    pub(crate) layer_id: u32,
+    pub(crate) row_count: u32,
+    pub(crate) dim: u32,
+    pub(crate) dtype: Dtype,
+    pub(crate) source_kind: SourceKind,
+    pub(crate) route_count: u32,
+    pub(crate) row_descriptor_bytes: u32,
+    pub(crate) route_bytes: u32,
+    pub(crate) payload_bytes: u64,
+    pub(crate) logical_payload_bytes: u64,
+    pub(crate) wire_bytes: u64,
+    pub(crate) flags: u32,
+    pub(crate) row_stride_bytes: u32,
+    pub(crate) status: Status,
+    pub(crate) executor_id: u64,
+    pub(crate) token_position: u64,
+    pub(crate) seq: u64,
+    /// The word at byte 124: zero, except in an exchange frame (`crate::row_shard`).
+    pub(crate) reserved: u32,
+}
+
+/// The version a request with `flags` is written as: 4 for a reduce-scattered request, else 3.
+fn request_version(flags: u32, rows: usize) -> Result<u16, WireError> {
+    if flags & FLAG_ROW_SLICE != 0 || (flags & FLAG_EXCHANGE_FP8 != 0 && flags & FLAG_REDUCE_SCATTER == 0) {
+        return Err(WireError::BadCode { field: "request flags", code: flags });
+    }
+    if flags & FLAG_REDUCE_SCATTER == 0 {
+        return Ok(layout::VERSION);
+    }
+    // Every rank's partition must hold a row: the reduce-scatter needs at least one row per rank.
+    if rows < layout::SPARKS {
+        return Err(WireError::DimMismatch { field: "reduce_scatter_rows", want: layout::SPARKS, got: rows });
+    }
+    Ok(layout::VERSION_ROW_SHARD)
+}
+
+/// The version a return with `flags` is written as: 4 for a row slice, else 3.
+fn return_version(flags: u32) -> Result<u16, WireError> {
+    if flags & (FLAG_REDUCE_SCATTER | FLAG_EXCHANGE_FP8) != 0 {
+        return Err(WireError::BadCode { field: "return flags", code: flags });
+    }
+    Ok(if flags & FLAG_ROW_SLICE != 0 { layout::VERSION_ROW_SHARD } else { layout::VERSION })
+}
+
+/// The version-4 rules for requests and returns, checked after the CRC (so a flipped bit is
+/// corruption, not a protocol mismatch): version-4 flags only in version 4 and version 4 only
+/// with them; FP8 exchange only with the reduce-scatter; at least one row per rank in a
+/// reduce-scattered request; a row-slice flag on every successful version-4 return; the word at
+/// byte 124 zero.
+fn check_extension(h: &HeaderFields) -> Result<(), WireError> {
+    if h.reserved != 0 {
+        return Err(WireError::BadCode { field: "reserved", code: h.reserved });
+    }
+    let v4 = h.version == layout::VERSION_ROW_SHARD;
+    let bad = |field: &'static str| Err(WireError::BadCode { field, code: h.flags });
+    match h.kind {
+        layout::KIND_REQUEST if !v4 && h.flags & FLAGS_ROW_SHARD != 0 => bad("version-3 request flags"),
+        layout::KIND_REQUEST if v4 => {
+            if request_version(h.flags, h.row_count as usize)? != layout::VERSION_ROW_SHARD {
+                return bad("version-4 request flags");
+            }
+            Ok(())
+        }
+        layout::KIND_RETURN if !v4 && h.flags & FLAGS_ROW_SHARD != 0 => bad("version-3 return flags"),
+        layout::KIND_RETURN if v4 => {
+            if h.flags & (FLAG_REDUCE_SCATTER | FLAG_EXCHANGE_FP8) != 0
+                || (h.status == Status::Ok && h.flags & FLAG_ROW_SLICE == 0)
+            {
+                return bad("version-4 return flags");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,11 +262,11 @@ fn get_f32(bytes: &[u8], at: usize, _field: &'static str) -> Result<f32, WireErr
     Ok(f32::from_le_bytes(bytes[at..end].try_into().unwrap()))
 }
 
-fn checked_mul(a: usize, b: usize, field: &'static str) -> Result<usize, WireError> {
+pub(crate) fn checked_mul(a: usize, b: usize, field: &'static str) -> Result<usize, WireError> {
     a.checked_mul(b).ok_or(WireError::DimMismatch { field, want: 0, got: usize::MAX })
 }
 
-fn as_u32(v: usize, field: &'static str) -> Result<u32, WireError> {
+pub(crate) fn as_u32(v: usize, field: &'static str) -> Result<u32, WireError> {
     u32::try_from(v).map_err(|_| WireError::DimMismatch { field, want: u32::MAX as usize, got: v })
 }
 
@@ -309,10 +385,10 @@ fn validate_rows_routes(rows: &[RowDescriptor], routes: &[RouteEntry]) -> Result
 // Header codec
 // ---------------------------------------------------------------------------
 
-fn write_header(out: &mut Vec<u8>, h: &HeaderFields, naive: WireNaive) {
+pub(crate) fn write_header(out: &mut Vec<u8>, h: &HeaderFields, naive: WireNaive) {
     let mut b = [0u8; layout::HEADER_LEN];
     b[hdr::MAGIC..hdr::MAGIC + 8].copy_from_slice(&layout::MAGIC);
-    put_u16(&mut b, hdr::VERSION, layout::VERSION);
+    put_u16(&mut b, hdr::VERSION, h.version);
     put_u16(&mut b, hdr::KIND, h.kind);
     put_u32(&mut b, hdr::HEADER_LEN, layout::HEADER_LEN as u32);
     put_u64(&mut b, hdr::REQUEST_ID, h.request_id);
@@ -334,11 +410,14 @@ fn write_header(out: &mut Vec<u8>, h: &HeaderFields, naive: WireNaive) {
     put_u64(&mut b, hdr::EXECUTOR_ID, h.executor_id);
     put_u64(&mut b, hdr::TOKEN_POSITION, h.token_position);
     put_u64(&mut b, hdr::SEQ, h.seq);
-    // CRC32C field and reserved stay zero here; `seal` fills the checksum.
+    put_u32(&mut b, hdr::RESERVED, h.reserved);
+    // The CRC32C field stays zero here; `seal` fills the checksum.
     out.extend_from_slice(&b);
 }
 
-fn parse_header(bytes: &[u8], naive: WireNaive) -> Result<HeaderFields, WireError> {
+/// Parse and check the header: magic, version (3, or 4 for the reduce-scatter extension), the
+/// kinds that version has, header length and the frame length against the bytes.
+pub(crate) fn parse_header(bytes: &[u8], naive: WireNaive) -> Result<HeaderFields, WireError> {
     if bytes.len() < layout::HEADER_LEN {
         return Err(WireError::TooShort { need: layout::HEADER_LEN, got: bytes.len() });
     }
@@ -348,11 +427,12 @@ fn parse_header(bytes: &[u8], naive: WireNaive) -> Result<HeaderFields, WireErro
         return Err(WireError::BadMagic(m));
     }
     let version = get_u16(bytes, hdr::VERSION, "version")?;
-    if version != layout::VERSION {
+    if version != layout::VERSION && version != layout::VERSION_ROW_SHARD {
         return Err(WireError::BadVersion(version));
     }
     let kind = get_u16(bytes, hdr::KIND, "kind")?;
-    if kind != layout::KIND_REQUEST && kind != layout::KIND_RETURN {
+    let exchange = version == layout::VERSION_ROW_SHARD && kind == layout::KIND_EXCHANGE;
+    if kind != layout::KIND_REQUEST && kind != layout::KIND_RETURN && !exchange {
         return Err(WireError::BadKind(kind));
     }
     let header_len = get_u32(bytes, hdr::HEADER_LEN, "header_len")?;
@@ -368,6 +448,7 @@ fn parse_header(bytes: &[u8], naive: WireNaive) -> Result<HeaderFields, WireErro
         return Err(WireError::TrailingBytes { declared, got: bytes.len() });
     }
     Ok(HeaderFields {
+        version,
         kind,
         request_id: get_u64(bytes, hdr::REQUEST_ID, "request_id")?,
         placement_version: get_u64(bytes, hdr::PLACEMENT_VERSION, "placement_version")?,
@@ -388,6 +469,7 @@ fn parse_header(bytes: &[u8], naive: WireNaive) -> Result<HeaderFields, WireErro
         executor_id: get_u64(bytes, hdr::EXECUTOR_ID, "executor_id")?,
         token_position: get_u64(bytes, hdr::TOKEN_POSITION, "token_position")?,
         seq: get_u64(bytes, hdr::SEQ, "seq")?,
+        reserved: get_u32(bytes, hdr::RESERVED, "reserved")?,
     })
 }
 
@@ -436,7 +518,7 @@ fn seal(mut frame: Vec<u8>, naive: WireNaive) -> Vec<u8> {
     frame
 }
 
-fn verify_crc(bytes: &[u8], naive: WireNaive, seq: u64) -> Result<(), WireError> {
+pub(crate) fn verify_crc(bytes: &[u8], naive: WireNaive, seq: u64) -> Result<(), WireError> {
     if naive.has(WireNaive::CRC_UNCHECKED) {
         // TRAP: "trust the transport" — no checksum verification at all.
         return Ok(());
@@ -499,6 +581,7 @@ pub fn encode_request_seq(
     }
     let rows = frame.rows.len();
     let routes = frame.routes.len();
+    let version = request_version(frame.flags, rows)?;
     let row_bytes = layout::request_row_bytes(naive);
     let row_descriptor_bytes = checked_mul(rows, layout::ROW_DESCRIPTOR_LEN, "row_descriptor_bytes")?;
     let route_bytes = checked_mul(routes, layout::ROUTE_ENTRY_LEN, "route_bytes")?;
@@ -517,6 +600,7 @@ pub fn encode_request_seq(
     write_header(
         &mut out,
         &HeaderFields {
+            version,
             kind: layout::KIND_REQUEST,
             request_id: frame.request_id,
             placement_version: frame.placement_version,
@@ -537,6 +621,7 @@ pub fn encode_request_seq(
             executor_id: frame.executor_id,
             token_position: frame.token_position,
             seq,
+            reserved: 0,
         },
         naive,
     );
@@ -622,6 +707,7 @@ pub fn encode_request_meta_into(
     write_header(
         &mut out,
         &HeaderFields {
+            version: layout::VERSION,
             kind: layout::KIND_REQUEST,
             request_id,
             placement_version: 1,
@@ -642,6 +728,7 @@ pub fn encode_request_meta_into(
             executor_id,
             token_position: 0,
             seq,
+            reserved: 0,
         },
         naive,
     );
@@ -697,6 +784,7 @@ pub fn encode_request_desc_into(
     write_header(
         &mut out,
         &HeaderFields {
+            version: layout::VERSION,
             kind: layout::KIND_REQUEST,
             request_id,
             placement_version: 1,
@@ -717,12 +805,32 @@ pub fn encode_request_desc_into(
             executor_id,
             token_position: 0,
             seq,
+            reserved: 0,
         },
         naive,
     );
     let mut header = [0u8; layout::HEADER_LEN];
     header.copy_from_slice(&out);
     Ok((header, row_descriptor_bytes, row_descriptor_bytes + route_bytes, body_len))
+}
+
+/// Set the flags of a request header built in place ([`encode_request_meta_into`],
+/// [`encode_request_desc_into`], both version 3 with no flags), and the version they need: a
+/// reduce-scattered request ([`FLAG_REDUCE_SCATTER`]) is version 4 and needs at least one row per
+/// rank. The CRC field is left as it is: like the in-place encoders, for frames sent with the CRC
+/// disabled ([`crc_disabled`]) or sealed afterwards.
+pub fn set_request_flags(header: &mut [u8], flags: u32) -> Result<(), WireError> {
+    if header.len() < layout::HEADER_LEN {
+        return Err(WireError::TooShort { need: layout::HEADER_LEN, got: header.len() });
+    }
+    if get_u16(header, hdr::KIND, "kind")? != layout::KIND_REQUEST {
+        return Err(WireError::BadKind(get_u16(header, hdr::KIND, "kind")?));
+    }
+    let rows = get_u32(header, hdr::ROW_COUNT, "row_count")? as usize;
+    let version = request_version(flags, rows)?;
+    put_u16(header, hdr::VERSION, version);
+    put_u32(header, hdr::FLAGS, flags);
+    Ok(())
 }
 
 /// Env-default request encode (NEGATIVE tests).
@@ -734,6 +842,7 @@ fn decode_request(h: &HeaderFields, bytes: &[u8], naive: WireNaive) -> Result<Re
     if h.row_count == 0 {
         return Err(WireError::DimMismatch { field: "row_count", want: 1, got: 0 });
     }
+    check_extension(h)?;
     let rows = h.row_count as usize;
     let routes = h.route_count as usize;
     let row_descriptor_bytes = checked_mul(rows, layout::ROW_DESCRIPTOR_LEN, "row_descriptor_bytes")?;
@@ -874,6 +983,7 @@ impl<'a> RequestView<'a> {
         if h.row_count == 0 {
             return Err(WireError::DimMismatch { field: "row_count", want: 1, got: 0 });
         }
+        check_extension(&h)?;
         let rows = h.row_count as usize;
         let routes = h.route_count as usize;
         let row_descriptor_bytes = checked_mul(rows, layout::ROW_DESCRIPTOR_LEN, "row_descriptor_bytes")?;
@@ -994,6 +1104,7 @@ pub fn return_header_seq(frame: &ReturnFrame, rows: usize, seq: u64, naive: Wire
     if naive.has(WireNaive::PER_ROUTE_RETURN) || naive.has(WireNaive::FP32_RETURN) {
         return Err(WireError::DimMismatch { field: "in_place_return_dtype", want: 0, got: 1 });
     }
+    let version = return_version(frame.flags)?;
     let block = layout::return_row_bytes(frame.route_count, naive);
     let payload_bytes = checked_mul(rows, block, "payload_bytes")?;
     let wire_len = layout::HEADER_LEN
@@ -1003,6 +1114,7 @@ pub fn return_header_seq(frame: &ReturnFrame, rows: usize, seq: u64, naive: Wire
     write_header(
         &mut out,
         &HeaderFields {
+            version,
             kind: layout::KIND_RETURN,
             request_id: frame.request_id,
             placement_version: frame.placement_version,
@@ -1023,6 +1135,7 @@ pub fn return_header_seq(frame: &ReturnFrame, rows: usize, seq: u64, naive: Wire
             executor_id: frame.executor_id,
             token_position: frame.token_position,
             seq,
+            reserved: 0,
         },
         naive,
     );
@@ -1059,6 +1172,7 @@ pub fn encode_return_seq(frame: &ReturnFrame, seq: u64, naive: WireNaive) -> Res
     let per_route = naive.has(WireNaive::PER_ROUTE_RETURN);
     let fp32 = !per_route && naive.has(WireNaive::FP32_RETURN);
     let dtype = if fp32 { Dtype::F32 } else { Dtype::Bf16 };
+    let version = return_version(frame.flags)?;
     let block = layout::return_row_bytes(frame.route_count, naive);
     let rows = frame.rows.len();
     let payload_bytes = checked_mul(rows, block, "payload_bytes")?;
@@ -1070,6 +1184,7 @@ pub fn encode_return_seq(frame: &ReturnFrame, seq: u64, naive: WireNaive) -> Res
     write_header(
         &mut out,
         &HeaderFields {
+            version,
             kind: layout::KIND_RETURN,
             request_id: frame.request_id,
             placement_version: frame.placement_version,
@@ -1090,6 +1205,7 @@ pub fn encode_return_seq(frame: &ReturnFrame, seq: u64, naive: WireNaive) -> Res
             executor_id: frame.executor_id,
             token_position: frame.token_position,
             seq,
+            reserved: 0,
         },
         naive,
     );
@@ -1131,6 +1247,7 @@ fn decode_return(h: &HeaderFields, bytes: &[u8], naive: WireNaive) -> Result<Ret
     if h.status == Status::Ok && h.flags & FLAG_RETURN_REQUIRED != FLAG_RETURN_REQUIRED {
         return Err(WireError::UnpresummedReturn { flags: h.flags });
     }
+    check_extension(h)?;
     if h.row_count == 0 {
         return Err(WireError::DimMismatch { field: "row_count", want: 1, got: 0 });
     }

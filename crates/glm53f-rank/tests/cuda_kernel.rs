@@ -12,6 +12,8 @@
 //!   8 and 64 rows (the default configuration up to 64 rows);
 //! - prefill, 512 and 4,096 rows: sampled rows against the kernel-order
 //!   reference;
+//! - the FP32 output of the prefill reduce-scatter (`ffn_f32`), rounded to
+//!   BF16, equals the default output bit for bit, 1 to 4,096 rows;
 //! - faults: an E4M3 NaN, a UE8M0 NaN, a bad expert id, a duplicate expert and
 //!   a negative weight are refused, and the kernel still serves afterwards.
 #![cfg(feature = "cuda")]
@@ -307,6 +309,20 @@ fn kernel_matches_the_references() {
             assert!(trms < 2e-3 && tmax < 3e-2, "prefill {rows} row {r}: FP32 SwiGLU");
             assert!(krms < 3e-3 && kmax < 5e-2, "prefill {rows} row {r}: BF16 SwiGLU");
         }
+    }
+
+    // The FP32 output (the prefill reduce-scatter's partial) is the same arithmetic: rounded
+    // to BF16 it is the default output bit for bit, in both configurations.
+    for rows in [1usize, 8, 64, 512, 4096] {
+        let (p, s) = testkit::wire_rows(0x5EED_8000 + rows as u64, rows);
+        let (ids, w) = testkit::routes(0x5EED_8100 + rows as u64, rows, 0);
+        let bf16 = run(&mut k, &layer, &p, &s, &ids, &w, rows);
+        let mut f32s = vec![0f32; rows * HIDDEN];
+        k.ffn_f32(&layer, Rows::separate(&p, &s, rows).unwrap(), &ids, &w, &mut f32s).unwrap();
+        let rounded: Vec<u16> = f32s.iter().map(|&v| glm53f_wire::bf16::f32_to_bf16_rne(v)).collect();
+        let differ = rounded.iter().zip(&bf16).filter(|(a, b)| a != b).count();
+        eprintln!("M{rows}: FP32 output rounded to BF16 vs the BF16 output: {differ} values differ");
+        assert_eq!(differ, 0, "M{rows}: the FP32 output is not the BF16 output's arithmetic");
     }
 
     // Faults are refused, and the kernel still serves afterwards.

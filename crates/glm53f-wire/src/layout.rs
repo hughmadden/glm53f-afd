@@ -27,10 +27,17 @@ use crate::naive::WireNaive;
 pub const MAGIC: [u8; 8] = *b"DS41RTE3";
 /// Frame format version (DS41RTE3 v3).
 pub const VERSION: u16 = 3;
+/// Version 4: version 3 plus the prefill reduce-scatter (`crate::row_shard`). The header and
+/// its L4 tail are unchanged. A frame is version 4 only when it uses the extension (a
+/// reduce-scattered request, a row-slice return, an exchange frame), so every other frame stays
+/// version 3 and a version-3 peer refuses exactly the frames it cannot read.
+pub const VERSION_ROW_SHARD: u16 = 4;
 /// Message kind: coordinator -> Spark request frame.
 pub const KIND_REQUEST: u16 = 1;
 /// Message kind: Spark -> coordinator compact return frame.
 pub const KIND_RETURN: u16 = 2;
+/// Message kind (version 4 only): the rank-to-rank exchange frame of the prefill reduce-scatter.
+pub const KIND_EXCHANGE: u16 = 3;
 
 /// Unified frame header length (v3 L4-extended: seq + CRC32C in the tail).
 pub const HEADER_LEN: usize = 128;
@@ -92,7 +99,7 @@ pub mod hdr {
     pub const TOKEN_POSITION: usize = 104; // u64
     pub const SEQ: usize = 112; // u64 (L4 sequence)
     pub const CRC32C: usize = 120; // u32 (L4 checksum; zeroed while computing)
-    pub const RESERVED: usize = 124; // u32 (must be 0)
+    pub const RESERVED: usize = 124; // u32 (must be 0; an exchange frame's row-shard word)
 }
 
 /// Row descriptor field offsets (40 B, byte-exact ds41rt v3).

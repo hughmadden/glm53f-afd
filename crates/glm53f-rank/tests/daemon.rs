@@ -115,6 +115,10 @@ fn the_daemon_serves_over_tcp_and_fails_requests_not_the_rank() {
         assert_eq!((ret.request_id, ret.layer_id, ret.status, ret.rows.len()), (id, 3, Status::Ok, rows));
         let mut want = vec![0u16; rows * HIDDEN];
         cpu.ffn(&layer, Rows::separate(&p, &s, rows).unwrap(), &ids, &w, &mut want).unwrap();
+        // The reduce-scatter's FP32 rows are the same arithmetic before the BF16 rounding.
+        let mut f32s = vec![0f32; rows * HIDDEN];
+        cpu.ffn_f32(&layer, Rows::separate(&p, &s, rows).unwrap(), &ids, &w, &mut f32s).unwrap();
+        assert!(f32s.iter().zip(&want).all(|(&v, &b)| glm53f_wire::bf16::f32_to_bf16_rne(v) == b), "request {id}: ffn_f32");
         for (i, row) in ret.rows.iter().enumerate() {
             let (mut d, mut r) = (0f64, 0f64);
             for (&g, &x) in row.codes.iter().zip(&want[i * HIDDEN..(i + 1) * HIDDEN]) {

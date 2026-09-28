@@ -179,6 +179,8 @@ pub struct CoordinatorSum {
     rank_buf: Vec<f32>,
     /// Distinct ranks landed per token slot (drives the rank-ordered sum).
     slot_rank_count: Vec<u8>,
+    /// Row-sharded mode ([`CoordinatorSum::row_sharded`]): which rows are filled.
+    row_filled: Option<Vec<bool>>,
 }
 
 impl CoordinatorSum {
@@ -194,6 +196,26 @@ impl CoordinatorSum {
             arrivals: 0,
             rank_buf: vec![0.0; crate::layout::SPARKS * rows * hidden],
             slot_rank_count: vec![0u8; rows],
+            row_filled: None,
+        }
+    }
+
+    /// The scatter mode, for a reduce-scattered exchange ([`crate::row_shard`]): every return is
+    /// a row slice, the rows of its rank's partition already summed over the four ranks. Each
+    /// row is written once, by the rank whose partition holds it, and nothing is added; a slice
+    /// that is not its rank's partition, a row filled twice and a four-plane return are refused.
+    pub fn row_sharded(rows: usize, hidden: usize, naive: WireNaive) -> Self {
+        Self {
+            naive,
+            rows,
+            hidden,
+            seen: Vec::new(),
+            distinct: 0,
+            acc: vec![0.0; rows * hidden],
+            arrivals: 0,
+            rank_buf: Vec::new(),
+            slot_rank_count: Vec::new(),
+            row_filled: Some(vec![false; rows]),
         }
     }
 
@@ -206,8 +228,18 @@ impl CoordinatorSum {
         self.distinct
     }
 
+    /// Slots a complete window fills: a partial per rank per row, or one row slot per row in the
+    /// scatter mode.
+    fn need(&self) -> usize {
+        if self.row_filled.is_some() {
+            self.rows
+        } else {
+            self.rows * crate::layout::SPARKS
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
-        self.distinct == self.rows * crate::layout::SPARKS
+        self.distinct == self.need()
     }
 
     /// Accumulate one accepted return frame (its rows as BF16 -> FP32).
@@ -225,6 +257,46 @@ impl CoordinatorSum {
             });
         }
         let rank = f.executor_id as usize;
+        // A row slice is never added as a plane, nor a plane written as a slice.
+        let slice = f.flags & crate::frame::FLAG_ROW_SLICE != 0;
+        if slice != self.row_filled.is_some() {
+            return Err(WireError::DimMismatch {
+                field: "row_slice",
+                want: usize::from(self.row_filled.is_some()),
+                got: usize::from(slice),
+            });
+        }
+        if let Some(filled) = self.row_filled.as_mut() {
+            let (first, count) = crate::row_shard::row_partition(self.rows, crate::layout::SPARKS, rank);
+            if f.token_position != first as u64 || f.rows.len() != count {
+                return Err(WireError::DimMismatch {
+                    field: "row_slice_partition",
+                    want: first,
+                    got: usize::try_from(f.token_position).unwrap_or(usize::MAX),
+                });
+            }
+            for (r, row) in f.rows.iter().enumerate() {
+                let token = first + r;
+                if row.codes.len() != self.hidden {
+                    return Err(WireError::DimMismatch { field: "return_row_codes", want: self.hidden, got: row.codes.len() });
+                }
+                if filled[token] {
+                    let slot = SlotKey {
+                        request_id: f.request_id,
+                        layer_id: f.layer_id,
+                        token_position: token as u64,
+                        executor_id: f.executor_id,
+                    };
+                    return Err(WireError::SlotFilled { slot });
+                }
+                filled[token] = true;
+                self.distinct += 1;
+                for (a, &code) in self.acc[token * self.hidden..(token + 1) * self.hidden].iter_mut().zip(&row.codes) {
+                    *a = crate::bf16::bf16_to_f32(code);
+                }
+            }
+            return Ok(());
+        }
         for (r, row) in f.rows.iter().enumerate() {
             let token = f
                 .token_position
@@ -306,7 +378,7 @@ impl CoordinatorSum {
 
     /// The FP32 sum once every slot is filled (else fail loud `Incomplete`).
     pub fn result(&self) -> Result<&[f32], WireError> {
-        let need = self.rows * crate::layout::SPARKS;
+        let need = self.need();
         if self.distinct != need {
             return Err(WireError::Incomplete { filled: self.distinct, need });
         }

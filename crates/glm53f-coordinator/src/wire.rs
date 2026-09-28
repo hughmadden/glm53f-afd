@@ -14,15 +14,21 @@
 //!   here; the device path passes it to `glm53f_coord_rank_sum_bf16`). Never both.
 //! - **The shared expert runs during the remote wait** ([`WireClient::moe_recv_during`]): its
 //!   hook runs after the request is posted and before the returns are collected.
-//! - **The return handling sits behind [`ReturnPath`]**: today every rank returns all rows and
-//!   the coordinator sums the four BF16 planes; when ranks reduce-scatter prefill-sized
-//!   exchanges, each rank will return one row-sharded part of a single plane.
+//! - **The return handling sits behind [`ReturnPath`]**: by default every rank returns all rows
+//!   and the coordinator sums the four BF16 planes; with [`ReturnPath::RowSharded`] the ranks
+//!   reduce-scatter prefill-sized exchanges among themselves (`DS41RTE3` v4,
+//!   `glm53f_wire::row_shard`) and each returns only its partition of the rows, summed, so the
+//!   coordinator receives each row once. The choice is made per exchange, by its row count, and
+//!   [`WireClient::collected`] gives each exchange's returns in their layout.
+//! - **Request ids start at a random base per connection**, so a rank's peer mesh can never
+//!   match a stale exchange frame of an earlier connection to a new exchange.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use glm53f_wire::frame::{Frame, HiddenRow, RequestFrame, ReturnFrame, RouteEntry, RowDescriptor};
 use glm53f_wire::l4::{CoordinatorSum, StreamReceiver, StreamSender};
+use glm53f_wire::row_shard::{row_partition, ExchangeDtype};
 use glm53f_wire::{SourceKind, WireNaive, HIDDEN, SPARKS};
 
 /// How the ranks' returns of one exchange become its routed output.
@@ -32,13 +38,18 @@ pub enum ReturnPath {
     /// coordinator adds the four planes in rank order, in FP32 (`CoordinatorSum` on the host,
     /// `glm53f_coord_rank_sum_bf16` on the device, bit-identical).
     FourPlaneSum,
-    /// Exchanges of at least `min_rows` rows (16 in the rank's design) are reduce-scattered among
-    /// the ranks, and each rank returns only its partition of the rows, already summed: one
-    /// row-sharded plane (no 4-to-1 incast). Not implemented in this client yet: its frame changes
-    /// (a request flag, a row-slice return flag and the slice's first row in the header) belong
-    /// to `glm53f-wire`; selecting it is refused at connect.
-    RowSharded { min_rows: usize },
+    /// Exchanges of at least `min_rows` rows are reduce-scattered among the ranks, and each rank
+    /// returns only its partition of the rows, already summed over the four ranks (no 4-to-1
+    /// incast into the coordinator's port). The ranks exchange their rows as `exchange` (BF16 is
+    /// the default: its error is close to the four-plane sum's). Smaller exchanges (decode and
+    /// verify windows) keep the four-plane sum, whose latency is better. `min_rows` must be at
+    /// least 4 (a row per rank); the design's threshold is 16 (`DEFAULT_ROW_SHARDED_MIN_ROWS`).
+    /// The ranks need their peer mesh (`glm53f-rank serve --peers`).
+    RowSharded { min_rows: usize, exchange: ExchangeDtype },
 }
+
+/// The design's threshold for [`ReturnPath::RowSharded`]: 16 rows and more.
+pub const DEFAULT_ROW_SHARDED_MIN_ROWS: usize = 16;
 
 /// The wire client's model parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,12 +68,99 @@ impl WireConfig {
     pub fn glm53_flash() -> WireConfig {
         WireConfig { experts: 288, routed_scale: 1.0, return_path: ReturnPath::FourPlaneSum }
     }
+
+    /// [`WireConfig::glm53_flash`] with the return path from the environment:
+    /// `GLM53F_ROW_SHARDED_MIN_ROWS` (unset or 0: four-plane returns; otherwise
+    /// [`ReturnPath::RowSharded`] from that many rows) and `GLM53F_EXCHANGE_DTYPE` (`bf16`, the
+    /// default, or `fp8`).
+    pub fn from_env() -> Result<WireConfig, String> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let mut cfg = WireConfig::glm53_flash();
+        let min_rows: usize = match var("GLM53F_ROW_SHARDED_MIN_ROWS") {
+            Some(v) => v.parse().map_err(|_| format!("GLM53F_ROW_SHARDED_MIN_ROWS={v}: not a row count"))?,
+            None => 0,
+        };
+        if min_rows > 0 {
+            let exchange = match var("GLM53F_EXCHANGE_DTYPE") {
+                Some(v) => ExchangeDtype::parse(&v).ok_or(format!("GLM53F_EXCHANGE_DTYPE={v}: bf16 or fp8"))?,
+                None => ExchangeDtype::Bf16,
+            };
+            cfg.return_path = ReturnPath::RowSharded { min_rows, exchange };
+        }
+        Ok(cfg)
+    }
+
+    /// The exchange dtype a `tokens`-row exchange is reduce-scattered with, or `None` for a
+    /// four-plane return.
+    pub fn row_sharded(&self, tokens: usize) -> Option<ExchangeDtype> {
+        match self.return_path {
+            ReturnPath::RowSharded { min_rows, exchange } if tokens >= min_rows.max(SPARKS) => Some(exchange),
+            _ => None,
+        }
+    }
 }
 
-/// The planes one collected exchange left in the receive buffers ([`WireClient::returned`]).
+/// The planes one collected four-plane exchange left in the receive buffers
+/// ([`WireClient::returned`]).
 pub enum Returned<'a> {
     /// Rank `r`'s BF16 partial plane `[tokens * HIDDEN]` (little-endian bytes), ranks 0..3.
     Planes([&'a [u8]; SPARKS]),
+}
+
+/// One rank's part of a reduce-scattered exchange: rows `first..first + rows` of the routed
+/// output, already summed over the four ranks, BF16 (little-endian bytes, `rows * HIDDEN * 2`).
+#[derive(Clone, Copy, Debug)]
+pub struct RowSlice<'a> {
+    pub first: usize,
+    pub rows: usize,
+    pub bytes: &'a [u8],
+}
+
+/// The returns of the last collected exchange, as its return path laid them out
+/// ([`WireClient::collected`]). They live in the receive buffers until the next send (an RDMA
+/// slot is re-posted then), so a device caller copies them out first: four planes into its
+/// staging buffer for the rank-order sum, or each row slice straight to row `first` of its
+/// output (the slices cover the rows once and are final BF16 when the routed scale is 1).
+pub enum Collected<'a> {
+    /// A four-plane exchange: rank `r`'s BF16 partial plane `[tokens * HIDDEN]`, to be added in
+    /// rank order (and multiplied by the routed scale).
+    Planes([&'a [u8]; SPARKS]),
+    /// A reduce-scattered exchange: rank `r`'s rows of the summed output; together they cover
+    /// the rows once, in rank order (multiply by the routed scale, if it is not 1).
+    RowSlices([RowSlice<'a>; SPARKS]),
+}
+
+/// An exchange sent and not yet collected.
+#[derive(Clone, Copy, Debug)]
+struct Inflight {
+    request_id: u64,
+    layer_id: u32,
+    tokens: usize,
+    /// Reduce-scattered (row-slice returns) rather than four planes.
+    sharded: bool,
+}
+
+/// What the receive buffers hold after [`WireClient::moe_recv_raw`]: `(tokens, sharded)`.
+type Last = (usize, bool);
+
+/// The return a rank owes for an exchange: `(first row, rows)`, all rows for a four-plane one.
+fn rank_rows(tokens: usize, rank: usize, sharded: bool) -> (usize, usize) {
+    if sharded {
+        row_partition(tokens, SPARKS, rank)
+    } else {
+        (0, tokens)
+    }
+}
+
+/// A request-id base for a new connection: the ranks key their peer exchanges by request id and
+/// layer, so ids must not repeat across connections (the time and the process id, mixed).
+fn request_id_base() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let mut z = t ^ (u64::from(std::process::id()) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    // Keep far from wrapping around within a connection's lifetime.
+    (z ^ (z >> 31)) >> 1
 }
 
 /// Wall-clock microsecond timestamp (CLOCK_REALTIME). Used by the cross-host
@@ -209,16 +307,24 @@ struct RdmaConn {
     sends_out: usize,
 }
 
-/// Check one return frame header against the request; returns its L4 sequence.
-fn validate_return_header(h: &[u8], rank: usize, layer_id: u32, request_id: u64, tokens: usize) -> Result<u64, String> {
-    use glm53f_wire::layout::{hdr, KIND_RETURN, RETURN_ROW_BYTES};
-    let want = glm53f_wire::HEADER_LEN + tokens * RETURN_ROW_BYTES;
+/// Check one return frame header against the request; returns its L4 sequence. A four-plane
+/// exchange's return carries all `tokens` rows (version 3); a reduce-scattered exchange's
+/// (`sharded`) carries the rank's partition, flagged as a row slice with `token_position` its
+/// first row (version 4).
+fn validate_return_header(h: &[u8], rank: usize, layer_id: u32, request_id: u64, tokens: usize, sharded: bool) -> Result<u64, String> {
+    use glm53f_wire::frame::{FLAG_RETURN_REQUIRED, FLAG_ROW_SLICE};
+    use glm53f_wire::layout::{hdr, KIND_RETURN, RETURN_ROW_BYTES, VERSION, VERSION_ROW_SHARD};
+    let (first, count) = rank_rows(tokens, rank, sharded);
+    let want = glm53f_wire::HEADER_LEN + count * RETURN_ROW_BYTES;
     let u16_at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
     let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
     if u32_at(hdr::STATUS) != 0 {
         return Err(format!("wire: Spark rank {rank} reported an error (layer {layer_id})"));
     }
+    let (want_version, want_flags) =
+        if sharded { (VERSION_ROW_SHARD, FLAG_RETURN_REQUIRED | FLAG_ROW_SLICE) } else { (VERSION, FLAG_RETURN_REQUIRED) };
+    let (version, flags) = (u16_at(hdr::VERSION), u32_at(hdr::FLAGS) & (FLAG_RETURN_REQUIRED | FLAG_ROW_SLICE));
     let (kind, req, layer, rows, stride, dtype, exec, pos, wb) = (
         u16_at(hdr::KIND),
         u64_at(hdr::REQUEST_ID),
@@ -230,12 +336,14 @@ fn validate_return_header(h: &[u8], rank: usize, layer_id: u32, request_id: u64,
         u64_at(hdr::TOKEN_POSITION),
         u64_at(hdr::WIRE_BYTES) as usize,
     );
-    if kind != KIND_RETURN || req != request_id || layer != layer_id || rows != tokens || stride != RETURN_ROW_BYTES
-        || dtype != glm53f_wire::layout::Dtype::Bf16 as u16 || exec != rank as u64 || pos != 0 || wb != want
+    if kind != KIND_RETURN || version != want_version || flags != want_flags || req != request_id || layer != layer_id
+        || rows != count || stride != RETURN_ROW_BYTES || dtype != glm53f_wire::layout::Dtype::Bf16 as u16
+        || exec != rank as u64 || pos != first as u64 || wb != want
     {
         return Err(format!(
-            "wire: rank {rank} return header mismatch (kind {kind} req {req}/{request_id} layer {layer}/{layer_id} \
-             rows {rows}/{tokens} stride {stride} dtype {dtype} exec {exec} pos {pos} bytes {wb}/{want})"
+            "wire: rank {rank} return header mismatch (kind {kind} version {version}/{want_version} flags {flags:#x}/{want_flags:#x} \
+             req {req}/{request_id} layer {layer}/{layer_id} rows {rows}/{count} stride {stride} dtype {dtype} exec {exec} \
+             pos {pos}/{first} bytes {wb}/{want})"
         ));
     }
     Ok(u64_at(hdr::SEQ))
@@ -385,17 +493,18 @@ impl SparkConn {
 
 impl SparkConn {
     /// Zero-copy return receive (perf reset R2): read one frame into `buf`,
-    /// validate the header against the request (kind, request, layer, rank, rows,
-    /// BF16 compact stride, status) and the L4 sequence, without decoding rows.
+    /// validate the header against the request (kind, version and flags for the
+    /// exchange's return path, request, layer, rank, rows and first row, BF16
+    /// compact stride, status) and the L4 sequence, without decoding rows.
     /// With CRC on (the default) the frame also takes the full `decode_frame`
     /// check, so the fast path only ever skips work `GLM53F_WIRE_NOCRC=1` waived.
-    fn recv_raw_blocking(&mut self, layer_id: u32, request_id: u64, tokens: usize) -> Result<(), String> {
-        use glm53f_wire::layout::{hdr, KIND_RETURN, RETURN_ROW_BYTES};
+    fn recv_raw_blocking(&mut self, layer_id: u32, request_id: u64, tokens: usize, sharded: bool) -> Result<(), String> {
         self.stream.set_nonblocking(false).map_err(|e| format!("spark set_blocking: {e}"))?;
         self.stream
             .set_read_timeout(Some(std::time::Duration::from_secs(120)))
             .map_err(|e| format!("spark set_read_timeout: {e}"))?;
-        let want = glm53f_wire::HEADER_LEN + tokens * RETURN_ROW_BYTES;
+        let rows = rank_rows(tokens, self.rank, sharded).1;
+        let want = glm53f_wire::HEADER_LEN + rows * glm53f_wire::layout::RETURN_ROW_BYTES;
         if self.buf.len() < want {
             self.buf.resize(want, 0);
         }
@@ -404,34 +513,7 @@ impl SparkConn {
                 .read_exact(&mut self.buf[..glm53f_wire::HEADER_LEN])
                 .map_err(|e| format!("spark read header: {e}"))?;
             let h = &self.buf[..glm53f_wire::HEADER_LEN];
-            let u16_at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
-            let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
-            let u64_at = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
-            let wb = u64_at(hdr::WIRE_BYTES) as usize;
-            if u32_at(hdr::STATUS) != 0 {
-                return Err(format!("wire: Spark rank {} reported an error (layer {layer_id})", self.rank));
-            }
-            let (kind, req, layer, rows, stride, dtype, exec, pos) = (
-                u16_at(hdr::KIND),
-                u64_at(hdr::REQUEST_ID),
-                u32_at(hdr::LAYER_ID),
-                u32_at(hdr::ROW_COUNT) as usize,
-                u32_at(hdr::ROW_STRIDE_BYTES) as usize,
-                u16_at(hdr::PAYLOAD_DTYPE),
-                u64_at(hdr::EXECUTOR_ID),
-                u64_at(hdr::TOKEN_POSITION),
-            );
-            if kind != KIND_RETURN || req != request_id || layer != layer_id || rows != tokens
-                || stride != RETURN_ROW_BYTES || dtype != glm53f_wire::layout::Dtype::Bf16 as u16
-                || exec != self.rank as u64 || pos != 0 || wb != want
-            {
-                return Err(format!(
-                    "wire: rank {} return header mismatch (kind {kind} req {req}/{request_id} layer {layer}/{layer_id} \
-                     rows {rows}/{tokens} stride {stride} dtype {dtype} exec {exec} pos {pos} bytes {wb}/{want})",
-                    self.rank
-                ));
-            }
-            let seq = u64_at(hdr::SEQ);
+            let seq = validate_return_header(h, self.rank, layer_id, request_id, tokens, sharded)?;
             self.stream
                 .read_exact(&mut self.buf[glm53f_wire::HEADER_LEN..want])
                 .map_err(|e| format!("spark read body: {e}"))?;
@@ -490,7 +572,7 @@ impl SparkConn {
     }
 
     /// RDMA receive of one return: busy-poll the completion, validate the header.
-    fn recv_rdma(&mut self, layer_id: u32, request_id: u64, tokens: usize) -> Result<(), String> {
+    fn recv_rdma(&mut self, layer_id: u32, request_id: u64, tokens: usize, sharded: bool) -> Result<(), String> {
         let rank = self.rank;
         let rc = self.rdma.as_mut().ok_or("rdma: not set up")?;
         let (slot, len) = rc
@@ -503,8 +585,9 @@ impl SparkConn {
         if len < glm53f_wire::HEADER_LEN {
             return Err(format!("rdma: short frame {len} from rank {rank}"));
         }
-        let seq = validate_return_header(&frame[..glm53f_wire::HEADER_LEN], rank, layer_id, request_id, tokens)?;
-        if len != glm53f_wire::HEADER_LEN + tokens * glm53f_wire::layout::RETURN_ROW_BYTES {
+        let seq = validate_return_header(&frame[..glm53f_wire::HEADER_LEN], rank, layer_id, request_id, tokens, sharded)?;
+        let rows = rank_rows(tokens, rank, sharded).1;
+        if len != glm53f_wire::HEADER_LEN + rows * glm53f_wire::layout::RETURN_ROW_BYTES {
             return Err(format!("rdma: rank {rank} frame length {len}"));
         }
         rc.last = Some((slot, len));
@@ -519,9 +602,11 @@ pub struct WireClient {
     /// RDMA mode: the request body shared by all ranks (dropped after `conns`,
     /// whose endpoints hold its registration).
     rdma_body: Option<glm53f_rdma::AlignedBuf>,
-    /// Sent, not yet collected exchanges `(request_id, layer_id, tokens)`, oldest
-    /// first (perf reset R4: two lanes in flight over RDMA).
-    inflight: std::collections::VecDeque<(u64, u32, usize)>,
+    /// Sent, not yet collected exchanges, oldest first (perf reset R4: two lanes in
+    /// flight over RDMA). Each keeps its return path: the two lanes' exchanges may differ.
+    inflight: std::collections::VecDeque<Inflight>,
+    /// The exchange whose returns the receive buffers hold (the last one collected).
+    last: Option<Last>,
     /// The body half the next RDMA request is built in (perf reset P6).
     send_half: usize,
     cfg: WireConfig,
@@ -533,8 +618,10 @@ impl WireClient {
         if addrs.len() != SPARKS {
             return Err(format!("wire: need {SPARKS} Spark addrs, got {}", addrs.len()));
         }
-        if let ReturnPath::RowSharded { .. } = cfg.return_path {
-            return Err("wire: the row-sharded return path is not implemented yet".into());
+        if let ReturnPath::RowSharded { min_rows, .. } = cfg.return_path {
+            if min_rows < SPARKS {
+                return Err(format!("wire: the row-sharded return needs at least {SPARKS} rows (one per rank), not {min_rows}"));
+            }
         }
         if cfg.experts == 0 || !cfg.routed_scale.is_finite() {
             return Err(format!("wire: bad configuration {cfg:?}"));
@@ -556,7 +643,21 @@ impl WireClient {
             }
             rdma_body = Some(body);
         }
-        Ok(Self { conns, next_request_id: 1, rdma_body, inflight: Default::default(), send_half: 0, cfg })
+        Ok(Self {
+            conns,
+            next_request_id: request_id_base(),
+            rdma_body,
+            inflight: Default::default(),
+            last: None,
+            send_half: 0,
+            cfg,
+        })
+    }
+
+    /// The request flags of a `tokens`-row exchange: a reduce-scatter with the configured
+    /// exchange dtype from the row-sharded threshold, none below it.
+    fn request_flags(&self, tokens: usize) -> u32 {
+        self.cfg.row_sharded(tokens).map_or(0, |d| d.request_flags())
     }
 
     pub fn config(&self) -> &WireConfig {
@@ -645,18 +746,22 @@ impl WireClient {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let naive = self.conns[0].tx.naive();
+        let flags = self.request_flags(tokens);
+        // Sending re-posts the receive slots the last returns lie in.
+        self.last = None;
         let half = self.claim_half()?;
         let body = self.rdma_body.as_mut().expect("rdma body");
         let dst = &mut body.as_mut_slice()[half * REQ_HALF..(half + 1) * REQ_HALF];
-        let (header, routes_off, hidden_off, blen) =
+        let (mut header, routes_off, hidden_off, blen) =
             glm53f_wire::frame::encode_request_desc_into(dst, request_id, layer_id, 0, 0, tokens, topk, naive)
                 .map_err(|e| format!("wire: {e}"))?;
+        glm53f_wire::frame::set_request_flags(&mut header, flags).map_err(|e| format!("wire: {e}"))?;
         let base = dst.as_mut_ptr();
         // SAFETY: both offsets lie inside `dst` (checked by the encoder against blen).
         let (routes, hidden) = unsafe { (base.add(routes_off), base.add(hidden_off)) };
         fill(routes, hidden, glm53f_wire::layout::HIDDEN_ROW_BYTES)?;
         self.post_half(half, &header, blen)?;
-        self.inflight.push_back((request_id, layer_id, tokens));
+        self.inflight.push_back(Inflight { request_id, layer_id, tokens, sharded: flags != 0 });
         Ok(())
     }
 
@@ -685,18 +790,22 @@ impl WireClient {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let naive = self.conns[0].tx.naive();
+        let flags = self.request_flags(tokens);
+        // Sending re-posts the receive slots the last returns lie in.
+        self.last = None;
         let half = self.claim_half()?;
         let body = self.rdma_body.as_mut().expect("rdma body");
         let dst = &mut body.as_mut_slice()[half * REQ_HALF..(half + 1) * REQ_HALF];
-        let (header, hidden_off, blen) =
+        let (mut header, hidden_off, blen) =
             glm53f_wire::frame::encode_request_meta_into(dst, request_id, layer_id, 0, 0, routes, topk, naive)
                 .map_err(|e| format!("wire: {e}"))?;
+        glm53f_wire::frame::set_request_flags(&mut header, flags).map_err(|e| format!("wire: {e}"))?;
         if hidden_off + tokens * glm53f_wire::layout::HIDDEN_ROW_BYTES != blen {
             return Err(format!("wire: mapped frame layout {hidden_off} + {tokens} rows != {blen}"));
         }
         fill(dst[hidden_off..].as_mut_ptr(), glm53f_wire::layout::HIDDEN_ROW_BYTES)?;
         self.post_half(half, &header, blen)?;
-        self.inflight.push_back((request_id, layer_id, tokens));
+        self.inflight.push_back(Inflight { request_id, layer_id, tokens, sharded: flags != 0 });
         Ok(())
     }
 
@@ -803,21 +912,23 @@ impl WireClient {
             })
             .collect();
         let request_id = self.send_layer(layer_id, tokens, hidden_rows, routes, topk)?;
-        self.inflight.push_back((request_id, layer_id, tokens));
+        self.inflight.push_back(Inflight { request_id, layer_id, tokens, sharded: self.request_flags(tokens) != 0 });
         Ok(())
     }
 
     /// Receive half: the four returns of the oldest in-flight exchange, left in
-    /// place for [`WireClient::rank_plane`] until the next send. Returns
-    /// `(layer_id, tokens)` of the exchange collected.
+    /// place for [`WireClient::collected`] (or [`WireClient::returned`] and
+    /// [`WireClient::rank_plane`] for a four-plane exchange) until the next send.
+    /// Returns `(layer_id, tokens)` of the exchange collected.
     pub fn moe_recv_raw(&mut self) -> Result<(u32, usize), String> {
-        let (request_id, layer_id, tokens) = self.inflight.pop_front().ok_or("wire: no exchange in flight")?;
+        let Inflight { request_id, layer_id, tokens, sharded } = self.inflight.pop_front().ok_or("wire: no exchange in flight")?;
+        self.last = None;
         let prof = std::env::var_os("GLM53F_PROFILE").is_some();
         let tc = std::time::Instant::now();
         if self.rdma_body.is_some() {
             // All four transfers proceed in hardware; poll each completion in turn.
             for conn in self.conns.iter_mut() {
-                conn.recv_rdma(layer_id, request_id, tokens)?;
+                conn.recv_rdma(layer_id, request_id, tokens, sharded)?;
             }
         } else if tokens > 1 {
             let conns = std::mem::take(&mut self.conns);
@@ -825,7 +936,7 @@ impl WireClient {
                 .into_iter()
                 .map(|mut conn| {
                     std::thread::spawn(move || {
-                        let r = conn.recv_raw_blocking(layer_id, request_id, tokens);
+                        let r = conn.recv_raw_blocking(layer_id, request_id, tokens, sharded);
                         (conn, r)
                     })
                 })
@@ -845,9 +956,10 @@ impl WireClient {
             }
         } else {
             for conn in self.conns.iter_mut() {
-                conn.recv_raw_blocking(layer_id, request_id, tokens)?;
+                conn.recv_raw_blocking(layer_id, request_id, tokens, sharded)?;
             }
         }
+        self.last = Some((tokens, sharded));
         tl("sum_done", Some(layer_id), None);
         if prof {
             eprintln!("PROFILE wire_collect_raw {:.3}", tc.elapsed().as_secs_f64() * 1e3);
@@ -866,19 +978,42 @@ impl WireClient {
         self.moe_recv_raw()
     }
 
-    /// The last collected exchange's returns, as the [`ReturnPath`] lays them out.
+    /// The last collected four-plane exchange's planes (the layout of [`ReturnPath::FourPlaneSum`],
+    /// which every exchange below the row-sharded threshold keeps). [`WireClient::collected`]
+    /// covers both layouts; this panics after a reduce-scattered exchange.
     pub fn returned(&self, tokens: usize) -> Returned<'_> {
-        match self.cfg.return_path {
-            ReturnPath::FourPlaneSum => Returned::Planes(std::array::from_fn(|r| self.rank_plane(r, tokens))),
-            // Refused at connect.
-            ReturnPath::RowSharded { .. } => unreachable!("row-sharded returns are not implemented"),
-        }
+        assert!(
+            !matches!(self.last, Some((_, true))),
+            "wire: the last exchange was reduce-scattered; read its row slices with collected()"
+        );
+        Returned::Planes(std::array::from_fn(|r| self.rank_plane(r, tokens)))
+    }
+
+    /// The last collected exchange's returns, in the layout its return path gave them: four
+    /// planes to add, or four row slices that cover the rows once. `None` unless the last call
+    /// was a [`WireClient::moe_recv_raw`] (a send re-posts the buffers; the host-sum paths leave
+    /// nothing here).
+    pub fn collected(&self) -> Option<Collected<'_>> {
+        let (tokens, sharded) = self.last?;
+        Some(if sharded {
+            Collected::RowSlices(std::array::from_fn(|r| {
+                let (first, rows) = row_partition(tokens, SPARKS, r);
+                RowSlice { first, rows, bytes: self.return_rows(r, rows) }
+            }))
+        } else {
+            Collected::Planes(std::array::from_fn(|r| self.rank_plane(r, tokens)))
+        })
     }
 
     /// Rank `rank`'s BF16 return plane `[tokens * HIDDEN]` (LE bytes) from the
-    /// last [`WireClient::moe_recv_raw`].
+    /// last [`WireClient::moe_recv_raw`] of a four-plane exchange.
     pub fn rank_plane(&self, rank: usize, tokens: usize) -> &[u8] {
-        let plane = tokens * glm53f_wire::layout::RETURN_ROW_BYTES;
+        self.return_rows(rank, tokens)
+    }
+
+    /// The first `rows` BF16 rows of rank `rank`'s last return, where they landed.
+    fn return_rows(&self, rank: usize, rows: usize) -> &[u8] {
+        let plane = rows * glm53f_wire::layout::RETURN_ROW_BYTES;
         let c = &self.conns[rank];
         if let Some(rc) = c.rdma.as_ref() {
             let (slot, _) = rc.last.expect("rank_plane before an RDMA return");
@@ -914,6 +1049,10 @@ impl WireClient {
 
         let request_id = self.next_request_id;
         self.next_request_id += 1;
+        // A reduce-scatter from the row-sharded threshold on (the same flags for every rank).
+        let flags = self.request_flags(tokens);
+        // Sending re-posts the receive slots the last returns lie in (RDMA).
+        self.last = None;
 
         let prof = std::env::var_os("GLM53F_PROFILE").is_some();
         let t0 = std::time::Instant::now();
@@ -951,7 +1090,7 @@ impl WireClient {
                 executor_id: 0,
                 source_kind: SourceKind::Decode,
                 token_position: 0,
-                flags: 0,
+                flags,
                 seq: 0,
                 rows,
                 routes: route_entries,
@@ -994,7 +1133,7 @@ impl WireClient {
                 executor_id: exec as u64,
                 source_kind: SourceKind::Decode,
                 token_position: 0,
-                flags: 0,
+                flags,
                 seq: 0,
                 rows: rows.clone(),
                 routes: route_entries.clone(),
@@ -1052,13 +1191,27 @@ impl WireClient {
         if !self.inflight.is_empty() {
             return Err("wire: host-sum exchange while a raw exchange is in flight".into());
         }
-        let _request_id = self.send_layer(layer_id, tokens, hidden_rows, routes, topk)?;
+        let request_id = self.send_layer(layer_id, tokens, hidden_rows, routes, topk)?;
         let parallel = tokens > 1;
         let prof = std::env::var_os("GLM53F_PROFILE").is_some();
-        // Collect the 4 rank partials. Blocking reads; the prefill uses one
-        // thread per connection, the decode reads the four sequentially.
+        // Collect the 4 rank partials (or, reduce-scattered, the 4 row slices). Blocking
+        // reads; the prefill uses one thread per connection, the decode reads the four
+        // sequentially.
         let tc = std::time::Instant::now();
-        let mut sum = CoordinatorSum::new(tokens, HIDDEN, WireNaive::NONE);
+        let mut sum = if self.cfg.row_sharded(tokens).is_some() {
+            CoordinatorSum::row_sharded(tokens, HIDDEN, WireNaive::NONE)
+        } else {
+            CoordinatorSum::new(tokens, HIDDEN, WireNaive::NONE)
+        };
+        let mut add = |frame: &ReturnFrame| -> Result<(), String> {
+            if (frame.request_id, frame.layer_id) != (request_id, layer_id) {
+                return Err(format!(
+                    "wire: a return for request {} layer {} while collecting request {request_id} layer {layer_id}",
+                    frame.request_id, frame.layer_id
+                ));
+            }
+            sum.accumulate(frame).map_err(|e| e.to_string())
+        };
         if parallel {
             let conns = std::mem::take(&mut self.conns);
             let handles: Vec<_> = conns
@@ -1074,7 +1227,7 @@ impl WireClient {
             for h in handles {
                 let (conn, r) = h.join().map_err(|_| "wire recv thread panic".to_string())?;
                 let frame = r.map_err(|e| format!("wire: {e} (layer {layer_id})"))?;
-                sum.accumulate(&frame).map_err(|e| e.to_string())?;
+                add(&frame)?;
                 new_conns.push(conn);
             }
             self.conns = new_conns;
@@ -1083,7 +1236,7 @@ impl WireClient {
                 let frame = conn
                     .recv_frame_blocking(layer_id)
                     .map_err(|e| format!("wire: {e} (layer {layer_id})"))?;
-                sum.accumulate(&frame).map_err(|e| e.to_string())?;
+                add(&frame)?;
             }
         }
         tl("sum_done", Some(layer_id), None);
@@ -1165,14 +1318,18 @@ mod tests {
         hdr
     }
 
-    /// Four mock ranks on one listener: each answers `exchanges` requests, rank `r` returning
-    /// `value(r)` in every element. Each request is reported on `seen` (rank, its routes) before
+    /// Four mock ranks on one listener: each answers `exchanges` requests. For a four-plane
+    /// request rank `r` returns `value(r)` in every element of every row; for a reduce-scattered
+    /// one it returns its partition of the rows holding `value(0) + ... + value(3)` (what the
+    /// ranks' exchange sums), or, with `planes_always`, a full plane anyway (a rank that does
+    /// not know the extension). Each request is reported on `seen` (rank, the request) before
     /// the rank waits for `go` (when given) and replies.
-    fn mock_ranks(
+    fn mock_ranks_with(
         exchanges: usize,
         value: fn(usize) -> f32,
-        seen: std::sync::mpsc::Sender<(usize, Vec<RouteEntry>)>,
+        seen: std::sync::mpsc::Sender<(usize, RequestFrame)>,
         go: Option<std::sync::mpsc::Receiver<()>>,
+        planes_always: bool,
     ) -> (String, std::thread::JoinHandle<()>) {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1193,7 +1350,7 @@ mod tests {
                         Frame::Request(r) => r,
                         Frame::Return(_) => panic!("expected request"),
                     };
-                    seen.send((rank, req.routes.clone())).expect("report");
+                    seen.send((rank, req.clone())).expect("report");
                     reqs.push(req);
                 }
                 if let Some(go) = go.as_ref() {
@@ -1201,18 +1358,25 @@ mod tests {
                 }
                 for (rank, (s, req)) in streams.iter_mut().zip(reqs).enumerate() {
                     let tokens = req.rows.len();
-                    let code = glm53f_wire::bf16::f32_to_bf16(value(rank), WireNaive::NONE);
+                    let sharded = req.flags & glm53f_wire::FLAG_REDUCE_SCATTER != 0 && !planes_always;
+                    let (first, rows, v) = if sharded {
+                        let (first, rows) = row_partition(tokens, SPARKS, rank);
+                        (first, rows, (0..SPARKS).map(value).sum())
+                    } else {
+                        (0, tokens, value(rank))
+                    };
+                    let code = glm53f_wire::bf16::f32_to_bf16(v, WireNaive::NONE);
                     let ret = ReturnFrame {
                         request_id: req.request_id,
                         placement_version: req.placement_version,
                         layer_id: req.layer_id,
                         executor_id: req.executor_id,
-                        token_position: 0,
+                        token_position: first as u64,
                         status: glm53f_wire::Status::Ok,
-                        flags: glm53f_wire::FLAG_RETURN_REQUIRED,
+                        flags: glm53f_wire::FLAG_RETURN_REQUIRED | if sharded { glm53f_wire::FLAG_ROW_SLICE } else { 0 },
                         route_count: 8,
                         seq: 0,
-                        rows: (0..tokens).map(|_| glm53f_wire::ReturnRow { codes: vec![code; HIDDEN] }).collect(),
+                        rows: (0..rows).map(|_| glm53f_wire::ReturnRow { codes: vec![code; HIDDEN] }).collect(),
                     };
                     let stamped = txs[rank].encode_return(&ret).expect("encode return");
                     s.write_all(&stamped).expect("send return");
@@ -1220,6 +1384,15 @@ mod tests {
             }
         });
         (addr, server)
+    }
+
+    fn mock_ranks(
+        exchanges: usize,
+        value: fn(usize) -> f32,
+        seen: std::sync::mpsc::Sender<(usize, RequestFrame)>,
+        go: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        mock_ranks_with(exchanges, value, seen, go, false)
     }
 
     fn config(scale: f32) -> WireConfig {
@@ -1244,9 +1417,10 @@ mod tests {
             server.join().expect("server join");
             for _ in 0..SPARKS {
                 let (_, got) = seen.recv().unwrap();
-                let ids: Vec<u32> = got.iter().map(|r| r.expert_id).collect();
+                let ids: Vec<u32> = got.routes.iter().map(|r| r.expert_id).collect();
                 assert_eq!(ids, routes.iter().map(|r| r.0).collect::<Vec<_>>());
                 assert!(ids.contains(&287) && ids.contains(&256));
+                assert_eq!(got.flags, 0, "four-plane requests carry no reduce-scatter flag");
             }
         }
     }
@@ -1289,13 +1463,103 @@ mod tests {
         server.join().expect("server join");
     }
 
+    fn sharded(min_rows: usize, exchange: ExchangeDtype, scale: f32) -> WireConfig {
+        WireConfig { return_path: ReturnPath::RowSharded { min_rows, exchange }, ..config(scale) }
+    }
+
+    fn prequant(tokens: usize) -> (Vec<u8>, Vec<u8>, Vec<(u32, f32)>) {
+        let (scales, scale_inv) = quantize_hidden_scales(&vec![0.5f32; tokens * HIDDEN]).unwrap();
+        let payload: Vec<u8> = (0..tokens * HIDDEN).map(|i| crate::fp8::encode_e4m3(0.5 * f64::from(scale_inv[i >> 5]))).collect();
+        let routes: Vec<(u32, f32)> = (0..tokens * 8).map(|i| (((i % 8) * 36 + i / 8 % 36) as u32, 0.1)).collect();
+        (payload, scales, routes)
+    }
+
+    /// With the row-sharded return path, exchanges below the threshold stay four-plane and the
+    /// others are reduce-scattered: their requests carry the flag (and the exchange dtype), the
+    /// host path assembles the row slices, the raw path hands them out through `collected`.
     #[test]
-    fn expert_ids_past_the_model_and_the_row_sharded_path_are_refused() {
+    fn exchanges_are_row_sharded_from_the_threshold_on() {
+        for (exchange, scale) in [(ExchangeDtype::Bf16, 1.0f32), (ExchangeDtype::Fp8RowScaled, 2.5)] {
+            let (seen_tx, seen) = std::sync::mpsc::channel();
+            let (addr, server) = mock_ranks(4, |r| (r + 1) as f32, seen_tx, None);
+            let mut client = WireClient::connect(&vec![addr; SPARKS], sharded(16, exchange, scale)).expect("connect");
+            // Host path: 15 rows are four planes, 18 rows are reduce-scattered; both sum to 10.
+            for tokens in [15usize, 18] {
+                let routes: Vec<(u32, f32)> = (0..tokens * 8).map(|i| ((i % 8 * 36) as u32, 0.125)).collect();
+                let sum = client.moe_layer(5, &vec![1.0f32; tokens * HIDDEN], &routes, 8).expect("moe_layer");
+                assert!(sum.len() == tokens * HIDDEN && sum.iter().all(|&v| v == 10.0 * scale), "{tokens} rows");
+                for _ in 0..SPARKS {
+                    let (_, req) = seen.recv().unwrap();
+                    let want = if tokens >= 16 { exchange.request_flags() } else { 0 };
+                    assert_eq!(req.flags, want, "{tokens} rows");
+                }
+            }
+            assert!(client.collected().is_none(), "the host path leaves nothing to collect");
+            // Raw path: the row slices cover the rows once, in rank order.
+            for tokens in [8usize, 37] {
+                let (payload, scales, routes) = prequant(tokens);
+                client.moe_send_raw(9, &payload, &scales, &routes, 8).expect("send");
+                assert_eq!(client.moe_recv_raw().expect("recv"), (9, tokens));
+                for _ in 0..SPARKS {
+                    seen.recv().unwrap();
+                }
+                match client.collected().expect("collected") {
+                    Collected::Planes(p) => {
+                        assert!(tokens < 16);
+                        for (r, plane) in p.iter().enumerate() {
+                            assert_eq!(plane.len(), tokens * HIDDEN * 2);
+                            assert_eq!(f32::from_bits(u32::from(u16::from_le_bytes([plane[0], plane[1]])) << 16), (r + 1) as f32);
+                        }
+                        let Returned::Planes(q) = client.returned(tokens);
+                        assert_eq!(q[3], p[3]);
+                    }
+                    Collected::RowSlices(s) => {
+                        assert!(tokens >= 16);
+                        let mut next = 0;
+                        for (r, slice) in s.iter().enumerate() {
+                            assert_eq!((slice.first, slice.rows), row_partition(tokens, SPARKS, r));
+                            assert_eq!(slice.first, next);
+                            next += slice.rows;
+                            assert_eq!(slice.bytes.len(), slice.rows * HIDDEN * 2);
+                            let v: Vec<f32> = slice.bytes.chunks_exact(2).map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)).collect();
+                            assert!(v.iter().all(|&x| x == 10.0), "rank {r}'s rows are the summed rows");
+                        }
+                        assert_eq!(next, tokens);
+                    }
+                }
+            }
+            drop(client);
+            server.join().expect("server join");
+        }
+    }
+
+    /// A rank that answers a reduce-scattered request with a full plane (it does not know the
+    /// extension) is refused, on the raw path and on the host path.
+    #[test]
+    fn a_plane_for_a_reduce_scattered_request_is_refused() {
+        for raw in [true, false] {
+            let (seen_tx, _seen) = std::sync::mpsc::channel();
+            let (addr, server) = mock_ranks_with(1, |_| 1.0, seen_tx, None, true);
+            let mut client = WireClient::connect(&vec![addr; SPARKS], sharded(16, ExchangeDtype::Bf16, 1.0)).expect("connect");
+            let (payload, scales, routes) = prequant(20);
+            let e = if raw {
+                client.moe_send_raw(3, &payload, &scales, &routes, 8).expect("send");
+                client.moe_recv_raw().unwrap_err()
+            } else {
+                client.moe_layer_prequant(3, &payload, &scales, &routes, 8).unwrap_err()
+            };
+            assert!(e.contains("mismatch") || e.contains("row_slice"), "{e}");
+            drop(client);
+            server.join().expect("server join");
+        }
+    }
+
+    #[test]
+    fn expert_ids_past_the_model_and_row_shards_smaller_than_a_row_per_rank_are_refused() {
         let (seen_tx, _seen) = std::sync::mpsc::channel();
         let (addr, server) = mock_ranks(0, |_| 1.0, seen_tx, None);
         let addrs = vec![addr; SPARKS];
-        let sharded = WireConfig { return_path: ReturnPath::RowSharded { min_rows: 16 }, ..config(1.0) };
-        assert!(WireClient::connect(&addrs, sharded).is_err());
+        assert!(WireClient::connect(&addrs, sharded(3, ExchangeDtype::Bf16, 1.0)).is_err());
         let mut client = WireClient::connect(&addrs, config(1.0)).expect("connect");
         let hidden = vec![1.0f32; HIDDEN];
         let mut routes: Vec<(u32, f32)> = (0..8).map(|i| (280 + i, 0.125)).collect();

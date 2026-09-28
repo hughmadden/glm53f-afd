@@ -29,7 +29,7 @@ DS41RT code is copied here.
 | Host RAM tier | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/hostcache.rs | `ec6931686c930754ede3d9d128e5bd720f25cec0fb701f4b7a85c002eb087a70` | src/hostcache.rs | Over `KvSlot` page and mark export; page size, state size and budget split are parameters; radix lookup; see below. Tests `eviction_is_least_recently_used_first` and `page_chain_identifies_prefixes` kept (the latter at 256- and 64-token pages) | unit tests in the file; tests/host_tier.rs; tests/scheduler.rs | 2026-09-28 |
 | Sampling contract and CPU reference | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/sampling.rs | `e9a1393a691766c98762af07a1986acaf612a682a59a6537833e36e9fd7e8679` | src/sampling.rs | Module doc (bound, masks); `After::from_logits` takes the id bound; new `greedy` (the kernel's rule, bounded), `Mask`, `apply_mask`, `select_pick`. `Sampling`, `DeviceRow`, `select` and their tests verbatim | unit tests in the file (7 kept, 4 new); tests/gpu.rs | 2026-09-28 |
 | Streaming holdback (`flush_pending`) | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/streaming.rs | `8fc947479f0113a589145f958cdbfa4f313c5bb5476135f7c9cd8853c9346e54` | src/streaming.rs | Takes a decode function (ids to bytes) in place of MiMo's tokenizer; the tests' toy tokenizers became toy decoders; test bodies verbatim | unit tests in the file | 2026-09-28 |
-| Expert wire client and FP8 K32 quantizer | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/wire.rs | `4a9a1fb866b914cec532c45d51d2e7e1ab558a1b978c28afd63c24059e3f2561` | src/wire.rs | `WireConfig` (experts 288, routed scale, `ReturnPath`); route validation; the scale on the host sum; `moe_recv_during`; `returned`; host-only batched quantizer; module doc; one pointer to a private document removed; tests reworked around a four-rank mock (below) | unit tests in the file | 2026-09-28 |
+| Expert wire client and FP8 K32 quantizer | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/src/wire.rs | `4a9a1fb866b914cec532c45d51d2e7e1ab558a1b978c28afd63c24059e3f2561` | src/wire.rs | `WireConfig` (experts 288, routed scale, `ReturnPath`); route validation; the scale on the host sum; `moe_recv_during`; `returned`; host-only batched quantizer; module doc; one pointer to a private document removed; tests reworked around a four-rank mock (below); the row-sharded return path (`ReturnPath::RowSharded`, `collected`, request ids from a random base per connection; below) | unit tests in the file; tests/row_sharded.rs | 2026-09-28 |
 | E4M3 codec | mimo26f-afd @ bab9fa2 : crates/mimo26-load/src/e4m3.rs (lines 14-81) | `767fc973a21aa65c09616c3acfa74eaa32f729dab33c7eeac9f7c5948a4bcfe3` | src/fp8.rs | `E4M3_MAX`, `decode_e4m3`, `decode_table`, `encode_e4m3` verbatim; module doc; two comments name the source repository; tests written here | unit tests in the file | 2026-09-28 |
 | Sampling kernel | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/kernels/sample.cu | `18267fac23b314a6ec4e09f0bcb72b91db143074a1c5615a7f9186d91e068ed5` | kernels/sample.cu | Entry point renamed; three comment lines. Kernel body verbatim | tests/gpu.rs, examples/sample_check.rs | 2026-09-28 |
 | Device argmax | mimo26f-afd @ bab9fa2 : crates/mimo26-coordinator/kernels/dflash.cu (lines 163-229, 256-267) | `ecb17cd49a5f1b9e636ab8d051155bae0bc87eee4d3757f0ed3833cd9b8f4caa` | kernels/select.cu | `argmax_kernel` verbatim; its two entry points renamed; called with the tokenizer's id bound | tests/gpu.rs | 2026-09-28 |
@@ -52,6 +52,8 @@ DS41RT code is copied here.
 | kernels/glm53f_coord.h | The kernels' C ABI | 2026-09-28 |
 | tests/common/mod.rs | A toy deterministic model and slot behind the traits (its positional state is a hash of the whole prefix, checked on every call), simulated memory and time, a call log | 2026-09-28 |
 | tests/scheduler.rs, tests/host_tier.rs, tests/engine.rs, tests/glm_prompt.rs, tests/gpu.rs | See Tests | 2026-09-28 |
+| tests/row_sharded.rs | Four real rank daemons on one GPU over loopback: the row-sharded return against the four-plane sum within the rank README's bound (BF16 and FP8 exchange) and both against the oracle's layers 3 and 4; decode stays four-plane; loopback timings; a dead peer fails the request | 2026-09-28 |
+| examples/wire_bench.rs | The exchange alone against four running ranks, four-plane and row-sharded on the same synthetic rows: per-exchange times, bytes into the coordinator, the two outputs' difference | 2026-09-28 |
 | PROVENANCE.md | This ledger | 2026-09-28 |
 
 ## Behavioural differences from the source
@@ -164,11 +166,22 @@ DS41RT code is copied here.
    2.5 travels inside the gate weights, as the reference and `glm53f-layers`' router compute
    them; 2.5 at the sum is for a coordinator that sends normalized weights.
 3. `moe_recv_during` runs a hook (the shared expert) between the send and the collection.
-4. `ReturnPath` holds the return handling: `FourPlaneSum` is the source's; `RowSharded` (the
-   ranks' reduce-scatter, as the rank daemon designs it) is refused until `glm53f-wire` has its
-   frame changes.
+4. `ReturnPath` holds the return handling: `FourPlaneSum` is the source's; `RowSharded` is the
+   ranks' reduce-scatter (`DS41RTE3` v4, `glm53f_wire::row_shard`). The choice is made per
+   exchange by its row count (`WireConfig::row_sharded`: from `min_rows`, at least 4, the
+   design's 16; smaller exchanges stay four-plane) and travels with the exchange in flight, so
+   the two RDMA lanes may differ. Reduce-scattered requests carry `FLAG_REDUCE_SCATTER` (and
+   `FLAG_EXCHANGE_FP8` for the FP8 exchange), also on the in-place RDMA paths
+   (`set_request_flags`); returns are validated as the rank's row slice (version 4, the row-slice
+   flag, its partition's rows and first row); the host path assembles them with
+   `CoordinatorSum::row_sharded`; `collected` hands out planes or row slices, and `returned`
+   stays the four-plane accessor. `WireConfig::from_env` reads `GLM53F_ROW_SHARDED_MIN_ROWS` and
+   `GLM53F_EXCHANGE_DTYPE`.
 5. `quantize_hidden_batched` encodes on the host (the source used the attention crate's device
    encoder under `cuda`); the device quantizer is `glm53f_coord_quantize_hidden`.
+6. Request ids start at a random base per connection (they started at 1): the ranks' peer mesh
+   keys exchange frames by request id and layer, so a stale frame of an earlier connection can
+   never match a new exchange. The host-sum path also checks each return's request and layer.
 
 ## Tests
 

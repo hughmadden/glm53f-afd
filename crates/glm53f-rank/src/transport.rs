@@ -600,13 +600,19 @@ mod tests {
 /// two-slot registered receive ring and leave by SEND from a registered buffer;
 /// completions are busy-polled. The TCP socket stays open for peer-shutdown
 /// detection only. Selected per connection by the coordinator's handshake.
+///
+/// The ranks' peer mesh (`crate::mesh`) uses the same transport, sized for its
+/// exchange frames: the rank that connects opens it ([`RdmaTransport::connect_sized`],
+/// the coordinator's side of the handshake) and polls it without blocking
+/// ([`RdmaTransport::try_recv`]).
 pub struct RdmaTransport {
     ep: glm53f_rdma::Endpoint,
     recv: glm53f_rdma::AlignedBuf,
-    /// Two send halves of `RDMA_RET_MAX`: a return is posted without waiting,
+    /// Two send halves of `half` bytes: a return is posted without waiting,
     /// and the next one is built in the other half (perf reset: the ~1.2 ms
     /// send completion leaves the critical path).
     send: glm53f_rdma::AlignedBuf,
+    half: usize,
     send_cur: usize,
     send_pending: [bool; 2],
     /// Receive slot lent out by `recv_slot`, re-posted by `release_slot`.
@@ -619,10 +625,33 @@ pub struct RdmaTransport {
 const RDMA_REQ_SLOT: usize = (glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::REQUEST_ROW_BYTES).div_ceil(4096) * 4096;
 const RDMA_RET_MAX: usize = (glm53f_wire::HEADER_LEN + 4096 * glm53f_wire::layout::RETURN_ROW_BYTES).div_ceil(4096) * 4096;
 
+/// The RoCE v2 device, port and GID index that own `stream`'s local IPv4 (the
+/// inference-fabric rule of `glm53f_rdma::fabric_port`; loopback and the test
+/// override fall back to any RoCE v2 GID of that address).
+fn roce_for(stream: &std::net::TcpStream) -> std::io::Result<(String, u8, i32)> {
+    use std::io::{Error, ErrorKind};
+    let ip = match stream.local_addr()? {
+        std::net::SocketAddr::V4(a) => *a.ip(),
+        a => return Err(Error::new(ErrorKind::Unsupported, format!("rdma: IPv6 {a}"))),
+    };
+    match glm53f_rdma::fabric_port(std::net::IpAddr::V4(ip)) {
+        Ok(Some((d, p, g, _))) => Ok((d, p, g)),
+        Ok(None) => glm53f_rdma::find_roce_v2(ip)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("rdma: no RoCE v2 GID for {ip}"))),
+        Err(e) => Err(Error::new(ErrorKind::PermissionDenied, e)),
+    }
+}
+
 impl RdmaTransport {
     /// If the peer opened with the RDMA handshake, complete it and return the
     /// transport; `Ok(None)` means a plain TCP peer (nothing was consumed).
     pub fn accept(stream: &std::net::TcpStream) -> std::io::Result<Option<Self>> {
+        Self::accept_sized(stream, RDMA_REQ_SLOT, RDMA_RET_MAX)
+    }
+
+    /// [`RdmaTransport::accept`] with two receive slots of `recv_slot` bytes
+    /// and two send halves of `send_half` bytes (both page-rounded).
+    pub fn accept_sized(stream: &std::net::TcpStream, recv_slot: usize, send_half: usize) -> std::io::Result<Option<Self>> {
         use glm53f_rdma::{AlignedBuf, Endpoint, Info, HANDSHAKE_LEN, HANDSHAKE_MAGIC};
         use std::io::{Error, ErrorKind, Read, Write};
         // Blocking peek, no timeout: a TCP coordinator may connect long before its
@@ -644,18 +673,10 @@ impl RdmaTransport {
         s.read_exact(&mut hello)?;
         s.set_read_timeout(None)?;
         let remote = Info::from_bytes(&hello[8..]).ok_or_else(|| Error::new(ErrorKind::InvalidData, "short rdma hello"))?;
-        let ip = match stream.local_addr()? {
-            std::net::SocketAddr::V4(a) => *a.ip(),
-            a => return Err(Error::new(ErrorKind::Unsupported, format!("rdma: IPv6 {a}"))),
-        };
-        let (dev, port, gid) = match glm53f_rdma::fabric_port(std::net::IpAddr::V4(ip)) {
-            Ok(Some((d, p, g, _))) => (d, p, g),
-            Ok(None) => glm53f_rdma::find_roce_v2(ip)
-                .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("rdma: no RoCE v2 GID for {ip}")))?,
-            Err(e) => return Err(Error::new(ErrorKind::PermissionDenied, e)),
-        };
-        let mut recv = AlignedBuf::new(2 * RDMA_REQ_SLOT);
-        let mut send = AlignedBuf::new(2 * RDMA_RET_MAX);
+        let (dev, port, gid) = roce_for(stream)?;
+        let (recv_slot, half) = (recv_slot.div_ceil(4096) * 4096, send_half.div_ceil(4096) * 4096);
+        let mut recv = AlignedBuf::new(2 * recv_slot);
+        let mut send = AlignedBuf::new(2 * half);
         let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, 2, None)
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         ep.post_recv(0).map_err(|e| Error::new(ErrorKind::Other, e))?;
@@ -667,7 +688,56 @@ impl RdmaTransport {
         s.write_all(&reply)?;
         eprintln!("rdma: RC on {dev} port {port} gid {gid} (qpn {} -> {})", ep.local_info().qpn, remote.qpn);
         stream.set_nonblocking(true)?;
-        Ok(Some(Self { ep, recv, send, send_cur: 0, send_pending: [false; 2], held: None, stream: s }))
+        Ok(Some(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], held: None, stream: s }))
+    }
+
+    /// The connecting side of the handshake (as the coordinator's wire client
+    /// does it): open an RC queue pair on the RoCE device that owns `stream`'s
+    /// local IPv4, post both receive slots, send `M26RDMA1` and this side's
+    /// queue-pair coordinates, and connect to the answer. Sizes as
+    /// [`RdmaTransport::accept_sized`].
+    pub fn connect_sized(stream: &std::net::TcpStream, recv_slot: usize, send_half: usize) -> std::io::Result<Self> {
+        use glm53f_rdma::{AlignedBuf, Endpoint, Info, HANDSHAKE_LEN, HANDSHAKE_MAGIC};
+        use std::io::{Error, ErrorKind, Read, Write};
+        let (dev, port, gid) = roce_for(stream)?;
+        let (recv_slot, half) = (recv_slot.div_ceil(4096) * 4096, send_half.div_ceil(4096) * 4096);
+        let mut recv = AlignedBuf::new(2 * recv_slot);
+        let mut send = AlignedBuf::new(2 * half);
+        let mut ep = Endpoint::open(&dev, port, gid, Some(&mut send), &mut recv, 2, None)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        ep.post_recv(0).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        ep.post_recv(1).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let mut s = stream.try_clone()?;
+        let mut msg = Vec::with_capacity(HANDSHAKE_LEN);
+        msg.extend_from_slice(HANDSHAKE_MAGIC);
+        msg.extend_from_slice(&ep.local_info().to_bytes());
+        s.write_all(&msg)?;
+        let mut reply = [0u8; HANDSHAKE_LEN];
+        s.read_exact(&mut reply)?;
+        if &reply[..8] != HANDSHAKE_MAGIC {
+            return Err(Error::new(ErrorKind::InvalidData, "rdma: the peer answered without the RDMA magic"));
+        }
+        let remote = Info::from_bytes(&reply[8..]).ok_or_else(|| Error::new(ErrorKind::InvalidData, "short rdma hello"))?;
+        ep.connect(&remote).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        eprintln!("rdma: RC on {dev} port {port} gid {gid} (qpn {} -> {})", ep.local_info().qpn, remote.qpn);
+        stream.set_nonblocking(true)?;
+        Ok(Self { ep, recv, send, half, send_cur: 0, send_pending: [false; 2], held: None, stream: s })
+    }
+
+    /// A received frame if one is waiting (copied out, its slot re-posted),
+    /// without blocking; an error once the peer closed its TCP side or the
+    /// queue pair failed.
+    pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self.ep.wait_recv(std::time::Duration::ZERO, Some(std::time::Duration::ZERO))? {
+            Some((slot, len)) => {
+                let base = slot as usize * self.ep.slot_len();
+                let frame = self.recv.as_slice()[base..base + len].to_vec();
+                self.ep.post_recv(slot)?;
+                Ok(Some(frame))
+            }
+            None if self.peer_gone() => Err("rdma: the peer closed the connection".into()),
+            None => Ok(None),
+        }
     }
 
     /// Wait for the next receive completion: `Some((slot, len))`, or `None`
@@ -725,18 +795,19 @@ impl ByteTransport for RdmaTransport {
             }
             self.send_pending[i] = false;
         }
-        Some(&mut self.send.as_mut_slice()[i * RDMA_RET_MAX..(i + 1) * RDMA_RET_MAX])
+        let half = self.half;
+        Some(&mut self.send.as_mut_slice()[i * half..(i + 1) * half])
     }
 
     /// Post the first `len` bytes of the current half without waiting for the
     /// completion ([`ByteTransport::send_buffer`] reaps it before reuse).
     fn send_in_place(&mut self, len: usize) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
-        if len > RDMA_RET_MAX {
+        if len > self.half {
             return Err(Error::new(ErrorKind::InvalidInput, "rdma: in-place frame exceeds the send buffer"));
         }
         let i = self.send_cur;
-        self.ep.post_send(None, Some((i * RDMA_RET_MAX, len))).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        self.ep.post_send(None, Some((i * self.half, len))).map_err(|e| Error::new(ErrorKind::Other, e))?;
         self.send_pending[i] = true;
         self.send_cur ^= 1;
         Ok(())

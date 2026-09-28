@@ -4,7 +4,8 @@
 //! its resident weights ([`ExpertKernel::prepare_layer`]); a call runs one
 //! rank's FFN on the wire rows as they arrived, FP8 E4M3 with UE8M0 K32 scales,
 //! plus top-8 expert ids and FP32 gate weights per row, and writes the rank's
-//! BF16 partial rows ([`ExpertKernel::ffn`]).
+//! BF16 partial rows ([`ExpertKernel::ffn`]), or the same rows before their
+//! BF16 rounding for the prefill reduce-scatter ([`ExpertKernel::ffn_f32`]).
 //!
 //! Two backends: [`CpuKernel`] (the kernel-order reference of
 //! [`crate::reference`], for the CPU gate and for serving tests) and, with the
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use crate::consts::{EXPERTS, HIDDEN, MAX_ROWS, TOPK};
 use crate::fp8::SCALES_PER_ROW;
 use crate::layout::{check_block, expert_block, LAYER_BYTES};
-use crate::reference::{expert_partial_kernel_order, rank_row, KernelSlice};
+use crate::reference::{expert_partial_kernel_order, rank_row, rank_row_f32, KernelSlice};
 
 /// Hidden rows as they arrived: `rows` rows of 4,096 E4M3 bytes at
 /// `payload_pitch` and 128 UE8M0 bytes at `scales_pitch`.
@@ -99,6 +100,12 @@ pub trait ExpertKernel {
     /// `weights` are [rows * 8], row-major.
     fn ffn(&mut self, layer: &Self::Layer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [u16])
         -> Result<FfnStats, String>;
+    /// [`ExpertKernel::ffn`] with the rows left in FP32 [rows * 4096]: the
+    /// sums before their BF16 rounding, which the prefill reduce-scatter adds
+    /// across the ranks first. The same arithmetic: rounding each value to
+    /// BF16 (nearest even) gives `ffn`'s output bit for bit.
+    fn ffn_f32(&mut self, layer: &Self::Layer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [f32])
+        -> Result<FfnStats, String>;
 }
 
 /// The device planner's route checks, on the host: every id in `0..288`,
@@ -159,22 +166,41 @@ impl ExpertKernel for CpuKernel {
 
     fn ffn(&mut self, layer: &CpuLayer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [u16])
         -> Result<FfnStats, String> {
-        rows.check()?;
-        check_routes(ids, weights, rows.rows)?;
-        if out.len() != rows.rows * HIDDEN {
-            return Err(format!("ffn: output holds {} values, want {}", out.len(), rows.rows * HIDDEN));
-        }
-        let t = std::time::Instant::now();
-        let mut x = vec![0f32; HIDDEN];
-        for i in 0..rows.rows {
-            crate::fp8::decode_row(rows.payload(i), rows.scales(i), &mut x)?;
-            let ys: Vec<Vec<f32>> = (0..TOPK)
-                .map(|s| expert_partial_kernel_order(&x, &layer.slice(ids[i * TOPK + s] as usize), true))
-                .collect();
-            rank_row(&ys, &weights[i * TOPK..(i + 1) * TOPK], &mut out[i * HIDDEN..(i + 1) * HIDDEN])?;
-        }
-        Ok(FfnStats { gpu_ms: t.elapsed().as_secs_f32() * 1e3, ..FfnStats::default() })
+        cpu_ffn(layer, rows, ids, weights, out.len(), |i, ys, w| rank_row(ys, w, &mut out[i * HIDDEN..(i + 1) * HIDDEN]))
     }
+
+    fn ffn_f32(&mut self, layer: &CpuLayer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [f32])
+        -> Result<FfnStats, String> {
+        cpu_ffn(layer, rows, ids, weights, out.len(), |i, ys, w| rank_row_f32(ys, w, &mut out[i * HIDDEN..(i + 1) * HIDDEN]))
+    }
+}
+
+/// The CPU backend's call: checks, then per row the 8 expert partials in
+/// kernel order, handed to `row(i, partials, weights)` to reduce into the
+/// output (`out_len` values).
+fn cpu_ffn(
+    layer: &CpuLayer,
+    rows: Rows<'_>,
+    ids: &[i32],
+    weights: &[f32],
+    out_len: usize,
+    mut row: impl FnMut(usize, &[Vec<f32>], &[f32]) -> Result<(), String>,
+) -> Result<FfnStats, String> {
+    rows.check()?;
+    check_routes(ids, weights, rows.rows)?;
+    if out_len != rows.rows * HIDDEN {
+        return Err(format!("ffn: output holds {out_len} values, want {}", rows.rows * HIDDEN));
+    }
+    let t = std::time::Instant::now();
+    let mut x = vec![0f32; HIDDEN];
+    for i in 0..rows.rows {
+        crate::fp8::decode_row(rows.payload(i), rows.scales(i), &mut x)?;
+        let ys: Vec<Vec<f32>> = (0..TOPK)
+            .map(|s| expert_partial_kernel_order(&x, &layer.slice(ids[i * TOPK + s] as usize), true))
+            .collect();
+        row(i, &ys, &weights[i * TOPK..(i + 1) * TOPK])?;
+    }
+    Ok(FfnStats { gpu_ms: t.elapsed().as_secs_f32() * 1e3, ..FfnStats::default() })
 }
 
 #[cfg(test)]

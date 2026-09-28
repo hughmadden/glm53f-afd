@@ -7,6 +7,7 @@
 // trellis tiles on the tensor cores)  ->  epilogue (rotate back, times svh, GLM's clamped SwiGLU with BF16
 // roundings, times the down projection's suh, rotate, FP16)  ->  down (tensor cores again)  ->  reduce (rotate
 // back, times svh, the 8 slots summed in slot order with their gate weights, BF16)  =  the rank's partial row.
+// `g53r_ffn_f32` leaves that row in FP32, for the prefill reduce-scatter.
 //
 // Sources. The tile decoder (`mcg2`, `decode_tile`), the MMA wrapper and the warp butterfly (`fwht128`) are
 // TensorFold's `src/tensorfold/families/glm5_next/cuda/exl3.cu` at bb4b4a3 (MIT, Copyright (c) 2026 TensorFold
@@ -465,11 +466,13 @@ __global__ void __launch_bounds__(128) down_kernel(const uint8_t* __restrict__ i
 }
 
 // ---- reduce: out[row] = BF16(sum over slots, in order, of w * (rot(sum of splits) * svh)) ---------------------
-// One warp per (row, 128-block of the model width).
+// One warp per (row, 128-block of the model width). F32 keeps the sums in FP32 (the prefill reduce-scatter adds
+// them across ranks before rounding): the same arithmetic, so their BF16 rounding is the default output's bits.
+template <bool F32>
 __global__ void __launch_bounds__(128) reduce_kernel(const float* __restrict__ Zd, const int* __restrict__ inverse,
                                                      const int32_t* __restrict__ ids, const float* __restrict__ wts,
                                                      const uint8_t* __restrict__ image, const int* __restrict__ counts,
-                                                     uint16_t* __restrict__ out, int P, int SKD, int rows,
+                                                     void* __restrict__ out, int P, int SKD, int rows,
                                                      unsigned* __restrict__ fault) {
     const int item = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const int row = item >> 5, blk = item & 31;
@@ -493,15 +496,21 @@ __global__ void __launch_bounds__(128) reduce_kernel(const float* __restrict__ Z
         for (int j = 0; j < 4; ++j) acc[j] = acc[j] + wt * (v[j] * HAD_SCALE * __half2float(svh[n + j]));
     }
     bool bad = false;
-    uint16_t o[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        bad = bad || !isfinite(acc[j]);
-        const __nv_bfloat16 b = __float2bfloat16_rn(acc[j]);
-        o[j] = *reinterpret_cast<const uint16_t*>(&b);
+    for (int j = 0; j < 4; ++j) bad = bad || !isfinite(acc[j]);
+    if (F32) {
+        *reinterpret_cast<float4*>(static_cast<float*>(out) + size_t(row) * H + n) =
+            make_float4(acc[0], acc[1], acc[2], acc[3]);
+    } else {
+        uint16_t o[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const __nv_bfloat16 b = __float2bfloat16_rn(acc[j]);
+            o[j] = *reinterpret_cast<const uint16_t*>(&b);
+        }
+        *reinterpret_cast<uint2*>(static_cast<uint16_t*>(out) + size_t(row) * H + n) =
+            make_uint2(uint32_t(o[0]) | (uint32_t(o[1]) << 16), uint32_t(o[2]) | (uint32_t(o[3]) << 16));
     }
-    *reinterpret_cast<uint2*>(out + size_t(row) * H + n) =
-        make_uint2(uint32_t(o[0]) | (uint32_t(o[1]) << 16), uint32_t(o[2]) | (uint32_t(o[3]) << 16));
     if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(fault, F_OUT);
 }
 
@@ -651,20 +660,17 @@ void g53r_scratch_free(g53r_scratch* S) {
     delete S;
 }
 
-// One rank's FFN for `rows` rows. `payload`: rows of 4,096 E4M3 bytes, `payload_pitch` apart; `scales`: rows of
-// 128 UE8M0 bytes, `scales_pitch` apart (4,096 / 128 for separate arrays; the request frame's interleaved rows
-// use its row stride for both). `ids`, `weights`: [rows * 8], row-major top-8. Writes the rank's partial rows,
-// BF16 [rows * 4,096], to `bf16_out` (host). `cfg` may be null (defaults). `ms` (8 floats, may be null):
-// host staging and uploads, GPU time, download and checks, groups; then the GPU phases plan, gate/up,
-// epilogue, down, reduce (9 floats in all). Returns 0 on success.
-int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_t payload_pitch, const uint8_t* scales,
-             size_t scales_pitch, const int32_t* ids, const float* weights, uint32_t rows, uint16_t* bf16_out,
-             const g53r_cfg* cfg_in, float* ms, char* err, size_t errlen) {
-    if (!L || !S || !payload || !scales || !ids || !weights || !bf16_out || rows == 0 || rows > MAX_ROWS ||
-        payload_pitch < size_t(H) || scales_pitch < size_t(H / 32)) {
+// The body of g53r_ffn and g53r_ffn_f32: exactly one of `bf16_out` and `f32_out` is set.
+static int ffn_impl(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_t payload_pitch,
+                    const uint8_t* scales, size_t scales_pitch, const int32_t* ids, const float* weights, uint32_t rows,
+                    uint16_t* bf16_out, float* f32_out, const g53r_cfg* cfg_in, float* ms, char* err, size_t errlen) {
+    if (!L || !S || !payload || !scales || !ids || !weights || (!bf16_out == !f32_out) || rows == 0 ||
+        rows > MAX_ROWS || payload_pitch < size_t(H) || scales_pitch < size_t(H / 32)) {
         set_msg(err, errlen, "ffn: bad handles, row count or pitches");
         return 1;
     }
+    const bool f32 = f32_out != nullptr;
+    const size_t out_bytes = size_t(rows) * H * (f32 ? 4 : 2);
     g53r_cfg cfg;
     g53r_default_cfg(rows, &cfg);
     if (cfg_in) {
@@ -702,7 +708,7 @@ int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_
     G53R_CK(S->z.ensure(size_t(2) * cfg.sk * routes * WID * 4), "z alloc");
     G53R_CK(S->xd.ensure(size_t(routes) * WID * 2), "xd alloc");
     G53R_CK(S->zd.ensure(size_t(cfg.skd) * routes * H * 4), "zd alloc");
-    G53R_CK(S->out.ensure(size_t(rows) * H * 2), "out alloc");
+    G53R_CK(S->out.ensure(out_bytes), "out alloc");
     int* const counts = S->meta.as<int>();
     unsigned* const fault = reinterpret_cast<unsigned*>(counts + 1);
     int32_t* const ids_d = S->iw.as<int32_t>();
@@ -749,11 +755,17 @@ int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_
                                                                       S->zd.as<float>(), routes, cfg.skd);
     G53R_CK(cudaGetLastError(), "down launch");
     G53R_CK(cudaEventRecord(S->ec, S->st), "event c");
-    reduce_kernel<<<rows * 8, 128, 0, S->st>>>(S->zd.as<float>(), S->inverse.as<int>(), ids_d, w_d, L->image, counts,
-                                               S->out.as<uint16_t>(), routes, cfg.skd, int(rows), fault);
+    if (f32)
+        reduce_kernel<true><<<rows * 8, 128, 0, S->st>>>(S->zd.as<float>(), S->inverse.as<int>(), ids_d, w_d, L->image,
+                                                         counts, S->out.p, routes, cfg.skd, int(rows), fault);
+    else
+        reduce_kernel<false><<<rows * 8, 128, 0, S->st>>>(S->zd.as<float>(), S->inverse.as<int>(), ids_d, w_d, L->image,
+                                                          counts, S->out.p, routes, cfg.skd, int(rows), fault);
     G53R_CK(cudaGetLastError(), "reduce launch");
     G53R_CK(cudaEventRecord(S->e1, S->st), "event 1");
-    G53R_CK(cudaMemcpyAsync(bf16_out, S->out.p, size_t(rows) * H * 2, cudaMemcpyDeviceToHost, S->st), "output download");
+    G53R_CK(cudaMemcpyAsync(f32 ? static_cast<void*>(f32_out) : static_cast<void*>(bf16_out), S->out.p, out_bytes,
+                            cudaMemcpyDeviceToHost, S->st),
+            "output download");
     int meta[2] = {0, 0};  // groups, fault word
     G53R_CK(cudaMemcpyAsync(meta, S->meta.p, 8, cudaMemcpyDeviceToHost, S->st), "meta download");
     G53R_CK(cudaStreamSynchronize(S->st), "ffn sync");
@@ -786,6 +798,28 @@ int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_
         for (int i = 0; i < 5; ++i) ms[4 + i] = ph[i];
     }
     return 0;
+}
+
+// One rank's FFN for `rows` rows. `payload`: rows of 4,096 E4M3 bytes, `payload_pitch` apart; `scales`: rows of
+// 128 UE8M0 bytes, `scales_pitch` apart (4,096 / 128 for separate arrays; the request frame's interleaved rows
+// use its row stride for both). `ids`, `weights`: [rows * 8], row-major top-8. Writes the rank's partial rows,
+// BF16 [rows * 4,096], to `bf16_out` (host). `cfg` may be null (defaults). `ms` (8 floats, may be null):
+// host staging and uploads, GPU time, download and checks, groups; then the GPU phases plan, gate/up,
+// epilogue, down, reduce (9 floats in all). Returns 0 on success.
+int g53r_ffn(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_t payload_pitch, const uint8_t* scales,
+             size_t scales_pitch, const int32_t* ids, const float* weights, uint32_t rows, uint16_t* bf16_out,
+             const g53r_cfg* cfg_in, float* ms, char* err, size_t errlen) {
+    return ffn_impl(L, S, payload, payload_pitch, scales, scales_pitch, ids, weights, rows, bf16_out, nullptr, cfg_in,
+                    ms, err, errlen);
+}
+
+// g53r_ffn with the partial rows left in FP32 [rows * 4,096] (`f32_out`, host): the reduce's sums before their
+// BF16 rounding, for the prefill reduce-scatter. Rounding them to BF16 (nearest even) gives g53r_ffn's bits.
+int g53r_ffn_f32(const g53r_layer* L, g53r_scratch* S, const uint8_t* payload, size_t payload_pitch,
+                 const uint8_t* scales, size_t scales_pitch, const int32_t* ids, const float* weights, uint32_t rows,
+                 float* f32_out, const g53r_cfg* cfg_in, float* ms, char* err, size_t errlen) {
+    return ffn_impl(L, S, payload, payload_pitch, scales, scales_pitch, ids, weights, rows, nullptr, f32_out, cfg_in,
+                    ms, err, errlen);
 }
 
 // Test hook: copy the last call's intermediates out of the scratch: the gate/up split partials Z

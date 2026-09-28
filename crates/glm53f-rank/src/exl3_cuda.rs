@@ -54,6 +54,22 @@ unsafe extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
+    fn g53r_ffn_f32(
+        l: *const RawLayer,
+        s: *mut RawScratch,
+        payload: *const u8,
+        payload_pitch: usize,
+        scales: *const u8,
+        scales_pitch: usize,
+        ids: *const i32,
+        weights: *const f32,
+        rows: u32,
+        f32_out: *mut f32,
+        cfg: *const Cfg,
+        ms: *mut f32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
 }
 
 unsafe extern "C" {
@@ -246,35 +262,51 @@ impl ExpertKernel for CudaKernel {
 
     fn ffn(&mut self, layer: &CudaLayer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [u16])
         -> Result<FfnStats, String> {
+        let (l, s) = (layer.0, self.scratch);
+        self.call(rows, ids, weights, out.len(), |cfg, ms, err, errlen| {
+            // SAFETY: `call` checked the rows (every read in bounds) and the extents of ids,
+            // weights and out.
+            unsafe {
+                g53r_ffn(l, s, rows.payload.as_ptr(), rows.payload_pitch, rows.scales.as_ptr(), rows.scales_pitch,
+                    ids.as_ptr(), weights.as_ptr(), rows.rows as u32, out.as_mut_ptr(), cfg, ms, err, errlen)
+            }
+        })
+    }
+
+    fn ffn_f32(&mut self, layer: &CudaLayer, rows: Rows<'_>, ids: &[i32], weights: &[f32], out: &mut [f32])
+        -> Result<FfnStats, String> {
+        let (l, s) = (layer.0, self.scratch);
+        self.call(rows, ids, weights, out.len(), |cfg, ms, err, errlen| {
+            // SAFETY: as in `ffn`.
+            unsafe {
+                g53r_ffn_f32(l, s, rows.payload.as_ptr(), rows.payload_pitch, rows.scales.as_ptr(), rows.scales_pitch,
+                    ids.as_ptr(), weights.as_ptr(), rows.rows as u32, out.as_mut_ptr(), cfg, ms, err, errlen)
+            }
+        })
+    }
+}
+
+impl CudaKernel {
+    /// The checks and statistics around one of the FFN entry points: `ffi(cfg, ms, err, errlen)`
+    /// makes the call once the rows and the extents (`out_len` output values) are checked.
+    fn call(
+        &mut self,
+        rows: Rows<'_>,
+        ids: &[i32],
+        weights: &[f32],
+        out_len: usize,
+        ffi: impl FnOnce(*const Cfg, *mut f32, *mut c_char, usize) -> c_int,
+    ) -> Result<FfnStats, String> {
         rows.check()?;
         let n = rows.rows;
-        if ids.len() != n * TOPK || weights.len() != n * TOPK || out.len() != n * HIDDEN {
+        if ids.len() != n * TOPK || weights.len() != n * TOPK || out_len != n * HIDDEN {
             return Err(format!("ffn: extents do not match {n} rows"));
         }
         let mut ms = [0f32; 9];
         let mut err = [0u8; 256];
         let cfg = self.cfg;
         let cfg_ptr = cfg.as_ref().map_or(core::ptr::null(), |c| c as *const Cfg);
-        // SAFETY: rows.check() bounds every row read; ids/weights/out are sized above.
-        let rc = unsafe {
-            g53r_ffn(
-                layer.0,
-                self.scratch,
-                rows.payload.as_ptr(),
-                rows.payload_pitch,
-                rows.scales.as_ptr(),
-                rows.scales_pitch,
-                ids.as_ptr(),
-                weights.as_ptr(),
-                n as u32,
-                out.as_mut_ptr(),
-                cfg_ptr,
-                ms.as_mut_ptr(),
-                err.as_mut_ptr() as *mut c_char,
-                err.len(),
-            )
-        };
-        if rc != 0 {
+        if ffi(cfg_ptr, ms.as_mut_ptr(), err.as_mut_ptr() as *mut c_char, err.len()) != 0 {
             return Err(err_string(&err));
         }
         Ok(FfnStats {

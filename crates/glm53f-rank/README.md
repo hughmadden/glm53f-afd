@@ -7,7 +7,9 @@ experts, in all 42 MoE layers (3–44). The weights are stored as EXL3 K4, the
 `tr3-4bpw` checkpoint's format. For every MoE layer of every forward pass the
 coordinator sends the routed rows. For each row, the rank returns the BF16 sum
 over the row's 8 experts of `gate_weight × expert_partial`. The coordinator
-adds the four ranks.
+adds the four ranks; for prefill-sized requests the ranks can add among
+themselves instead, and each returns a quarter of the rows
+([Prefill reduce-scatter](#prefill-reduce-scatter)).
 
 **Status (28 September 2026):**
 
@@ -21,10 +23,16 @@ adds the four ranks.
   is at least 0.990 and the relative RMS error 5–11%, the 4-bit quantization
   error. This holds on the GPU and on the CPU.
 - The daemon serves end to end over TCP.
+- The prefill reduce-scatter runs end to end: four daemons with their peer
+  mesh, on the development GPU over loopback TCP, return the oracle's layers 3
+  and 4 row-sharded, within the derived bound of the four-plane return
+  ([Prefill reduce-scatter](#prefill-reduce-scatter)).
 - Not yet done:
   - running on a Spark (`sm_121`);
-  - the RDMA path (ported unchanged, but untested without a fabric);
-  - the prefill reduce-scatter, which is a design with a CPU simulation.
+  - the RDMA path, for the coordinator's link and the peer mesh (built, but
+    untested without a fabric);
+  - the forward's use of the row-sharded return (the coordinator's wire client
+    has it; `RemoteExperts` does not use it yet).
 
 Contents:
 
@@ -67,8 +75,8 @@ GLM53F_FP8_DIR=<copy of the same experts from the official FP8 checkpoint> \
 **Features:**
 
 - `cuda` builds the kernels.
-- `rdma` builds the RDMA shim (`glm53f-rdma`). A Spark's binary uses
-  `--features cuda,rdma`.
+- `rdma` builds the RDMA shim (`glm53f-rdma`), for the coordinator's link and
+  the peer mesh. A Spark's binary uses `--features cuda,rdma`.
 
 The workspace takes no external crates.
 
@@ -394,9 +402,11 @@ cargo test  -p glm53f-rank --release --features cuda --test cuda_kernel -- --noc
 cargo run   -p glm53f-rank --release --features cuda --example exl3_bench -- --sweep
 cargo build -p glm53f-rank --release --features cuda,rdma
 
-# Once per rank: cut its share and serve it.
+# Once per rank: cut its share and serve it. --peers lists the four ranks' peer-mesh
+# addresses in rank order (the same list on every rank) for the prefill reduce-scatter.
 target/release/glm53f-rank slice --checkpoint <exl3-checkpoint> --rank R --out <rank-dir> --source "<repo>@<revision>"
-target/release/glm53f-rank serve --rank R --dir <rank-dir> --listen <fabric-address>:8600
+GLM53F_RDMA=1 target/release/glm53f-rank serve --rank R --dir <rank-dir> --listen <fabric-address>:8600 \
+  --peers <fabric-0>:8601,<fabric-1>:8601,<fabric-2>:8601,<fabric-3>:8601
 ```
 
 **Expected results:**
@@ -467,7 +477,10 @@ replaced:
 3. **Prepare every layer** before listening. `--lazy` prepares each on first
    use instead. `--allow-partial` serves a directory with only some layers
    (bring-up and tests); a request for a missing layer fails.
-4. **Accept connections.** Connections that do not arrive on the RDMA fabric
+4. **Join the peer mesh** when `--peers` is given (see
+   [The peer mesh](#the-peer-mesh)): only then does the rank serve
+   reduce-scattered requests.
+5. **Accept connections.** Connections that do not arrive on the RDMA fabric
    are refused (`glm53f_rdma::fabric_port`; `GLM53F_WIRE_ALLOW_LAN=1` for
    tests). A coordinator that opens with the RDMA handshake gets an RC queue
    pair; anything else stays on TCP.
@@ -489,64 +502,126 @@ coordinator's `glm53f-rdma`. The frames are `DS41RTE3` v3 with the L4 ladder
 connection closes. The daemon keeps listening: it fails the request, not the
 rank.
 
-**Environment variables:**
+**Flags and environment variables:**
 
-- `GLM53F_RANK_TRACE=1`: a timing line per request;
+- `--peers A0,A1,A2,A3` (`GLM53F_RANK_PEERS`): the four ranks' peer-mesh
+  addresses in rank order; this rank listens on its own;
+- `--peer-timeout-ms N` (`GLM53F_RANK_PEER_TIMEOUT_MS`, default 10,000): how
+  long an exchange waits for a peer's link or frame before it fails;
+- `GLM53F_RDMA=1`: the peer links this rank dials are RDMA RC (an `rdma` build);
+- `GLM53F_RANK_TRACE=1`: a timing line per request, and an `exchange` line per
+  reduce-scattered request;
 - `GLM53F_TIMELINE=1`: cross-host timeline events;
 - `GLM53F_RANK_DUMP_FRAME=<path>` (with `GLM53F_RANK_DUMP_LAYER`, default 3):
   the first request frame of that layer is written to `<path>`, for offline
   replay.
 
 `tests/daemon.rs` runs the binary: two requests, a request for a missing layer
-(error return, connection closed) and a new connection, over TCP.
+(error return, connection closed) and a new connection, over TCP. The
+reduce-scatter's daemon test is glm53f-coordinator's `tests/row_sharded.rs`.
 
 ## Prefill reduce-scatter
 
-**The problem.** Today every rank returns every row: `rows × 8,192` bytes each,
-four partial planes converging on the coordinator's port. At 4,096 rows that is
-4 × 32 MB per layer into one 200 Gb/s port, about 5 ms per layer. It is a 4→1
-incast that drops packets on switches without priority flow control. For
-prefill-sized requests the ranks should reduce among themselves and return
-each row once.
+**The problem.** In the four-plane return every rank returns every row:
+`rows × 8,192` bytes each, four partial planes converging on the coordinator's
+port. At 4,096 rows that is 4 × 32 MB per layer into one 200 Gb/s port, about
+5 ms per layer. It is a 4→1 incast that drops packets on switches without
+priority flow control. For prefill-sized requests the ranks reduce among
+themselves and return each row once.
 
-This packet ships the protocol and its CPU simulation (`src/reduce_scatter.rs`,
-`tests/reduce_scatter.rs`). It follows glmrt v9 (`rdma_reduction.rs`,
-`intermediate_sharding.rs`), reimplemented.
+It follows glmrt v9 (`rdma_reduction.rs`, `intermediate_sharding.rs`),
+reimplemented: `src/reduce_scatter.rs` (the arithmetic and bookkeeping),
+`src/mesh.rs` (the links between the ranks) and version 4 of the wire
+(`glm53f-wire`, `src/row_shard.rs`).
 
 ### Protocol
 
-1. **When.** A request frame of 16 rows or more whose flags carry
-   `FLAG_REDUCE_SCATTER`. This is a new request flag, proposed as bit 18. The
-   coordinator sets it, so all four ranks treat a request the same way.
+1. **When.** The coordinator decides per exchange, by its row count
+   (`ReturnPath::RowSharded` in glm53f-coordinator's wire client: 16 rows and
+   more by default; decode and verify windows keep the four-plane return,
+   whose latency is better). It sets `FLAG_REDUCE_SCATTER` (bit 18) on the
+   request to all four ranks, and `FLAG_EXCHANGE_FP8` (bit 19) for the FP8
+   exchange. Such a request is `DS41RTE3` version 4 and has at least one row
+   per rank.
 2. **Partition.** The rows split into four contiguous ranges, and the first
-   `rows % 4` ranks get one extra row (`partition`, glmrt's
+   `rows % 4` ranks get one extra row (`row_partition`, glmrt's
    `balanced_row_partition`).
-3. **Exchange.** Each rank computes its full FP32 partial: the kernel's reduce
-   output before its BF16 rounding. It then sends each peer that peer's rows.
-   - **Message.** A 64-byte header (magic `G53RRS01`, request id, layer,
-     source and destination ranks, the request's row count, first row, rows
-     carried, exchange dtype, per-link sequence, and a CRC32C over the
-     message), followed by the rows.
-   - **Connections.** One RC queue pair per rank pair, 6 in all. The lower
-     rank connects. Addresses come from configuration (`spark-0` … `spark-3`
-     on the fabric).
+3. **Exchange.** Each rank computes its full FP32 partial: the kernel's
+   reduce output before its BF16 rounding (`ExpertKernel::ffn_f32`; rounded,
+   it is the four-plane return's rows bit for bit). It sends each peer that
+   peer's rows in an exchange frame: version 4, kind 3, with the header and L4
+   tail of every frame (a sequence per link and direction, the CRC32C unless
+   disabled). The frame's `executor_id` is the sender, `token_position` the
+   first row, and the word at byte 124 packs the receiver, the world size and
+   the request's row count.
 4. **Reduce.** For each of its rows, a rank adds per element, in rank order
    0–3 and in FP32, its own row and the three decoded peer rows. It rounds the
-   sum to BF16. A missing, duplicate, corrupted or mismatched message fails
-   the request.
-5. **Return.** A compact return frame carries only the rank's rows, with two
-   changes:
-   - a new return flag `FLAG_ROW_SLICE` (proposed as bit 17);
-   - the first row in the header's reserved u32 at byte 124.
+   sum to BF16. A missing, duplicate, corrupted or mismatched frame fails the
+   request.
+5. **Return.** A row-slice return carries only the rank's rows: version 4,
+   `FLAG_ROW_SLICE` (bit 17) with the usual `SPARK_REDUCTION |
+   V41_COMPACT_BF16`, `row_count` the partition's rows and `token_position` its
+   first row. The coordinator checks each rank's slice against the partition
+   and places the rows: each row once, nothing added
+   (`WireClient::collected`, or `CoordinatorSum::row_sharded` on the host
+   path).
 
-   The coordinator's `CoordinatorSum` gets a scatter mode: each row is filled
-   once, by its owner, and nothing is added. A decoder that does not know the
-   flag rejects the frame, because the reserved field is not zero.
+**Old and new peers.** Only the frames that use the extension are version 4. A
+version-3 decoder accepts version 3 only, so an old rank refuses a
+reduce-scattered request (and closes the connection) instead of answering with
+a full plane, and an old coordinator never adds a row slice as a plane.
+Version-3 frames are unchanged, so old ranks still serve four-plane requests.
+The version-4 decoder refuses a version-4 request or return without its flag,
+a version-3 one with a version-4 flag, and a nonzero word at byte 124 in
+requests and returns (`glm53f-wire`, `tests/row_shard.rs`).
 
-These wire changes (the two flags, the row offset and the scatter mode) belong
-to `glm53f-wire` and the coordinator. They are not made in this packet.
+### The peer mesh
 
-### Error and dtype: BF16 exchange proposed
+- **Links.** One link per pair of ranks, six in all. The lower rank dials and
+  the higher one accepts. Each rank listens on its own entry of `--peers` (the
+  four ranks' addresses in rank order, on the fabric) and dials the ranks
+  above it. The daemon's fabric guard applies to these connections too
+  (loopback is exempt; `GLM53F_WIRE_ALLOW_LAN=1` for tests).
+- **Hello.** A 16-byte hello each way (magic `G53RMESH`, wire version 4, world
+  size, source and destination ranks, transport) refuses a peer at the wrong
+  address, of another version or of another world before any frame.
+- **Transport.** RDMA RC with `GLM53F_RDMA=1` in an `rdma` build: the
+  coordinator link's transport, sized for exchange frames (two receive slots
+  and two send halves of 8.4 MB per link). The dialling side opens it and the
+  accepting side follows the hello. Otherwise TCP: a reader thread per link
+  validates each frame and hands it to the serving thread, so two ranks
+  sending each other megabytes at once cannot block each other. Over RDMA the
+  serving thread polls the receive queue, as the RDMA design polls
+  completions.
+- **Keys.** An exchange is keyed by request id and layer. Frames of another
+  exchange (the coordinator's other prefill lane, which a faster peer may
+  already be sending) wait until their exchange claims them. The coordinator
+  starts each connection's request ids at a random base, so a stale frame
+  never matches a later exchange; frames nobody claims are dropped after twice
+  the timeout.
+- **Failure.** An exchange fails and never hangs:
+  - a peer without a link, or whose frame has not arrived, within
+    `--peer-timeout-ms` (10 s by default);
+  - a link lost while its frame is awaited: at once;
+  - a frame that names the exchange but not its rows, dtype or ranks, and a
+    duplicate.
+
+  The daemon sends an error return and closes the coordinator's connection,
+  as for any failed request. The lower rank of a lost link dials it again.
+- **Trace.** Under `GLM53F_RANK_TRACE=1`, one line per exchange:
+  `exchange ... part=<first>+<rows> dtype=... send=... wait=... sum=...
+  return=... ms`. They are the encoding and posting of the three frames, the
+  wait for the peers, the sum and its BF16 rounding, and the return.
+
+**Tests.** `tests/reduce_scatter.rs` (all four ranks on the CPU against the
+exact sum), `tests/mesh.rs` (four meshes over loopback: every partition bit for
+bit against the in-process protocol, two exchanges in flight, a peer that never
+sends, one that dies during the exchange, one gone before it, a wrong peer
+list), and glm53f-coordinator's `tests/row_sharded.rs` (four daemons on the
+GPU: the oracle's layers both ways, decode staying four-plane, timings, a
+killed peer).
+
+### Error and dtype: BF16 exchange by default
 
 The simulation takes four independent partial planes. They are mostly unit
 normal, with a few channels 40× larger and a few rows 1,000× smaller. It
@@ -556,7 +631,7 @@ FP32 additions. It also measures the RMS error:
 
 | Return path | RMS error / RMS of the sum |
 |---|---:|
-| Today: four BF16 planes, added in FP32 by the coordinator | 1.7e-3 |
+| Four BF16 planes, added in FP32 by the coordinator | 1.7e-3 |
 | Reduce-scatter, **BF16** exchange | 2.2e-3 |
 | Reduce-scatter, FP8 E4M3 exchange, one FP32 scale per row (glmrt's) | 1.9e-2 |
 
@@ -564,26 +639,56 @@ FP8 exchange is ten times less precise. E4M3 has 3 mantissa bits, so each
 exchanged value is off by up to 6%. It is a numerics change that would have to
 pass the KL gate.
 
+**On real layers** (glm53f-coordinator `tests/row_sharded.rs`: four daemons on
+the development GPU, the oracle's layer-3 and layer-4 prefill inputs, 33 rows,
+the same request both ways). Every row-sharded element is within the bound
+above applied to the difference of the two paths: half a BF16 step of the
+owning rank's own partial (unrounded in one path, rounded in the other), half a
+BF16 step of the row-sharded sum, the FP32 additions of both paths, and for
+the FP8 exchange half an E4M3 step of each peer's value.
+
+| Layer | Exchange | Row-sharded vs four planes: RMS / RMS of the sum | Worst element / bound | Cosine vs the oracle: four planes, row-sharded | Relative RMS vs the oracle: four planes, row-sharded |
+|---|---|---:|---:|---|---|
+| 3 | BF16 | 1.98e-3 | 0.97 | 0.9931, 0.9931 | 5.24%, 5.24% |
+| 4 | BF16 | 1.79e-3 | 0.97 | 0.9903, 0.9903 | 10.38%, 10.38% |
+| 3 | FP8 | 1.91e-2 | 0.83 | 0.9931, 0.9929 | 5.24%, 5.67% |
+| 4 | FP8 | 2.20e-2 | 0.82 | 0.9903, 0.9900 | 10.38%, 10.61% |
+
+Against the oracle, the BF16 exchange changes nothing visible; the FP8
+exchange adds 0.2–0.4 points of relative RMS.
+
 BF16 exchange costs no extra egress. Per rank, per row of the request:
 
 | | To peers | To the coordinator | Total out | Into the coordinator (all ranks) |
 |---|---:|---:|---:|---:|
-| Today | 0 | 8 KB | 8 KB | 32 KB |
+| Four planes | 0 | 8 KB | 8 KB | 32 KB |
 | Reduce-scatter, BF16 | 6 KB | 2 KB | **8 KB** | **8 KB** |
 | Reduce-scatter, FP8 | 3 KB | 2 KB | 5 KB | 8 KB |
 
-**Proposal: BF16 exchange by default.** FP8 is worth it only if Spark-to-Spark
+**BF16 is the default exchange.** FP8 is worth it only if Spark-to-Spark
 bandwidth turns out to be the limit and the KL gate allows it.
 
 ### Remaining incast and timing
 
 - **Incast.** Each Spark still receives from three peers at once, but each
-  burst is a quarter of today's per-rank volume. If that still drops packets,
-  a ring schedule (three steps, each rank sending to one neighbour) removes
-  incast altogether. It costs two extra hops of latency.
-- **Timing.** Exchange and reduction can run chunk by chunk, overlapped with
-  the next chunk's kernels. Row chunks of the prefill wavefront already fit
-  that pattern.
+  burst is a quarter of the four-plane return's per-rank volume. If that still
+  drops packets, a ring schedule (three steps, each rank sending to one
+  neighbour) removes incast altogether. It costs two extra hops of latency.
+- **Measured on the development GPU only** (four daemons sharing one RTX 4090,
+  loopback TCP, 2,048 rows, glm53f-coordinator `examples/wire_bench.rs`, median
+  of 10): four planes 23.7 ms and row-sharded (BF16) 33.9 ms per exchange,
+  with 67.1 MB and 16.8 MB into the coordinator. Loopback has no incast to
+  remove, and the reduce-scatter adds the ranks' work: encoding the frames
+  (5–11 ms for 1,536 rows) and the sum (1.4–3.1 ms), both on the CPU, spread
+  over threads. The target hardware's numbers are the ones that count.
+- **Next, if the trace shows them:**
+  - the BF16 frames are the kernel's BF16 output rows bit for bit, so the
+    kernel could write the peers' rows as BF16 and only the rank's own rows as
+    FP32, and the encoding would disappear;
+  - the sum could run on the GPU;
+  - exchange and reduction can run chunk by chunk, overlapped with the next
+    chunk's kernels; row chunks of the prefill wavefront already fit that
+    pattern.
 
 ## Open issues
 
@@ -600,8 +705,10 @@ bandwidth turns out to be the limit and the KL gate allows it.
 4. **Batch invariance.** Prefill-size calls (above 64 rows) use another K
    split than decode-size calls. A row is bitwise batch-invariant within each
    regime, not across them.
-5. **The reduce-scatter** still needs the peer RDMA mesh in the daemon, the
-   wire flags and the coordinator's scatter mode.
+5. **The reduce-scatter** runs over TCP on one machine. Still to do: the
+   peer mesh over RDMA on the target hardware (built, untested), its timings
+   there against the four-plane return, and the forward's use of the
+   row-sharded return (glm53f-forward's `RemoteExperts`).
 6. **Performance** is not tuned beyond the split sweep. Candidates:
    - graphs for the fixed decode shapes;
    - double-buffered rotation tiles;

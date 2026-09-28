@@ -232,6 +232,18 @@ pub fn expert_partial_kernel_order(x: &[f32], ks: &KernelSlice, bf16: bool) -> V
 /// order (a multiply then an add, as the kernel's final reduce), then BF16
 /// (nearest even). Non-finite sums are an error, as on the device.
 pub fn rank_row(ys: &[Vec<f32>], weights: &[f32], out: &mut [u16]) -> Result<(), String> {
+    assert_eq!(out.len(), HIDDEN);
+    let mut row = vec![0f32; HIDDEN];
+    rank_row_f32(ys, weights, &mut row)?;
+    for (o, &v) in out.iter_mut().zip(&row) {
+        *o = glm53f_wire::bf16::f32_to_bf16_rne(v);
+    }
+    Ok(())
+}
+
+/// [`rank_row`] before its BF16 rounding: the FP32 sums the prefill
+/// reduce-scatter adds across ranks.
+pub fn rank_row_f32(ys: &[Vec<f32>], weights: &[f32], out: &mut [f32]) -> Result<(), String> {
     assert_eq!(ys.len(), weights.len());
     assert_eq!(out.len(), HIDDEN);
     for (h, o) in out.iter_mut().enumerate() {
@@ -242,7 +254,7 @@ pub fn rank_row(ys: &[Vec<f32>], weights: &[f32], out: &mut [u16]) -> Result<(),
         if !acc.is_finite() {
             return Err(format!("rank row: column {h} is not finite"));
         }
-        *o = glm53f_wire::bf16::f32_to_bf16_rne(acc);
+        *o = acc;
     }
     Ok(())
 }

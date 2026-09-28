@@ -6,7 +6,10 @@
 //! MoE layer's routed rows as `DS41RTE3` v3 request frames (FP8 E4M3 rows with
 //! UE8M0 K32 scales, top-8 expert ids and FP32 gate weights per row); the rank
 //! returns, per row, the BF16 sum over its 8 routed experts of
-//! `gate_weight * expert_partial` (8,192 bytes a row).
+//! `gate_weight * expert_partial` (8,192 bytes a row). For prefill-sized
+//! requests the coordinator can ask for the reduce-scatter instead (`DS41RTE3`
+//! v4): the ranks add their partials among themselves over the peer mesh and
+//! each returns only its quarter of the rows, summed.
 //!
 //! # Modules
 //!
@@ -15,8 +18,9 @@
 //!   rank's weight image and the TP4 slicing, through `glm53f-model`),
 //!   [`reference`] (the dequantized FP32 expert FFN and a kernel-order
 //!   emulation), [`kernel`] (the kernel interface and its CPU backend),
-//!   [`reduce_scatter`] (the prefill FP8 reduce-scatter, simulated on the
-//!   CPU), [`testkit`] (synthetic layers, rows and routes).
+//!   [`testkit`] (synthetic layers, rows and routes).
+//! - The prefill reduce-scatter: [`reduce_scatter`] (partition, exchange
+//!   frames, the sum in rank order) and [`mesh`] (the links between the ranks).
 //! - Serving shell, ported from mimo26f-afd v1.2.0 (`PROVENANCE.md`):
 //!   [`transport`], [`server`], [`serve`], [`route`], [`boot`], [`resident`],
 //!   [`manifest`], [`sha256`], [`wire`], [`timeline`], and, with the `cuda`
@@ -39,6 +43,7 @@ pub mod half;
 pub mod kernel;
 pub mod layout;
 pub mod manifest;
+pub mod mesh;
 pub mod reduce_scatter;
 pub mod reference;
 pub mod resident;

@@ -44,6 +44,14 @@
 //! summed. [`CoordinatorSum`] keys partials by header identity and refuses
 //! duplicate slots, so corruption cannot land in the FP32 sum undetected.
 //!
+//! # Version 4: the prefill reduce-scatter
+//!
+//! See [`row_shard`]: a reduce-scattered request, a row-slice return and the
+//! rank-to-rank exchange frame, on the same header and L4 tail. Only the frames
+//! that use the extension are version 4, so a version-3 peer refuses exactly
+//! those, by version, and keeps working for everything else.
+//! [`CoordinatorSum::row_sharded`] assembles the row slices.
+//!
 //! # Naive discipline (suite convention)
 //!
 //! Trap wrong-implementation switches live in [`naive`]; NEGATIVE tests call
@@ -59,15 +67,18 @@ pub mod frame;
 pub mod l4;
 pub mod layout;
 pub mod naive;
+pub mod row_shard;
 
 pub use async_api::{ExpertClient, Ticket, Transport};
 pub use error::{Disposition, WireError};
 pub use frame::{
     decode_frame, decode_frame_env, encode_request, encode_request_env, encode_return,
     encode_return_env, frame_seq, Frame, HiddenRow, RequestFrame, ReturnFrame, ReturnRow,
-    RouteEntry, RowDescriptor, FLAG_RETURN_REQUIRED, FLAG_SPARK_REDUCTION, FLAG_V41_COMPACT_BF16,
+    RouteEntry, RowDescriptor, FLAG_EXCHANGE_FP8, FLAG_REDUCE_SCATTER, FLAG_RETURN_REQUIRED,
+    FLAG_ROW_SLICE, FLAG_SPARK_REDUCTION, FLAG_V41_COMPACT_BF16,
 };
 pub use l4::{retry_until, CoordinatorSum, SlotKey, StreamReceiver, StreamSender};
+pub use row_shard::{row_partition, ExchangeDtype, ExchangeHeader, ExchangeView};
 pub use layout::{
     request_row_bytes, request_row_bytes_env, return_row_bytes, return_row_bytes_env, Dtype,
     SourceKind, Status, HIDDEN, HIDDEN_ROW_BYTES, HEADER_LEN, REQUEST_ROW_BYTES, RETURN_ROW_BYTES,
