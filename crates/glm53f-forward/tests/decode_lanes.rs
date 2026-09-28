@@ -14,6 +14,9 @@
 //! row-independent (`tests/verify_commit.rs`), so the decode steps of six one-row requests equal
 //! one pass's bit for bit, and a verify pass of 25 rows moves within rounding (the same tokens on
 //! every row whose two best logits are at least [`TIE`] apart, logits within the chain test's 5%).
+//! A near tie in a router's top 8 can fall the other way under that rounding; the test records
+//! every call's routes, and from a request's first flipped route on its rows carry another
+//! expert's output, so they are held only to a loose bound (0.5) and reported.
 //!
 //! 1. **Six requests** (prompts of 3 to 41 tokens), layers 0-4 and the head, the local FP8
 //!    experts: 3 decode steps (lanes of 3 and 3 requests), a verify round with windows of 1 to 8
@@ -100,6 +103,100 @@ impl<B: ExpertBackend> ExpertBackend for OneInFlight<B> {
     fn depth(&self) -> usize {
         1
     }
+}
+
+/// Routed experts that record every call's routes (layer, the host's expert ids) in call order.
+struct Routes<B: ExpertBackend> {
+    inner: B,
+    log: Arc<std::sync::Mutex<Vec<(usize, Vec<i32>)>>>,
+}
+
+impl<B: ExpertBackend> ExpertBackend for Routes<B> {
+    fn submit(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> glm53f_forward::Result<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((call.layer, call.host_ids.to_vec()));
+        self.inner.submit(call, stream)
+    }
+    fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> glm53f_forward::Result<()> {
+        self.inner.finish(call, stream)
+    }
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
+}
+
+/// A run's routes per MoE layer, every call's rows in call order, each row's expert ids sorted.
+/// Two lanes (lane A's rows, then lane B's) and one pass give the same row order.
+fn routes_by_layer(log: &[(usize, Vec<i32>)]) -> std::collections::BTreeMap<usize, Vec<Vec<i32>>> {
+    let mut m = std::collections::BTreeMap::<usize, Vec<Vec<i32>>>::new();
+    for (layer, ids) in log {
+        for row in ids.chunks(8) {
+            let mut r = row.to_vec();
+            r.sort_unstable();
+            m.entry(*layer).or_default().push(r);
+        }
+    }
+    m
+}
+
+/// The logit rows of [`script`] (in [`Outcome`] order) of requests whose routes differ between
+/// two runs at or before that row: a request's routes flip when a near tie among its router's
+/// top 8 falls the other way under the row counts' rounding, and from then on its rows may move
+/// by more than rounding. Returns the rows and the number of flipped routes.
+fn flipped_rows(a: &[(usize, Vec<i32>)], b: &[(usize, Vec<i32>)]) -> (Vec<bool>, usize) {
+    let (ra, rb) = (routes_by_layer(a), routes_by_layer(b));
+    assert_eq!(
+        ra.iter().map(|(l, v)| (*l, v.len())).collect::<Vec<_>>(),
+        rb.iter().map(|(l, v)| (*l, v.len())).collect::<Vec<_>>(),
+        "the runs routed the same rows"
+    );
+    let n = PROMPTS.len();
+    let prefill: usize = PROMPTS.iter().sum();
+    // Each route row's (request, logit row) in the script's order: the prompts' own passes, 3
+    // decode steps, the verify round, 2 device decode steps. A prompt's rows before its last
+    // have no logit row of their own; they map to the prompt's logit row.
+    let mut map: Vec<(usize, usize)> = Vec::new();
+    for (i, &p) in PROMPTS.iter().enumerate() {
+        map.extend(std::iter::repeat((i, i)).take(p));
+    }
+    let mut row = n;
+    for _ in 0..3 {
+        map.extend((0..n).map(|i| (i, row + i)));
+        row += n;
+    }
+    for (i, &w) in WINDOWS.iter().enumerate() {
+        map.extend((0..w).map(|j| (i, row + j)));
+        row += w;
+    }
+    for _ in 0..2 {
+        map.extend((0..n).map(|i| (i, row + i)));
+        row += n;
+    }
+    let total = row;
+    assert_eq!(map.len(), prefill + 5 * n + WINDOWS.iter().sum::<usize>());
+    // The first logit row of each request from which its routes differ.
+    let mut from = vec![usize::MAX; n];
+    let mut flips = 0;
+    for (layer, rows_a) in &ra {
+        let rows_b = &rb[layer];
+        assert_eq!(rows_a.len(), map.len(), "layer {layer}: one route row per forward row");
+        for (r, (x, y)) in rows_a.iter().zip(rows_b).enumerate() {
+            if x != y {
+                flips += 1;
+                let (req, lrow) = map[r];
+                from[req] = from[req].min(lrow);
+            }
+        }
+    }
+    // Which logit rows belong to which request.
+    let mut owner = vec![0usize; total];
+    for &(req, lrow) in &map {
+        owner[lrow] = req;
+    }
+    let tainted = (0..total).map(|r| r >= from[owner[r]]).collect();
+    (tainted, flips)
 }
 
 /// What a slot keeps, as bytes: every KDA layer's state and conv window, every DSA layer's tail
@@ -360,15 +457,26 @@ fn decode_and_verify_in_two_lanes() {
     let local = |st: &Arc<Stream>| {
         LocalFp8Experts::new(&edir, 3 << 30, 64, st, Fp8Act::Bf16).expect("local experts")
     };
-    let Some(mut fwd) = forward_with(LAYERS, cfg, |st| Box::new(local(st)), 12, 96, 16) else {
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = |st: &Arc<Stream>| -> Box<dyn ExpertBackend> {
+        Box::new(Routes {
+            inner: local(st),
+            log: log.clone(),
+        })
+    };
+    let Some(mut fwd) = forward_with(LAYERS, cfg, recorded, 12, 96, 16) else {
         return;
     };
+    let take = || std::mem::take(&mut *log.lock().unwrap());
     fwd.set_lane_trace(true, true);
     let two = script(&mut fwd, How::Lanes);
+    let two_routes = take();
     fwd.set_lane_trace(false, false);
     fwd.cfg.decode_lane_rows = 0;
     let seq = script(&mut fwd, How::TwoPasses);
+    take();
     let one = script(&mut fwd, How::OnePass);
+    let one_routes = take();
     // One call in flight at a time: lane A's head runs before lane B's last call is collected.
     let stream = fwd.stream().clone();
     fwd.set_experts(Box::new(OneInFlight(local(&stream))));
@@ -388,23 +496,36 @@ fn decode_and_verify_in_two_lanes() {
         &one.logits[..head_rows * VOCAB],
     ) && two.picks[..head_rows] == one.picks[..head_rows];
     let (rows, same) = decided(&one.logits, &one.picks, &two.picks);
+    // Rows of requests whose routes flipped (a near tie in a router's top 8) are held to a
+    // looser bound: from the flip on they carry another expert's output, not rounding.
+    let (tainted, flips) = flipped_rows(&two_routes, &one_routes);
+    assert_eq!(tainted.len(), two.picks.len());
+    let rel = |r: usize| {
+        err(
+            &two.logits[r * VOCAB..(r + 1) * VOCAB],
+            &one.logits[r * VOCAB..(r + 1) * VOCAB],
+        )
+        .rel_rms
+    };
     let worst = (0..two.picks.len())
-        .map(|r| {
-            err(
-                &two.logits[r * VOCAB..(r + 1) * VOCAB],
-                &one.logits[r * VOCAB..(r + 1) * VOCAB],
-            )
-            .rel_rms
-        })
+        .filter(|&r| !tainted[r])
+        .map(rel)
         .fold(0f64, f64::max);
+    let worst_flipped = (0..two.picks.len())
+        .filter(|&r| tainted[r])
+        .map(rel)
+        .fold(0f64, f64::max);
+    let flipped_rows = tainted.iter().filter(|&&t| t).count();
     eprintln!(
         "six requests, layers 0-4 and the head, local FP8 experts: 3 decode steps (lanes of 3 + 3), \
          a verify round of {WINDOWS:?} rows kept {KEEP:?} (lanes cut after request {}), 2 decode \
          steps from device ids: two lanes against two passes, logits and picks bit for bit \
          {exact}, the slots' KDA states, conv windows, pages and tails {kept_exact}; with one call \
          in flight {depth1}; against one pass: the prompts and the decode steps before the verify \
-         bit for bit {before}, every row's logits within {worst:.2e} (relative RMS, worst row), \
-         picks equal on {same}/{rows} rows decided by {TIE}",
+         bit for bit {before}, the logits of rows with the same routes within {worst:.2e} \
+         (relative RMS, worst row), {flips} routes flipped (near ties of a router's top 8) \
+         leaving {flipped_rows} rows within {worst_flipped:.2e}, picks equal on {same}/{rows} rows \
+         decided by {TIE}",
         balanced_cut(&WINDOWS)
     );
     assert!(exact, "two lanes differ from two passes");
@@ -416,6 +537,10 @@ fn decode_and_verify_in_two_lanes() {
     );
     assert_eq!(same, rows, "two lanes pick other tokens than one pass");
     assert!(worst < 5e-2, "two lanes against one pass: {worst:.3e}");
+    assert!(
+        worst_flipped < 0.5,
+        "two lanes against one pass after a flipped route: {worst_flipped:.3e}"
+    );
 
     // The bounds: under decode_lane_rows, over decode_lane_max_rows, one request.
     let mut kvs: Vec<GlmKv> = (0..6)
