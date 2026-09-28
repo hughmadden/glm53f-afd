@@ -12,6 +12,9 @@
 //! - a file whose token digest is not the teacher's, or that lacks a teacher row: refused
 //!   (exit 1).
 //!
+//! With `GLM53F_KL_TEACHER` (a fetched panel of any size), a second test plans that panel and reads
+//! the plan back with the model's real widths.
+//!
 //! Needs `python3` (or `GLM53F_PYTHON`); skips without it.
 
 mod common;
@@ -102,6 +105,40 @@ fn write_engine(
         }
         f.finish().unwrap();
     }
+}
+
+/// With `GLM53F_KL_TEACHER` (a panel `klgate_fetch.py` wrote, of any size): `klgate.py plan` over
+/// its windows, read back by the scorer's reader with the model's real widths (154,880 columns,
+/// tokenizer ids below 154,856). This is the plan a run on the target hardware reads.
+#[test]
+fn the_plan_of_a_fetched_panel_is_accepted() {
+    let Some(dir) = std::env::var_os("GLM53F_KL_TEACHER") else {
+        eprintln!("skip: GLM53F_KL_TEACHER is not set");
+        return;
+    };
+    if !have_python() {
+        return;
+    }
+    let root = scratch("fetched-plan");
+    let plan_path = root.join("plan.json");
+    let out = klgate(&[
+        "plan",
+        "--teacher",
+        dir.to_str().unwrap(),
+        "--out",
+        plan_path.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "klgate.py plan failed");
+    let plan = Plan::parse(&fs::read(&plan_path).unwrap(), 154_880, 154_856).unwrap();
+    let rows: usize = plan.windows.iter().map(|w| w.positions.len()).sum();
+    assert!(plan.windows.iter().all(|w| w.tokens.len() == 2048));
+    eprintln!(
+        "plan read back: {} windows of 2048 tokens, {rows} rows ({:.2} GB of F32 logits), sha256 {}",
+        plan.windows.len(),
+        (rows * 154_880 * 4) as f64 / 1e9,
+        plan.sha256
+    );
+    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

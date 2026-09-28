@@ -41,5 +41,10 @@ Face commits unless marked GitHub. Digests are the sha256 of the file bytes as f
 | BF16 teacher logits, token panel and receipts | `brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits` (dataset) @ `95f4fdd94bf29989db2e0d1054e4931f55edb6aa` | dataset card: `license: other` |
 | Teacher model | `zai-org/GLM-5.3-Flash-BF16` @ `a6c167b62691b2bac901344b65cb651a70f53e43` (recorded in the dataset's receipts) | model card: MIT |
 
+The 125-window panel of `docs/KL-GATE.md` section 6c takes 100 more windows (roles `confirmation`
+and `selection`) from the same dataset at the same revision, listed in
+`logits/full-panel/full-panel-manifest.json` (file sha256
+`c0c70608c6436324852732720afa6d060e7e220f2a6ce2945e8fe63ba8b99a8f`).
+
 Nothing from these datasets is stored in this repository. `klgate_fetch.py` downloads a subset
 to a directory given on its command line.

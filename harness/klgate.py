@@ -33,6 +33,12 @@ Files: the teacher directory has the dataset's layout (``dataset-manifest.json``
 ``klgate_fetch.py``). The engine directory has one ``<window>.safetensors`` per window: ``logits``
 F32 [R, V] and ``positions`` I32 [R], metadata ``window_id`` and ``tokens_sha256``.
 
+Windows: the 25 qualification windows (role ``final``) are listed in ``dataset-manifest.json``; the
+dataset's 640 other windows (roles ``confirmation``, ``selection``, ``conditional-fit``, ``fit``)
+in ``logits/full-panel/full-panel-manifest.json``, read when present. By default the commands
+take the panel ``klgate_fetch.py`` recorded in ``FETCH-MANIFEST.json`` (in its order), else every
+window of ``dataset-manifest.json``; ``--windows``, ``--roles`` and ``--exclude`` select.
+
 Standard library only (tested with Python 3.12).
 """
 from __future__ import annotations
@@ -45,6 +51,7 @@ import json
 import math
 import os
 import random
+import shutil
 import struct
 import sys
 import tempfile
@@ -63,6 +70,7 @@ SHIFT_RATIO_MIN = 3.0  # shifted self-KL must reach this multiple of the teacher
 POSITION_BUCKETS = ((0, 256), (256, 1024), (1024, 1 << 30))
 PERCENTILE_MIN_EXCEEDANCES = 100
 Z95 = NormalDist().inv_cdf(0.975)
+FULL_PANEL_MANIFEST = "logits/full-panel/full-panel-manifest.json"
 
 
 class GateError(Exception):
@@ -175,6 +183,11 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def window_ids_sha256(ids: list[str]) -> str:
+    """A panel's identity: sha256 of its window ids, one per line (``printf '%s\\n' ... | sha256sum``)."""
+    return hashlib.sha256("".join(f"{i}\n" for i in ids).encode()).hexdigest()
+
+
 class Teacher:
     """The teacher panel: windows, token ids and where each window's logits are."""
 
@@ -189,6 +202,24 @@ class Teacher:
         self.manifest_sha256 = hashlib.sha256(raw).hexdigest()
         self.stored_vocab = int(self.manifest["vocab_size"])
         self.windows = {w["window_id"]: w for w in self.manifest["logit_files"]}
+        self.default_ids = list(self.windows)
+        self.full_panel = None
+        path = os.path.join(root, FULL_PANEL_MANIFEST)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                raw = f.read()
+            full = json.loads(raw)
+            for key in ("model_revision", "token_panel_receipt_sha256", "vocab_size"):
+                if full.get(key) != self.manifest.get(key):
+                    raise GateError(f"{path}: {key} {full.get(key)!r} differs from the dataset manifest's "
+                                    f"{self.manifest.get(key)!r}")
+            for w in full["logit_files"]:
+                if w["window_id"] in self.windows or w.get("role") == "final":
+                    raise GateError(f"{path}: window {w['window_id']} repeats one of the dataset manifest's, "
+                                    "or is a final window")
+                self.windows[w["window_id"]] = w
+            self.full_panel = {"full_panel_manifest_sha256": full.get("full_panel_manifest_sha256"),
+                               "full_panel_manifest_file_sha256": hashlib.sha256(raw).hexdigest()}
         self.tokenizer_vocab = None
         receipt = os.path.join(root, "calibration/panel-v1/tokenizer.receipt.json")
         if os.path.exists(receipt):
@@ -200,16 +231,51 @@ class Teacher:
             with open(fm) as f:
                 d = json.load(f)
             self.fetch = {"repo": d.get("repo"), "revision": d.get("revision")}
+            panel = d.get("panel")
+            if panel is not None:  # the windows the fetch was for, in its order
+                ids = list(panel["windows"])
+                unknown = [w for w in ids if w not in self.windows]
+                if unknown or panel.get("window_ids_sha256") not in (None, window_ids_sha256(ids)):
+                    raise GateError(f"{fm}: the panel's windows {unknown[:3]} are in no manifest here, or its "
+                                    "window_ids_sha256 does not match its windows")
+                self.default_ids = ids
 
-    def ids(self, windows: str, exclude: str) -> list[str]:
-        ids = list(self.windows)
+    def role(self, wid: str) -> str:
+        return self.windows[wid].get("role", "")
+
+    def ids(self, windows: str, exclude: str, roles: str = "") -> list[str]:
+        ids = list(self.default_ids)
         if windows:
             ids = windows.split(",")
             unknown = [w for w in ids if w not in self.windows]
-            if unknown:
-                raise GateError(f"unknown windows {unknown}")
+            if unknown or len(set(ids)) != len(ids):
+                raise GateError(f"unknown or repeated windows {unknown or ids}")
+        if roles:
+            keep = roles.split(",")
+            known = {self.role(w) for w in self.windows}
+            if not set(keep) <= known:
+                raise GateError(f"--roles {roles}: the roles here are {sorted(known)}")
+            ids = [w for w in ids if self.role(w) in keep]
         drop = set(exclude.split(",")) if exclude else set()
-        return [w for w in ids if w not in drop]
+        ids = [w for w in ids if w not in drop]
+        if not ids:
+            raise GateError("no windows selected")
+        return ids
+
+    def identity(self, ids: list[str]) -> dict:
+        """The teacher panel's identity and the selected windows'."""
+        roles: dict[str, int] = {}
+        for w in ids:
+            roles[self.role(w)] = roles.get(self.role(w), 0) + 1
+        return {
+            "dataset_sha256": self.manifest.get("dataset_sha256"),
+            "dataset_manifest_file_sha256": self.manifest_sha256,
+            "model_revision": self.manifest.get("model_revision"),
+            "full_panel_manifest_sha256": (self.full_panel or {}).get("full_panel_manifest_sha256"),
+            "full_panel_manifest_file_sha256": (self.full_panel or {}).get("full_panel_manifest_file_sha256"),
+            "fetch": self.fetch,
+            "panel": {"windows": len(ids), "window_ids_sha256": window_ids_sha256(ids), "roles": roles},
+        }
 
     def tokens(self, wid: str) -> list[int]:
         w = self.windows[wid]
@@ -452,6 +518,7 @@ def summarize(results: list[dict], teacher: Teacher, b: int, seed: int) -> dict:
         wins.append({
             "window_id": res["window_id"],
             "domain": w.get("domain", ""),
+            "role": w.get("role", ""),
             "prediction_positions": count,
             "n": len(res["kld"]),
             "mean": tot / count,
@@ -485,16 +552,22 @@ def summarize(results: list[dict], teacher: Teacher, b: int, seed: int) -> dict:
     for q, name in ((0.5, "p50"), (0.9, "p90"), (0.95, "p95"), (0.99, "p99"), (0.999, "p999")):
         if rows * (1 - q) >= PERCENTILE_MIN_EXCEEDANCES or q == 0.5:
             quant[name] = weighted_quantile(xs, ws, q)
-    domains = {}
-    for d in sorted({w["domain"] for w in wins}):
-        sel = [w for w in wins if w["domain"] == d]
-        dp = sum(w["prediction_positions"] for w in sel)
-        domains[d] = {
-            "windows": len(sel),
-            "rows": sum(w["n"] for w in sel),
-            "mean": fsum(w["total_kld"] for w in sel) / dp,
-            "top1_agreement": fsum(w["total_agree"] for w in sel) / dp,
-        }
+
+    def group(key: str, values) -> dict:
+        out = {}
+        for d in values:
+            sel = [w for w in wins if w[key] == d]
+            dp = sum(w["prediction_positions"] for w in sel)
+            out[d] = {
+                "windows": len(sel),
+                "rows": sum(w["n"] for w in sel),
+                "mean": fsum(w["total_kld"] for w in sel) / dp,
+                "top1_agreement": fsum(w["total_agree"] for w in sel) / dp,
+            }
+        return out
+
+    domains = group("domain", sorted({w["domain"] for w in wins}))
+    roles = group("role", dict.fromkeys(w["role"] for w in wins))  # in panel order
     buckets = {}
     for lo, hi in POSITION_BUCKETS:
         sel = [(c, k) for w in wins for p, c, k in zip(w["positions"], w["cells"], w["kld"]) if lo <= p < hi]
@@ -518,6 +591,7 @@ def summarize(results: list[dict], teacher: Teacher, b: int, seed: int) -> dict:
         "max_kld": max(xs),
         "min_kld": min(xs),
         "per_domain": domains,
+        "per_role": roles,
         "per_position_bucket": buckets,
         "per_window": wins,
     }
@@ -554,23 +628,29 @@ def _columns(teacher: Teacher, policy: str) -> tuple[int, int | None]:
 
 def cmd_plan(a) -> int:
     teacher = Teacher(a.teacher)
+    ids = teacher.ids(a.windows, a.exclude, a.roles)
     windows = []
-    for wid in teacher.ids(a.windows, a.exclude):
+    for wid in ids:
         toks = teacher.tokens(wid)
         _, pos = teacher.logits(wid)
         windows.append({
             "window_id": wid,
+            "role": teacher.role(wid),
             "tokens_sha256": tokens_sha256(toks),
             "token_ids_npy_sha256": teacher.windows[wid]["token_ids_sha256"],
             "tokens": toks,
             "positions": sorted(pos),
         })
+    ident = teacher.identity(ids)
     plan = {
         "schema": SCHEMA_PLAN,
         "row_semantics": "row r = logits after tokens[0..r] (inclusive), predicting tokens[r+1]",
-        "dataset_sha256": teacher.manifest.get("dataset_sha256"),
-        "dataset_manifest_file_sha256": teacher.manifest_sha256,
-        "teacher_model_revision": teacher.manifest.get("model_revision"),
+        "dataset_sha256": ident["dataset_sha256"],
+        "dataset_manifest_file_sha256": ident["dataset_manifest_file_sha256"],
+        "full_panel_manifest_sha256": ident["full_panel_manifest_sha256"],
+        "full_panel_manifest_file_sha256": ident["full_panel_manifest_file_sha256"],
+        "teacher_model_revision": ident["model_revision"],
+        "panel": ident["panel"],
         "vocab": teacher.stored_vocab,
         "windows": windows,
     }
@@ -578,7 +658,9 @@ def cmd_plan(a) -> int:
         json.dump(plan, f, separators=(",", ":"))
         f.write("\n")
     rows = sum(len(w["positions"]) for w in windows)
-    print(f"plan: {len(windows)} windows, {rows} rows to write ({rows * teacher.stored_vocab * 4 / 1e9:.2f} GB of F32 logits) -> {a.out}")
+    roles = ", ".join(f"{r} {n}" for r, n in ident["panel"]["roles"].items())
+    print(f"plan: {len(windows)} windows ({roles}; window ids sha256 {ident['panel']['window_ids_sha256'][:12]}), "
+          f"{rows} rows to write ({rows * teacher.stored_vocab * 4 / 1e9:.2f} GB of F32 logits) -> {a.out}")
     return 0
 
 
@@ -634,6 +716,9 @@ def print_report(rep: dict) -> None:
     subset = s["scored_rows"] < s["panel_positions"]
     print(f"KL(teacher || engine), nats; vocabulary: {rep['vocab_policy']} ({rep['columns']:,} columns)")
     print(f"windows {s['windows']}, scored rows {s['scored_rows']:,} standing for {s['panel_positions']:,} positions")
+    p = rep["teacher"].get("panel")
+    if p:
+        print("  panel: " + ", ".join(f"{r} {n}" for r, n in p["roles"].items()) + f"; window ids sha256 {p['window_ids_sha256']}")
     line = f"  mean KLD                    {s['mean_kld']:.6f}"
     if subset:
         se = s["se_subset"]
@@ -655,6 +740,9 @@ def print_report(rep: dict) -> None:
     if rep.get("teacher_pad_mass_max") is not None:
         print(f"  teacher probability on the padded columns, max over rows: {rep['teacher_pad_mass_max']:.3e}")
     print("  per domain: " + "; ".join(f"{d} {v['mean']:.5f} (top-1 {v['top1_agreement']:.3f})" for d, v in s["per_domain"].items()))
+    if len(s.get("per_role", {})) > 1:
+        print("  per role: " + "; ".join(f"{r} {v['windows']} windows {v['mean']:.5f} (top-1 {v['top1_agreement']:.3f})"
+                                         for r, v in s["per_role"].items()))
     print("  per position: " + "; ".join(f"{k} {v['mean']:.5f} ({v['rows']} rows)" for k, v in s["per_position_bucket"].items()))
     print("  per window: window  domain  rows  mean  sd  top-1  teacher-top1=next")
     for w in s["per_window"]:
@@ -667,7 +755,7 @@ def print_report(rep: dict) -> None:
 
 def cmd_score(a) -> int:
     teacher = Teacher(a.teacher)
-    ids = teacher.ids(a.windows, a.exclude)
+    ids = teacher.ids(a.windows, a.exclude, a.roles)
     cols, pad_from = _columns(teacher, a.vocab)
     results, engine_meta = _score(teacher, a.engine, ids, cols, pad_from, _jobs(a.jobs))
     bad = _check_alignment(results)
@@ -682,12 +770,7 @@ def cmd_score(a) -> int:
                       "positions, each scored row weighted by the positions it stands for (1 when all are scored)"),
         "vocab_policy": a.vocab,
         "columns": cols,
-        "teacher": {
-            "dataset_sha256": teacher.manifest.get("dataset_sha256"),
-            "dataset_manifest_file_sha256": teacher.manifest_sha256,
-            "model_revision": teacher.manifest.get("model_revision"),
-            "fetch": teacher.fetch,
-        },
+        "teacher": teacher.identity(ids),
         "engine": {wid: m for wid, m in sorted(engine_meta.items())},
         "harness_sha256": sha256_file(os.path.abspath(__file__)),
         "teacher_pad_mass_max": pad,
@@ -718,7 +801,7 @@ def cmd_score(a) -> int:
 
 def cmd_canary(a) -> int:
     teacher = Teacher(a.teacher)
-    ids = teacher.ids(a.windows, a.exclude)
+    ids = teacher.ids(a.windows, a.exclude, a.roles)
     cols, pad_from = _columns(teacher, a.vocab)
     workers = _jobs(a.jobs)
     same, _ = _score(teacher, None, ids, cols, pad_from, workers)
@@ -765,6 +848,12 @@ def cmd_compare(a) -> int:
     if set(pa) != set(pb):
         raise GateError(f"the reports score different rows ({len(pa)} vs {len(pb)}, {len(set(pa) ^ set(pb))} differ)")
     wins = sorted({w for w, _ in pa})
+    # Reports written before the dataset's other windows could be read hold final windows only.
+    role = {w["window_id"]: w.get("role", "final") for w in ra["summary"]["per_window"]}
+    full = [tuple(r["teacher"].get(k) for k in ("full_panel_manifest_sha256", "full_panel_manifest_file_sha256"))
+            for r in (ra, rb)]
+    if any(role[w] != "final" for w in wins) and (full[0][0] is None or full[0] != full[1]):
+        raise GateError("the reports' non-final windows are from different (or unrecorded) full-panel manifests")
     stats, counts, xs, ys = [], [], [], []
     a_only = b_only = 0
     for wid in wins:
@@ -802,6 +891,13 @@ def cmd_compare(a) -> int:
               f"[{quantile(ratio_reps, 0.025):.4f}, {quantile(ratio_reps, 0.975):.4f}]")
     print(f"  per-row correlation         {_fmt(rho, 4)}")
     print(f"  top-1 (rows): A agrees and B not {a_only}, B agrees and A not {b_only}; McNemar p {p_mcnemar:.3g}")
+    roles = list(dict.fromkeys(role[w["window_id"]] for w in ra["summary"]["per_window"]))
+    if len(roles) > 1:
+        parts = []
+        for r in roles:
+            sel = [i for i, w in enumerate(wins) if role[w] == r]
+            parts.append(f"{r} {len(sel)} windows {fsum(stats[i][0] for i in sel) / sum(counts[i] for i in sel):+.6f}")
+        print("  mean A - B per role         " + "; ".join(parts))
     if a.margin is None:
         return 0
     ok = hi < a.margin
@@ -847,15 +943,20 @@ def _npy(path: str, xs: list[int]) -> None:
         f.write(b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header.encode("latin1") + _i32(xs))
 
 
-def _panel(root: str, rng: random.Random, windows: int, count: int, vocab: int, tok_vocab: int, subset: dict[str, list[int]]) -> dict:
-    """A synthetic panel in the dataset's layout; teacher logits in float32."""
+def _panel(root: str, rng: random.Random, windows: int, count: int, vocab: int, tok_vocab: int,
+           subset: dict[str, list[int]], extra: tuple[str, ...] = ()) -> dict:
+    """A synthetic panel in the dataset's layout; teacher logits in float32. ``windows`` final
+    windows in ``dataset-manifest.json``, then the ``extra`` windows (ids ``<role>-NNNN``) in the
+    full-panel manifest."""
     arrays = os.path.join(root, "calibration/panel-v1/arrays")
     os.makedirs(arrays)
     os.makedirs(os.path.join(root, "logits"))
     os.makedirs(os.path.join(root, "teacher-rows"))
-    entries, logits, tokens = [], {}, {}
-    for k in range(windows):
-        wid = f"final-{k:04d}"
+    entries, full_entries, logits, tokens = [], [], {}, {}
+    specs = [(f"final-{k:04d}", "final", f"logits/window-{k:04d}.safetensors") for k in range(windows)]
+    specs += [(wid, wid.rsplit("-", 1)[0], f"logits/full-panel/{wid.rsplit('-', 1)[0]}/{wid}.safetensors")
+              for wid in extra]
+    for k, (wid, role, path) in enumerate(specs):
         rows = []
         toks = [rng.randrange(tok_vocab) for _ in range(count + 1)]
         for r in range(count):
@@ -866,8 +967,7 @@ def _panel(root: str, rng: random.Random, windows: int, count: int, vocab: int, 
             rows.append(list(array("f", row)))  # float32-rounded
         npy = os.path.join(arrays, f"{wid}.tokens.npy")
         _npy(npy, toks)
-        path = f"logits/window-{k:04d}.safetensors"
-        entry = {"window_id": wid, "path": path, "role": "final", "domain": f"d{k % 2}",
+        entry = {"window_id": wid, "path": path, "role": role, "domain": f"d{k % 2}",
                  "prediction_positions": count, "token_ids_sha256": sha256_file(npy)}
         meta = {"window_id": wid, "token_ids_sha256": entry["token_ids_sha256"]}
         if wid in subset:
@@ -881,15 +981,21 @@ def _panel(root: str, rng: random.Random, windows: int, count: int, vocab: int, 
             entry["bytes"] = 0
         else:
             full = os.path.join(root, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
             _write_st(full, {"logits": ("F32", [count, vocab], b"".join(_f32(r) for r in rows))}, meta)
             entry["sha256"] = sha256_file(full)
             entry["bytes"] = os.path.getsize(full)
-        entries.append(entry)
+        (entries if role == "final" else full_entries).append(entry)
         logits[wid], tokens[wid] = rows, toks
     manifest = {"dataset_sha256": "synthetic", "model_revision": "synthetic", "vocab_size": vocab,
                 "logit_files": entries}
     with open(os.path.join(root, "dataset-manifest.json"), "w") as f:
         json.dump(manifest, f)
+    if full_entries:
+        os.makedirs(os.path.join(root, os.path.dirname(FULL_PANEL_MANIFEST)), exist_ok=True)
+        with open(os.path.join(root, FULL_PANEL_MANIFEST), "w") as f:
+            json.dump({"full_panel_manifest_sha256": "synthetic-full", "model_revision": "synthetic",
+                       "vocab_size": vocab, "logit_files": full_entries}, f)
     with open(os.path.join(root, "calibration/panel-v1/tokenizer.receipt.json"), "w") as f:
         json.dump({"vocab_size": tok_vocab}, f)
     return {"logits": logits, "tokens": tokens}
@@ -995,6 +1101,17 @@ def selftest() -> int:
     check("a steep head: scoring positions 0-4 exactly removes most of the subsample's bias",
           abs(err_head) < abs(err_plain) / 3, f"relative error {err_plain:+.4f} without, {err_head:+.4f} with")
 
+    def ns(**kw):
+        """The command-line namespace of plan, score and canary: the parser's defaults, then kw."""
+        base = dict(engine=None, windows="", roles="", exclude="", vocab="stored", jobs=1,
+                    bootstrap=200, seed=BOOTSTRAP_SEED, json=None, max_mean=None, min_top1=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def load(path):
+        with open(path) as f:
+            return json.load(f)
+
     print("end to end (synthetic panel, 3 windows x 12 positions, 40 columns, 36 real)")
     with tempfile.TemporaryDirectory() as tmp:
         troot = os.path.join(tmp, "teacher")
@@ -1004,13 +1121,10 @@ def selftest() -> int:
         positions = {wid: (sub[wid] if wid in sub else list(range(12))) for wid in panel["logits"]}
 
         def args(**kw):
-            base = dict(teacher=troot, engine=None, windows="", exclude="", vocab="stored", jobs=1,
-                        bootstrap=200, seed=BOOTSTRAP_SEED, json=None, max_mean=None, min_top1=None)
-            base.update(kw)
-            return argparse.Namespace(**base)
+            return ns(teacher=troot, **kw)
 
         plan_path = os.path.join(tmp, "plan.json")
-        cmd_plan(argparse.Namespace(teacher=troot, windows="", exclude="", out=plan_path))
+        cmd_plan(args(out=plan_path))
         with open(plan_path) as f:
             plan = json.load(f)
         pw = {w["window_id"]: w for w in plan["windows"]}
@@ -1063,7 +1177,7 @@ def selftest() -> int:
         check("compare: a report against itself differs by exactly 0 and passes", rc4 == 0)
         rc5 = cmd_compare(argparse.Namespace(a=rep2_path, b=rep_path, margin=1e-6, bootstrap=200, seed=1))
         check("compare: noisy against exact fails a tight margin", rc5 == 3)
-        rc6 = cmd_canary(argparse.Namespace(teacher=troot, windows="", exclude="", vocab="stored", jobs=1))
+        rc6 = cmd_canary(args())
         check("canary on the synthetic teacher passes", rc6 == 0)
 
         for name, kwargs in (("a missing teacher row", {"drop": {4}}),
@@ -1085,6 +1199,70 @@ def selftest() -> int:
         check("an off-by-one engine scores at entropy scale", rep7["summary"]["mean_kld"] > SHIFT_RATIO_MIN * ent,
               f"{rep7['summary']['mean_kld']:.3f} vs entropy {ent:.3f}")
 
+    print("a larger panel (the same 3 final windows, then confirmation-0000 and selection-0000 from the "
+          "full-panel manifest)")
+    with tempfile.TemporaryDirectory() as tmp:
+        xroot, froot = os.path.join(tmp, "teacher-larger"), os.path.join(tmp, "teacher-final")
+        sub = {"final-0002": [1, 4, 7, 10], "selection-0000": [0, 3, 6, 9]}
+        panel = _panel(xroot, random.Random(2), 3, 12, 40, 36, sub, extra=("confirmation-0000", "selection-0000"))
+        shutil.copytree(xroot, froot)  # the final windows alone: no full-panel manifest
+        os.remove(os.path.join(froot, FULL_PANEL_MANIFEST))
+        order = ["final-0000", "final-0001", "final-0002", "confirmation-0000", "selection-0000"]
+        with open(os.path.join(xroot, "FETCH-MANIFEST.json"), "w") as f:
+            json.dump({"repo": "synthetic", "revision": "0" * 40,
+                       "panel": {"windows": order, "window_ids_sha256": window_ids_sha256(order)}}, f)
+        tx = Teacher(xroot)
+        check("the fetched panel is the default, in its order; --roles selects",
+              tx.ids("", "") == order and tx.ids("", "", "final") == order[:3]
+              and tx.ids("", "", "selection,confirmation") == order[3:] and Teacher(froot).ids("", "") == order[:3])
+        plan_path = os.path.join(tmp, "plan.json")
+        cmd_plan(ns(teacher=xroot, out=plan_path))
+        plan = load(plan_path)
+        check("plan: the panel's windows in its order, its identity and the full-panel manifest's",
+              [w["window_id"] for w in plan["windows"]] == order
+              and plan["panel"] == {"windows": 5, "window_ids_sha256": window_ids_sha256(order),
+                                    "roles": {"final": 3, "confirmation": 1, "selection": 1}}
+              and plan["full_panel_manifest_sha256"] == "synthetic-full"
+              and plan["full_panel_manifest_file_sha256"] == sha256_file(os.path.join(xroot, FULL_PANEL_MANIFEST)))
+        noise = random.Random(4)
+        eng = os.path.join(tmp, "engine")
+        positions = {wid: sub.get(wid, list(range(12))) for wid in order}
+        _engine(eng, panel, tx, lambda wid, p, row: [x + noise.gauss(0, 0.3) for x in row], positions)
+        rx, rxf, rf = (os.path.join(tmp, n) for n in ("larger.json", "larger-final.json", "final.json"))
+        cmd_score(ns(teacher=xroot, engine=eng, json=rx))
+        cmd_score(ns(teacher=xroot, engine=eng, json=rxf, roles="final"))
+        cmd_score(ns(teacher=froot, engine=eng, json=rf))
+        x, xf, fo = load(rx), load(rxf), load(rf)
+        check("score: every panel window, per role, the panel's identity",
+              x["summary"]["scored_rows"] == 12 * 3 + 4 + 4 and list(x["summary"]["per_role"]) == ["final", "confirmation", "selection"]
+              and x["teacher"]["panel"]["window_ids_sha256"] == window_ids_sha256(order))
+        check("its final windows score exactly as the final-only panel does, and compare pairs them",
+              [w["kld"] for w in xf["summary"]["per_window"]] == [w["kld"] for w in fo["summary"]["per_window"]]
+              and cmd_compare(argparse.Namespace(a=rxf, b=rf, margin=1e-12, bootstrap=200, seed=1)) == 0)
+        x["teacher"]["full_panel_manifest_file_sha256"] = "0" * 64
+        other = os.path.join(tmp, "other-manifest.json")
+        with open(other, "w") as f:
+            json.dump(x, f)
+        try:
+            cmd_compare(argparse.Namespace(a=rx, b=other, margin=None, bootstrap=200, seed=1))
+            check("compare refuses non-final windows from different full-panel manifests", False)
+        except GateError:
+            check("compare refuses non-final windows from different full-panel manifests", True)
+        check("canary on the larger panel passes", cmd_canary(ns(teacher=xroot)) == 0)
+        path = os.path.join(xroot, FULL_PANEL_MANIFEST)
+        good = load(path)
+        for name, change in (("repeats a final window", lambda m: m["logit_files"][0].update(window_id="final-0001")),
+                             ("is for another token panel", lambda m: m.update(token_panel_receipt_sha256="0" * 64))):
+            bad = json.loads(json.dumps(good))
+            change(bad)
+            with open(path, "w") as f:
+                json.dump(bad, f)
+            try:
+                Teacher(xroot)
+                check(f"refuses a full-panel manifest that {name}", False)
+            except GateError:
+                check(f"refuses a full-panel manifest that {name}", True)
+
     ok = all(checks)
     print(f"selftest: {sum(checks)}/{len(checks)} checks passed" + ("" if ok else " -- FAILED"))
     return 0 if ok else 1
@@ -1101,7 +1279,9 @@ def main() -> int:
         p.add_argument("--teacher", required=True, help="teacher panel directory")
         if engine:
             p.add_argument("--engine", required=True, help="directory of <window>.safetensors engine outputs")
-        p.add_argument("--windows", default="", help="comma-separated window ids (default: all)")
+        p.add_argument("--windows", default="", help="comma-separated window ids (default: the fetched panel, "
+                       "else every window of dataset-manifest.json)")
+        p.add_argument("--roles", default="", help="comma-separated roles to keep, e.g. final")
         p.add_argument("--exclude", default="", help="comma-separated window ids to leave out")
         p.add_argument("--vocab", default="stored",
                        help="columns scored: stored (all, default), tokenizer (drop padded columns), or a number")
@@ -1110,6 +1290,7 @@ def main() -> int:
     p = sp.add_parser("plan", help="write the engine's input")
     p.add_argument("--teacher", required=True)
     p.add_argument("--windows", default="")
+    p.add_argument("--roles", default="")
     p.add_argument("--exclude", default="")
     p.add_argument("--out", required=True)
     p = sp.add_parser("score", help="score engine outputs against the teacher")

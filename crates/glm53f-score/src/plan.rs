@@ -223,6 +223,40 @@ mod tests {
         assert!(p.select(Some(&["final-0009".to_string()])).is_err());
     }
 
+    /// What `klgate.py plan` writes for a panel of several roles: the other roles' windows (ids
+    /// with hyphens), each window's role, and the panel's identity beside the plan's own fields.
+    #[test]
+    fn a_plan_of_a_larger_panel() {
+        let windows: [(&str, &[u32], &[usize]); 3] = [
+            ("final-0024", &[5, 6, 7, 8], &[0, 2]),
+            ("confirmation-0000", &[9, 10, 11], &[1]),
+            ("conditional-fit-0012", &[12, 13, 14, 15], &[0, 1, 2]),
+        ];
+        let ws: Vec<String> = windows
+            .iter()
+            .map(|(id, t, p)| {
+                let role = id.rsplit_once('-').unwrap().0;
+                format!(
+                    r#"{{"window_id":"{id}","role":"{role}","tokens_sha256":"{}","token_ids_npy_sha256":"{}","tokens":{t:?},"positions":{p:?}}}"#,
+                    tokens_sha256(t),
+                    "a".repeat(64)
+                )
+            })
+            .collect();
+        let text = format!(
+            r#"{{"schema":"{SCHEMA}","row_semantics":"row r = logits after tokens[0..r]","dataset_sha256":"d","dataset_manifest_file_sha256":"m","full_panel_manifest_sha256":"f","full_panel_manifest_file_sha256":"g","teacher_model_revision":"r","panel":{{"windows":3,"window_ids_sha256":"i","roles":{{"final":1,"confirmation":1,"conditional-fit":1}}}},"vocab":100,"windows":[{}]}}"#,
+            ws.join(",")
+        );
+        let p = Plan::parse(text.as_bytes(), 100, 50).unwrap();
+        let ids: Vec<&str> = p.windows.iter().map(|w| w.window_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["final-0024", "confirmation-0000", "conditional-fit-0012"]
+        );
+        assert_eq!(p.dataset_sha256.as_deref(), Some("d"));
+        assert_eq!(p.windows[2].positions, vec![0, 1, 2]);
+    }
+
     #[test]
     fn bad_plans_are_refused() {
         let good: &[u32] = &[5, 6, 7, 8];

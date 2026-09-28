@@ -7,17 +7,26 @@ The dataset (default ``brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits``) stores,
 tokens[r + 1]. Each row is 619,520 bytes, so a subset of rows from every window can be fetched
 with one range request per row instead of downloading 1.27 GB per window.
 
+Windows: the 25 qualification windows (role ``final``, listed in ``dataset-manifest.json``) and
+640 more in four other roles (``confirmation``, ``selection``, ``conditional-fit``, ``fit``,
+listed in ``logits/full-panel/full-panel-manifest.json``; the same teacher and capture method).
+By default every final window. ``--panel N`` takes the first N windows in the order final,
+confirmation, selection, conditional-fit, fit, each role in window-id order: every such panel
+contains every smaller one, and N = 25 is the final windows. ``--windows`` names windows.
+
 What this tool writes under ``--out`` (paths as in the dataset, so a full download and a subset
 are read the same way by ``klgate.py``):
 
   README.md, dataset-manifest.json, capture-receipt.json, token-panel-receipt.json,
   backend.json, plan.json                          verbatim, verified against the Hub listing
+  logits/full-panel/full-panel-manifest.json       verbatim, when a window is not a final one
   calibration/panel-v1/*.json                      verbatim (window metadata and receipts)
   calibration/panel-v1/arrays/<window>.tokens.npy  verbatim token ids, int32 [2048]
   teacher-rows/<window>.safetensors                the fetched rows: ``positions`` I32 [n] and
                                                    ``logits`` F32 [n, 154880], with the source
                                                    file's identity in ``__metadata__``
   FETCH-MANIFEST.json                              what was fetched (byte ranges, digests, checks)
+                                                   and the panel: its windows in order
   SHA256SUMS                                       sha256 of every file above (``sha256sum -c``)
 
 Checks: every whole file against the Hub listing at the pinned revision (sha256 for LFS files,
@@ -31,6 +40,9 @@ sha256.
 One range request is latency-bound (a few hundred KB/s), so rows are fetched over several
 connections; ``--rate`` caps their sum. An interrupted run resumes: a window in progress is
 ``<window>.safetensors.partial`` plus ``.partial.rows`` (the rows already written, one per line).
+That includes a run stopped after its last row, inside its closing step: the same command finishes
+it without fetching a row. Every window of the panel holds two open files until it is finished,
+so a panel of more than about 500 windows needs a higher ``ulimit -n``.
 
 Standard library only. No token is needed for this public dataset; if ``HF_TOKEN`` is set it is
 sent to the Hub host only (never to the CDN host a download redirects to) and never printed.
@@ -39,16 +51,20 @@ Rows: every window's first ``--head-rows`` rows (default 5: the KL per position 
 start of a window and falls fastest there) and ``--rows-per-window`` evenly spaced rows (default
 184, one at the middle of each of 184 equal strata). ``klgate.py`` weights each row by the
 positions it stands for. Rows already in an earlier finished file for the same source are copied,
-not fetched again.
+not fetched again: in ``--out``, and in each ``--reuse`` directory (an earlier fetch).
 
-Example (25 windows x 189 rows, about 2.93 GB at 3 MB/s, roughly 17 minutes):
+Examples (189 rows a window, 117 MB; about 2.93 GB for the 25 final windows at 3 MB/s, roughly
+17 minutes; ``--panel 125`` adds 100 windows, 11.7 GB, copying the first 25 from the first fetch):
 
   python3 harness/klgate_fetch.py --revision 95f4fdd94bf29989db2e0d1054e4931f55edb6aa \\
       --rows-per-window 184 --head-rows 5 --rate 3e6 --max-bytes 3e9 --connections 12 --out <dir>
+  python3 harness/klgate_fetch.py --revision 95f4fdd94bf29989db2e0d1054e4931f55edb6aa \\
+      --panel 125 --reuse <dir> --rate 5e6 --max-bytes 12e9 --connections 20 --out <dir-125>
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import hashlib
 import http.client
@@ -82,6 +98,11 @@ META_FILES = (
     "calibration/panel-v1/corpus.receipt.json",
     "calibration/panel-v1/arrays/causal-mask-2048.npy",
 )
+# The manifest of the 640 non-final windows (fetched only when a panel needs one of them).
+FULL_PANEL_MANIFEST = "logits/full-panel/full-panel-manifest.json"
+# The order a panel of N windows takes them in: the qualification windows first, then the roles
+# the dataset's names suggest were least involved in building quantized checkpoints.
+PANEL_ORDER = ("final", "confirmation", "selection", "conditional-fit", "fit")
 
 
 class FetchError(Exception):
@@ -107,6 +128,43 @@ def row_plan(count: int, n: int, head: int) -> tuple[list[int], str]:
     rows = sorted(set(range(head)) | set(evenly_spaced(count, n)))
     rule = f"evenly spaced: row_i = ((2i+1)*{count}) // (2*{n}), i < {n}"
     return rows, (f"rows 0..{head - 1}, and {rule}" if head else rule)
+
+
+def panel_windows(entries: list[dict], n: int) -> list[dict]:
+    """The first n windows in PANEL_ORDER, each role in window-id order.
+
+    Each role interleaves its source documents (window k of a role is from document k mod 4
+    while the role's documents last), so a prefix of a role is spread over its documents."""
+    roles: dict[str, list[dict]] = {}
+    for w in entries:
+        roles.setdefault(w.get("role", ""), []).append(w)
+    other = sorted(set(roles) - set(PANEL_ORDER))
+    if other:
+        raise FetchError(f"windows of roles {other} have no place in the panel order {PANEL_ORDER}")
+    ordered = [w for r in PANEL_ORDER for w in sorted(roles.get(r, []), key=lambda w: w["window_id"])]
+    if not 1 <= n <= len(ordered):
+        raise FetchError(f"--panel must be in 1..{len(ordered)}, got {n}")
+    return ordered[:n]
+
+
+def window_ids_sha256(ids: list[str]) -> str:
+    """The panel's identity: sha256 of its window ids, one per line (``printf '%s\\n' ... | sha256sum``)."""
+    return hashlib.sha256("".join(f"{i}\n" for i in ids).encode()).hexdigest()
+
+
+def check_full_panel(manifest: dict, full: dict) -> None:
+    """The non-final manifest belongs with the dataset manifest: same teacher, token panel and
+    vocabulary, window ids unique, no final window in it."""
+    for key in ("model_revision", "token_panel_receipt_sha256", "vocab_size"):
+        if full.get(key) != manifest.get(key):
+            raise FetchError(f"{FULL_PANEL_MANIFEST}: {key} {full.get(key)!r} differs from the dataset "
+                             f"manifest's {manifest.get(key)!r}")
+    ids = [w["window_id"] for w in full["logit_files"]]
+    finals = {w["window_id"] for w in manifest["logit_files"]}
+    if len(set(ids)) != len(ids) or finals & set(ids):
+        raise FetchError(f"{FULL_PANEL_MANIFEST}: repeated window ids, or ids of the dataset manifest")
+    if any(w.get("role") == "final" for w in full["logit_files"]):
+        raise FetchError(f"{FULL_PANEL_MANIFEST}: lists a final window")
 
 
 def git_blob_sha1(data: bytes) -> str:
@@ -376,7 +434,8 @@ def st_header(tensors: dict[str, tuple[str, list[int], int]], metadata: dict[str
 class Window:
     """One window's subset file being assembled: header first, rows written at fixed offsets."""
 
-    def __init__(self, hub: Hub, out: str, w: dict, rows: list[int], rule: str, listing: dict):
+    def __init__(self, hub: Hub, out: str, w: dict, rows: list[int], rule: str, listing: dict,
+                 reuse: tuple[str, ...] = ()):
         self.w, self.rows, self.out = w, rows, out
         self.wid, src = w["window_id"], w["path"]
         entry = listing.get(src)
@@ -447,14 +506,15 @@ class Window:
         self.fd = os.open(self.partial, os.O_WRONLY)
         self.side = open(self.sidecar, "a")
         self.lock = threading.Lock()
-        self.reused = self._reuse_local()
+        earlier = [self.dst] + [os.path.join(d, "teacher-rows", f"{self.wid}.safetensors") for d in reuse]
+        self.reused = sum(self._reuse_local(p) for p in earlier)
 
-    def _reuse_local(self) -> int:
+    def _reuse_local(self, path: str) -> int:
         """Copy rows this plan shares with an earlier, finished file of the same source."""
-        if not os.path.exists(self.dst):
+        if not os.path.exists(path):
             return 0
         try:
-            with open(self.dst, "rb") as f:
+            with open(path, "rb") as f:
                 (n,) = struct.unpack("<Q", f.read(8))
                 hdr = json.loads(f.read(n))
                 a, b = hdr["positions"]["data_offsets"]
@@ -564,54 +624,85 @@ def _complete(path: str, w: dict, rows: list[int]) -> bool:
         return False
 
 
-def run(a: argparse.Namespace) -> int:
+def _verbatim(hub: Hub, out: str, listing: dict, path: str) -> bytes:
+    """A whole file: the local copy when it matches the listing, else fetched and checked."""
+    local = os.path.join(out, path)
+    if os.path.exists(local):
+        with open(local, "rb") as f:
+            raw = f.read()
+        if matches_listing(raw, listing[path]):
+            return raw
+    return hub.whole_file(path, listing[path])
+
+
+def run(a: argparse.Namespace, hub_class: type | None = None) -> int:
     if not re.fullmatch(r"[0-9a-f]{40}", a.revision):
         raise FetchError("--revision must be a full 40-hex commit")
+    if a.panel is not None and a.windows:
+        raise FetchError("--panel and --windows are exclusive")
     out = os.path.abspath(a.out)
     pacer = Pacer(a.rate, int(a.max_bytes))
-    hub = Hub(pacer, a.endpoint, a.repo, a.revision, os.environ.get("HF_TOKEN") or None)
+    hub = (hub_class or Hub)(pacer, a.endpoint, a.repo, a.revision, os.environ.get("HF_TOKEN") or None)
 
     listing = hub.listing()
     log(f"{a.repo}@{a.revision}: {len(listing)} files listed")
-    local_manifest = os.path.join(out, "dataset-manifest.json")
-    if os.path.exists(local_manifest) and matches_listing(
-        open(local_manifest, "rb").read(), listing["dataset-manifest.json"]
-    ):
-        manifest_raw = open(local_manifest, "rb").read()
-    else:
-        manifest_raw = hub.whole_file("dataset-manifest.json", listing["dataset-manifest.json"])
+    manifest_raw = _verbatim(hub, out, listing, "dataset-manifest.json")
     manifest = json.loads(manifest_raw)
     finals = [w for w in manifest["logit_files"] if w.get("role") == "final"]
-    if a.windows:
-        want = a.windows.split(",")
-        finals = [w for w in finals if w["window_id"] in want]
-        if len(finals) != len(want):
-            raise FetchError(f"unknown window ids in --windows {a.windows}")
-    counts = {int(w["prediction_positions"]) for w in finals}
+    final_ids = {w["window_id"] for w in finals}
+    want = a.windows.split(",") if a.windows else []
+    full_raw = None
+    entries = finals
+    if (a.panel or 0) > len(finals) or any(i not in final_ids for i in want):
+        if FULL_PANEL_MANIFEST not in listing:
+            raise FetchError(f"{FULL_PANEL_MANIFEST} is not in the listing")
+        full_raw = _verbatim(hub, out, listing, FULL_PANEL_MANIFEST)
+        full = json.loads(full_raw)
+        check_full_panel(manifest, full)
+        entries = finals + full["logit_files"]
+    if a.panel is not None:
+        selected = panel_windows(entries, a.panel)
+        panel_rule = f"the first {a.panel} windows in the order {', '.join(PANEL_ORDER)}, each role in window-id order"
+    elif want:
+        by_id = {w["window_id"]: w for w in entries}
+        unknown = [i for i in want if i not in by_id]
+        if unknown or len(set(want)) != len(want):
+            raise FetchError(f"--windows: unknown or repeated window ids {unknown or want}")
+        selected = [by_id[i] for i in want]
+        panel_rule = "the windows named by --windows, in that order"
+    else:
+        selected = finals
+        panel_rule = "every final window"
+    ids = [w["window_id"] for w in selected]
+    counts = {int(w["prediction_positions"]) for w in selected}
     if len(counts) != 1:
         raise FetchError(f"windows with different position counts {counts}")
     rows, rule = row_plan(counts.pop(), a.rows_per_window, a.head_rows)
     vocab = int(manifest["vocab_size"])
-    tokens = [f"calibration/panel-v1/arrays/{w['window_id']}.tokens.npy" for w in finals]
-    whole = ["dataset-manifest.json"] + [p for p in META_FILES if p != "dataset-manifest.json"] + tokens
+    tokens = [f"calibration/panel-v1/arrays/{i}.tokens.npy" for i in ids]
+    whole = (["dataset-manifest.json"] + [p for p in META_FILES if p != "dataset-manifest.json"]
+             + ([FULL_PANEL_MANIFEST] if full_raw is not None else []) + tokens)
     missing = [p for p in whole if p not in listing]
     if missing:
         raise FetchError(f"not in the listing: {missing}")
-    planned = sum(int(listing[p]["size"]) for p in whole) + len(finals) * (len(rows) * vocab * 4 + 2048)
-    log(f"plan: {len(finals)} windows x {len(rows)} rows ({rule}) of {vocab * 4:,} bytes, plus {len(whole)} "
-        f"whole files: {planned:,} bytes at most; {pacer.used:,} fetched so far; budget {pacer.max_bytes:,}")
+    planned = sum(int(listing[p]["size"]) for p in whole) + len(selected) * (len(rows) * vocab * 4 + 2048)
+    log(f"plan: {len(selected)} windows ({panel_rule}) x {len(rows)} rows ({rule}) of {vocab * 4:,} bytes, "
+        f"plus {len(whole)} whole files: {planned:,} bytes at most, rows found in earlier files not "
+        f"fetched; {pacer.used:,} fetched so far; budget {pacer.max_bytes:,}")
     if a.plan_only:
-        print(json.dumps({"windows": [w["window_id"] for w in finals], "rows": rows, "bytes": planned}))
+        print(json.dumps({"windows": ids, "window_ids_sha256": window_ids_sha256(ids), "rows": rows,
+                          "bytes": planned}))
         return 0
 
     os.makedirs(out, exist_ok=True)
     files = []
+    known = {"dataset-manifest.json": manifest_raw, FULL_PANEL_MANIFEST: full_raw}
     for p in whole:
         dst = os.path.join(out, p)
         if not (os.path.exists(dst) and matches_listing(open(dst, "rb").read(), listing[p])):
-            write_atomic(dst, manifest_raw if p == "dataset-manifest.json" else hub.whole_file(p, listing[p]))
+            write_atomic(dst, known[p] if known.get(p) is not None else hub.whole_file(p, listing[p]))
         files.append({"path": p, **_ident(listing[p])})
-    by_id = {w["window_id"]: w for w in finals}
+    by_id = {w["window_id"]: w for w in selected}
     for p in tokens:
         wid = os.path.basename(p)[: -len(".tokens.npy")]
         if sha256_file(os.path.join(out, p)) != by_id[wid]["token_ids_sha256"]:
@@ -620,16 +711,18 @@ def run(a: argparse.Namespace) -> int:
 
     windows: list[Window] = []
     kept: list[dict] = []
-    for w in finals:
+    reuse = tuple(os.path.abspath(d) for d in a.reuse)
+    for w in selected:
         dst = os.path.join(out, "teacher-rows", f"{w['window_id']}.safetensors")
         if _complete(dst, w, rows):
             log(f"{w['window_id']}: complete from an earlier run")
             kept.append({"window_id": w["window_id"], "rows": rows, "local": os.path.relpath(dst, out),
                          "rows_sha256": None, "note": "complete from an earlier run of this tool"})
             continue
-        windows.append(Window(hub, out, w, rows, rule, listing))
+        windows.append(Window(hub, out, w, rows, rule, listing, reuse))
         if windows[-1].done:
-            log(f"{w['window_id']}: {len(windows[-1].done)} of {len(rows)} rows already on disk")
+            log(f"{w['window_id']}: {len(windows[-1].done)} of {len(rows)} rows already on disk "
+                f"({windows[-1].reused} copied from earlier files)")
 
     tasks = [(win, k) for win in windows for k in win.todo()]
     log(f"{len(tasks)} rows to fetch over {a.connections} connections")
@@ -668,6 +761,12 @@ def run(a: argparse.Namespace) -> int:
         "row_rule": rule,
         "bytes_fetched_this_run": pacer.used,
         "fetch_rate_limit_bytes_per_second": a.rate,
+        "panel": {
+            "rule": panel_rule,
+            "windows": ids,
+            "window_ids_sha256": window_ids_sha256(ids),
+            "roles": dict(collections.Counter(w.get("role", "") for w in selected)),
+        },
         "whole_files": files,
         "windows": sorted(records, key=lambda r: r["window_id"]),
         "local_files": [{"path": p, "sha256": h, "bytes": n} for p, h, n in sums],
@@ -678,7 +777,7 @@ def run(a: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="destination directory (created)")
     ap.add_argument("--revision", required=True, help="dataset commit, 40 hex digits")
@@ -686,12 +785,20 @@ def main() -> int:
     ap.add_argument("--endpoint", default=os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
     ap.add_argument("--rows-per-window", type=int, default=184, help="evenly spaced rows per window")
     ap.add_argument("--head-rows", type=int, default=5, help="also every row 0..K-1 of each window")
-    ap.add_argument("--windows", default="", help="comma-separated window ids (default: every final window)")
+    ap.add_argument("--windows", default="", help="comma-separated window ids of any role (default: every final window)")
+    ap.add_argument("--panel", type=int, help="the first N windows in the order final, confirmation, selection, "
+                    "conditional-fit, fit (each role in window-id order); 25 = the final windows")
+    ap.add_argument("--reuse", action="append", default=[], metavar="DIR",
+                    help="an earlier fetch whose rows are copied instead of fetched (repeatable)")
     ap.add_argument("--rate", type=float, default=3e6, help="bytes per second over all connections (0: unlimited)")
     ap.add_argument("--max-bytes", type=float, default=3e9, help="refuse to fetch more than this")
     ap.add_argument("--connections", type=int, default=12)
     ap.add_argument("--plan-only", action="store_true", help="print the plan and the byte count, fetch no rows")
-    a = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    a = parser().parse_args()
     try:
         return run(a)
     except FetchError as e:
