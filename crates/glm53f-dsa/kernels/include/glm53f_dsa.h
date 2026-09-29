@@ -150,7 +150,9 @@ int32_t glm53f_dsa_mla_absorb_q_bf16(const uint16_t* q, int64_t ldq, int32_t row
 // [rows][64] (natural log of the sum of exp(scale * score)). `splits` > 1 splits
 // each row's tokens across blocks (partials in the workspace, merged at the
 // end); `head_groups` in {1, 2, 4} is how many 16-head groups share one decoded
-// tile. Uses the kernel set up by glm53f_dsa_init (otherwise the v1 kernel).
+// tile. Uses the kernel set up by glm53f_dsa_init (otherwise the v1 kernel);
+// unsplit with 4 head groups (the prefill plan), a kernel that staggers the
+// block's two pairs of head groups, with the same bits.
 uint64_t glm53f_dsa_mla_workspace_bytes(int32_t rows, int32_t splits);
 int32_t glm53f_dsa_mla_sparse_attn(const uint16_t* q_abs, const int32_t* tokens,
                                    int32_t token_stride, const int32_t* counts,
@@ -166,6 +168,16 @@ int32_t glm53f_dsa_mla_sparse_attn(const uint16_t* q_abs, const int32_t* tokens,
 // gives the same result up to rounding.
 void glm53f_dsa_mla_plan(int32_t rows, int32_t max_tokens, int32_t sms, int32_t* splits,
                          int32_t* head_groups);
+
+// glm53f_dsa_mla_sparse_attn with the v2 kernel for every plan (same contract; for
+// the unsplit 4-group plan, the prefill kernel's bits), kept for A/B comparison.
+int32_t glm53f_dsa_mla_sparse_attn_v2(const uint16_t* q_abs, const int32_t* tokens,
+                                      int32_t token_stride, const int32_t* counts,
+                                      const int32_t* row_req, int32_t rows, float scale,
+                                      glm53f_dsa_cache_t cache, int32_t splits,
+                                      int32_t head_groups, void* workspace,
+                                      uint64_t workspace_bytes, float* o_lat, float* lse,
+                                      void* stream);
 
 // The first implementation of glm53f_dsa_mla_sparse_attn (same contract), kept
 // for A/B comparison. glm53f_dsa_mla_sparse_attn falls back to it when the

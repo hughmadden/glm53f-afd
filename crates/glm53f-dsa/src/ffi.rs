@@ -168,6 +168,26 @@ unsafe extern "C" {
         stream: CudaStream,
     ) -> CudaError;
 
+    /// `glm53f_dsa_mla_sparse_attn` with the v2 kernel for every plan (same contract; for the
+    /// unsplit four-group plan, the prefill kernel's bits), kept for A/B comparison.
+    pub fn glm53f_dsa_mla_sparse_attn_v2(
+        q_abs: *const u16,
+        tokens: *const i32,
+        token_stride: i32,
+        counts: *const i32,
+        row_req: *const i32,
+        rows: i32,
+        scale: f32,
+        cache: DsaCache,
+        splits: i32,
+        head_groups: i32,
+        workspace: *mut c_void,
+        workspace_bytes: u64,
+        o_lat: *mut f32,
+        lse: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+
     /// The first sparse-attention implementation (same contract), kept for A/B comparison.
     pub fn glm53f_dsa_mla_sparse_attn_v1(
         q_abs: *const u16,

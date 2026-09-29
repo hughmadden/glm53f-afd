@@ -300,7 +300,31 @@ at 1 to 256 rows (`tests/gpu.rs`, `sparse_attn_head_groups_are_bitwise`), so a
 pass too small to fill the multiprocessors with 4 groups takes fewer: one block
 per 16-head group up to a quarter as many rows as the GPU has multiprocessors, 2
 groups up to half (`mla_head_groups` in `glm53f-forward`;
-`docs/PERFORMANCE.md` §5b). Two entry points are
+`docs/PERFORMANCE.md` §5b).
+
+The unsplit plan with 4 head groups (the forward's prefill plan) runs
+`attn_v3_kernel`. `attn_v2_kernel<4>` runs its phases in lock step, so the
+tensor cores idle through every softmax and tile conversion. The v3 block (one
+row, 64 heads, 16 warps) staggers its two pairs of head groups by one phase with
+named barriers: pair X scores tile i while pair Y waits; Y scores it while X runs
+its softmax; X's `P × V` overlaps Y's softmax; Y's `P × V` overlaps X loading
+tile i + 1 (prefetched into L1 once X has scored tile i) and converting it into
+a second tile buffer. Each group's softmax is
+split over its four warps (8 tokens each; maxima, probabilities and pair sums
+shared in shared memory) instead of every warp repeating it. Every value is
+`attn_v2_kernel`'s, from the same operations in the same order; the previous
+kernel stays available as `glm53f_dsa_mla_sparse_attn_v2`, and
+`prefill_sparse_attn_is_bitwise` compares the two bit for bit (two requests,
+heavily and hardly overlapping selections, duplicate and missing tokens,
+unmapped pages, lengths at the tile edges and past the stride, 1 to 271 rows).
+Addressing is additive (unswizzled 520-element tile rows, partial scores at
+[token / 8][head][token % 8]), which frees registers: 64 bytes of spills per
+thread on sm_89 and 156 on sm_120, against 124 and 204 for `attn_v2_kernel<4>`.
+In the forward on the RTX 4090 (`examples/prefill_bench.rs`, 4 lanes × 2,048
+rows, the GPU otherwise idle), the op takes 3.6–3.7 ms per lane and DSA layer
+instead of 5.1–5.2 ms (29% less; the same ratio at 1 lane).
+
+Two entry points are
 for prefill-sized passes, each with the bits of the one it replaces
 (`prefill_absorb_and_unabsorb_match_bitwise`, 1 to 257 rows):
 
@@ -324,9 +348,14 @@ Measured costs are below. **Design for the next step:**
   `Σ_p p/4 × 8,192` flops (≈1.1·10¹⁵ per layer). An FP8 × FP8 variant
   (`mma.m16n8k32.e4m3`, query quantized per head) doubles the rate but changes
   numerics and needs the KL gate.
-- **Sparse MLA, shared selections.** Consecutive prompt rows' selections overlap
-  heavily. A block over R consecutive rows attends over the union of their
-  tokens with per-row masks, decoding each latent tile once for R × 64 heads.
+- **Sparse MLA, tiles shared across rows** (measured, not taken). A row's output
+  accumulators (64 heads × 512 f32) fill half the register file, so a
+  multiprocessor works on one row at a time and its decoded tile already
+  serves all 64 heads. Decoding each record once for all rows (an F16 copy
+  loaded by `cp.async`) made the lock-step kernel 4% slower on the RTX 4090;
+  the time was in the lock-step phases, which `attn_v3_kernel` overlaps.
+  Attending over a union of rows' tokens with masks would change each row's
+  tiles, so it could not keep the bits.
 - **Dense start.** Rows at positions ≤ 2,050 attend to every earlier token; a
   causal flash-attention kernel (MQA: one latent shared by 64 heads) reuses
   each tile across a block of rows instead of re-reading it per row.
@@ -362,7 +391,7 @@ cargo run --release -p glm53f-dsa --features cuda --example dsa_ab -- mid
 |---|---|
 | unit (`src/`) | E4M3 round-to-nearest-even against brute force at every midpoint, power-of-two scale minimality, BF16/F16 rounding, record and page layout sizes, tail round trip, key order, SHA-256 vectors |
 | `tests/reference.rs` | absorbed = expanded within the f32 bound at real dimensions; whole-layer forms agree; window size (1, 3, 8, all) gives bit-identical results; k-pool and tail edges (lengths 1–64 around pool boundaries, dense and sparse rows); the reference output layout, with and without left padding; deterministic ties under any chunking; the 512-pool budget over 3,000 pools |
-| `tests/gpu.rs` | latent write byte-exact; pooled-key write and tail commit; selection exact on integer data with ties (three chunk plans, three merge levels); random data within an f16 bound; the fused selection, its prepared variant and the first implementation identical (scores, pools, tokens) for three plans and at 1M tokens (262,144 pools, 1 and 8 rows); one workspace reused on garbage, after one zero-fill, interleaved and inside replayed CUDA graphs; sparse attention for 2,051 / 2,048 / 777 / 64 / 1 tokens, split and unsplit, 1/2/4 head groups and the recommended plan, current and first kernel each against the CPU and against each other; absorb bit-exact (and its BF16 output) for 1–17 rows, un-absorb within its summation bound; the absorbed GPU path against the expanded CPU; layer 3 on real weights against the oracle fixtures |
+| `tests/gpu.rs` | latent write byte-exact; pooled-key write and tail commit; selection exact on integer data with ties (three chunk plans, three merge levels); random data within an f16 bound; the fused selection, its prepared variant and the first implementation identical (scores, pools, tokens) for three plans and at 1M tokens (262,144 pools, 1 and 8 rows); one workspace reused on garbage, after one zero-fill, interleaved and inside replayed CUDA graphs; sparse attention for 2,051 / 2,048 / 777 / 64 / 1 tokens, split and unsplit, 1/2/4 head groups and the recommended plan, current and first kernel each against the CPU and against each other; the prefill kernel against the v2 kernel bit for bit; absorb bit-exact (and its BF16 output) for 1–17 rows, un-absorb within its summation bound; the absorbed GPU path against the expanded CPU; layer 3 on real weights against the oracle fixtures |
 | `tests/real_data.rs` | FP8 against BF16 on layer 3's real weights (table above) |
 | `tests/goldens.rs` | the indexer from fixtures alone (scores, selections, the `index_topk = 16` variant); the whole layer from `attn_norm` with weights, prompt and decode steps; a synthetic fixture round trip that runs by default |
 
@@ -448,9 +477,9 @@ attention + un-absorb): before 38.5 + 45.8 + 18.7 + 48.2 = 151 µs cold
 **Other kernels** (`examples/dsa_bench.rs`, eager): latent write 2 µs,
 pooled-key write 4 µs (8 rows). **Prefill-shaped:** `index_select` 4,096 rows at
 32K context 2.2 ms; 2,048 rows at 1M context 37.0 ms (119 TFLOP/s, as before);
-`sparse_attn` 2.5–2.8 µs per row at 2,051 tokens (4 head groups, unsplit; the
-first kernel 3.8–4.0 µs); 1.4 µs per row for a dense causal start of 2,048 rows (first
-kernel 2.2 µs).
+`sparse_attn` 1.8–2.1 µs per row at 2,051 tokens (4 head groups, unsplit; the
+v2 kernel 2.5–2.8 µs, the first kernel 3.8–4.0 µs); 1.0 µs per row for a dense
+causal start of 2,048 rows (v2 1.4–1.5 µs, first kernel 2.2 µs).
 
 ## Open issues
 
@@ -473,7 +502,12 @@ kernel 2.2 µs).
   KL gate.
 - **`attn_v2_kernel<4>`** (4 head groups, 512 threads) spills registers (124
   bytes per thread on sm_89, 204 on sm_120); `glm53f_dsa_mla_plan` never picks
-  it, and at prefill sizes it is no faster than 2 groups on the 4090.
+  it split, and unsplit `attn_v3_kernel` replaces it (64 and 156 bytes).
+- **`attn_v3_kernel`** needs 100,608 bytes of shared memory per block (the
+  opt-in limit is 101,376 on sm_89, and on sm_120 by NVIDIA's table; not
+  measured there); on a device with less,
+  `glm53f_dsa_mla_sparse_attn` runs `attn_v2_kernel` for that plan. Its
+  schedule is tuned on the RTX 4090 only.
 - **Plans** (`glm53f_dsa_index_plan`, `glm53f_dsa_mla_plan`) are measured on the
   RTX 4090 only; any plan gives the same selection (and the same attention up to
   rounding), so callers may override them.

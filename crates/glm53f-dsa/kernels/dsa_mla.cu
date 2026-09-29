@@ -3,6 +3,10 @@
 // glm53f_dsa_mla_sparse_attn runs attn_v2_kernel (described at its definition):
 // F16 tensor-core products straight from the E4M3 codes, tiles of 32 tokens
 // shared by up to four 16-head groups, splits merged by attn_merge_v2_kernel.
+// The unsplit plan with four head groups (prefill passes) runs attn_v3_kernel
+// instead: attn_v2_kernel's arithmetic and bits, with its two pairs of head
+// groups staggered so one pair's softmax and loads overlap the other's products
+// (glm53f_dsa_mla_sparse_attn_v2 keeps attn_v2_kernel for that plan too).
 //
 // glm53f_dsa_mla_sparse_attn_v1 (sparse_attn_kernel, kept for comparison)
 // follows the structure of ds41rt's v41_sparse_attention.cu attend<> kernel
@@ -875,6 +879,349 @@ __global__ __launch_bounds__(128) void attn_merge_v2_kernel(const float* partial
   if (tid == 0 && lse) lse[int64_t(row) * kHeads + h] = sum > 0.f ? M + logf(sum) : -INFINITY;
 }
 
+// ---------------------------------------------------------------------------
+// Sparse attention, v3: the unsplit plan with four head groups (prefill passes), the bits of
+// attn_v2_kernel.
+//
+// attn_v2_kernel<4> runs its tiles in lock step: all 16 warps convert a tile, score it, wait,
+// run the softmax, multiply P x V and wait again, so the tensor cores idle while the warps are in
+// their softmax or conversion. Here the block (one row, 64 heads, 16 warps) is two pairs of head
+// groups, X (groups 0-1, warps 0-7) and Y (groups 2-3, warps 8-15), staggered by one phase with
+// named barriers: X scores tile i while Y waits; Y scores tile i while X runs its softmax; X's
+// P x V overlaps Y's softmax; Y's P x V overlaps X loading and converting tile i + 1 into the
+// other of two tile buffers (X's registers hold the codes only then; X prefetches their cache
+// lines into L1 after scoring tile i). Y's warp 8 resolves tile i + 1's records while it waits
+// for X. Each head group's softmax is split over its four warps
+// (each sums, exponentiates and pair-sums one group of 8 tokens and shares the results) instead
+// of every warp repeating it. Each head group's arithmetic is attn_v2_kernel's, operation for
+// operation: the same tiles of 32 of the row's own tokens, the same fragments, products, sums and
+// roundings, only run at other times or by another warp of the group, so the results are the same
+// bits.
+// Addressing is additive, to leave registers to the accumulators: tile rows are 520 F16 apart
+// (v2's padding) with unswizzled 16-byte units, X's conversion stores units cp + 8 k so a quarter
+// warp writes 128 contiguous bytes, and a warp's partial scores sit at [token / 8][head][token % 8].
+namespace v3 {
+constexpr int kT = 32;
+constexpr int kStride = 520;                  // F16 per tile row (as v2)
+constexpr int kTileBytes = kT * kStride * 2;  // 33,280
+constexpr int kScaleBytes = kT * 4 * 4;       // 512
+constexpr int kPartBytes = 4 * 16 * kT * 4;   // 8,192 per head group
+constexpr int kRingBytes = 2 * kT * 4;        // record offsets of the next tile, two slots
+constexpr uint64_t kSmem = 2ull * kTileBytes + 2 * kScaleBytes + 4ull * kPartBytes + kRingBytes;  // 100,608
+// Named barriers (0 is __syncthreads; 1-4 are the head groups, 128 threads). The pair barriers
+// count all 512 threads: one pair arrives, the other syncs; ids alternate by parity so that a pair
+// cannot arrive twice on one before the other has synced.
+constexpr int kBarXQk = 5;    // + (i & 1): X scored tile i (so tile i is converted); Y syncs before scoring it
+constexpr int kBarYDone = 7;  // + (i & 1): Y is done with tile i; X syncs before converting tile i + 2
+constexpr int kBarYRef = 9;   // + (i & 1): Y put tile i + 1's records in the ring; X syncs before prefetching them
+constexpr int kBarXGrp = 11;  // X alone (256 threads): tile i + 1 converted, tile i's partials read
+}  // namespace v3
+
+__device__ __forceinline__ void bar_sync_n(int id, int n) { asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void bar_arrive_n(int id, int n) { asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory"); }
+
+// Position of (head, token) in a warp's 512 partial scores: additive in the token group.
+__device__ __forceinline__ int v3_part(int head, int tok) { return (tok >> 3) * 128 + head * 8 + (tok & 7); }
+
+__global__ __launch_bounds__(512, 1) void attn_v3_kernel(const __nv_bfloat16* __restrict__ q_abs,
+    const int32_t* __restrict__ tokens, int token_stride, const int32_t* __restrict__ counts,
+    const int32_t* __restrict__ row_req, float scale, glm53f_dsa_cache_t cache, float* __restrict__ o_lat,
+    float* __restrict__ lse) {
+  constexpr int kT = v3::kT, kStride = v3::kStride;
+  extern __shared__ __align__(128) unsigned char smem[];
+  __half* tiles = reinterpret_cast<__half*>(smem);                                          // [2][32][520]
+  float* tsc = reinterpret_cast<float*>(smem + 2 * v3::kTileBytes);                          // [2][32][4]; -1: missing
+  float* part = reinterpret_cast<float*>(smem + 2 * v3::kTileBytes + 2 * v3::kScaleBytes);   // [16 warps][512]
+  uint32_t* ring = reinterpret_cast<uint32_t*>(smem + 2 * v3::kTileBytes + 2 * v3::kScaleBytes + 4 * v3::kPartBytes);
+  float* amax_x = part;  // prologue only
+
+  const int row = blockIdx.x;
+  const int wi = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int hg = wi >> 2, w = wi & 3;
+  const bool is_x = hg < 2;
+  const int head0 = hg * 16;
+  const int req = row_req[row];
+  const int n_tok = min(counts[2 * row + 1], token_stride);
+  const int tiles_n = (n_tok + kT - 1) / kT;
+  const int32_t* trow = tokens + int64_t(row) * token_stride;
+
+  auto resolve = [&](int j) -> uint32_t {  // record offset of the row's j-th token (16-byte units), or ~0
+    uint32_t r = 0xFFFFFFFFu;
+    if (j < n_tok) {
+      const int64_t off = latent_offset(cache, req, __ldg(trow + j));
+      if (off >= 0) r = uint32_t(off >> 4);
+    }
+    return r;
+  };
+  // X's conversion slot: token lt of the tile (8 threads a token), 16-byte units cp + 8 k.
+  const int lt = (threadIdx.x & 255) >> 3, cp = threadIdx.x & 7;
+  uint2 raw[8];
+  float rscale = 0.f;
+  auto fetch = [&](uint32_t r) {
+    if (r != 0xFFFFFFFFu) {
+      const uint8_t* rec = cache.base + (int64_t(r) << 4);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) raw[k] = __ldg(reinterpret_cast<const uint2*>(rec) + cp + 8 * k);
+      rscale = cp < 4 ? __ldg(reinterpret_cast<const float*>(rec + kLatentDim) + cp) : 0.f;
+    } else {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) raw[k] = make_uint2(0, 0);
+      rscale = -1.f;
+    }
+  };
+  auto convert = [&](int b) {
+    __half* row_base = tiles + b * (v3::kTileBytes / 2) + lt * kStride;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      *reinterpret_cast<uint4*>(row_base + 8 * (cp + 8 * k)) =
+          make_uint4(e4m3x2_to_f16x2(raw[k].x), e4m3x2_to_f16x2(raw[k].x >> 16), e4m3x2_to_f16x2(raw[k].y),
+                     e4m3x2_to_f16x2(raw[k].y >> 16));
+    if (cp < 4) tsc[b * (kT * 4) + lt * 4 + cp] = rscale;
+  };
+
+  // Prologue: X converts tile 0; the query and its per-head scales as in attn_v2_kernel.
+  if (is_x && tiles_n > 0) fetch(resolve(lt));
+  uint32_t qraw[8][4];
+  {
+    const __nv_bfloat16* qh = q_abs + (int64_t(row) * kHeads + head0) * kLatentDim + 128 * w + 2 * t;
+#pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+      qraw[kk][0] = __ldg(reinterpret_cast<const uint32_t*>(qh + g * kLatentDim + 16 * kk));
+      qraw[kk][1] = __ldg(reinterpret_cast<const uint32_t*>(qh + (g + 8) * kLatentDim + 16 * kk));
+      qraw[kk][2] = __ldg(reinterpret_cast<const uint32_t*>(qh + g * kLatentDim + 16 * kk + 8));
+      qraw[kk][3] = __ldg(reinterpret_cast<const uint32_t*>(qh + (g + 8) * kLatentDim + 16 * kk + 8));
+    }
+  }
+  {
+    float m0 = 0.f, m1 = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+#pragma unroll
+      for (int r = 0; r < 4; r += 2) {
+        m0 = fmaxf(m0, fmaxf(fabsf(__uint_as_float(qraw[kk][r] << 16)), fabsf(__uint_as_float(qraw[kk][r] & 0xFFFF0000u))));
+        m1 = fmaxf(m1, fmaxf(fabsf(__uint_as_float(qraw[kk][r + 1] << 16)),
+                             fabsf(__uint_as_float(qraw[kk][r + 1] & 0xFFFF0000u))));
+      }
+    }
+    m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
+    m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
+    m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+    m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+    if (t == 0) {
+      amax_x[(hg * 4 + w) * 16 + g] = m0;
+      amax_x[(hg * 4 + w) * 16 + g + 8] = m1;
+    }
+  }
+  if (is_x && tiles_n > 0) convert(0);
+  __syncthreads();  // head maxima written; tile 0 converted
+  float up[2], sm_scale[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int head = g + 8 * h;
+    float m = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) m = fmaxf(m, amax_x[(hg * 4 + q) * 16 + head]);
+    int e = 0;
+    if (m > 0.f && isfinite(m)) {
+      int E;
+      frexpf(m, &E);
+      e = max(-120, min(120, 15 - E));
+    }
+    up[h] = exp2_int(e);
+    sm_scale[h] = scale * exp2_int(-e);
+  }
+  uint32_t qa[8][4];
+#pragma unroll
+  for (int kk = 0; kk < 8; ++kk) {
+    qa[kk][0] = bf16x2_to_f16x2(qraw[kk][0], up[0]);
+    qa[kk][1] = bf16x2_to_f16x2(qraw[kk][1], up[1]);
+    qa[kk][2] = bf16x2_to_f16x2(qraw[kk][2], up[0]);
+    qa[kk][3] = bf16x2_to_f16x2(qraw[kk][3], up[1]);
+  }
+  __syncthreads();  // the maxima are read (the partials alias them)
+
+  float acc[16][4];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+  float m_run[2] = {-1e30f, -1e30f}, l_run[2] = {0.f, 0.f};
+  const int lm = lane >> 3, lr = lane & 7;
+  float* pw = part + wi * 512;
+  float* pgrp = part + hg * 4 * 512;  // the head group's four warps' partials
+
+  // attn_v2_kernel's steps for this warp's head group. Scores of the tile in buffer b, scaled by
+  // the tokens' group-w scales, into this warp's partials.
+  auto scores = [&](int b) {
+    const __half* tile = tiles + b * (v3::kTileBytes / 2);
+    const float* ts = tsc + b * (kT * 4);
+    float sc[4][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+#pragma unroll
+      for (int jp = 0; jp < 2; ++jp) {
+        uint32_t bb[4];
+        ldsm_x4(bb, tile + (16 * jp + (lm >> 1) * 8 + lr) * kStride + 8 * (16 * w + 2 * kk + (lm & 1)));
+        mma_f16_16816(sc[2 * jp], qa[kk], bb[0], bb[1]);
+        mma_f16_16816(sc[2 * jp + 1], qa[kk], bb[2], bb[3]);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float s0 = ts[(8 * j + 2 * t) * 4 + w], s1 = ts[(8 * j + 2 * t + 1) * 4 + w];
+      const float x0 = s0 >= 0.f ? sc[j][0] * s0 : -INFINITY, x1 = s1 >= 0.f ? sc[j][1] * s1 : -INFINITY;
+      const float x2 = s0 >= 0.f ? sc[j][2] * s0 : -INFINITY, x3 = s1 >= 0.f ? sc[j][3] * s1 : -INFINITY;
+      *reinterpret_cast<float2*>(pw + v3_part(g, 8 * j + 2 * t)) = make_float2(x0, x1);
+      *reinterpret_cast<float2*>(pw + v3_part(g + 8, 8 * j + 2 * t)) = make_float2(x2, x3);
+    }
+  };
+  // Softmax of tile ti, split over the group's warps: warp w sums the four partials of token group
+  // w (tokens 8 w .. 8 w + 7), takes its maxima and exponentials and its lanes' pair sums; the
+  // group shares maxima, probabilities and pair sums through its partial area (each region is
+  // read before it is reused). Every value is attn_v2_kernel's (the tile maximum is the same
+  // maximum, and each lane adds the same pair sums to its running sum in the same order); the
+  // lanes then form P (F16, times the tokens' group-w scales) into pa and rescale the output.
+  auto softmax = [&](int ti, int b, uint32_t (&pa)[2][4]) {
+    const float* ts = tsc + b * (kT * 4);
+    const int tok = ti * kT + 8 * w + 2 * t;
+    float2 lo = make_float2(0.f, 0.f), hi = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float2 a = *reinterpret_cast<const float2*>(pgrp + q * 512 + v3_part(g, 8 * w + 2 * t));
+      const float2 c = *reinterpret_cast<const float2*>(pgrp + q * 512 + v3_part(g + 8, 8 * w + 2 * t));
+      lo.x += a.x;
+      lo.y += a.y;
+      hi.x += c.x;
+      hi.y += c.y;
+    }
+    const bool v0 = tok < n_tok, v1 = tok + 1 < n_tok;
+    const float s0 = v0 ? lo.x * sm_scale[0] : -INFINITY;
+    const float s1 = v1 ? lo.y * sm_scale[0] : -INFINITY;
+    const float s2 = v0 ? hi.x * sm_scale[1] : -INFINITY;
+    const float s3 = v1 ? hi.y * sm_scale[1] : -INFINITY;
+    float mx0 = fmaxf(s0, s1), mx1 = fmaxf(s2, s3);
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+    float* gmax = pgrp + w * 128;  // warp 0's partials of token group w, read by this warp only
+    if (t == 0) {
+      gmax[g] = mx0;
+      gmax[g + 8] = mx1;
+    }
+    bar_sync_n(1 + hg, 128);
+    float alpha[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      float m = -INFINITY;  // as attn_v2_kernel's running tile maximum, NaN scores never win
+#pragma unroll
+      for (int q = 0; q < 4; ++q) m = fmaxf(m, pgrp[q * 128 + g + 8 * h]);
+      const float m_new = fmaxf(m_run[h], m);
+      alpha[h] = __expf(m_run[h] - m_new);
+      m_run[h] = m_new;
+      l_run[h] *= alpha[h];
+    }
+    const float p0 = __expf(s0 - m_run[0]), p1 = __expf(s1 - m_run[0]);
+    const float p2 = __expf(s2 - m_run[1]), p3 = __expf(s3 - m_run[1]);
+    float* sp = pgrp + 512;       // probabilities, in the partials' layout
+    float* sq = pgrp + 2 * 512;   // pair sums, [token group][head][lane t]
+    *reinterpret_cast<float2*>(sp + v3_part(g, 8 * w + 2 * t)) = make_float2(p0, p1);
+    *reinterpret_cast<float2*>(sp + v3_part(g + 8, 8 * w + 2 * t)) = make_float2(p2, p3);
+    sq[w * 64 + g * 4 + t] = p0 + p1;
+    sq[w * 64 + (g + 8) * 4 + t] = p2 + p3;
+    bar_sync_n(1 + hg, 128);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      l_run[0] += sq[j * 64 + g * 4 + t];
+      l_run[1] += sq[j * 64 + (g + 8) * 4 + t];
+      const float2 a = *reinterpret_cast<const float2*>(sp + v3_part(g, 8 * j + 2 * t));
+      const float2 c = *reinterpret_cast<const float2*>(sp + v3_part(g + 8, 8 * j + 2 * t));
+      const float r0 = ts[(8 * j + 2 * t) * 4 + w], r1 = ts[(8 * j + 2 * t + 1) * 4 + w];
+      pa[j >> 1][(j & 1) * 2] = pack_f16(a.x * r0, a.y * r1);
+      pa[j >> 1][(j & 1) * 2 + 1] = pack_f16(c.x * r0, c.y * r1);
+    }
+    if (alpha[0] != 1.f || alpha[1] != 1.f) {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        acc[j][0] *= alpha[0];
+        acc[j][1] *= alpha[0];
+        acc[j][2] *= alpha[1];
+        acc[j][3] *= alpha[1];
+      }
+    }
+  };
+  auto pv = [&](int b, const uint32_t (&pa)[2][4]) {
+    const __half* tile = tiles + b * (v3::kTileBytes / 2);
+#pragma unroll
+    for (int ks = 0; ks < 2; ++ks) {
+#pragma unroll
+      for (int jp = 0; jp < 8; ++jp) {
+        uint32_t bb[4];
+        ldsm_x4_trans(bb, tile + (16 * ks + (lm & 1) * 8 + lr) * kStride + 8 * (16 * w + 2 * jp + (lm >> 1)));
+        mma_f16_16816(acc[2 * jp], pa[ks], bb[0], bb[1]);
+        mma_f16_16816(acc[2 * jp + 1], pa[ks], bb[2], bb[3]);
+      }
+    }
+  };
+
+  if (is_x) {
+    for (int i = 0; i < tiles_n; ++i) {
+      const int b = i & 1;
+      scores(b);
+      bar_arrive_n(v3::kBarXQk + b, 512);
+      if (i + 1 < tiles_n) {
+        // Start moving tile i + 1's records into L1 (5 lines each), so the loads after P x V hit.
+        bar_sync_n(v3::kBarYRef + b, 512);
+        const uint32_t r = ring[((i + 1) & 1) * kT + lt];
+        if (r != 0xFFFFFFFFu && cp < 5)
+          asm volatile("prefetch.global.L1 [%0];" ::"l"(cache.base + (int64_t(r) << 4) + 128 * cp));
+      }
+      bar_sync_n(1 + hg, 128);  // the group's partials of tile i
+      uint32_t pa[2][4];
+      softmax(i, b, pa);
+      pv(b, pa);
+      if (i + 1 < tiles_n) {
+        fetch(ring[((i + 1) & 1) * kT + lt]);
+        if (i >= 1) bar_sync_n(v3::kBarYDone + (b ^ 1), 512);  // buffer b ^ 1 (tile i - 1) is free
+        convert(b ^ 1);
+        bar_sync_n(v3::kBarXGrp, 256);
+      }
+    }
+  } else {
+    for (int i = 0; i < tiles_n; ++i) {
+      const int b = i & 1;
+      if (i + 1 < tiles_n) {
+        if (wi == 8) ring[((i + 1) & 1) * kT + lane] = resolve((i + 1) * kT + lane);
+        bar_arrive_n(v3::kBarYRef + b, 512);
+      }
+      bar_sync_n(v3::kBarXQk + b, 512);
+      scores(b);
+      bar_sync_n(1 + hg, 128);  // the group's partials of tile i
+      uint32_t pa[2][4];
+      softmax(i, b, pa);
+      pv(b, pa);
+      if (i + 2 < tiles_n) bar_arrive_n(v3::kBarYDone + b, 512);
+    }
+  }
+
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    l_run[h] += __shfl_xor_sync(0xffffffffu, l_run[h], 1);
+    l_run[h] += __shfl_xor_sync(0xffffffffu, l_run[h], 2);
+  }
+  const float i0 = l_run[0] > 0.f ? 1.f / l_run[0] : 0.f, i1 = l_run[1] > 0.f ? 1.f / l_run[1] : 0.f;
+  float* dst = o_lat + (int64_t(row) * kHeads + head0) * kLatentDim + 128 * w + 2 * t;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    *reinterpret_cast<float2*>(dst + g * kLatentDim + 8 * j) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+    *reinterpret_cast<float2*>(dst + (g + 8) * kLatentDim + 8 * j) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
+  }
+  if (lse && w == 0 && t == 0) {
+    lse[int64_t(row) * kHeads + head0 + g] = l_run[0] > 0.f ? m_run[0] + logf(l_run[0]) : -INFINITY;
+    lse[int64_t(row) * kHeads + head0 + g + 8] = l_run[1] > 0.f ? m_run[1] + logf(l_run[1]) : -INFINITY;
+  }
+}
+
 __global__ __launch_bounds__(128) void attn_merge_kernel(const float* partial, int rows, int splits, float* o_lat,
                                                          float* lse) {
   const int row = blockIdx.x, h = blockIdx.y;
@@ -909,6 +1256,8 @@ using namespace glm53f;
 namespace {
 // Opt-in shared memory per block on the current device (set by glm53f_dsa_init).
 int g_smem_optin = 0;
+// attn_v3_kernel is set up (the device has its shared memory).
+bool g_v3 = false;
 }  // namespace
 
 extern "C" int32_t glm53f_dsa_init(void) {
@@ -929,6 +1278,11 @@ extern "C" int32_t glm53f_dsa_init(void) {
   if (st != cudaSuccess) return st;
   st = cudaFuncSetAttribute(attn_v2_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, optin);
   if (st != cudaSuccess) return st;
+  if (uint64_t(optin) >= v3::kSmem) {
+    st = cudaFuncSetAttribute(attn_v3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(v3::kSmem));
+    if (st != cudaSuccess) return st;
+    g_v3 = true;
+  }
   g_smem_optin = optin;
   return cudaSuccess;
 }
@@ -1050,6 +1404,22 @@ int32_t launch_merge_v2(float* partial, int32_t rows, int32_t splits, float* o_l
 }  // namespace
 
 extern "C" int32_t glm53f_dsa_mla_sparse_attn(const uint16_t* q_abs, const int32_t* tokens, int32_t token_stride,
+    const int32_t* counts, const int32_t* row_req, int32_t rows, float scale, glm53f_dsa_cache_t cache,
+    int32_t splits, int32_t head_groups, void* workspace, uint64_t workspace_bytes, float* o_lat, float* lse,
+    void* stream) {
+  const int32_t bad = check_attn_args(q_abs, tokens, token_stride, counts, row_req, rows, cache, splits, head_groups,
+                                      workspace, workspace_bytes, o_lat);
+  if (bad != cudaSuccess || rows == 0) return bad;
+  if (splits == 1 && head_groups == 4 && g_v3) {
+    attn_v3_kernel<<<rows, 512, v3::kSmem, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q_abs), tokens, token_stride, counts, row_req, scale, cache, o_lat, lse);
+    return cudaGetLastError();
+  }
+  return glm53f_dsa_mla_sparse_attn_v2(q_abs, tokens, token_stride, counts, row_req, rows, scale, cache, splits,
+                                       head_groups, workspace, workspace_bytes, o_lat, lse, stream);
+}
+
+extern "C" int32_t glm53f_dsa_mla_sparse_attn_v2(const uint16_t* q_abs, const int32_t* tokens, int32_t token_stride,
     const int32_t* counts, const int32_t* row_req, int32_t rows, float scale, glm53f_dsa_cache_t cache,
     int32_t splits, int32_t head_groups, void* workspace, uint64_t workspace_bytes, float* o_lat, float* lse,
     void* stream) {

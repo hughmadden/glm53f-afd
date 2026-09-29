@@ -1143,6 +1143,157 @@ fn sparse_attn_head_groups_are_bitwise() {
     }
 }
 
+/// The prefill plan (unsplit, four head groups) runs a kernel that staggers the block's two pairs
+/// of head groups. It gives `glm53f_dsa_mla_sparse_attn_v2`'s bits for that plan (the previous
+/// kernel) on rows whose selections overlap heavily, as neighbouring prefill rows do, or hardly at
+/// all; with duplicate and -1 tokens, unmapped and out-of-range pages, lengths at the tile edges and
+/// past the token stride; over two requests, per-head query magnitudes from 2^-20 to 2^20 and zero
+/// heads; in passes of 1 to 271 rows and with a shorter token stride.
+#[test]
+fn prefill_sparse_attn_is_bitwise() {
+    let Some(_gpu) = gpu_ready() else {
+        return;
+    };
+    let mut rng = Rng::new(17);
+    // Two requests of 5,000 tokens in one layer; afterwards request 1's logical page 3 is unmapped
+    // and its page 7 points past the layer.
+    let tokens = 5000usize;
+    let lp = tokens.div_ceil(PAGE_TOKENS);
+    let max_pages = lp + 2;
+    let mut perm: Vec<i32> = (0..2 * lp as i32).collect();
+    for i in (1..perm.len()).rev() {
+        perm.swap(i, rng.below(i + 1));
+    }
+    let mut tables = vec![-1i32; 2 * max_pages];
+    for q in 0..2 {
+        tables[q * max_pages..q * max_pages + lp].copy_from_slice(&perm[q * lp..(q + 1) * lp]);
+    }
+    let mut layer = PagedLayer::new(2 * lp, PAGE_LAYER_BYTES);
+    for q in 0..2 {
+        for t in 0..tokens {
+            let rec = cache::encode_latent(&random_latent(&mut rng), ScaleMode::Pow2);
+            layer.write_latent(&tables[q * max_pages..(q + 1) * max_pages], t, &rec);
+        }
+    }
+    tables[max_pages + 3] = -1;
+    tables[max_pages + 7] = 2 * lp as i32 + 5;
+    let dev = DevCache::upload(&layer, &tables, max_pages);
+
+    // Selections: 512 pools of the visible ones (the pool's 4 tokens each), then the tail.
+    let select = |pools: &[usize], pos: usize| -> Vec<i32> {
+        let mut v: Vec<i32> = pools.iter().flat_map(|p| (4 * p..4 * p + 4).map(|t| t as i32)).collect();
+        v.extend(((pos + 1) / 4 * 4..=pos).map(|t| t as i32));
+        v
+    };
+    let random_pools = |rng: &mut Rng, visible: usize| -> Vec<usize> {
+        let mut all: Vec<usize> = (0..visible).collect();
+        for i in (1..visible).rev() {
+            all.swap(i, rng.below(i + 1));
+        }
+        let mut p = all[..512.min(visible)].to_vec();
+        p.sort_unstable();
+        p
+    };
+    let mut rows: Vec<(i32, Vec<i32>)> = Vec::new();
+    // Request 0: consecutive positions, each row replacing about 5% of the previous row's pools.
+    let mut pools = random_pools(&mut rng, 4500 / 4);
+    for pos in 4500..4660 {
+        let visible = (pos + 1) / 4;
+        for p in pools.iter_mut() {
+            if rng.below(100) < 5 {
+                *p = rng.below(visible);
+            }
+        }
+        pools.sort_unstable();
+        pools.dedup();
+        while pools.len() < 512 {
+            pools.push(rng.below(visible));
+            pools.sort_unstable();
+            pools.dedup();
+        }
+        rows.push((0, select(&pools, pos)));
+    }
+    // Request 1: independent selections, some with duplicate and -1 tokens and tokens on the
+    // unmapped (192-255) and out-of-range (448-511) pages.
+    for i in 0..100 {
+        let pos = 4800 + i;
+        let mut v = select(&random_pools(&mut rng, (pos + 1) / 4), pos);
+        if i % 3 == 1 {
+            for k in (0..v.len() - 1).step_by(97) {
+                v[k + 1] = v[k];
+            }
+            for k in (5..v.len()).step_by(331) {
+                v[k] = -1;
+            }
+            v[40] = 200;
+            v[41] = 450;
+        }
+        rows.push((1, v));
+    }
+    // Lengths at the tile edges (request 0's tokens) and a count past the stride.
+    for n in [0usize, 1, 31, 32, 33, 63, 64, 65, 2048, 2051, 2051] {
+        rows.push((0, random_token_list(&mut rng, tokens, n).iter().map(|t| *t as i32).collect()));
+    }
+    let n_rows = rows.len();
+    let past_stride = n_rows - 1;
+
+    // Query: per (row, head) a random power of two in [2^-20, 2^20] times normals; some heads zero.
+    let mut q = vec![0u16; n_rows * 64 * 512];
+    for rh in 0..n_rows * 64 {
+        let s = 2f32.powi(rng.below(41) as i32 - 20);
+        for l in 0..512 {
+            q[rh * 512 + l] = if rh % 29 == 5 { 0 } else { f32_to_bf16_bits(rng.normal() * s) };
+        }
+    }
+
+    let run = |f: AttnFn, rs: &[(i32, Vec<i32>)], q: &[u16], stride: usize, counts_past: Option<usize>| -> (Vec<u32>, Vec<u32>) {
+        let n = rs.len();
+        let mut toks = vec![-1i32; n * stride];
+        let mut counts = vec![0i32; n * 2];
+        let mut req = vec![0i32; n];
+        for (r, (qr, l)) in rs.iter().enumerate() {
+            let m = l.len().min(stride);
+            toks[r * stride..r * stride + m].copy_from_slice(&l[..m]);
+            counts[2 * r + 1] = l.len() as i32;
+            req[r] = *qr;
+        }
+        if let Some(r) = counts_past {
+            counts[2 * r + 1] = stride as i32 + 100;
+        }
+        let (dq, dt, dc, dr) = (
+            DeviceBuffer::from_slice(q).unwrap(),
+            DeviceBuffer::from_slice(&toks).unwrap(),
+            DeviceBuffer::from_slice(&counts).unwrap(),
+            DeviceBuffer::from_slice(&req).unwrap(),
+        );
+        let (o_lat, lse) = (DeviceBuffer::zeroed(n * 64 * 512 * 4).unwrap(), DeviceBuffer::zeroed(n * 64 * 4).unwrap());
+        check(
+            unsafe {
+                f(dq.as_ptr(), dt.as_ptr(), stride as i32, dc.as_ptr(), dr.as_ptr(), n as i32, 0.0625, dev.view(), 1, 4, ptr::null_mut(), 0, o_lat.as_mut_ptr(), lse.as_mut_ptr(), ptr::null_mut())
+            },
+            "sparse_attn",
+        )
+        .unwrap();
+        gpu::sync().unwrap();
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+        (bits(o_lat.download(n * 64 * 512).unwrap()), bits(lse.download(n * 64).unwrap()))
+    };
+    // Passes: every row; the first 1, 2 and 7 rows; request 1's rows alone; with a token stride of 1,500.
+    let passes: [(usize, usize, usize); 6] = [(0, n_rows, 2051), (0, 1, 2051), (0, 2, 2051), (155, 7, 2051), (160, 100, 2051), (0, n_rows, 1500)];
+    for (first, n, stride) in passes {
+        let rs = &rows[first..first + n];
+        let qs = &q[first * 32768..(first + n) * 32768];
+        let past = (first..first + n).contains(&past_stride).then(|| past_stride - first);
+        let got = run(ffi::glm53f_dsa_mla_sparse_attn, rs, qs, stride, past);
+        let want = run(ffi::glm53f_dsa_mla_sparse_attn_v2, rs, qs, stride, past);
+        assert!(got.1 == want.1, "rows {first}..{} (stride {stride}): lse differs", first + n);
+        for r in 0..n {
+            let (a, b) = (&got.0[r * 32768..(r + 1) * 32768], &want.0[r * 32768..(r + 1) * 32768]);
+            assert!(a == b, "rows {first}..{} (stride {stride}): row {} differs", first + n, first + r);
+        }
+    }
+}
+
 #[test]
 fn dense_rows_and_no_pools() {
     let Some(_gpu) = gpu_ready() else {

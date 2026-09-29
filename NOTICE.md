@@ -95,3 +95,8 @@ authors under their own terms.
 ## NVIDIA CUDA toolkit
 
 - The CUDA runtime and cuBLAS are linked from the installed toolkit, not included. `crates/glm53f-forward/src/cuda.rs` and `src/cublas.rs`, and `crates/glm53f-dflash/src/cuda.rs` and `src/blas.rs`, re-declare the function signatures and enumeration values they call.
+
+## FlashAttention-3 (paper)
+
+- **Source:** "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision", arXiv:2407.08608v2, §3.1.
+- **What was taken:** nothing is copied. The prefill sparse-attention kernel (`attn_v3_kernel` in `crates/glm53f-dsa/kernels/dsa_mla.cu`) staggers two groups of warps so that one group's softmax overlaps the other's matrix products, the ping-pong scheduling the paper describes; the kernel, its arithmetic and its schedule are written here.
