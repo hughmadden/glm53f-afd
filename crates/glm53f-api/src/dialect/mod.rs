@@ -88,8 +88,9 @@ pub trait Dialect: Send + Sync {
 
     /// What a request that turns thinking off gets, for a chat template with no off mode: the
     /// template's own lowest reasoning effort, with thinking on (the prompt opens the reasoning
-    /// block and the parser reads it as reasoning). `None`: thinking off is off. Either way,
-    /// `reasoning_effort: "none"` asks for no reasoning at all.
+    /// block and the parser reads it as reasoning). So does a `reasoning_effort` that names the
+    /// lowest effort ("none", "minimal"), whatever the thinking switch says. `None`: thinking off
+    /// is off, and so are "none" and "minimal" unless the request turns thinking on.
     fn thinking_off_effort(&self) -> Option<&'static str> {
         None
     }

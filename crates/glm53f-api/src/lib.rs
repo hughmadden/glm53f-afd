@@ -23,14 +23,18 @@
 //!    use);
 //! 3. a top-level `enable_thinking`;
 //! 4. `thinking.type` (GLM and Anthropic): `"disabled"` is off, any other type on;
-//! 5. `reasoning_effort: "none"` (top level, else in `chat_template_kwargs`): off.
+//! 5. `reasoning_effort` (top level, else in `chat_template_kwargs`) of `"none"` or `"minimal"`,
+//!    the names OpenAI clients send for the lowest effort: off.
 //!
 //! Otherwise the dialect's default applies ([`Dialect::default_thinking`]; on for
 //! GLM-5.3-Flash). A dialect whose chat template has no off mode maps "off" to its lowest
-//! effort with thinking on ([`Dialect::thinking_off_effort`]; GLM-5.3-Flash: `"low"`), except
-//! for `reasoning_effort: "none"`, which keeps thinking off: no reasoning at all. The engine gets the switch with `reasoning_effort` as sent (top
-//! level, else in `chat_template_kwargs`; the chat template decides what a value
-//! means) and `clear_thinking` (`chat_template_kwargs`, else `thinking`; off unless
+//! effort with thinking on ([`Dialect::thinking_off_effort`]; GLM-5.3-Flash: `"low"`), and so
+//! does a `reasoning_effort` of `"none"` or `"minimal"`, whatever the switch says: `"none"` is
+//! exactly thinking off, and the API renders only the efforts the template has (GLM-5.3-Flash:
+//! never an empty think block). Every other `reasoning_effort` goes to the template as sent,
+//! which decides what a value means (GLM-5.3-Flash: exactly `"low"` and `"high"` are Low and
+//! High; anything else, `"medium"` and `"max"` too, is Max). The engine gets the switch with
+//! `reasoning_effort` and `clear_thinking` (`chat_template_kwargs`, else `thinking`; off unless
 //! sent), which drops the reasoning of assistant turns before the last user
 //! message. An assistant turn's reasoning in the history is read from
 //! `reasoning_content`, else `reasoning`. `harness/api_contract.py` checks all of

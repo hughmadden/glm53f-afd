@@ -54,7 +54,7 @@ answer):
 | Case | Code | Prose | Counting |
 |---|---:|---:|---:|
 | No drafter (28 Sep) | 52.7 | 52.7 | 52.7 |
-| DFlash2, no reasoning (an empty think block; 29 Sep) | 115.0 | 63.7 | 133.1 |
+| DFlash2, no reasoning (an empty think block, no longer served; 29 Sep) | 115.0 | 63.7 | 133.1 |
 | DFlash2, thinking on (the model's default; 28 Sep) | 82.7 | 73.3 | 169.1 |
 
 **Concurrency** (aggregate tok/s, 400-token streams): 316–326 at 16 streams with 16 slots; 601 at
@@ -176,13 +176,16 @@ The API serves `GET /v1/models` and `POST /v1/chat/completions`, streamed or not
 and reasoning (`reasoning_content`). Thinking is on by default, as the model's chat template renders
 it.
 - The template has no thinking-off mode; it renders a reasoning effort of Low, High or Max, Max by
-  default.
+  default. The server renders only those efforts, never an empty think block.
 - A request that turns thinking off (`chat_template_kwargs.enable_thinking: false` or its alias
   `chat_template_kwargs.thinking: false`, or `thinking.type: "disabled"`) gets the template's Low
   effort: a short plan under `reasoning_content`, then the answer.
-- `reasoning_effort: "none"` asks for no reasoning at all (an empty think block), for callers with
-  tiny token budgets.
-- `reasoning_effort: "low"` / `"high"` / `"max"` choose the effort directly.
+- `reasoning_effort: "none"` and `"minimal"` are the lowest effort, which is Low: the same request
+  as thinking off, and the same prompt. The short plan counts against `max_tokens`, so a very small
+  budget can end inside it.
+- `reasoning_effort: "low"` / `"high"` / `"max"` choose the effort directly. Any other value goes
+  to the template as sent, and the template renders Max for it (`"medium"` is Max, not a middle
+  effort).
 - A reply with tool calls carries the text the model wrote before them as `content` (its ending
   whitespace dropped; `null` when there is none), streamed or not.
 - A tool call the model writes badly (its closing tag missing, markup in its name, arguments but no

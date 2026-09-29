@@ -101,3 +101,17 @@ nothing. Each of the first three items below is a separate hunk.
 | src/lib.rs | Crate doc: the switch's sources, tool calls | — | 2026-09-29 |
 | tests/acceptance.rs | `glm_tool_calls_as_the_model_writes_them` (the recipe's six shapes, lost calls, the text around calls: each whole and streamed a character and a token at a time), the think-block test, `parse_reports_are_logged_under_the_completion_id` (the server logs from its own threads, so a child process serves the requests and the test reads its stderr) | the tests themselves | 2026-09-29 |
 | harness/test_api_contract.py | The fake server reads `chat_template_kwargs.thinking` as the API does | the self-test | 2026-09-29 |
+
+## Changed here (the lowest effort's names)
+
+`reasoning_effort: "none"` was rendered as an empty think block under the template's Max effort. It
+and `"minimal"`, the names of the lowest effort, are now thinking off: the template's Low effort with
+the think block open, so the API renders only the efforts the template has (`docs/DESIGN.md`,
+"Thinking switch and reasoning history"). Own logic; nothing is copied.
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/types.rs | `lowest_effort` ("none", "minimal"); it is the last link of the thinking switch's chain (was `reasoning_effort: "none"` alone) | glm.rs `request_fields_map_to_the_template_switches` | 2026-09-29 |
+| src/chat.rs | A dialect with a lowest effort (`thinking_off_effort`) renders thinking on at that effort for a request that turns thinking off or names the lowest effort, whatever the switch says; the `effort_none` case (thinking off, the empty block) is removed | glm.rs `reasoning_effort_none_and_minimal_reach_the_engine_as_the_low_effort`, `the_thinking_switch_forms_and_their_precedence_reach_the_engine`; tests/acceptance.rs `glm_thinking_off_is_low_effort`, `glm_lowest_effort_names_render_the_low_prompt`; glm53f-coordinator tests/glm_prompt.rs `effort_requests_render_the_templates_efforts` (the real template) | 2026-09-29 |
+| src/engine.rs, src/dialect/mod.rs, src/dialect/glm.rs, src/lib.rs | Docs: `PromptOptions::reasoning_effort`, `Dialect::thinking_off_effort`, the GLM dialect, the crate doc | — | 2026-09-29 |
+| harness/api_contract.py, harness/test_api_contract.py | THINK-OFF: `reasoning_effort=none` is judged as the other off forms are (a short reasoning under the reasoning field is allowed), `=minimal` is a new off form, and the streamed check reads the field name and markup, not "no reasoning"; the fake server maps both names to Low (new broken mode `effort-minimal-ignored`) | the self-test | 2026-09-29 |

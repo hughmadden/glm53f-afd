@@ -43,6 +43,8 @@ def thinking_of(body, mode):
     effort = body.get("reasoning_effort") or kw.get("reasoning_effort")
     if effort == "none" and mode != "effort-none-ignored":
         return False
+    if effort == "minimal" and mode != "effort-minimal-ignored":
+        return False
     return True
 
 
@@ -164,10 +166,10 @@ class Fake:
             h.close_connection = True
             return
         thinking = thinking_of(body, mode)
-        # `off-low-effort`: a template with no off mode (GLM-5.3-Flash) maps "off" to its Low
-        # effort: thinking on, a short reasoning, and a prompt unlike thinking on's.
-        kw_effort = body.get("reasoning_effort") or (body.get("chat_template_kwargs") or {}).get("reasoning_effort")
-        low = mode == "off-low-effort" and thinking is False and kw_effort != "none"
+        # `off-low-effort`: a template with no off mode (GLM-5.3-Flash) maps "off", and the lowest
+        # effort's names ("none", "minimal"), to its Low effort: thinking on, a short reasoning,
+        # and a prompt unlike thinking on's.
+        low = mode == "off-low-effort" and thinking is False
         if low:
             thinking = True
         tools = body.get("tools") or []
@@ -245,8 +247,8 @@ def run(mode, *extra):
 
 class GoodServer(unittest.TestCase):
     def test_off_as_low_effort_passes(self):
-        """A server whose template has no off mode maps thinking off to its Low effort (a short
-        reasoning, a different prompt); reasoning_effort=none still gives no reasoning."""
+        """A server whose template has no off mode maps thinking off, and reasoning_effort none and
+        minimal, to its Low effort (a short reasoning, a different prompt)."""
         p, rows, _, _ = run("off-low-effort")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual({k for k, r in rows.items() if r["verdict"] != "PASS"}, set(), p.stdout)
@@ -284,6 +286,7 @@ class BrokenServers(unittest.TestCase):
         "mojibake": {"UTF8-raw"},                              # raw UTF-8 decoded as Latin-1
         "think-ignored": {"THINK-OFF"},
         "effort-none-ignored": {"THINK-OFF"},
+        "effort-minimal-ignored": {"THINK-OFF"},
         "clear-ignored": {"CLEAR-THINKING"},
         "carry": {"ISO"},                                      # context carried across requests
         "dieafter": {"ISO"},                                   # the row is clean; the server then dies

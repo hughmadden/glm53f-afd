@@ -104,7 +104,9 @@ pub struct GenerateOutcome {
 pub struct PromptOptions {
     /// The thinking switch: the request's, else the dialect's default.
     pub thinking: bool,
-    /// `reasoning_effort` as the client sent it; the chat template decides what it means.
+    /// `reasoning_effort` as the client sent it; the chat template decides what it means. The
+    /// dialect's lowest effort ([`crate::Dialect::thinking_off_effort`]) replaces it when the
+    /// request turns thinking off or names the lowest effort ("none", "minimal").
     pub reasoning_effort: Option<String>,
     /// `clear_thinking`: drop the reasoning of assistant turns before the last user message.
     pub clear_thinking: Option<bool>,

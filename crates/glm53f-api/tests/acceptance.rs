@@ -1364,23 +1364,35 @@ impl Engine for OptionsStub {
 /// GLM-5.3-Flash's chat template has no thinking-off mode: a request that turns thinking off
 /// (`enable_thinking: false` either way, or `thinking.type: "disabled"`) renders with the
 /// template's Low effort and thinking on, and its short reasoning comes back as reasoning, not
-/// content. `reasoning_effort: "none"` still renders with thinking off (no reasoning at all), and
-/// a request that sets no switch keeps the template's default (thinking on, its own effort).
+/// content. So does `reasoning_effort: "none"` or `"minimal"`, the lowest effort's names, at the
+/// top level or in `chat_template_kwargs`, whatever the switch says: the API never renders an
+/// empty think block. A request that sets no switch keeps the template's default (thinking on,
+/// its own effort), and every other effort goes to the template as sent.
 #[test]
 fn glm_thinking_off_is_low_effort() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let srv = start_engine_with(OptionsStub(seen.clone()), Arc::new(GlmDialect));
+    let low = (true, Some("low"));
     let cases = [
-        (r#""chat_template_kwargs":{"enable_thinking":false}"#, (true, Some("low")), true),
-        (r#""chat_template_kwargs":{"thinking":false}"#, (true, Some("low")), true),
-        (r#""enable_thinking":false"#, (true, Some("low")), true),
-        (r#""thinking":{"type":"disabled"}"#, (true, Some("low")), true),
-        (r#""chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high""#, (true, Some("low")), true),
-        (r#""reasoning_effort":"none""#, (false, Some("none")), false),
-        (r#""reasoning_effort":"low""#, (true, Some("low")), true),
-        (r#""chat_template_kwargs":{"enable_thinking":true}"#, (true, None), true),
+        (r#""chat_template_kwargs":{"enable_thinking":false}"#, low),
+        (r#""chat_template_kwargs":{"thinking":false}"#, low),
+        (r#""enable_thinking":false"#, low),
+        (r#""thinking":{"type":"disabled"}"#, low),
+        (r#""chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high""#, low),
+        (r#""reasoning_effort":"none""#, low),
+        (r#""reasoning_effort":"minimal""#, low),
+        (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, low),
+        (r#""chat_template_kwargs":{"reasoning_effort":"minimal"}"#, low),
+        (r#""chat_template_kwargs":{"enable_thinking":true},"reasoning_effort":"none""#, low),
+        (r#""thinking":{"type":"enabled"},"reasoning_effort":"minimal""#, low),
+        (r#""reasoning_effort":"low""#, low),
+        (r#""reasoning_effort":"high""#, (true, Some("high"))),
+        (r#""reasoning_effort":"max""#, (true, Some("max"))),
+        (r#""reasoning_effort":"medium""#, (true, Some("medium"))),
+        (r#""chat_template_kwargs":{"enable_thinking":true}"#, (true, None)),
+        (r#""stream":false"#, (true, None)),
     ];
-    for (extra, want, reasons) in cases {
+    for (extra, want) in cases {
         let body = format!(r#"{{"model":"glm-5.3-flash","messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
         let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
         assert_eq!(status, 200, "{extra}: {resp}");
@@ -1389,8 +1401,42 @@ fn glm_thinking_off_is_low_effort() {
         let v = glm53f_api::json::parse(&resp).unwrap();
         let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
         assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("OK"), "{extra}: {resp}");
-        let reasoning = msg.get("reasoning_content").and_then(|c| c.as_str()).unwrap_or("");
-        assert_eq!(reasoning.is_empty(), !reasons, "{extra}: {resp}");
+        assert_eq!(msg.get("reasoning_content").and_then(|c| c.as_str()), Some("Answer briefly."), "{extra}: {resp}");
+    }
+}
+
+/// Thinking off, `reasoning_effort` "none" and "minimal" (top level or in `chat_template_kwargs`)
+/// and `reasoning_effort: "low"` reach the model as one prompt, the Low effort with the think
+/// block open: the scripted model answers it with its short reasoning (the default effort is
+/// another prompt, and gets its longer one).
+#[test]
+fn glm_lowest_effort_names_render_the_low_prompt() {
+    let srv = start_engine_with(GlmScript, Arc::new(GlmDialect));
+    let ask = |extra: &str| {
+        let body = format!(r#"{{"model":"glm-5.3-flash","messages":[{{"role":"user","content":"What is 2 + 2?"}}],"max_tokens":64{extra}}}"#);
+        let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &body);
+        assert_eq!(status, 200, "{extra}: {resp}");
+        let v = glm53f_api::json::parse(&resp).unwrap();
+        let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).unwrap();
+        let text = |k: &str| msg.get(k).and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let prompt_tokens = v.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|p| p.as_f64()).unwrap();
+        (text("reasoning_content"), text("content"), prompt_tokens)
+    };
+    let (default_reasoning, default_content, _) = ask("");
+    assert_eq!((default_reasoning.as_str(), default_content.as_str()), ("Two and two.", "4"));
+    let (_, _, low_tokens) = ask(r#","reasoning_effort":"low""#);
+    for extra in [
+        r#","chat_template_kwargs":{"enable_thinking":false}"#,
+        r#","thinking":{"type":"disabled"}"#,
+        r#","reasoning_effort":"low""#,
+        r#","reasoning_effort":"none""#,
+        r#","reasoning_effort":"minimal""#,
+        r#","chat_template_kwargs":{"reasoning_effort":"none"}"#,
+        r#","chat_template_kwargs":{"reasoning_effort":"minimal"}"#,
+        r#","chat_template_kwargs":{"enable_thinking":true},"reasoning_effort":"none""#,
+    ] {
+        let (reasoning, content, prompt_tokens) = ask(extra);
+        assert_eq!((reasoning.as_str(), content.as_str(), prompt_tokens), ("2+2.", "4", low_tokens), "{extra}");
     }
 }
 

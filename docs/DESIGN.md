@@ -280,12 +280,26 @@ to about C1 throughput. This design rules that out.
     `chat_template_kwargs.thinking` false, a top-level `enable_thinking` false, or `thinking.type`
     "disabled") gets the template's **Low** effort, as other hosts of this model do. The model writes a short plan,
     returned under `reasoning_content`, then answers.
-  - `reasoning_effort: "none"` asks for no reasoning at all. The prompt then ends with an empty
-    think block, the form the template writes for an assistant turn without reasoning.
+  - `reasoning_effort: "none"` and `"minimal"` (OpenAI's names for the lowest effort) are the same
+    request as thinking off, at the top level or in `chat_template_kwargs` and whatever the
+    thinking switches say: the lowest effort the template has, Low, thinking on. The API renders
+    only the efforts the template has and never ends a prompt with an empty think block (the form
+    the template writes for an assistant turn without reasoning; the tokenizer still renders it
+    for a caller that asks for it). The short plan counts against `max_tokens`.
+  - Every other `reasoning_effort` goes to the template as sent. The template reads exactly
+    `"low"` and `"high"` (Low and High) and renders Max for anything else: unset, `"max"`,
+    `"medium"` (not a middle effort), `"xhigh"`, a different case (`"High"`), the empty string. A
+    value that is not a string counts as unset. The top-level value wins over
+    `chat_template_kwargs.reasoning_effort`.
   - Why (29 September 2026): the empty block under the template's Max effort takes long,
     low-entropy output off the model's distribution. Draft acceptance dropped, and other stacks
     report corrupted long structured output. In the same benchmark, Low effort decoded 10–15%
-    faster (docs/PERFORMANCE.md §0).
+    faster (docs/PERFORMANCE.md §0). "None" was first left as the empty block for callers with
+    tiny token budgets. On the target hardware (29 September 2026, greedy, engine `073b553`) it got
+    none of three long lists right (count to 400, the first 300 primes, 1 to 400 in words): counts
+    jumped or looped and one ran to the length cap, with BF16 or F32 KDA states alike. Low got all
+    three with F32 states and two with BF16 (the primes correct but run past 300), and 8 of 9
+    shorter list tasks against 4 or 5 of 9 for the empty block. So "none" now means Low.
 - **Earlier turns keep their reasoning** unless the request sets `clear_thinking`. Re-rendering the
   history unchanged is what lets a follow-up turn resume from the previous turn's snapshot.
 

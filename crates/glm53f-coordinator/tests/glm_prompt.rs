@@ -132,6 +132,80 @@ fn tool_call_arguments_that_are_not_an_object_are_an_error() {
     assert!(e.contains("messages[0]") && e.contains("not a JSON object"), "{e}");
 }
 
+/// The effort requests end to end, through the API's handler and the real chat template: thinking
+/// off, and a `reasoning_effort` of "none" or "minimal" (top level or in `chat_template_kwargs`,
+/// with thinking switched on too), render the same prompt as "low": the Low effort with the think
+/// block open, never an empty one. "high" renders High; "max", "medium" and a request that says
+/// nothing render Max, as the template does.
+#[test]
+fn effort_requests_render_the_templates_efforts() {
+    use std::sync::{Arc, Mutex};
+
+    use glm53f_api::dialect::GlmDialect;
+    use glm53f_api::engine::{Engine, GenerateOutcome, GenerateParams};
+    use glm53f_api::types::{ChatMessage, Tool};
+
+    /// Renders each prompt with the real template and keeps it.
+    struct Renders(Mutex<Vec<String>>);
+    impl Engine for Renders {
+        fn tokenize(&self, _: &[ChatMessage], _: &[Tool], _: bool) -> usize {
+            1
+        }
+        fn render_chat(&self, m: &[ChatMessage], t: &[Tool], thinking: bool) -> String {
+            self.render_prompt(m, t, &PromptOptions { thinking, ..Default::default() })
+        }
+        fn render_prompt(&self, m: &[ChatMessage], t: &[Tool], opts: &PromptOptions) -> String {
+            let (m, t, o) = to_template(m, t, opts).unwrap();
+            let text = template::render(&m, &t, &o).unwrap();
+            self.0.lock().unwrap().push(text.clone());
+            text
+        }
+        fn generate(&self, _: &str, _: &GenerateParams, _: &mut dyn FnMut(&str)) -> Result<GenerateOutcome, String> {
+            Ok(GenerateOutcome { text: "ok".into(), finish_reason: "stop".into(), completion_tokens: 1 })
+        }
+    }
+
+    let engine = Arc::new(Renders(Mutex::new(Vec::new())));
+    let dialect: Arc<dyn glm53f_api::Dialect> = Arc::new(GlmDialect);
+    let served = |extra: &str| {
+        let sep = if extra.is_empty() { "" } else { "," };
+        let body = json::parse(&format!(r#"{{"messages":[{{"role":"user","content":"hi"}}]{sep}{extra}}}"#)).unwrap();
+        glm53f_api::chat::handle(engine.clone(), dialect.clone(), &body).unwrap_or_else(|e| panic!("{extra}: {e:?}"));
+        engine.0.lock().unwrap().pop().expect("the prompt was rendered")
+    };
+    let rendered = |thinking: bool, effort: Option<&str>| {
+        let msgs = [ChatMessage { role: "user".into(), content: "hi".into(), tool_calls: Vec::new(), reasoning_content: None,
+            tool_call_id: None }];
+        let opts = PromptOptions { thinking, reasoning_effort: effort.map(str::to_string), clear_thinking: None };
+        let (m, t, o) = to_template(&msgs, &[], &opts).unwrap();
+        template::render(&m, &t, &o).unwrap()
+    };
+
+    let low = rendered(true, Some("low"));
+    assert!(low.contains("Reasoning Effort: Low") && low.ends_with(template::THINK), "{low}");
+    for extra in [
+        r#""reasoning_effort":"low""#,
+        r#""reasoning_effort":"none""#,
+        r#""reasoning_effort":"minimal""#,
+        r#""chat_template_kwargs":{"reasoning_effort":"none"}"#,
+        r#""chat_template_kwargs":{"reasoning_effort":"minimal"}"#,
+        r#""chat_template_kwargs":{"enable_thinking":false}"#,
+        r#""thinking":{"type":"disabled"}"#,
+        r#""chat_template_kwargs":{"enable_thinking":true},"reasoning_effort":"none""#,
+        r#""thinking":{"type":"enabled"},"reasoning_effort":"minimal""#,
+    ] {
+        assert_eq!(served(extra), low, "{extra}");
+    }
+    let high = rendered(true, Some("high"));
+    assert!(high.contains("Reasoning Effort: High") && high.ends_with(template::THINK), "{high}");
+    assert_eq!(served(r#""reasoning_effort":"high""#), high);
+    let max = rendered(true, None);
+    assert!(max.contains("Reasoning Effort: Max") && max.ends_with(template::THINK), "{max}");
+    for extra in ["", r#""reasoning_effort":"max""#, r#""reasoning_effort":"medium""#, r#""chat_template_kwargs":{"enable_thinking":true}"#] {
+        assert_eq!(served(extra), max, "{extra:?}");
+    }
+}
+
 #[test]
 fn the_official_tokenizer_encodes_the_goldens_ids() {
     let Ok(path) = std::env::var("GLM53F_TOKENIZER") else {

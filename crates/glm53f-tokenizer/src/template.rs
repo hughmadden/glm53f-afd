@@ -8,7 +8,7 @@
 //!
 //! - **Prefix:** `[gMASK]<sop>`, then `<|system|>Reasoning Effort: X`, where X is `Low` or `High`
 //!   when `reasoning_effort` is exactly `low` or `high`, and `Max` otherwise (unset,
-//!   `medium`, `none` and `High` all mean Max).
+//!   `medium`, `none` and `High` all mean Max; the API sends `low` for `none` and `minimal`).
 //! - **Tools** (when the list is not empty): a system block listing each tool's function object
 //!   as one JSON line (`tojson` of each value; the `strict` and `defer_loading` keys are left out;
 //!   a tool whose `defer_loading` is true is not listed), then the call format.
@@ -32,13 +32,13 @@
 //!   reasoning block.
 //!
 //! **Thinking off is not in the template.** The template always opens the think block; it has
-//! no `enable_thinking` variable (the reference ignores one). The API renders "thinking off" as
-//! the template's Low effort (`glm53f-api`'s `Dialect::thinking_off_effort`) and uses
-//! [`Options::thinking`] = false only for `reasoning_effort: "none"`. [`Options::thinking`] = false ends
-//! the prompt with `<|assistant|>` and an empty think block instead: the form the template itself
-//! writes for an assistant turn without reasoning, so the model continues exactly as after such
-//! a turn. The goldens pin that form (`rendered_with_answer`). Every other output equals the
-//! reference.
+//! no `enable_thinking` variable (the reference ignores one). The API renders "thinking off", and
+//! `reasoning_effort` "none" and "minimal", as the template's Low effort (`glm53f-api`'s
+//! `Dialect::thinking_off_effort`) and never asks for [`Options::thinking`] = false. That option
+//! stays for callers that want it: it ends the prompt with `<|assistant|>` and an empty think
+//! block instead, the form the template itself writes for an assistant turn without reasoning,
+//! so the model continues exactly as after such a turn. The goldens pin that form
+//! (`rendered_with_answer`). Every other output equals the reference.
 //!
 //! **Images** render as `<|begin_of_image|>` + marker + `<|end_of_image|>`. With no marker the
 //! marker is `<|image|>`, as in the template; an engine puts its own marker there and expands it

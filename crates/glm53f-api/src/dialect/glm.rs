@@ -5,11 +5,13 @@
 //!
 //! - **Reasoning.** With thinking on, the prompt ends by opening the think block, so a
 //!   completion starts inside it: the text up to the first &lt;/think&gt; is reasoning
-//!   ([`GlmDialect::reasoning_first`] is the thinking switch). A request that turns thinking off
-//!   renders with the template's Low effort, thinking on ([`GlmDialect::thinking_off_effort`]);
-//!   only `reasoning_effort: "none"` ends the prompt with an empty think block, and then the
-//!   completion starts in content. A think block the model
-//!   opens later is reasoning too, up to its first closing tag; an unclosed block runs to the end.
+//!   ([`GlmDialect::reasoning_first`] is the thinking switch). A request that turns thinking off,
+//!   or sends `reasoning_effort` "none" or "minimal", renders with the template's Low effort,
+//!   thinking on ([`GlmDialect::thinking_off_effort`]): the API never ends the prompt with an
+//!   empty think block, so a completion always starts in reasoning ([`parse`] still reads one
+//!   that starts in content, for a caller that asks for `thinking` false). A think block the
+//!   model opens later is reasoning too, up to its first closing tag; an unclosed block runs to
+//!   the end.
 //! - **Tool calls.** &lt;tool_call&gt;NAME, then per argument
 //!   &lt;arg_key&gt;KEY&lt;/arg_key&gt;&lt;arg_value&gt;VALUE&lt;/arg_value&gt;, then
 //!   &lt;/tool_call&gt;. Calls follow each other directly. Nothing is escaped: the template
@@ -67,7 +69,8 @@ const AV_END: &str = concat!("<", "/arg_value", ">");
 
 /// GLM-5.3-Flash's completion markup (see the module doc). Its chat template always thinks, at
 /// a reasoning effort of Low, High or Max (the default), and has no off switch: thinking is on by
-/// default, and a request that turns it off gets Low effort.
+/// default, and a request that turns it off, or sends `reasoning_effort` "none" or "minimal", gets
+/// Low effort.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GlmDialect;
 
@@ -90,10 +93,10 @@ impl Dialect for GlmDialect {
     }
 
     /// The template has no off mode: "off" is its Low effort ("Reasoning Effort: Low", the think
-    /// block open). An empty think block under the template's default Max effort put long
+    /// block open), and so are `reasoning_effort` "none" and "minimal", the names of the lowest
+    /// effort. An empty think block under the template's default Max effort put long
     /// low-entropy output off the model's distribution: fewer drafts accepted, and reported
-    /// corruption of long structured output on other stacks. `reasoning_effort: "none"` still
-    /// gives the empty block.
+    /// corruption of long structured output on other stacks; the API no longer renders it.
     fn thinking_off_effort(&self) -> Option<&'static str> {
         Some("low")
     }
@@ -694,9 +697,20 @@ mod tests {
         assert_eq!(parse_req(r#","thinking":{"type":"disabled"}"#).enable_thinking, Some(false));
         assert_eq!(parse_req(r#","thinking":{"type":"enabled","clear_thinking":true}"#).enable_thinking, Some(true));
         assert_eq!(parse_req(r#","thinking":{"type":"enabled","clear_thinking":true}"#).clear_thinking, Some(true));
-        assert_eq!(parse_req(r#","reasoning_effort":"none""#).enable_thinking, Some(false));
-        let r = parse_req(r#","reasoning_effort":"low""#);
-        assert_eq!((r.enable_thinking, r.reasoning_effort.as_deref()), (None, Some("low")));
+        // The names of the lowest effort are thinking off, in either place; the effort is kept as sent.
+        for effort in ["none", "minimal"] {
+            let r = parse_req(&format!(r#","reasoning_effort":"{effort}""#));
+            assert_eq!((r.enable_thinking, r.reasoning_effort.as_deref()), (Some(false), Some(effort)));
+            let r = parse_req(&format!(r#","chat_template_kwargs":{{"reasoning_effort":"{effort}"}}"#));
+            assert_eq!((r.enable_thinking, r.reasoning_effort.as_deref()), (Some(false), Some(effort)));
+        }
+        // No other value touches the switch (the template reads the exact words "low" and "high").
+        for effort in ["low", "medium", "high", "max", "None", "MINIMAL", ""] {
+            let r = parse_req(&format!(r#","reasoning_effort":"{effort}""#));
+            assert_eq!((r.enable_thinking, r.reasoning_effort.as_deref()), (None, Some(effort)), "{effort:?}");
+        }
+        // A value that is not a string is no effort at all.
+        assert_eq!(parse_req(r#","reasoning_effort":5,"chat_template_kwargs":{"reasoning_effort":null}"#).reasoning_effort, None);
         let r = parse_req(r#","chat_template_kwargs":{"reasoning_effort":"high","clear_thinking":false}"#);
         assert_eq!((r.reasoning_effort.as_deref(), r.clear_thinking), (Some("high"), Some(false)));
         // The template's own switch wins over the others.
@@ -871,24 +885,27 @@ mod tests {
         (reasoning, content)
     }
 
-    /// No reasoning at all (`reasoning_effort: "none"`) end to end: the engine is told thinking is
-    /// off (to render the prompt and to count it), and the completion is read as content, whole
-    /// and streamed. (Thinking turned off any other way is the template's Low effort:
-    /// `tests/acceptance.rs` `glm_thinking_off_is_low_effort`.)
+    /// `reasoning_effort` "none" and "minimal" end to end: they are thinking off, which for this
+    /// template is the Low effort with the think block open, never an empty block. The engine is
+    /// told thinking is on at "low" (to render the prompt and to count it), and the completion, a
+    /// short plan and then the answer, is read as reasoning and content, whole and streamed.
     #[test]
-    fn reasoning_effort_none_reaches_the_engine_as_off_and_the_parse() {
-        let stub = stub("Just the answer.", 4);
+    fn reasoning_effort_none_and_minimal_reach_the_engine_as_the_low_effort() {
+        let stub = stub(&format!("A short plan.{TH_END}Just the answer."), 4);
         let base = serve(stub.clone());
-        let body = r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}"#;
-        let v = json::parse(&post(&base, body)).unwrap();
-        let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
-        assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Just the answer."));
-        assert!(msg.get("reasoning_content").is_none() && msg.get("reasoning").is_none());
-        let streamed = body.replace(r#""reasoning_effort":"none""#, r#""reasoning_effort":"none","stream":true"#);
-        assert_eq!(streamed_text(&post(&base, &streamed)), (String::new(), "Just the answer.".to_string()));
-        let off = PromptOptions { thinking: false, reasoning_effort: Some("none".into()), clear_thinking: None };
-        assert_eq!(stub.seen.lock().unwrap().as_slice(), [off.clone(), off.clone()]);
-        assert_eq!(stub.counted.lock().unwrap().as_slice(), [off.clone(), off]);
+        for effort in ["none", "minimal"] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"reasoning_effort":"{effort}"}}"#);
+            let v = json::parse(&post(&base, &body)).unwrap();
+            let msg = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).and_then(|c| c.get("message")).unwrap();
+            assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Just the answer."), "{effort}");
+            assert_eq!(msg.get("reasoning_content").and_then(|c| c.as_str()), Some("A short plan."), "{effort}");
+            assert!(msg.get("reasoning").is_none(), "{effort}");
+            let streamed = body.replace(&format!(r#""reasoning_effort":"{effort}""#), &format!(r#""reasoning_effort":"{effort}","stream":true"#));
+            assert_eq!(streamed_text(&post(&base, &streamed)), ("A short plan.".to_string(), "Just the answer.".to_string()), "{effort}");
+        }
+        let low = PromptOptions { thinking: true, reasoning_effort: Some("low".into()), clear_thinking: None };
+        assert_eq!(stub.seen.lock().unwrap().as_slice(), [low.clone(), low.clone(), low.clone(), low.clone()]);
+        assert_eq!(stub.counted.lock().unwrap().as_slice(), [low.clone(), low.clone(), low.clone(), low]);
     }
 
     /// Every form of the thinking switch, and their precedence, reaches the engine: the same
@@ -914,21 +931,32 @@ mod tests {
             // GLM and Anthropic.
             (r#""thinking":{"type":"disabled"}"#, opts(true, Some("low"), None)),
             (r#""thinking":{"type":"enabled","budget_tokens":1024}"#, opts(true, None, None)),
-            // OpenAI's effort: "none" is thinking off with no reasoning at all (the empty think
-            // block); every other value goes to the template as sent.
-            (r#""reasoning_effort":"none""#, opts(false, Some("none"), None)),
-            (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(false, Some("none"), None)),
+            // OpenAI's efforts "none" and "minimal" name the lowest effort: thinking off, so the
+            // template's Low effort, in either place (never an empty think block).
+            (r#""reasoning_effort":"none""#, opts(true, Some("low"), None)),
+            (r#""chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(true, Some("low"), None)),
+            (r#""reasoning_effort":"minimal""#, opts(true, Some("low"), None)),
+            (r#""chat_template_kwargs":{"reasoning_effort":"minimal"}"#, opts(true, Some("low"), None)),
+            // Every other value goes to the template as sent (exactly "low" and "high" render Low
+            // and High; anything else renders Max). The top-level value wins over the kwargs one.
             (r#""reasoning_effort":"low""#, opts(true, Some("low"), None)),
+            (r#""reasoning_effort":"high""#, opts(true, Some("high"), None)),
+            (r#""reasoning_effort":"max""#, opts(true, Some("max"), None)),
+            (r#""reasoning_effort":"medium""#, opts(true, Some("medium"), None)),
             (r#""reasoning_effort":"low","chat_template_kwargs":{"reasoning_effort":"high"}"#, opts(true, Some("low"), None)),
+            (r#""reasoning_effort":"high","chat_template_kwargs":{"reasoning_effort":"none"}"#, opts(true, Some("high"), None)),
+            (r#""reasoning_effort":"none","chat_template_kwargs":{"reasoning_effort":"high"}"#, opts(true, Some("low"), None)),
             // Precedence: chat_template_kwargs (enable_thinking, then thinking), top-level
-            // enable_thinking, thinking.type, effort "none".
+            // enable_thinking, thinking.type, the lowest effort's names. Whichever way the switch
+            // resolves, those names still mean the Low effort.
             (r#""chat_template_kwargs":{"enable_thinking":true},"thinking":{"type":"disabled"},"reasoning_effort":"none""#,
-                opts(true, Some("none"), None)),
+                opts(true, Some("low"), None)),
             (r#""chat_template_kwargs":{"enable_thinking":true,"thinking":false}"#, opts(true, None, None)),
             (r#""chat_template_kwargs":{"thinking":false},"enable_thinking":true,"thinking":{"type":"enabled"}"#,
                 opts(true, Some("low"), None)),
             (r#""enable_thinking":true,"thinking":{"type":"disabled"}"#, opts(true, None, None)),
-            (r#""thinking":{"type":"enabled"},"reasoning_effort":"none""#, opts(true, Some("none"), None)),
+            (r#""thinking":{"type":"enabled"},"reasoning_effort":"none""#, opts(true, Some("low"), None)),
+            (r#""enable_thinking":true,"reasoning_effort":"minimal""#, opts(true, Some("low"), None)),
             (r#""thinking":{"type":"disabled"},"reasoning_effort":"high""#, opts(true, Some("low"), None)),
             // clear_thinking: chat_template_kwargs, then thinking.
             (r#""chat_template_kwargs":{"clear_thinking":true}"#, opts(true, None, Some(true))),

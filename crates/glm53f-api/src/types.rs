@@ -133,11 +133,13 @@ pub struct ChatRequest {
     /// The request's thinking switch, the first of: `chat_template_kwargs.enable_thinking`,
     /// `chat_template_kwargs.thinking` (a boolean: the spelling some clients and chat templates
     /// use), top-level `enable_thinking`, `thinking.type` (`disabled` is off, any other type on),
-    /// and `reasoning_effort: "none"` (off). `None` when the request says nothing: the dialect's
-    /// default applies ([`crate::Dialect::default_thinking`]).
+    /// and a `reasoning_effort` that names the lowest effort, "none" or "minimal" (off).
+    /// `None` when the request says nothing: the dialect's default applies
+    /// ([`crate::Dialect::default_thinking`]).
     pub enable_thinking: Option<bool>,
     /// `reasoning_effort` (top level, else `chat_template_kwargs`), as sent: the chat template
-    /// decides what a value means.
+    /// decides what a value means. The handler maps the names of the lowest effort ("none",
+    /// "minimal") to the dialect's lowest effort ([`crate::Dialect::thinking_off_effort`]).
     pub reasoning_effort: Option<String>,
     /// `clear_thinking` (`chat_template_kwargs`, else `thinking`): drop the reasoning of assistant
     /// turns before the last user message, where the template supports it.
@@ -286,6 +288,12 @@ fn parse_tool(v: &Json) -> Result<Tool, ApiError> {
     })
 }
 
+/// Whether a `reasoning_effort` names the lowest effort: "none" and "minimal", which OpenAI clients
+/// send for it. A request that sends one gets what a request that turns thinking off gets.
+pub(crate) fn lowest_effort(reasoning_effort: Option<&str>) -> bool {
+    matches!(reasoning_effort, Some("none" | "minimal"))
+}
+
 impl ChatRequest {
     /// Decode and validate a parsed request body; `decode` turns each inline
     /// image into pixels and a token count (the engine's
@@ -368,7 +376,7 @@ impl ChatRequest {
             .or_else(|| kwargs.and_then(|k| k.get("thinking")).and_then(|t| t.as_bool()))
             .or_else(|| body.get("enable_thinking").and_then(|t| t.as_bool()))
             .or_else(|| thinking.and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(|t| t != "disabled"))
-            .or_else(|| (reasoning_effort.as_deref() == Some("none")).then_some(false));
+            .or_else(|| lowest_effort(reasoning_effort.as_deref()).then_some(false));
         let clear_thinking = kwargs.and_then(|k| k.get("clear_thinking")).and_then(|c| c.as_bool())
             .or_else(|| thinking.and_then(|t| t.get("clear_thinking")).and_then(|c| c.as_bool()));
         let parallel_tool_calls = body.get("parallel_tool_calls").and_then(|p| p.as_bool()).unwrap_or(true);
