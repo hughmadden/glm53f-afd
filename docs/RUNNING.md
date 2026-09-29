@@ -192,6 +192,21 @@ model generates, and for the engine's own wait on a long prefill. The comment ca
 clients ignore it, and every event, its content and its order are what they were. A gateway's idle
 or read timeout only has to exceed 15 s.
 
+### Bonded coordinator NIC
+
+The measured coordinator's network is a bond of two 200 Gb/s ports (a ConnectX-7, in a PCIe Gen5
+x8 slot). The prefill figures come from boots where both ports carried the return traffic, each
+42–58% of it; the one early run that put 62.8% on a port matched them ([PERFORMANCE.md](PERFORMANCE.md)
+§0), so the split has not been seen to limit prefill at these rates.
+
+- **Check after a start.** Send four prompts of about 6K tokens at once and read each port's
+  received bytes before and after (`ethtool -S <port>`, the `rx_bytes_phy` counter): each port
+  should have received 42–58% of the total.
+- **If one port takes everything, restart the coordinator** and check again. The split can differ
+  from one start to the next.
+- **A single 200 Gb/s port also works.** Prefill on one port instead of a bond has not been
+  measured.
+
 ### Numerics defaults
 
 Each option changes the engine's arithmetic and became a default only after the KL gate and speed

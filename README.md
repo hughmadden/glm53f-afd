@@ -37,7 +37,12 @@ from their reference implementation and tested against it ([docs/DESIGN.md](docs
 |---|---|---|
 | Coordinator | One RTX 5090 (32 GB) in an x86-64 host. Host RAM holds the embedding and the KV snapshot tier | CUDA 12.8 or later (`sm_120`) |
 | Ranks | Four DGX Spark (GB10, 128 GB unified memory), about 38 GB of experts each | CUDA 13 (`sm_121`) |
-| Fabric | A RoCE v2 port of at least 100 Gb/s on each machine (measured at 200 Gb/s). Expert traffic refuses any other network; the API can use any | rdma-core (`libibverbs`) |
+| Fabric | A RoCE v2 port of at least 100 Gb/s on each machine (measured with 200 Gb/s ports; the coordinator's is a bond of two, below). Expert traffic refuses any other network; the API can use any | rdma-core (`libibverbs`) |
+
+**The measured coordinator's network** is a ConnectX-7 with two 200 Gb/s ports bonded, in a PCIe
+Gen5 x8 slot. The prefill figures come from boots where both ports carried the return traffic,
+each 42–58% of it. A single 200 Gb/s port also works; prefill with one port is untested.
+[docs/RUNNING.md](docs/RUNNING.md#bonded-coordinator-nic) says how to check the balance.
 
 ## Measured (28–29 September 2026)
 
