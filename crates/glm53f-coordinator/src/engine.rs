@@ -182,7 +182,14 @@ pub struct CoordinatorEngine<C: PromptCodec> {
     queue: Arc<Queue>,
     max_context: Option<usize>,
     cfg: EngineConfig,
+    /// The scheduler's thread ([`CoordinatorEngine::start`]; none over a caller's channel).
+    scheduler: Option<std::thread::JoinHandle<()>>,
+    /// What else [`Engine::health`] asks ([`CoordinatorEngine::with_health`]).
+    health: Option<HealthCheck>,
 }
+
+/// A check of state the scheduler's model holds (the expert wire's), read from another thread.
+type HealthCheck = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 impl<C: PromptCodec> CoordinatorEngine<C> {
     /// Start the scheduler on its own thread over `model` and its `slots` (all empty), with an
@@ -201,17 +208,24 @@ impl<C: PromptCodec> CoordinatorEngine<C> {
         eprintln!("[coordinator] batching scheduler: {} slots; max context {max_context:?} tokens per request; queue \
             depth {}", slots.len(), queue.depth());
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let scheduler = std::thread::Builder::new()
             .name("glm53f-scheduler".into())
             .spawn(move || Scheduler::new(model, slots, cache, sched, rx).run())
             .map_err(|e| format!("spawn scheduler: {e}"))?;
-        Ok(Self::with_channel(codec, tx, queue, max_context, cfg))
+        Ok(CoordinatorEngine { scheduler: Some(scheduler), ..Self::with_channel(codec, tx, queue, max_context, cfg) })
     }
 
     /// An engine over an existing job channel (a scheduler the caller runs).
     pub fn with_channel(codec: C, jobs: mpsc::Sender<Job>, queue: Arc<Queue>, max_context: Option<usize>,
         cfg: EngineConfig) -> Self {
-        CoordinatorEngine { codec, jobs: Mutex::new(jobs), queue, max_context, cfg }
+        CoordinatorEngine { codec, jobs: Mutex::new(jobs), queue, max_context, cfg, scheduler: None, health: None }
+    }
+
+    /// Adds `check` to [`Engine::health`]: state the model holds on the scheduler's thread and
+    /// shares for reading (`glm53f-serve`: whether the expert wire has failed). It must not wait.
+    pub fn with_health(mut self, check: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Self {
+        self.health = Some(Box::new(check));
+        self
     }
 
     pub fn codec(&self) -> &C {
@@ -271,6 +285,15 @@ impl<C: PromptCodec> Engine for CoordinatorEngine<C> {
 
     fn admit(&self) -> Result<Option<QueuePlace>, String> {
         self.queue.admit().map(Some)
+    }
+
+    /// Serving while the scheduler's thread runs (it ends only by a panic: the engine holds its
+    /// job channel open) and the added check passes; the queue and the model are not touched.
+    fn health(&self) -> Result<(), String> {
+        if self.scheduler.as_ref().is_some_and(|t| t.is_finished()) {
+            return Err("the scheduler stopped (see the log); restart the coordinator".into());
+        }
+        self.health.as_ref().map_or(Ok(()), |check| check())
     }
 
     fn generate(&self, prompt: &str, params: &GenerateParams, on_delta: &mut dyn FnMut(&str))

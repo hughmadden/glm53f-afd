@@ -3,7 +3,8 @@
 //! --experts remote` in front of them, and one streamed chat completion through the HTTP API:
 //! HTTP -> queue -> scheduler -> forward (layers 0-4, the MoE layers on the ranks) -> sampler ->
 //! SSE. The text is meaningless by design (5 of 45 layers); the test checks the loop, not the
-//! words.
+//! words. Then `GET /health`: 200 while serving; after a rank is stopped and a request fails on
+//! the wire, 503 with the wire's failure.
 //!
 //! Needs `GLM53F_CHECKPOINT_DIR` (the coordinator's weights, with the tokenizer and the official
 //! chat template), `GLM53F_RANK_BIN` (a `glm53f-rank` binary built with `--features cuda`) and
@@ -101,6 +102,27 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
     }
 }
 
+/// One request with a whole (not chunked) response: its status and body.
+fn request(api: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(api).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: {api}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).expect("read the response");
+    let status = resp
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = resp.split_once("\r\n\r\n").map_or("", |x| x.1).to_string();
+    (status, body)
+}
+
 fn delta_text(chunk: &Json) -> Option<String> {
     let d = chunk.get("choices")?.as_array()?.first()?.get("delta")?;
     let mut s = String::new();
@@ -144,15 +166,26 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
         return;
     }
 
-    let (ranks, addrs) = spawn_ranks(&bin, &dirs);
+    let (mut ranks, addrs) = spawn_ranks(&bin, &dirs);
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
     let api = format!("127.0.0.1:{port}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_glm53f-serve"));
+    // The numerics defaults, whatever this process's environment says.
+    for k in [
+        "GLM53F_KDA_FP8",
+        "GLM53F_KDA_STATE_BF16",
+        "GLM53F_PREFILL_W8A16",
+        "GLM53F_KDA_PREFILL_W8A8",
+        "GLM53F_KDA_CHUNKED_PREFILL",
+    ] {
+        cmd.env_remove(k);
+    }
     let mut serve = Procs {
-        children: vec![Command::new(env!("CARGO_BIN_EXE_glm53f-serve"))
+        children: vec![cmd
             .arg("--checkpoint")
             .arg(&ckpt)
             .args([
@@ -263,10 +296,41 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
         "finish_reason {finish:?}"
     );
     assert!(usage.is_some_and(|n| n >= 1.0), "usage {usage:?}");
+
+    // Health while serving.
+    assert_eq!(
+        request(&api, "GET", "/health", ""),
+        (200, r#"{"status":"ok"}"#.to_string())
+    );
+    // A rank gone: the next request fails on the expert wire, the forward refuses every pass
+    // after it until the coordinator restarts, and the health check says so.
+    let _ = ranks.children[0].kill();
+    let _ = ranks.children[0].wait();
+    let body = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Name three birds."}],"max_tokens":4}"#;
+    let (status, resp) = request(&api, "POST", "/v1/chat/completions", body);
+    assert_eq!(status, 500, "a request with a rank gone: {resp}");
+    let (status, health) = request(&api, "GET", "/health", "");
+    assert_eq!(status, 503, "{health}");
+    let h = json::parse(&health).expect("a JSON body");
+    assert_eq!(
+        h.get("status").and_then(|s| s.as_str()),
+        Some("unavailable")
+    );
+    let reason = h.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+    assert!(
+        reason.starts_with("expert wire: ") && reason.ends_with("; restart the coordinator"),
+        "{reason}"
+    );
+    eprintln!("health: 200 while serving; with rank 0 stopped, 503: {reason}");
+
     let log = log.lock().unwrap().join("\n");
     assert!(
         log.contains("DEVELOPMENT MODE"),
         "the development mode was not announced"
+    );
+    assert!(
+        log.contains("[coordinator] numerics: BF16 KDA states (D8), W8A16 prefill projections, chunked KDA prefill"),
+        "the default numerics were not logged"
     );
     drop(serve);
     drop(ranks);

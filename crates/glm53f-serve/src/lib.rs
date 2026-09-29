@@ -27,6 +27,16 @@
 //! A request then runs HTTP -> queue -> scheduler -> forward (attention, dense and shared MLPs,
 //! router on this GPU; routed experts on the ranks) -> sampler -> tokens streamed back.
 //!
+//! # Health
+//!
+//! `GET /health` answers 200 `{"status":"ok"}` while the engine can serve, and 503
+//! `{"status":"unavailable","reason":"..."}` once it cannot: the expert wire failed (the forward
+//! then refuses every pass until the coordinator restarts and reconnects), or the scheduler's
+//! thread ended. It reads that state only, never the request queue or the GPU, so it answers at
+//! once under any load; it does not prove that the next pass succeeds, which only a request does.
+//! The API listens only once the engine is ready (step 5 above), so before that a probe's
+//! connection is refused: there is no "starting" answer.
+//!
 //! # Options
 //!
 //! | Option | Environment | Default | What |

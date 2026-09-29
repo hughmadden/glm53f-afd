@@ -348,6 +348,8 @@ pub struct MockModel {
     pub row_ns: u64,
     /// The copying model ([`copying_logits`]) instead of the hash model.
     pub copying: bool,
+    /// Prefill panics: a bug in a pass, which ends the scheduler's thread.
+    pub panic_in_prefill: bool,
 }
 
 impl MockModel {
@@ -361,6 +363,7 @@ impl MockModel {
             pass_ns: 1_000_000,
             row_ns: 250_000,
             copying: false,
+            panic_in_prefill: false,
         }
     }
 
@@ -402,6 +405,7 @@ impl ModelForward for MockModel {
     }
 
     fn prefill(&mut self, segs: &mut [Segment<'_, MockSlot>]) -> Result<Vec<SegmentOut>, String> {
+        assert!(!self.panic_in_prefill, "the toy model's prefill panics, as asked");
         self.record(Call::Prefill(segs.iter().map(|s| (s.slot.id, s.tokens.len())).collect()));
         self.cost(segs.iter().map(|s| s.tokens.len()).sum());
         let mut out = Vec::new();

@@ -99,7 +99,7 @@
 //! error; the coordinator has to reconnect by restarting.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use glm53f_coordinator::gpu as cgpu;
@@ -400,7 +400,8 @@ pub struct RemoteExperts {
     /// pipelined wire's (`GLM53F_WIRE_INFLIGHT`; none by default).
     sent: VecDeque<Sent>,
     inflight: usize,
-    failed: Option<String>,
+    /// The first wire failure, shared ([`RemoteExperts::failure`]).
+    failed: Arc<OnceLock<String>>,
     times: Arc<Mutex<WireTimes>>,
     /// The exchanges of the pass being traced ([`ExpertBackend::trace_begin`]).
     pass: Option<Vec<PassRec>>,
@@ -451,7 +452,7 @@ impl RemoteExperts {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MAX_LANES)
                 .clamp(1, MAX_LANES),
-            failed: None,
+            failed: Arc::new(OnceLock::new()),
             times: Arc::new(Mutex::new(WireTimes::default())),
             pass: None,
         };
@@ -558,8 +559,15 @@ impl RemoteExperts {
         *self.times.lock().unwrap_or_else(|p| p.into_inner()) = WireTimes::default();
     }
 
+    /// The first wire failure, once there is one, as every later call reports it (a shared
+    /// handle: take it before handing the backend to the forward). `glm53f-serve`'s `GET /health`
+    /// reads it: the coordinator has to restart to reconnect.
+    pub fn failure(&self) -> Arc<OnceLock<String>> {
+        self.failed.clone()
+    }
+
     fn live(&self) -> Result<()> {
-        match &self.failed {
+        match self.failed.get() {
             Some(e) => Err(Error::Other(format!(
                 "the expert ranks failed earlier ({e}); restart the coordinator"
             ))),
@@ -570,7 +578,7 @@ impl RemoteExperts {
     /// Record a wire failure: this and every later call fail with it.
     fn fail(&mut self, e: String) -> Error {
         let msg = format!("expert wire: {e}");
-        self.failed = Some(msg.clone());
+        let _ = self.failed.set(msg.clone());
         self.sent.clear();
         Error::Other(msg)
     }

@@ -4,6 +4,7 @@
 # std-only (no external crates). The coordinator wires the `Engine` trait into
 # its binary. Serves:
 #   GET  /v1/models
+#   GET  /health               (the engine's state: 200, or 503 with its reason)
 #   POST /v1/chat/completions  (non-stream + SSE, tool-call parsing T27/T29/T24)
 #
 # The HTTP/1.1 server and the JSON codec are hand-rolled so the crate is

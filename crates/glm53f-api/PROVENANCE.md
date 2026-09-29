@@ -46,6 +46,7 @@ to mimo26f-afd's design records and are kept verbatim as provenance.
 | tests/acceptance.rs (end) | `reasoning_opened_by_the_prompt_streams_as_reasoning`: a test-local dialect whose prompt opens the reasoning block (as GLM-5.3-Flash's template does); streamed reasoning and content match the non-stream parse. | 2026-09-28 |
 | tests/acceptance.rs (last section) | `GlmScript`, a scripted GLM-5.3-Flash stand-in served with `GlmDialect` (a small GLM-like prompt whose length is its token count, answers to the contract harness's prompts, three-character deltas); `reasoning_is_reasoning_content_whole_and_streamed`, `every_chunk_carries_the_completion_head`, and `api_contract_harness_passes_against_the_glm_script`, which runs `harness/api_contract.py` against it and requires every row to pass. | 2026-09-28 |
 | src/dialect/glm.rs | `GlmDialect`, GLM-5.3-Flash's completion markup: reasoning first when the prompt opened the think block (`reasoning_first(thinking) = thinking`), thinking on by default; the tool-call envelope read in the order the streaming splitter walks it; argument values typed by the tool's JSON schema, inverting the chat template (a string property keeps its text exactly; other values are JSON when the schema allows); every loss reported, a nameless call with arguments an error, the tool-call cap. Written here; the tool-call format and the schema-typed values follow the GLM-5.3-Flash chat template (sha256 `0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5`) and were cross-read with tpurtell/glmrt-5.3-1rtx-4spark @ `dc6d9b8` : `rust/crates/glmrt-api/src/tooling.rs` (sha256 `cb657995662cbca79bbb2515f822de2d8d3e14ec11a7987d185a61db38eed93f`), no code copied. Tests in the file: parser cases (reasoning, parallel calls, nested JSON, strings holding tags, malformed calls, cap, schema typing, template round trip), request-field mapping, two server tests (a call split across stream deltas; thinking off end to end) and a source-hygiene check. | 2026-09-28 |
+| src/health.rs | `GET /health`: 200 `{"status":"ok"}` while `Engine::health` passes, 503 `{"status":"unavailable","reason":...}` with its reason when not; own code, in the shape of `models.rs`. | 2026-09-29 |
 | PROVENANCE.md | This ledger. | 2026-09-28 |
 
 ## Changed here (the GLM dialect and its request fields)
@@ -115,3 +116,17 @@ the think block open, so the API renders only the efforts the template has (`doc
 | src/chat.rs | A dialect with a lowest effort (`thinking_off_effort`) renders thinking on at that effort for a request that turns thinking off or names the lowest effort, whatever the switch says; the `effort_none` case (thinking off, the empty block) is removed | glm.rs `reasoning_effort_none_and_minimal_reach_the_engine_as_the_low_effort`, `the_thinking_switch_forms_and_their_precedence_reach_the_engine`; tests/acceptance.rs `glm_thinking_off_is_low_effort`, `glm_lowest_effort_names_render_the_low_prompt`; glm53f-coordinator tests/glm_prompt.rs `effort_requests_render_the_templates_efforts` (the real template) | 2026-09-29 |
 | src/engine.rs, src/dialect/mod.rs, src/dialect/glm.rs, src/lib.rs | Docs: `PromptOptions::reasoning_effort`, `Dialect::thinking_off_effort`, the GLM dialect, the crate doc | — | 2026-09-29 |
 | harness/api_contract.py, harness/test_api_contract.py | THINK-OFF: `reasoning_effort=none` is judged as the other off forms are (a short reasoning under the reasoning field is allowed), `=minimal` is a new off form, and the streamed check reads the field name and markup, not "no reasoning"; the fake server maps both names to Low (new broken mode `effort-minimal-ignored`) | the self-test | 2026-09-29 |
+
+## Changed here (`GET /health`)
+
+A production health check and a test ladder probe `GET /health`; the source served no such route (a
+request for it was a 404). The engine answers from its state, so the route never waits behind the
+request queue or the model. Own code; nothing is copied.
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/engine.rs | New `Engine::health`, defaulting to `Ok(())`, so existing engines are unchanged | tests/acceptance.rs (health tests) | 2026-09-29 |
+| src/lib.rs | The router serves `GET /health` (`health::handle`); new `serve_listener`, `serve` on an already-bound listener, which `serve` calls; crate doc | tests/acceptance.rs `health_is_ok_while_the_engine_can_serve_and_takes_no_queue_place`, `health_is_503_with_the_reason_once_the_engine_cannot_serve` (both through `serve_listener`) | 2026-09-29 |
+| src/http.rs | The reason phrase of 503 (`Service Unavailable`) | the 503 test | 2026-09-29 |
+| Cargo.toml | The header comment lists the route | — | 2026-09-29 |
+| tests/acceptance.rs | `start_served` (the crate's own routes on a loopback port), `raw_get`, the `WireDown` stub and the two health tests | the tests themselves | 2026-09-29 |

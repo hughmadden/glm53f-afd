@@ -1,6 +1,6 @@
 //! `glm53f-api` — the OpenAI-compatible HTTP/1.1 API (A8, I5-R8).
 //!
-//! std-only (no external crates). Serves `GET /v1/models` and
+//! std-only (no external crates). Serves `GET /v1/models`, `GET /health` and
 //! `POST /v1/chat/completions` (non-stream + SSE with the `include_usage` usage
 //! block), splits completions into content, reasoning and tool calls through
 //! the model's [`Dialect`] (the MiMo dialect, COHERENCE-TRAPS T27/T29 and cap
@@ -8,6 +8,10 @@
 //! `tool_choice` with a 400. The model itself is behind the [`Engine`] trait,
 //! which the coordinator implements; the tests drive the server with a stub
 //! engine.
+//!
+//! `GET /health` answers 200 `{"status":"ok"}` while the engine can serve, and 503
+//! `{"status":"unavailable","reason":...}` once it cannot ([`Engine::health`]); it
+//! reads the engine's state only, so it answers at once however busy the engine is.
 //!
 //! # Reasoning and the thinking switch
 //!
@@ -60,12 +64,14 @@
 pub mod chat;
 pub mod dialect;
 pub mod engine;
+pub mod health;
 pub mod http;
 pub mod json;
 pub mod models;
 pub mod types;
 
 use std::io;
+use std::net::TcpListener;
 use std::sync::Arc;
 
 pub use dialect::{Dialect, ParseResult, ParsedCall, StreamTags};
@@ -77,7 +83,13 @@ use http::Request;
 /// Run the API on `addr` (e.g. `0.0.0.0:8000`) with the given engine and the
 /// model's completion dialect.
 pub fn serve<E: Engine + Send + Sync + 'static>(addr: &str, engine: Arc<E>, dialect: Arc<dyn Dialect>) -> io::Result<()> {
-    http::serve(addr, move |req| route(engine.clone(), dialect.clone(), req))
+    serve_listener(TcpListener::bind(addr)?, engine, dialect)
+}
+
+/// [`serve`] on an already-bound listener (lets tests bind an ephemeral port).
+pub fn serve_listener<E: Engine + Send + Sync + 'static>(listener: TcpListener, engine: Arc<E>,
+    dialect: Arc<dyn Dialect>) -> io::Result<()> {
+    http::serve_listener(listener, move |req| route(engine.clone(), dialect.clone(), req))
 }
 
 fn route<E: Engine + Send + Sync + 'static>(engine: Arc<E>, dialect: Arc<dyn Dialect>, req: Request) -> http::Response {
@@ -85,6 +97,7 @@ fn route<E: Engine + Send + Sync + 'static>(engine: Arc<E>, dialect: Arc<dyn Dia
     let path = req.path.split('?').next().unwrap_or("");
     match (req.method.as_str(), path) {
         ("GET", "/v1/models") => models::handle(),
+        ("GET", "/health") => health::handle(&*engine),
         ("POST", "/v1/chat/completions") => {
             match json::parse_bytes(&req.body) {
                 Ok(body) => match chat::handle(engine, dialect, &body) {

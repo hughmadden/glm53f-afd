@@ -163,11 +163,15 @@ mod daemon {
                     .max(verify_rows(o.slots, DRAFTS + 1, sched.spec_max_rows));
         }
         let rows = fcfg.lane_rows().max(fcfg.max_verify_rows);
+        // The expert wire's first failure, for `GET /health` (the forward refuses every call after
+        // it until the coordinator restarts).
+        let mut wire_failure = None;
         let (experts, experts_bytes, experts_what): (Box<dyn ExpertBackend>, usize, String) =
             match &o.experts {
                 Experts::Remote(addrs) => {
                     eprintln!("[coordinator] connecting the expert ranks {addrs:?}");
                     let r = s(RemoteExperts::connect(addrs, rows, o.prefill_lanes))?;
+                    wire_failure = Some(r.failure());
                     let (recv, body) = r.host_bytes();
                     let what = format!(
                         "the expert exchange, {rows} rows an exchange, {} in flight at most \
@@ -376,7 +380,13 @@ mod daemon {
             sched,
             queue,
             EngineConfig::new(eos, max_context),
-        )?;
+        )?
+        .with_health(move || match wire_failure.as_ref().and_then(|f| f.get()) {
+            Some(e) => Err(format!("{e}; restart the coordinator")),
+            None => Ok(()),
+        });
+        // The API listens only from here, once the engine is ready: before, a probe's connection
+        // is refused, so `GET /health` never has to answer "not yet".
         eprintln!(
             "[coordinator] serving the API on {}{}",
             o.listen,

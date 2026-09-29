@@ -164,6 +164,12 @@ pub trait Engine {
         Ok(None)
     }
 
+    /// Whether the engine can serve requests now (`GET /health`), answered from its state: it
+    /// queues nothing and waits for nothing. `Err` says why not (answered 503). Default: it can.
+    fn health(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Generate the completion. `on_delta` is called with each incremental text
     /// delta (the API forwards it as an SSE content delta); the returned text is
     /// the full completion the API parses for tool calls and think blocks.

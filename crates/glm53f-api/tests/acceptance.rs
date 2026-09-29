@@ -1011,6 +1011,84 @@ fn a_full_queue_is_429_with_retry_after() {
 }
 
 // ---------------------------------------------------------------------------
+// Health (added in glm53f-afd): the routes as `glm53f_api::serve` has them.
+// ---------------------------------------------------------------------------
+
+/// The API as `glm53f_api::serve` routes it, on a loopback port.
+fn start_served<E: Engine + Send + Sync + 'static>(engine: E) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let engine = Arc::new(engine);
+    let handle = std::thread::spawn(move || {
+        let _ = glm53f_api::serve_listener(listener, engine, Arc::new(MimoDialect));
+    });
+    Server { base: format!("http://127.0.0.1:{port}"), _handle: handle }
+}
+
+/// A GET's whole response, head and body.
+fn raw_get(srv: &Server, path: &str) -> String {
+    let hostport = srv.base.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(hostport).expect("connect");
+    use std::io::Write;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+/// `GET /health` while the engine can serve: 200 and `{"status":"ok"}`, from the engine's state
+/// alone. `BusyStub`'s queue is full and its generation panics: the health check touches neither.
+#[test]
+fn health_is_ok_while_the_engine_can_serve_and_takes_no_queue_place() {
+    let srv = start_served(BusyStub);
+    for path in ["/health", "/health?probe=1"] {
+        let resp = raw_get(&srv, path);
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(resp.contains("\r\nContent-Type: application/json\r\n"), "{resp}");
+        assert!(resp.ends_with("\r\n\r\n{\"status\":\"ok\"}"), "{resp}");
+    }
+    let (status, _) = http_get(&format!("{}/v1/models", srv.base));
+    assert_eq!(status, 200);
+    let (status, _) = http_post(&format!("{}/health", srv.base), "{}");
+    assert_eq!(status, 404, "only GET");
+}
+
+/// An engine that can no longer serve: its expert wire failed.
+struct WireDown;
+
+impl Engine for WireDown {
+    fn tokenize(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / 4
+    }
+    fn render_chat(&self, messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        last_content(messages)
+    }
+    fn health(&self) -> Result<(), String> {
+        Err("expert wire: rank 2 closed its connection; restart the coordinator".into())
+    }
+    fn generate(&self, _: &str, _: &GenerateParams, _: &mut dyn FnMut(&str)) -> Result<GenerateOutcome, String> {
+        Err("the expert ranks failed earlier; restart the coordinator".into())
+    }
+}
+
+/// Once the engine cannot serve, `GET /health` is 503 with its reason, so a health check sees what
+/// a request would meet; `/v1/models` stays 200 (it is static).
+#[test]
+fn health_is_503_with_the_reason_once_the_engine_cannot_serve() {
+    let srv = start_served(WireDown);
+    let resp = raw_get(&srv, "/health");
+    assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{resp}");
+    let v = glm53f_api::json::parse(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("unavailable"));
+    assert_eq!(
+        v.get("reason").and_then(|s| s.as_str()),
+        Some("expert wire: rank 2 closed its connection; restart the coordinator")
+    );
+    let (status, _) = http_get(&format!("{}/v1/models", srv.base));
+    assert_eq!(status, 200);
+}
+
+// ---------------------------------------------------------------------------
 // The dialect seam (added in glm53f-afd).
 // ---------------------------------------------------------------------------
 

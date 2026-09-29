@@ -1,11 +1,11 @@
 //! The `glm53f_api::Engine` implementation over the toy model, with the scheduler on its own
-//! thread: generation, streaming, stop strings held back, end-of-sequence, the bounded queue and
-//! chat-template errors.
+//! thread: generation, streaming, stop strings held back, end-of-sequence, the bounded queue,
+//! health and chat-template errors.
 
 mod common;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use common::*;
 use glm53f_api::engine::{Engine, GenerateParams, PromptOptions};
@@ -118,6 +118,42 @@ fn a_full_queue_is_refused_before_the_response_starts() {
     assert!(e.admit().is_err(), "the API answers this with 429");
     drop(place);
     assert!(e.admit().is_ok());
+}
+
+/// `Engine::health` (the API's `GET /health`): serving while the scheduler runs and the check the
+/// daemon adds passes (the expert wire's state), with the queue full or not; failing, with the
+/// reason, once the check fails, or once the scheduler's thread has ended (a pass panicked).
+#[test]
+fn health_follows_the_scheduler_and_the_added_check() {
+    let wire: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    let w = wire.clone();
+    let e = engine(Vec::new(), Queue::new(1, Duration::from_millis(0)))
+        .with_health(move || w.get().map_or(Ok(()), |m| Err(m.clone())));
+    let place = e.admit().unwrap();
+    assert!(e.admit().is_err(), "the queue is full");
+    assert_eq!(e.health(), Ok(()));
+    drop(place);
+    wire.set("expert wire: rank 1 closed its connection".to_string()).unwrap();
+    assert_eq!(e.health(), Err("expert wire: rank 1 closed its connection".to_string()));
+
+    let dev = device(10_000_000);
+    let mut model = MockModel::new(&dev, 8);
+    model.panic_in_prefill = true;
+    let slots: Vec<MockSlot> = (0..4).map(|i| MockSlot::new(i, &dev, 64)).collect();
+    let sched = test_config(Vec::new(), glm53f_coordinator::scheduler::wall_clock());
+    let queue = Queue::new(16, Duration::from_secs(1));
+    let e = CoordinatorEngine::start(Letters, model, slots, None, sched, queue, EngineConfig::new(Vec::new(), 100_000))
+        .unwrap();
+    assert_eq!(e.health(), Ok(()));
+    let err = e.generate("abc", &params(4, Vec::new()), &mut |_| {}).unwrap_err();
+    assert_eq!(err, "scheduler stopped");
+    let t0 = Instant::now();
+    while e.health().is_ok() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the scheduler's thread did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let why = e.health().unwrap_err();
+    assert!(why.starts_with("the scheduler stopped"), "{why}");
 }
 
 #[test]
