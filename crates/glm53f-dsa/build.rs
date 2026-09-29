@@ -7,8 +7,8 @@
 //!
 //! Environment:
 //!   GLM53F_NVCC       nvcc path (default /usr/local/cuda/bin/nvcc)
-//!   GLM53F_CUDA_ARCH  target, e.g. sm_89 (default; the RTX 4090 dev proxy) or
-//!                     sm_120 (the RTX 5090 coordinator)
+//!   GLM53F_CUDA_ARCH  target: sm_120 (default; the RTX 5090 coordinator) or sm_89 (an
+//!                     RTX 4090, the development GPU)
 //!   GLM53F_CUDA_LIB   directory holding libcudart (default: next to nvcc, ../lib64)
 
 use std::env;
@@ -36,7 +36,7 @@ fn main() {
     }
 
     let nvcc = PathBuf::from(env::var("GLM53F_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into()));
-    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_89".into());
+    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
     let cuda_lib = env::var("GLM53F_CUDA_LIB").map(PathBuf::from).unwrap_or_else(|_| {
         nvcc.parent().and_then(|b| b.parent()).map(|r| r.join("lib64")).unwrap_or_else(|| PathBuf::from("/usr/local/cuda/lib64"))
     });

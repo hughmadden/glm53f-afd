@@ -33,8 +33,8 @@ path = "src/main.rs"
 default = []
 # Compile and link the EXL3 expert kernels (build.rs runs nvcc). Off by default
 # so `cargo test --workspace` needs no CUDA toolkit. GLM53F_CUDA_ARCH picks the
-# target: sm_89 (default, an RTX 4090 used as a development proxy) or sm_121
-# (DGX Spark, built on the Spark with CUDA 13).
+# target: sm_121 (default: a DGX Spark, built on the Spark with CUDA 13) or
+# sm_89 (an RTX 4090, the development GPU).
 cuda = []
 # Build the RDMA RC transport's native shim (libibverbs). The rank binary on a
 # Spark is built with `--features cuda,rdma`.

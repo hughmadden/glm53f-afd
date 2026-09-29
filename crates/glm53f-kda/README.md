@@ -53,8 +53,8 @@ cargo run  -p glm53f-kda --features cuda --release --example kda_bench
 With `--features cuda`, `build.rs` compiles `kernels/*.cu` with nvcc:
 
 - `GLM53F_NVCC` is the compiler (default `/usr/local/cuda/bin/nvcc`);
-- `GLM53F_CUDA_ARCH` is the target (default `sm_89`, an RTX 4090 used as a development
-  proxy; the RTX 5090 is `sm_120`);
+- `GLM53F_CUDA_ARCH` is the target (default `sm_120`, the RTX 5090; the tests here run on an
+  RTX 4090, the development GPU, built with `GLM53F_CUDA_ARCH=sm_89`);
 - `GLM53F_CUDA_LIB` is where `libcudart` lives (default `/usr/local/cuda/lib64`).
 
 Run the GPU tests with `--release`: the prefill tests compare against the chain over 16K-row

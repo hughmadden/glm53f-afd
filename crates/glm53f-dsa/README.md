@@ -384,7 +384,8 @@ cargo run --release -p glm53f-dsa --features cuda --example dsa_ab -- mid
 ```
 
 `GLM53F_NVCC` (default `/usr/local/cuda/bin/nvcc`), `GLM53F_CUDA_ARCH` (default
-`sm_89`; `sm_120` for the RTX 5090) and `GLM53F_CUDA_LIB` configure the build;
+`sm_120`, the RTX 5090; the tests here run on an RTX 4090, the development GPU, built with
+`GLM53F_CUDA_ARCH=sm_89`) and `GLM53F_CUDA_LIB` configure the build;
 `GLM53F_GOLDENS` moves the fixture root.
 
 | Suite | Checks |

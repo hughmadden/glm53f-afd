@@ -82,7 +82,9 @@ Contents:
 # CPU gate: no CUDA toolkit or GPU needed.
 cargo test -p glm53f-rank --release
 
-# The kernels, on a CUDA GPU (default target sm_89; use at most a few GB).
+# The kernels, on a CUDA GPU (use at most a few GB). The default target is sm_121, a DGX Spark;
+# the development GPU, an RTX 4090, is sm_89.
+export GLM53F_CUDA_ARCH=sm_89
 cargo test -p glm53f-rank --release --features cuda -- --test-threads=1
 cargo run  -p glm53f-rank --release --features cuda --example exl3_bench -- [--dir <rank-dir> [--layer 3,4]] [--sweep] [--min]
 
@@ -94,9 +96,9 @@ GLM53F_FP8_DIR=<copy of the same experts from the official FP8 checkpoint> \
 
 **Build variables:**
 
-- `GLM53F_CUDA_ARCH`: the target GPU architecture; `sm_89` by default, `sm_121`
-  for a DGX Spark. The architecture is baked into the binary, and the daemon
-  refuses a device of another architecture.
+- `GLM53F_CUDA_ARCH`: the target GPU architecture; `sm_121` (a DGX Spark, built with
+  CUDA 13) by default, `sm_89` for an RTX 4090, the development GPU. The architecture
+  is baked into the binary, and the daemon refuses a device of another architecture.
 - `GLM53F_NVCC`: the `nvcc` to use.
 - `GLM53F_CUDA_LIB`: the directory holding `libcudart`.
 

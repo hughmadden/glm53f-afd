@@ -4,7 +4,7 @@
 //!   the engine's sources (`crates/`, the workspace manifest and lock file) differ from it,
 //!   untracked files included; `unknown` outside a git checkout;
 //! - `GLM53F_SCORE_CUDA_ARCH`: the target the kernel crates compile for (`GLM53F_CUDA_ARCH`,
-//!   default `sm_89`, as their build scripts read it).
+//!   default `sm_120`, as their build scripts read it).
 //!
 //! It reruns when a source under `crates/` changes or the checkout's `HEAD` moves.
 
@@ -68,6 +68,6 @@ fn main() {
         None => "unknown".to_string(),
     };
     println!("cargo:rustc-env=GLM53F_SCORE_REVISION={revision}");
-    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_89".into());
+    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
     println!("cargo:rustc-env=GLM53F_SCORE_CUDA_ARCH={arch}");
 }

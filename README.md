@@ -155,6 +155,10 @@ GLM53F_CUDA_ARCH=sm_120 cargo build --release -p glm53f-serve --features cuda,rd
 GLM53F_CUDA_ARCH=sm_121 cargo build --release -p glm53f-rank --features cuda,rdma
 ```
 
+Those two values are the defaults. The tests run on an RTX 4090, a development GPU and not a
+target, and build for it with `GLM53F_CUDA_ARCH=sm_89`
+([docs/RUNNING.md](docs/RUNNING.md#development-on-one-gpu)).
+
 **Weights** (not included; the revisions this repository's documents cite):
 
 | For | Hugging Face repository | Revision |

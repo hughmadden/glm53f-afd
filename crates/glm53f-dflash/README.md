@@ -30,7 +30,7 @@ seven tokens per step; the target verifies them in one window.
 cargo test -p glm53f-dflash                                  # CPU; data tests skip
 GLM53F_DFLASH_DIR=<drafter> GLM53F_CHECKPOINT_DIR=<GLM-5.3-Flash with embed_tokens and lm_head> \
 GLM53F_GOLDENS=oracle/goldens cargo test -p glm53f-dflash --release
-GLM53F_NVCC=<nvcc> GLM53F_CUDA_LIB=<cuda lib64> ... cargo test -p glm53f-dflash --release --features cuda
+GLM53F_CUDA_ARCH=sm_89 GLM53F_NVCC=<nvcc> GLM53F_CUDA_LIB=<cuda lib64> ... cargo test -p glm53f-dflash --release --features cuda
 ```
 
 ## Sources

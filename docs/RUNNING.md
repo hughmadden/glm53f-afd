@@ -28,9 +28,12 @@ time for one architecture, chosen by environment variables:
 
 | Variable | Default | What |
 |---|---|---|
-| `GLM53F_CUDA_ARCH` | `sm_89` | The GPU the kernels are built for: `sm_120` for the RTX 5090, `sm_121` for a DGX Spark |
+| `GLM53F_CUDA_ARCH` | `sm_120`; `sm_121` for `glm53f-rank` | The GPU the kernels are built for: `sm_120` for the RTX 5090, `sm_121` for a DGX Spark. Set `sm_89` for the RTX 4090 the development suites run on ([Development on one GPU](#development-on-one-gpu)) |
 | `GLM53F_NVCC` | `/usr/local/cuda/bin/nvcc` | The `nvcc` to run |
 | `GLM53F_CUDA_LIB` | `/usr/local/cuda/lib64` | The directory holding `libcudart` and `libcublas` |
+
+The defaults are the production targets; the two builds below set the variable anyway, to name
+the target.
 
 The coordinator, on any x86-64 machine with CUDA 12.8 or later (the build needs no GPU):
 
@@ -430,6 +433,11 @@ logits are meaningless.
 
 ## Development on one GPU
 
+- **Build for the development GPU.** It is an RTX 4090 (`sm_89`), which is neither target, so
+  build and run every command in this section with `GLM53F_CUDA_ARCH=sm_89` (the rank daemon the
+  tests start, too). A build left at the defaults targets `sm_120` (`sm_121` for the rank), and
+  its kernels do not run on it. The 4090 is a development proxy, not a target: the timings in
+  these documents that come from it say so.
 - `--experts local` runs the official FP8 experts on the coordinator's GPU, loaded on demand
   from `--experts-dir` (a checkpoint holding the experts of the layers run).
 - `--dev-layers 0-N` runs decoder layers 0 to N only, then the head, so the whole serving loop

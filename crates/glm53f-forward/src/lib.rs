@@ -112,7 +112,7 @@
 //! and `GLM53F_GOLDENS` (default `oracle/goldens`), and skip cleanly without them; the drafter's
 //! tests also `GLM53F_DFLASH_DIR` (the DFlash2 checkpoint) and run all 45 layers on the weights of
 //! the first `GLM53F_DRAFT_TEST_LAYERS` (default 5), repeated. The build
-//! uses `GLM53F_NVCC`, `GLM53F_CUDA_ARCH` (default `sm_89`) and `GLM53F_CUDA_LIB`, as the other
+//! uses `GLM53F_NVCC`, `GLM53F_CUDA_ARCH` (default `sm_120`) and `GLM53F_CUDA_LIB`, as the other
 //! kernel crates do.
 
 pub mod error;

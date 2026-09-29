@@ -335,7 +335,8 @@ to about C1 throughput. This design rules that out.
   The engine refuses anything else. The API may use any network.
 - **Binaries.** One binary per role: `coordinator` (x86-64, sm_120) and `rank`
   (arm64, sm_121). Both are built natively, with kernels compiled ahead of time
-  for the device found at build time.
+  for the architecture `GLM53F_CUDA_ARCH` names, by default the role's own
+  (`sm_120`, `sm_121`); the tests set `sm_89` for the RTX 4090 they run on.
 
 ## 11. What this design does differently from its sources
 

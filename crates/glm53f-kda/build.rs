@@ -6,8 +6,8 @@
 //!
 //! Environment:
 //! - `GLM53F_NVCC`: the nvcc to run (default `/usr/local/cuda/bin/nvcc`);
-//! - `GLM53F_CUDA_ARCH`: the target (default `sm_89`, an RTX 4090 used as a development
-//!   proxy; the RTX 5090 coordinator is `sm_120`);
+//! - `GLM53F_CUDA_ARCH`: the target (default `sm_120`, the RTX 5090 coordinator; set `sm_89` to
+//!   build for an RTX 4090, the development GPU);
 //! - `GLM53F_CUDA_LIB`: the directory holding `libcudart` (default `/usr/local/cuda/lib64`).
 //!
 //! `--fmad=false` is load-bearing: the chain and the replays share one state-update routine,
@@ -33,7 +33,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let kernels = manifest_dir.join("kernels");
     let nvcc = env::var("GLM53F_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into());
-    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_89".into());
+    let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
     let cuda_lib = env::var("GLM53F_CUDA_LIB").unwrap_or_else(|_| "/usr/local/cuda/lib64".into());
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
