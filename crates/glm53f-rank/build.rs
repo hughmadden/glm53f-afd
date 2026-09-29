@@ -11,7 +11,9 @@
 //!   GPU. The architecture is baked into the binary, and the daemon refuses to
 //!   serve on a device of another architecture;
 //! - `GLM53F_CUDA_LIB`: the directory holding `libcudart` (default
-//!   `/usr/local/cuda/lib64`).
+//!   `/usr/local/cuda/lib64`);
+//! - `GLM53F_NVCC_LINEINFO`: `1` passes `-lineinfo`, source lines for profilers (Nsight). Off by
+//!   default: it writes the build machine's absolute source paths into the device code.
 //!
 //! `--fmad=false` keeps every multiply and add of the rotations and epilogues
 //! separately rounded, as the CPU reference computes them (the tensor-core
@@ -25,7 +27,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/exl3_rank.cu");
-    for key in ["GLM53F_NVCC", "GLM53F_CUDA_ARCH", "GLM53F_CUDA_LIB"] {
+    for key in [
+        "GLM53F_NVCC",
+        "GLM53F_CUDA_ARCH",
+        "GLM53F_CUDA_LIB",
+        "GLM53F_NVCC_LINEINFO",
+    ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -34,6 +41,8 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let nvcc = env::var("GLM53F_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into());
     let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_121".into());
+    // -lineinfo writes this machine's absolute source paths into the device code, so it is opt-in.
+    let lineinfo = env::var("GLM53F_NVCC_LINEINFO").is_ok_and(|v| v == "1");
     let cuda_lib = env::var("GLM53F_CUDA_LIB").unwrap_or_else(|_| "/usr/local/cuda/lib64".into());
     // "sm_121a" -> 121: the compute capability the daemon checks the device against.
     let baked: String = arch.trim_start_matches("sm_").chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -42,7 +51,8 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let obj = out.join("exl3_rank.o");
     let status = Command::new(&nvcc)
-        .args(["-O3", "-std=c++17", "-lineinfo", "--fmad=false", "--ftz=false", "--prec-div=true"])
+        .args(["-O3", "-std=c++17", "--fmad=false", "--ftz=false", "--prec-div=true"])
+        .args(lineinfo.then_some("-lineinfo"))
         .arg(format!("-arch={arch}"))
         .arg("-Xcompiler=-fPIC")
         .arg(format!("-DG53R_BAKED_ARCH={baked}"))

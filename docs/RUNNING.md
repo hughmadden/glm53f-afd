@@ -31,6 +31,7 @@ time for one architecture, chosen by environment variables:
 | `GLM53F_CUDA_ARCH` | `sm_120`; `sm_121` for `glm53f-rank` | The GPU the kernels are built for: `sm_120` for the RTX 5090, `sm_121` for a DGX Spark. Set `sm_89` for the RTX 4090 the development suites run on ([Development on one GPU](#development-on-one-gpu)) |
 | `GLM53F_NVCC` | `/usr/local/cuda/bin/nvcc` | The `nvcc` to run |
 | `GLM53F_CUDA_LIB` | `/usr/local/cuda/lib64` | The directory holding `libcudart` and `libcublas` |
+| `GLM53F_NVCC_LINEINFO` | unset | `1` compiles the kernels with `-lineinfo`, for source correlation in a profiler such as Nsight. Off by default, because it writes the build machine's absolute source paths into the device code |
 
 The defaults are the production targets; the two builds below set the variable anyway, to name
 the target.

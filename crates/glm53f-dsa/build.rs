@@ -10,6 +10,9 @@
 //!   GLM53F_CUDA_ARCH  target: sm_120 (default; the RTX 5090 coordinator) or sm_89 (an
 //!                     RTX 4090, the development GPU)
 //!   GLM53F_CUDA_LIB   directory holding libcudart (default: next to nvcc, ../lib64)
+//!   GLM53F_NVCC_LINEINFO
+//!                     1 passes -lineinfo (source lines for profilers, Nsight); off by default:
+//!                     it writes the build machine's absolute source paths into the device code
 
 use std::env;
 use std::path::PathBuf;
@@ -17,7 +20,12 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    for key in ["GLM53F_NVCC", "GLM53F_CUDA_ARCH", "GLM53F_CUDA_LIB"] {
+    for key in [
+        "GLM53F_NVCC",
+        "GLM53F_CUDA_ARCH",
+        "GLM53F_CUDA_LIB",
+        "GLM53F_NVCC_LINEINFO",
+    ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -37,6 +45,8 @@ fn main() {
 
     let nvcc = PathBuf::from(env::var("GLM53F_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into()));
     let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
+    // -lineinfo writes this machine's absolute source paths into the device code, so it is opt-in.
+    let lineinfo = env::var("GLM53F_NVCC_LINEINFO").is_ok_and(|v| v == "1");
     let cuda_lib = env::var("GLM53F_CUDA_LIB").map(PathBuf::from).unwrap_or_else(|_| {
         nvcc.parent().and_then(|b| b.parent()).map(|r| r.join("lib64")).unwrap_or_else(|| PathBuf::from("/usr/local/cuda/lib64"))
     });
@@ -47,7 +57,8 @@ fn main() {
         let src = kernels_dir.join(u);
         let obj = out.join(format!("{}.o", src.file_stem().unwrap().to_string_lossy()));
         let status = Command::new(&nvcc)
-            .args(["-O3", "-std=c++17", "-lineinfo", "--ftz=false", "--prec-div=true", "--prec-sqrt=true"])
+            .args(["-O3", "-std=c++17", "--ftz=false", "--prec-div=true", "--prec-sqrt=true"])
+            .args(lineinfo.then_some("-lineinfo"))
             .arg(format!("-arch={arch}"))
             .arg("-Xcompiler=-fPIC")
             .arg(format!("-I{}", include.display()))

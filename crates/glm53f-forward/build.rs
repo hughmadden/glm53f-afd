@@ -9,7 +9,9 @@
 //! - `GLM53F_CUDA_ARCH`: the target (default `sm_120`, the RTX 5090 coordinator; set `sm_89` to
 //!   build for an RTX 4090, the development GPU);
 //! - `GLM53F_CUDA_LIB`: the directory holding `libcudart` and `libcublas` (default
-//!   `/usr/local/cuda/lib64`).
+//!   `/usr/local/cuda/lib64`);
+//! - `GLM53F_NVCC_LINEINFO`: `1` passes `-lineinfo`, source lines for profilers (Nsight). Off by
+//!   default: it writes the build machine's absolute source paths into the device code.
 //!
 //! `--fmad=false`: every multiply-add in the kernels that a result depends on is written as
 //! an explicit `__fmaf_rn`, so nvcc contracts nothing and a row's arithmetic is fixed by the
@@ -25,7 +27,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/glm53f_forward.h");
     println!("cargo:rerun-if-changed=kernels/common.cuh");
-    for key in ["GLM53F_NVCC", "GLM53F_CUDA_ARCH", "GLM53F_CUDA_LIB"] {
+    for key in [
+        "GLM53F_NVCC",
+        "GLM53F_CUDA_ARCH",
+        "GLM53F_CUDA_LIB",
+        "GLM53F_NVCC_LINEINFO",
+    ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -36,6 +43,8 @@ fn main() {
     let kernels = manifest_dir.join("kernels");
     let nvcc = env::var("GLM53F_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into());
     let arch = env::var("GLM53F_CUDA_ARCH").unwrap_or_else(|_| "sm_120".into());
+    // -lineinfo writes this machine's absolute source paths into the device code, so it is opt-in.
+    let lineinfo = env::var("GLM53F_NVCC_LINEINFO").is_ok_and(|v| v == "1");
     let cuda_lib = env::var("GLM53F_CUDA_LIB").unwrap_or_else(|_| "/usr/local/cuda/lib64".into());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -44,7 +53,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/{src}");
         let obj = out.join(src.replace(".cu", ".o"));
         let status = Command::new(&nvcc)
-            .args(["-O3", "-std=c++17", "-lineinfo"])
+            .args(["-O3", "-std=c++17"])
+            .args(lineinfo.then_some("-lineinfo"))
             .args([
                 "--fmad=false",
                 "--ftz=false",
