@@ -215,7 +215,8 @@ pub struct ForwardConfig {
     /// Rows of the blocks a DSA layer's sparse MLA core (absorb, attention, un-absorb) runs in:
     /// its buffers (the absorbed query and the latent output, 256 KiB a row) are sized for one
     /// block, shared by the lanes, instead of for a whole lane. The core is row-independent, so
-    /// the blocks change no bit. At least 8 (a decode or verify window runs in one block).
+    /// the blocks change no bit. At least 8 (a decode or verify window runs in one block). A cap:
+    /// the forward rounds it down to a multiple of the GPU's multiprocessors ([`mla_block`]).
     pub mla_block_rows: usize,
     /// Decode and verify passes of one lane: bytes of the next layer's weights pulled into L2 while
     /// a MoE layer's routed experts are out (`crate::prefetch`); 0 turns it off. Changes no bit.
@@ -884,12 +885,12 @@ impl Workspaces {
         [idx, mla, kda]
     }
 
-    /// Rows of one sparse MLA block for passes of up to `rows` rows.
-    fn mla_rows(cfg: &ForwardConfig, rows: usize, dsa_layers: usize) -> usize {
+    /// Rows of one sparse MLA block for passes of up to `rows` rows on `sms` multiprocessors.
+    fn mla_rows(cfg: &ForwardConfig, rows: usize, dsa_layers: usize, sms: i32) -> usize {
         if dsa_layers == 0 {
             0
         } else {
-            rows.min(cfg.mla_block_rows)
+            rows.min(mla_block(cfg.mla_block_rows, sms))
         }
     }
 
@@ -1011,7 +1012,7 @@ impl ForwardBuffers {
         let v = VerifyScratch::new(cfg.max_verify_rows, shape.kda_layers, dl)?;
         let ws = Workspaces::new(
             Workspaces::plan(cfg, rows, sms, dl),
-            Workspaces::mla_rows(cfg, rows, dl),
+            Workspaces::mla_rows(cfg, rows, dl, sms),
         )?;
         Ok(ForwardBuffers {
             cfg: *cfg,
@@ -1194,6 +1195,20 @@ fn mla_head_groups(rows: usize, sms: i32, cap: usize) -> usize {
         .div_ceil(sms.max(1) as usize)
         .next_power_of_two()
         .min(cap)
+}
+
+/// Rows of a sparse MLA block under a cap of `cap` rows on `sms` multiprocessors: the largest
+/// multiple of `sms` up to `cap`, as the one-split kernels run a block's rows one to a
+/// multiprocessor, in waves; `cap` itself when that would be under 8 rows. 512 on the RTX 4090
+/// (128 multiprocessors); 510 on the RTX 5090 (170), where 512 took four waves, the last of 2 rows.
+fn mla_block(cap: usize, sms: i32) -> usize {
+    let sms = sms.max(1) as usize;
+    let whole = cap / sms * sms;
+    if whole >= 8 {
+        whole
+    } else {
+        cap
+    }
 }
 
 /// Pipeline timings of the last traced pass (with [`GlmForward::set_lane_trace`] on): per MoE
@@ -4438,6 +4453,30 @@ mod tests {
     /// groups` blocks) fits one wave of the multiprocessors, and never more than the configured
     /// number: 1 for up to a quarter as many rows as the GPU has multiprocessors, 2 up to half
     /// as many, then the prefill setting.
+    #[test]
+    fn the_mla_block_is_whole_waves() {
+        assert_eq!(mla_block(512, 128), 512);
+        assert_eq!(mla_block(512, 170), 510);
+        assert_eq!(mla_block(340, 170), 340);
+        assert_eq!(mla_block(512, 84), 504);
+        assert_eq!(mla_block(100, 170), 100);
+        assert_eq!(mla_block(8, 5), 8);
+        for sms in [1, 5, 46, 84, 128, 132, 170, 188] {
+            for cap in 8..=1024 {
+                let b = mla_block(cap, sms);
+                let s = sms as usize;
+                assert!((8..=cap).contains(&b), "{cap} rows, {sms} SMs: {b}");
+                // Whole waves, as many as fit, whenever a wave fits in the cap and is 8 rows or
+                // more; the cap itself otherwise.
+                if cap / s * s >= 8 {
+                    assert!(b % s == 0 && b + s > cap, "{cap} rows, {sms} SMs: {b}");
+                } else {
+                    assert_eq!(b, cap);
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_head_groups_of_a_pass() {
         let rows = [

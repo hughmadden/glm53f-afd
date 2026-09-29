@@ -26,7 +26,8 @@
 //!   default in `glm53f-serve`, while this bench runs the FP8 projections W8A8 unless
 //!   `GLM53F_PREFILL_W8A16` is set);
 //! - `GLM53F_BENCH_HEAD_GROUPS`, `GLM53F_BENCH_MLA_BLOCK`: `ForwardConfig::prefill_head_groups`
-//!   and `mla_block_rows` (neither changes a bit);
+//!   and `mla_block_rows` (a cap, rounded down to a multiple of the multiprocessors; neither
+//!   changes a bit);
 //! - `GLM53F_BENCH_TABLES=all`: every pass's `OPS` table (default: the first and the last);
 //! - the projections' numerics options, each off unless set to something other than `0` (in
 //!   `glm53f-serve` W8A16 is on by default): `GLM53F_KDA_FP8`, `GLM53F_KDA_FP8_POW2`,

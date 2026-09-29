@@ -441,8 +441,8 @@ BF16 projections vary by about 3% between runs.
   and adds.
 - With 2 head groups per sparse MLA block instead of 4 (the same bits), and with MLA blocks of
   256, 512 or a whole lane, sparse MLA timed within 1.5% of the default on the 4090.
-- On `sm_120` the 4-group kernel spills registers (the DSA crate's README), so the target
-  should time 2 groups: `GLM53F_BENCH_HEAD_GROUPS=2` in `prefill_bench`.
+- On `sm_120` the 4-group kernel spills registers (the DSA crate's README), yet on the RTX 5090
+  4 groups still timed 22–29% faster than 2 at 96 to 170 rows (section 5c).
 
 **The lane scratch** (`ForwardBuffers`, 16 slots, 128 verify rows, page tables for 1M tokens;
 allocated and measured on the development GPU):
@@ -527,10 +527,31 @@ row, one call after an L2 flush, best of three, µs. "Before" is the previous bu
 - Above half as many rows as multiprocessors the settings are close: at 96 and 128 rows 4 groups
   is within 11% of the best; at 170 rows, just over one wave, 2 groups timed 15–21% faster; at 256
   and 512 rows the winner changes with the context. Those passes keep the prefill setting.
-- Not measured on the 5090, which has 170 multiprocessors and whose 4-group kernel spills more
-  registers than on the 4090 (the DSA crate's README): run `dsa_ab -- mid` there. If 2 groups win
-  above half the multiprocessors' rows, set `prefill_head_groups` to 2 for it; the rule takes it
-  as the most.
+- The 5090, with 170 multiprocessors and a 4-group kernel that spills more registers than the
+  4090's (the DSA crate's README), was measured since: section 5c.
+
+### 5c. Sparse MLA on the RTX 5090 (target hardware, 30 September 2026)
+
+**Head groups.** `dsa_ab -- mid` on the 5090, with today's sparse attention kernel: the rule's
+choice (`mla_head_groups`) was the fastest at every row count from 9 to 512 at both contexts, cold
+and in a graph (26 of 26). 4 groups beat 2 by 22–29% at 96, 128 and 170 rows (225, 230 and 243 µs
+against 311, 311 and 314 at 128K, cold), so `prefill_head_groups` stays 4 on the target too.
+
+**Blocks in whole waves.** The one-split kernels run a block's rows one to a multiprocessor, so a
+block of 512 rows took four waves on the 5090's 170 multiprocessors, the last of 2 rows.
+`ForwardConfig::mla_block_rows` (512) is now a cap that the forward rounds down to a multiple of
+the multiprocessors (`mla_block`): 510 rows on the 5090, still 512 on the 4090. `prefill_bench`
+on the 5090 (four lanes of 2,048 rows, the chunked KDA prefill with W8A16; three runs of three
+passes, the median of the nine):
+
+| MLA block | Pass | Sparse attention | DSA attention |
+|---:|---:|---:|---:|
+| 512 | 1,154.7 ms | 3.542 ms | 9.20 ms |
+| **510** (three waves) | **1,130.0 ms (−2.1%)** | **2.963 ms (−16.3%)** | **8.63 ms (−6.2%)** |
+| 340 (two waves) | 1,132.3 ms (−1.9%) | 2.983 ms (−15.8%) | 8.68 ms (−5.6%) |
+
+Rows are independent, so the blocks change no bit (the same logits digest with blocks of 8 to
+1,000 rows, section 5a).
 
 ## 6. Start-up
 

@@ -13,7 +13,8 @@
 //! - `GLM53F_DIGEST_LANE_ROWS`: rows per lane (default 1000; passes of twice that);
 //! - `GLM53F_DIGEST_TOKENS`: prompt tokens (default 6000);
 //! - `GLM53F_DIGEST_EVERY`: score every this many positions (default 37);
-//! - `GLM53F_DIGEST_MLA_BLOCK`: `ForwardConfig::mla_block_rows` (default: the default);
+//! - `GLM53F_DIGEST_MLA_BLOCK`: `ForwardConfig::mla_block_rows` (default: the default; a cap,
+//!   rounded down to a multiple of the multiprocessors);
 //! - `GLM53F_DIGEST_DECODE`: after the prompt, this many greedy decode steps, then as many verify
 //!   passes of 8 rows (each committed, 4 rows kept), whose logits get a second line, the decode
 //!   digest (default 0: none; at most 6);
