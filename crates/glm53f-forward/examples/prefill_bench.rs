@@ -22,7 +22,8 @@
 //! - `GLM53F_BENCH_LOADED`: decoder layers loaded (default 5), `GLM53F_BENCH_LAYERS` run (45);
 //! - `GLM53F_BENCH_OPS=0`: the same passes without the op profile (its overhead);
 //! - `GLM53F_BENCH_KDA_CHUNKED=1`: KDA through the chunked prefill kernel instead of the chain
-//!   (`ForwardConfig::kda_chunked_prefill`, a numerics change the KL gate has not passed);
+//!   (`ForwardConfig::kda_chunked_prefill`; with W8A16 it passed the KL gate and is on by
+//!   default in `glm53f-serve`, while this bench runs the FP8 projections W8A8);
 //! - `GLM53F_BENCH_HEAD_GROUPS`, `GLM53F_BENCH_MLA_BLOCK`: `ForwardConfig::prefill_head_groups`
 //!   and `mla_block_rows` (neither changes a bit);
 //! - `GLM53F_BENCH_TABLES=all`: every pass's `OPS` table (default: the first and the last).

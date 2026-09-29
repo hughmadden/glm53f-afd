@@ -434,7 +434,10 @@ latency-bound blocks. The next steps below would put its idle SMs to use.
   the target hardware. The chunked prefill alone raised the mean KL by 0.0021 nats and failed
   the gate's margin; with W8A16 projections the pair lowered it, but 25 windows could not yet
   show it non-inferior. It stays opt-in, `glm53f-serve --kda-chunked-prefill`;
-  `docs/KL-GATE.md` §6b.)*
+  `docs/KL-GATE.md` §6b.)* *(Later on 29 September: on the 125-window panel the pair passed,
+  upper bound +0.0002 nats against the 0.002 margin, and prefilled 21-28% faster, so it is
+  `glm53f-serve`'s default; `--kda-chain-prefill --prefill-w8a8` restores the chain and W8A8;
+  `docs/KL-GATE.md` §6d.)*
 
 ### Open, and possible next steps
 

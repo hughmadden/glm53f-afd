@@ -50,15 +50,20 @@
 //! | `--experts-dir DIR` | `GLM53F_EXPERTS_DIR` | the checkpoint | `local`: a checkpoint holding the routed experts |
 //! | `--local-experts-gib G` | | 4 | `local`: device memory for the experts, loaded on demand |
 //! | `--prefill-lanes N` | | 2 | Lanes of a prefill pass, 1 to 4 (as `glm53f-serve`) |
-//! | `--kda-chunked-prefill` | | off | KDA of passes over 8 rows through the chunked kernel (a numerics change under test) |
+//! | `--kda-chunked-prefill` / `--kda-chain-prefill` | `GLM53F_KDA_CHUNKED_PREFILL` (`0`: the chain) | on | KDA of passes over 8 rows through the chunked kernel instead of the chain (as `glm53f-serve`) |
 //! | `--fp8-act bf16\|dynamic` | | `bf16` | FP8 projections of up to 8 rows: BF16 activations (W8A16) or the checkpoint's dynamic E4M3 (W8A8) |
 //! | `--no-promote-k32` | | off | The FP8 tensor-core GEMM accumulates whole 128-blocks in the tensor core |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (as `glm53f-serve`) |
-//! | `--kda-state-bf16` | `GLM53F_KDA_STATE_BF16=1` | off | Numerics under test (D8): the KDA recurrent states in BF16 |
-//! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows with BF16 activations (W8A16) |
-//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows |
+//! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states in BF16 (as `glm53f-serve`) |
+//! | `--prefill-w8a16` / `--prefill-w8a8` | `GLM53F_PREFILL_W8A16` (`0`: W8A8) | on | FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3 (as `glm53f-serve`) |
+//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows |
 //! | `--dev-layers 0-N` | | off | Development: decoder layers 0 to N only, then the head (as `glm53f-serve`) |
 //! | `--dev-load-layers N` | | off | Development: load decoder layers 0 to N - 1 and run all 45 on repeats of them |
+//!
+//! **Numerics.** The defaults are `glm53f-serve`'s: BF16 KDA states (D8) and, since 29 September
+//! 2026, the chunked KDA prefill with W8A16 (`docs/KL-GATE.md` §6d). `--kda-state-f32
+//! --prefill-w8a8 --kda-chain-prefill` score the engine with every numerics option off, the
+//! configuration of `docs/KL-GATE.md` §6a.
 //!
 //! The expert wire reads its own variables, as in `glm53f-serve`: `GLM53F_RDMA=1`,
 //! `GLM53F_WIRE_NOCRC=1` (which the ranks must set too) and the others `docs/RUNNING.md` lists.
@@ -88,12 +93,16 @@ options:
                          decode path)
   --windows <id,...>     score these windows of the plan only
   --experts remote|local|zero  --local-experts-gib <g>  --prefill-lanes 1-4
-  --kda-chunked-prefill  --fp8-act bf16|dynamic  --no-promote-k32
-numerics under test (off by default, as glm53f-serve):
+  --fp8-act bf16|dynamic  --no-promote-k32
+numerics (as glm53f-serve; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8              KDA projections quantized to FP8 block-128 at load (D2)
-  --kda-state-bf16       KDA recurrent states stored in BF16 (D8)
-  --prefill-w8a16        FP8 projections over 8 rows with BF16 activations
-  --kda-prefill-w8a8     with the two above: the FP8 KDA projections keep E4M3 activations
+  --kda-state-bf16       KDA recurrent states stored in BF16 (D8; the default)
+  --kda-state-f32        KDA recurrent states stored in F32 (the reference)
+  --prefill-w8a16        FP8 projections over 8 rows with BF16 activations (the default)
+  --prefill-w8a8         FP8 projections over 8 rows with E4M3 activations (the reference)
+  --kda-chunked-prefill  KDA of passes over 8 rows through the chunked kernel (the default)
+  --kda-chain-prefill    KDA of passes over 8 rows through the serial chain (the reference)
+  --kda-prefill-w8a8     with --kda-fp8 and W8A16: the FP8 KDA projections keep E4M3 activations
 development (the logits are meaningless):
   --dev-layers 0-N       decoder layers 0..=N only
   --dev-load-layers N    load decoder layers 0..N-1, run all 45 on repeats of them
@@ -436,11 +445,32 @@ mod tests {
         assert_eq!((o.pass_rows, o.lanes, o.windows.clone()), (4096, 2, None));
         assert_eq!(
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
-            (false, Fp8Act::Bf16, true)
+            (true, Fp8Act::Bf16, true)
         );
-        // The engine's defaults, as glm53f-serve's: D8 (BF16 KDA states) on since it passed the gate.
-        assert_eq!(o.numerics, Numerics { kda_state_bf16: true, ..Numerics::default() });
+        // The engine's defaults, as glm53f-serve's: D8 (BF16 KDA states), and the chunked KDA
+        // prefill with W8A16, on since they passed the gate.
+        let defaults = Numerics {
+            kda_state_bf16: true,
+            prefill_w8a16: true,
+            kda_chunked_prefill: true,
+            ..Numerics::default()
+        };
+        assert_eq!(o.numerics, defaults);
         assert!(!o.development());
+        // Their opt-outs reach the scorer's own chunked-prefill switch too, from the flags and from
+        // the environment (glm53f-serve's numerics parser reads both first).
+        let o = Options::parse(&args("--plan p --out o --kda-chain-prefill --prefill-w8a8"), &env)
+            .unwrap();
+        assert!(!o.kda_chunked_prefill && !o.numerics.kda_chunked_prefill);
+        assert_eq!(o.numerics, Numerics { kda_state_bf16: true, ..Numerics::default() });
+        let chain = |k: &str| match k {
+            "GLM53F_KDA_CHUNKED_PREFILL" | "GLM53F_PREFILL_W8A16" => Some("0".to_string()),
+            other => env(other),
+        };
+        let o = Options::parse(&args("--plan p --out o"), &chain).unwrap();
+        assert!(!o.kda_chunked_prefill && !o.numerics.prefill_w8a16);
+        let o = Options::parse(&args("--plan p --out o --kda-chunked-prefill"), &chain).unwrap();
+        assert!(o.kda_chunked_prefill);
         let o = Options::parse(
             &args(
                 "--checkpoint /c --plan p --out o --experts local --pass-rows 8 --windows a,b \
@@ -466,7 +496,7 @@ mod tests {
             (o.kda_chunked_prefill, o.fp8_act, o.promote_k32),
             (true, Fp8Act::Dynamic, false)
         );
-        // The numerics under test, as glm53f-serve takes them; the engine line names them.
+        // The numerics options, as glm53f-serve takes them; the engine line names them.
         let o = Options::parse(
             &args("--plan p --out o --kda-fp8 --kda-state-bf16 --prefill-w8a16"),
             &env,
@@ -493,14 +523,30 @@ mod tests {
             &b,
         );
         assert!(plain.contains("BF16 KDA projections") && plain.contains("KDA states BF16"));
+        assert!(
+            plain.contains("W8A16 beyond (BF16 tiles of the FP8 weights, cuBLAS)")
+                && plain.contains("KDA over 8 rows: the chunked prefill kernel"),
+            "{plain}"
+        );
         let f32_state = engine_line(
             &Options::parse(&args("--plan p --out o --kda-state-f32"), &env).unwrap(),
             &b,
         );
         assert!(f32_state.contains("KDA states F32"), "{f32_state}");
+        // Every numerics option off: the reference arithmetic.
+        let reference = engine_line(
+            &Options::parse(
+                &args("--plan p --out o --kda-state-f32 --prefill-w8a8 --kda-chain-prefill"),
+                &env,
+            )
+            .unwrap(),
+            &b,
+        );
         assert!(
-            plain.contains("W8A8 beyond with k32-promoted accumulation"),
-            "{plain}"
+            reference.contains("W8A8 beyond with k32-promoted accumulation")
+                && reference.contains("KDA: the chain")
+                && reference.contains("KDA states F32"),
+            "{reference}"
         );
         // Local experts default to the checkpoint.
         let o = Options::parse(

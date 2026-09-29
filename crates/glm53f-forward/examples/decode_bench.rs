@@ -14,10 +14,11 @@
 //! - `GLM53F_BENCH_EXPERTS=local` with `GLM53F_EXPERTS_DIR`: run the routed experts of layers 3
 //!   and 4 on this GPU (default: zeros, the coordinator's own work only);
 //! - `GLM53F_BENCH_PREFILL_ROWS`: rows of one prefill pass (default 256);
-//! - the numerics under test, as `glm53f-serve` reads them (each off unless set to something
-//!   other than `0`): `GLM53F_KDA_FP8` (FP8 KDA projections), `GLM53F_KDA_STATE_BF16` (BF16 KDA
-//!   states), `GLM53F_PREFILL_W8A16` (FP8 projections over 8 rows with BF16 activations),
-//!   `GLM53F_KDA_PREFILL_W8A8` (with the two above, the FP8 KDA projections keep E4M3).
+//! - the numerics options, each off unless set to something other than `0` (`glm53f-serve` has
+//!   D8, W8A16 and the chunked KDA prefill on by default): `GLM53F_KDA_FP8` (FP8 KDA
+//!   projections), `GLM53F_KDA_STATE_BF16` (BF16 KDA states), `GLM53F_PREFILL_W8A16` (FP8
+//!   projections over 8 rows with BF16 activations), `GLM53F_KDA_PREFILL_W8A8` (with the two
+//!   above, the FP8 KDA projections keep E4M3).
 //!
 //! The routed experts run on the expert ranks in the engine, so the extrapolation leaves them
 //! out; the router's host copy of the routes (the step's host round trip) stays in.

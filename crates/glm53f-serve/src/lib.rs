@@ -50,9 +50,9 @@
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
 //! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states stored in BF16, computed in f32 (68 MiB less per slot and per snapshot); passed the KL gate on the target hardware (docs/KL-GATE.md §6b) |
-//! | `--prefill-w8a16` | `GLM53F_PREFILL_W8A16=1` | off | Numerics under test: FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (64 MiB of GEMM scratch) |
-//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8 --prefill-w8a16`: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
-//! | `--kda-chunked-prefill` | `GLM53F_KDA_CHUNKED_PREFILL=1` | off | Numerics under test: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |
+//! | `--prefill-w8a16` / `--prefill-w8a8` | `GLM53F_PREFILL_W8A16` (`0`: W8A8) | on | FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (W8A8; 64 MiB of GEMM scratch); with the chunked KDA prefill, passed the KL gate on the target hardware (docs/KL-GATE.md §6d) |
+//! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
+//! | `--kda-chunked-prefill` / `--kda-chain-prefill` | `GLM53F_KDA_CHUNKED_PREFILL` (`0`: the chain) | on | The KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain; its workspace takes 34 MiB a slot); with W8A16, passed the KL gate on the target hardware (docs/KL-GATE.md §6d) |
 //! | `--dev-layers 0-N` | | off | Development mode (below) |
 //!
 //! The shell reads more of its own: `GLM53F_QUEUE_DEPTH`, `GLM53F_QUEUE_WAIT_MS`,
@@ -71,10 +71,12 @@
 //! `GLM53F_PROFILE` (the forward's lane trace: a `PIPE` line per prefill pass, a `STEP` line per
 //! decode step, see `glm53f-forward`'s `LaneTrace::step_summary`).
 //!
-//! **Numerics under test.** The `Numerics` options change the engine's arithmetic; each becomes
-//! a default only after the KL gate (`docs/KL-GATE.md`) and speed runs on the target hardware.
-//! D8 (BF16 KDA states) passed and is on; the others are off. `glm53f-score` takes the same flags. The start-up log names the
-//! ones on.
+//! **Numerics.** The `Numerics` options change the engine's arithmetic; each becomes a default
+//! only after the KL gate (`docs/KL-GATE.md`) and speed runs on the target hardware. D8 (BF16 KDA
+//! states) passed and is on. The chunked KDA prefill with W8A16 projections passed as a pair (it
+//! prefilled 21-28% faster, decode unchanged) and is on; the chunked kernel without W8A16 failed
+//! the gate, so `--prefill-w8a8` goes with `--kda-chain-prefill`. D2 and `--kda-prefill-w8a8` are
+//! off. `glm53f-score` takes the same flags. The start-up log names the ones on.
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
 //! reached through an address without a RoCE v2 device at the floor rate. `GLM53F_WIRE_ALLOW_LAN=1`
@@ -97,7 +99,9 @@
 //!
 //! The default is 8,192 rows in four lanes of 2,048: on the target hardware four lanes kept the GPU
 //! 86% busy and prefilled 4.1K tok/s at 4K-79K tokens, against 3.5-4.0K with two lanes of 2,048
-//! (docs/PERFORMANCE.md §0), and a 1,048,576-token request still fits at 16 slots. The sizing notes
+//! (docs/PERFORMANCE.md §0), and a 1,048,576-token request still fits at 16 slots. With the
+//! chunked KDA prefill and W8A16 (the defaults since 29 September 2026) the same lanes prefill
+//! 5.0-5.2K tok/s with the GPU 66-69% busy: the exchange sets the pace again. The sizing notes
 //! below predate the lanes: 4,096 rows keeps the lanes'
 //! scratch at about 1.1 GiB (8,192 rows take about 2.1 GiB; before the lanes shared their
 //! attention-kind buffers and the sparse MLA core ran in row blocks, 3.1 and 6.1 GiB; measured by
@@ -159,8 +163,11 @@
 //! (0.98 M tokens) at 32 slots, 2.71 GiB (0.47 M tokens) at 48, at some cost in prefill rate.
 //! 64 slots left at most 0.37 GiB (`--prefill-rows 2048` and a budget of 128 rows). This table
 //! predates the lanes' shared scratch (about 2 GiB more pool at 4,096 prefill rows) and the
-//! options under test (`--kda-fp8` 4.26 GiB, `--kda-state-bf16` 68 MiB a slot); the start-up
-//! log gives the current plan.
+//! numerics options (`--kda-fp8` 4.26 GiB less, BF16 KDA states 68 MiB a slot less; the chunked
+//! KDA prefill's workspace 34 MiB a slot more, W8A16's GEMM scratch 64 MiB more); the start-up
+//! log gives the current plan. With today's defaults the target measured at 16 slots forward
+//! buffers of 3.40 GiB and a pool of 8.73 GiB (1.52 M tokens): a 1,048,576-token request fits.
+//! At 48 slots the chunked prefill's workspace is 1.59 GiB, about 1.1 GiB more than at 16.
 //!
 //! # Decode lanes
 //!
@@ -218,13 +225,16 @@ options:
   --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
-numerics (each gated by KL; D8 on, the rest off by default):
+numerics (each gated by KL; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
   --kda-state-bf16    KDA recurrent states stored in BF16 (D8; the default)
   --kda-state-f32     KDA recurrent states stored in F32 (the reference)
-  --prefill-w8a16     FP8 projections over 8 rows with BF16 activations
-  --kda-prefill-w8a8  with the two above: the FP8 KDA projections keep E4M3 activations
-  --kda-chunked-prefill  the KDA of prefill passes through the chunked kernel
+  --prefill-w8a16     FP8 projections over 8 rows with BF16 activations (the default)
+  --prefill-w8a8      FP8 projections over 8 rows with E4M3 activations (the reference)
+  --kda-prefill-w8a8  with --kda-fp8 and W8A16: the FP8 KDA projections keep E4M3 activations
+  --kda-chunked-prefill  the KDA of prefill passes through the chunked kernel (the default)
+  --kda-chain-prefill    the KDA of prefill passes through the serial chain (the reference; the
+                      chunked kernel passed the gate only with W8A16)
   --dev-layers 0-N    DEVELOPMENT: decoder layers 0..=N only; the output is meaningless text";
 
 /// Expert ranks.
@@ -244,7 +254,9 @@ pub enum Experts {
     Local { dir: PathBuf, gib: f64 },
 }
 
-/// Numerics under test (the KL gate and speed runs decide): D8 on by default, the rest off.
+/// The numerics options (the KL gate and speed runs decide): D8, W8A16 and the chunked KDA
+/// prefill on by default, D2 and `kda_prefill_w8a8` off. `Numerics::default()` is every option
+/// off: the reference arithmetic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Numerics {
     /// D2: the KDA layers' q|k|v|b and o projections quantized at load to FP8 E4M3 with
@@ -253,39 +265,45 @@ pub struct Numerics {
     /// D8: the KDA recurrent states stored in BF16, computed in f32. On unless
     /// `--kda-state-f32` or `GLM53F_KDA_STATE_BF16=0` (it passed the KL gate).
     pub kda_state_bf16: bool,
-    /// FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3
-    /// (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`).
+    /// FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3. On unless
+    /// `--prefill-w8a8` or `GLM53F_PREFILL_W8A16=0` (it passed the KL gate with
+    /// `kda_chunked_prefill`).
     pub prefill_w8a16: bool,
     /// With `kda_fp8` and `prefill_w8a16`: the FP8 KDA projections keep E4M3 activations over 8
     /// rows (`--kda-prefill-w8a8`, `GLM53F_KDA_PREFILL_W8A8=1`).
     pub kda_prefill_w8a8: bool,
-    /// The KDA of prefill passes through the chunked kernel instead of the serial chain
-    /// (`--kda-chunked-prefill`, `GLM53F_KDA_CHUNKED_PREFILL=1`); decode and verify keep the chain.
+    /// The KDA of prefill passes through the chunked kernel instead of the serial chain; decode
+    /// and verify keep the chain. On unless `--kda-chain-prefill` or
+    /// `GLM53F_KDA_CHUNKED_PREFILL=0` (it passed the KL gate with `prefill_w8a16`).
     pub kda_chunked_prefill: bool,
 }
 
 impl Numerics {
-    /// The environment's choices (a variable set to anything but `0` turns its option on).
+    /// The environment's choices: a variable set to anything but `0` turns its option on, and
+    /// the options on by default are off only when theirs is `0`.
     pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Numerics {
         let on = |k: &str| env(k).is_some_and(|v| v != "0");
+        let on_unless_0 = |k: &str| env(k).map_or(true, |v| v != "0");
         Numerics {
             kda_fp8: on("GLM53F_KDA_FP8"),
-            kda_state_bf16: env("GLM53F_KDA_STATE_BF16").map_or(true, |v| v != "0"),
-            prefill_w8a16: on("GLM53F_PREFILL_W8A16"),
+            kda_state_bf16: on_unless_0("GLM53F_KDA_STATE_BF16"),
+            prefill_w8a16: on_unless_0("GLM53F_PREFILL_W8A16"),
             kda_prefill_w8a8: on("GLM53F_KDA_PREFILL_W8A8"),
-            kda_chunked_prefill: on("GLM53F_KDA_CHUNKED_PREFILL"),
+            kda_chunked_prefill: on_unless_0("GLM53F_KDA_CHUNKED_PREFILL"),
         }
     }
 
-    /// Turn on the option `flag` names; false when it names none.
+    /// Turn on or off the option `flag` names; false when it names none.
     pub fn flag(&mut self, flag: &str) -> bool {
         match flag {
             "--kda-fp8" => self.kda_fp8 = true,
             "--kda-state-bf16" => self.kda_state_bf16 = true,
             "--kda-state-f32" => self.kda_state_bf16 = false,
             "--prefill-w8a16" => self.prefill_w8a16 = true,
+            "--prefill-w8a8" => self.prefill_w8a16 = false,
             "--kda-prefill-w8a8" => self.kda_prefill_w8a8 = true,
             "--kda-chunked-prefill" => self.kda_chunked_prefill = true,
+            "--kda-chain-prefill" => self.kda_chunked_prefill = false,
             _ => return false,
         }
         true
@@ -771,72 +789,84 @@ mod tests {
     }
 
     #[test]
-    fn numerics_under_test_are_off_unless_asked_for() {
+    fn numerics_defaults_and_their_opt_outs() {
         let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
-        // D8 passed the KL gate and is on by default; the rest are off unless asked for.
+        // D8, and the chunked KDA prefill with W8A16, passed the KL gate and are on by default;
+        // D2 and the FP8 KDA projections' W8A8 prefill are off unless asked for.
+        let defaults = Numerics {
+            kda_state_bf16: true,
+            prefill_w8a16: true,
+            kda_chunked_prefill: true,
+            ..Numerics::default()
+        };
         let o = Options::parse(&args("--checkpoint /c"), &env).unwrap();
-        assert_eq!(o.numerics, Numerics { kda_state_bf16: true, ..Numerics::default() });
-        assert_eq!(o.numerics.describe(), "BF16 KDA states (D8)");
-        let o = Options::parse(&args("--checkpoint /c --kda-state-f32"), &env).unwrap();
+        assert_eq!(o.numerics, defaults);
+        assert_eq!(
+            o.numerics.describe(),
+            "BF16 KDA states (D8), W8A16 prefill projections, chunked KDA prefill"
+        );
+        // Each default has a flag that turns it off; all three give the reference arithmetic.
+        let o = Options::parse(
+            &args("--checkpoint /c --kda-state-f32 --prefill-w8a8 --kda-chain-prefill"),
+            &env,
+        )
+        .unwrap();
         assert_eq!(o.numerics, Numerics::default());
         assert_eq!(o.numerics.describe(), "none");
+        for (flag, want) in [
+            ("--kda-state-f32", Numerics { kda_state_bf16: false, ..defaults }),
+            ("--prefill-w8a8", Numerics { prefill_w8a16: false, ..defaults }),
+            ("--kda-chain-prefill", Numerics { kda_chunked_prefill: false, ..defaults }),
+        ] {
+            let o = Options::parse(&args(&format!("--checkpoint /c {flag}")), &env).unwrap();
+            assert_eq!(o.numerics, want, "{flag}");
+        }
         let o = Options::parse(
             &args("--checkpoint /c --kda-fp8 --kda-state-bf16 --prefill-w8a16"),
             &env,
         )
         .unwrap();
-        let all = Numerics {
-            kda_fp8: true,
-            kda_state_bf16: true,
-            prefill_w8a16: true,
-            kda_prefill_w8a8: false,
-            kda_chunked_prefill: false,
-        };
-        assert_eq!(o.numerics, all);
+        assert_eq!(o.numerics, Numerics { kda_fp8: true, ..defaults });
         assert_eq!(
             o.numerics.describe(),
-            "FP8 KDA projections (D2), BF16 KDA states (D8), W8A16 prefill projections"
+            "FP8 KDA projections (D2), BF16 KDA states (D8), W8A16 prefill projections, chunked \
+             KDA prefill"
         );
-        // The environment: anything but 0.
+        // The environment: anything but 0 turns an option on, and 0 turns a default off.
         let env2 = |k: &str| match k {
             "GLM53F_KDA_FP8" => Some("1".to_string()),
             "GLM53F_KDA_STATE_BF16" => Some("0".to_string()),
-            "GLM53F_PREFILL_W8A16" => Some("yes".to_string()),
+            "GLM53F_PREFILL_W8A16" => Some("0".to_string()),
+            "GLM53F_KDA_CHUNKED_PREFILL" => Some("0".to_string()),
             other => env(other),
         };
         let o = Options::parse(&args("--checkpoint /c"), &env2).unwrap();
-        assert_eq!(
-            o.numerics,
-            Numerics {
-                kda_fp8: true,
-                kda_state_bf16: false,
-                prefill_w8a16: true,
-                kda_prefill_w8a8: false,
-                kda_chunked_prefill: false,
-            }
-        );
+        assert_eq!(o.numerics, Numerics { kda_fp8: true, ..Numerics::default() });
+        // The flags win over the environment, either way.
         let o = Options::parse(
-            &args("--checkpoint /c --kda-fp8 --prefill-w8a16 --kda-prefill-w8a8"),
-            &env,
+            &args("--checkpoint /c --prefill-w8a16 --kda-chunked-prefill"),
+            &env2,
         )
         .unwrap();
+        assert!(o.numerics.prefill_w8a16 && o.numerics.kda_chunked_prefill);
+        let env3 = |k: &str| match k {
+            "GLM53F_PREFILL_W8A16" => Some("yes".to_string()),
+            "GLM53F_KDA_CHUNKED_PREFILL" => Some("1".to_string()),
+            other => env(other),
+        };
+        assert_eq!(Options::parse(&args("--checkpoint /c"), &env3).unwrap().numerics, defaults);
+        let o = Options::parse(&args("--checkpoint /c --kda-chain-prefill"), &env3).unwrap();
+        assert!(!o.numerics.kda_chunked_prefill && o.numerics.prefill_w8a16);
+        let o =
+            Options::parse(&args("--checkpoint /c --kda-fp8 --kda-prefill-w8a8"), &env).unwrap();
         assert!(o.numerics.kda_prefill_w8a8);
         assert!(o
             .numerics
             .describe()
-            .ends_with("the FP8 KDA projections W8A8 at prefill"));
-        let o = Options::parse(&args("--checkpoint /c --kda-chunked-prefill"), &env).unwrap();
-        assert!(o.numerics.kda_chunked_prefill);
-        assert_eq!(o.numerics.describe(), "BF16 KDA states (D8), chunked KDA prefill");
-        let env3 = |k: &str| match k {
-            "GLM53F_KDA_CHUNKED_PREFILL" => Some("1".to_string()),
-            other => env(other),
-        };
-        let o = Options::parse(&args("--checkpoint /c"), &env3).unwrap();
-        assert!(o.numerics.kda_chunked_prefill);
+            .ends_with("the FP8 KDA projections W8A8 at prefill, chunked KDA prefill"));
         // The flags take no value.
-        let o = Options::parse(&args("--kda-state-bf16 --checkpoint /c"), &env).unwrap();
-        assert!(o.numerics.kda_state_bf16 && o.checkpoint == PathBuf::from("/c"));
+        let o = Options::parse(&args("--kda-chain-prefill --checkpoint /c"), &env).unwrap();
+        assert!(!o.numerics.kda_chunked_prefill && o.checkpoint == PathBuf::from("/c"));
     }
 
     #[test]

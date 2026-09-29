@@ -96,9 +96,7 @@ mod daemon {
         }
         let shape = s(ModelShape::new(&cfg.text, layers))?;
         let num = o.numerics;
-        if num != Default::default() {
-            eprintln!("[coordinator] numerics under test: {}", num.describe());
-        }
+        eprintln!("[coordinator] numerics: {}", num.describe());
         let t0 = Instant::now();
         let wopts = WeightOptions {
             kda_fp8: num.kda_fp8,

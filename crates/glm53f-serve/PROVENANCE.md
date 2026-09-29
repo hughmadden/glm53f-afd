@@ -20,6 +20,7 @@ wires this repository's crates together.
 | tests/dev_mode.rs | Four rank daemons and the daemon in development mode on one GPU; one streamed chat completion over HTTP | 2026-09-28 |
 | src/lib.rs, src/main.rs (copy windows) | `--copy-windows on\|off` (`GLM53F_COPY_WINDOWS`), on by default, handed to the scheduler (`SchedulerConfig::copy_windows`); its documentation and test | 2026-09-29 |
 | src/lib.rs, src/main.rs (snapshots) | `GLM53F_PREFIX_CACHE_ENTRIES` documented as an optional cap (none by default) and the rule snapshots follow without it; the start-up memory line gives a mark's pages and the cap, if any, instead of the banks' size at 24 | 2026-09-29 |
+| src/lib.rs, src/main.rs (numerics defaults) | The chunked KDA prefill and W8A16 on by default, as D8 before them, after the KL gate: `--kda-chain-prefill`, `--prefill-w8a8` and `0` in their variables turn them off; the start-up line names the numerics in force; the tests | 2026-09-29 |
 | Cargo.toml | The manifest | 2026-09-28 |
 
 ## Test data
