@@ -213,6 +213,10 @@ template renders it.
   name) is not dropped and never fails the request: its text comes back as `content`, streamed or
   not, and the server logs why. One shape is recovered: a name followed by a stray closing tag,
   when the rest is a tool the request offered.
+- A streamed reply is never quiet for more than 15 s: a tool call is held back until it is
+  complete, so while the model writes a long one (or a long prompt prefills) the API sends the SSE
+  comment `: keepalive` whenever nothing has been written for 15 s, and a proxy or client with an
+  idle timeout keeps the connection. The comment carries no data; no event changes.
 
 ## Status and limitations
 

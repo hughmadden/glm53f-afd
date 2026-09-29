@@ -180,6 +180,14 @@ fn max_context_is_what_one_slot_can_grow_to() {
     assert_eq!(glm53f_coordinator::engine::max_context(&model, &slot, 40, 1000), Some(1000));
 }
 
+/// The API's keepalive for a stream that has written nothing is the engine's own wait for a token.
+#[test]
+fn the_keepalive_is_the_engines_configuration() {
+    let e = engine(Vec::new(), Queue::new(16, Duration::from_secs(1)));
+    assert_eq!(e.keepalive(), Duration::from_secs(15));
+    assert_eq!(e.keepalive(), EngineConfig::new(Vec::new(), 1).keepalive);
+}
+
 /// The engine plugs into `glm53f_api::serve` (a compile-time check: it is an `Engine` that can be
 /// shared between the server's connection threads), with GLM-5.3-Flash's codec as with any other.
 #[test]

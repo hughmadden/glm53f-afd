@@ -2118,3 +2118,174 @@ fn lost_call_log_child() {
         println!("completion id: {}", head.get("id").and_then(|i| i.as_str()).unwrap());
     }
 }
+
+// ---------------------------------------------------------------------------
+// The keepalive while a tool call is held back (added in glm53f-afd).
+// ---------------------------------------------------------------------------
+
+/// GLM-5.3-Flash writing slowly: after the reasoning its prompt opened, `text` in the deltas
+/// `split` makes, `gap` apart, on an engine whose keepalive interval is `keepalive`.
+struct SlowGlm {
+    text: String,
+    split: fn(&str) -> Vec<String>,
+    gap: std::time::Duration,
+    keepalive: std::time::Duration,
+}
+
+impl Engine for SlowGlm {
+    fn tokenize(&self, _messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> usize {
+        4
+    }
+    fn render_chat(&self, _messages: &[ChatMessage], _tools: &[Tool], _thinking: bool) -> String {
+        String::new()
+    }
+    fn keepalive(&self) -> std::time::Duration {
+        self.keepalive
+    }
+    fn generate(
+        &self,
+        _prompt: &str,
+        _params: &GenerateParams,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GenerateOutcome, String> {
+        let deltas = (self.split)(&format!("{AGENT_REASONING}{GLM_THINK_END}{}", self.text));
+        for d in &deltas {
+            std::thread::sleep(self.gap);
+            on_delta(d);
+        }
+        Ok(GenerateOutcome { text: deltas.concat(), finish_reason: "stop".into(), completion_tokens: deltas.len() })
+    }
+}
+
+/// The keepalive comments of an SSE body.
+fn keepalives(raw: &str) -> usize {
+    raw.lines().filter(|l| l.trim() == ": keepalive").count()
+}
+
+/// The data events of an SSE body as text, in order, without their `id` and `created`, which differ
+/// between two replies to the same request: what a client reads of the stream.
+fn events_without_id(raw: &str) -> Vec<String> {
+    use glm53f_api::json::{serialize, Json};
+    sse_events(raw)
+        .into_iter()
+        .map(|ev| match ev {
+            Json::Object(pairs) => {
+                serialize(&Json::Object(pairs.into_iter().filter(|(k, _)| k != "id" && k != "created").collect()))
+            }
+            other => serialize(&other),
+        })
+        .collect()
+}
+
+/// The first `n` characters of a reply, for a failure message (a whole reply is long).
+fn head(raw: &str, n: usize) -> String {
+    raw.chars().take(n).collect()
+}
+
+/// A tool call is held back until the model has written all of it, so a long one, a file written
+/// whole, left the stream silent for as long as the model took (25.1 s for 3,043 tokens on the
+/// target hardware), and a proxy or client with a shorter idle timeout cut it. Now the stream writes
+/// the keepalive comment whenever nothing has been written for the engine's keepalive interval, all
+/// through the held-back call; the events are the same, in the same order, as with the keepalive out
+/// of reach, and the reply is the whole reply.
+#[test]
+fn a_held_back_tool_call_sends_keepalives_and_the_same_reply() {
+    use std::time::{Duration, Instant};
+    let command = "echo hello world && ls -la /tmp; ".repeat(70);
+    let text = format!("Let me write it.\n{}", glm_tool_call("bash", &[("command", &command)]));
+    let (gap, interval) = (Duration::from_millis(2), Duration::from_millis(300));
+    let slow = |keepalive| {
+        start_engine_with(SlowGlm { text: text.clone(), split: by_token, gap, keepalive }, Arc::new(GlmDialect))
+    };
+    let (kept, quiet) = (slow(interval), slow(Duration::from_secs(3600)));
+    let url = |srv: &Server| format!("{}/v1/chat/completions", srv.base);
+
+    let started = Instant::now();
+    let (status, with) = http_post(&url(&kept), &tool_case_body("", true));
+    let took = started.elapsed();
+    assert_eq!(status, 200, "{}", head(&with, 300));
+    let (status, without) = http_post(&url(&quiet), &tool_case_body("", true));
+    assert_eq!(status, 200, "{}", head(&without, 300));
+
+    // One comment for each interval the call took, at least (it takes 2 ms a delta, 780 deltas: over
+    // 1.5 s), and none closer together than an interval.
+    let n = keepalives(&with);
+    assert!(n >= 3, "{n} keepalives in {took:?}: {}", head(&with, 300));
+    assert!(n as u128 <= took.as_millis() / interval.as_millis() + 1, "{n} keepalives in {took:?}");
+    assert_eq!(keepalives(&without), 0, "{}", head(&without, 300));
+    // They come while the call is held back: after the text before it, before its first delta.
+    let last_text = with.rfind("\"content\":").expect("text before the call");
+    let first_call = with.find("\"tool_calls\"").expect("the call");
+    let (first, last) = (with.find(": keepalive").unwrap(), with.rfind(": keepalive").unwrap());
+    assert!(last_text < first && last < first_call, "text {last_text}, keepalives {first}-{last}, call {first_call}");
+    // Nothing else changes: every event, its content and its order.
+    assert_eq!(events_without_id(&with), events_without_id(&without));
+
+    // The reply is the whole one (which takes as long again).
+    let g = gather(&with);
+    assert_eq!(g.content.concat(), "Let me write it.");
+    assert_eq!(g.finish.as_deref(), Some("tool_calls"));
+    assert_eq!(g.reasoning, AGENT_REASONING);
+    let (status, whole) = http_post(&url(&quiet), &tool_case_body("", false));
+    assert_eq!(status, 200, "{}", head(&whole, 300));
+    let v = glm53f_api::json::parse(&whole).unwrap();
+    let choice = v.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()).unwrap();
+    let msg = choice.get("message").unwrap();
+    let calls: Vec<(String, String)> = msg.get("tool_calls").and_then(|t| t.as_array()).unwrap_or(&[]).iter()
+        .map(|t| {
+            let f = t.get("function").unwrap();
+            (f.get("name").and_then(|n| n.as_str()).unwrap().to_string(), f.get("arguments").and_then(|a| a.as_str()).unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(g.calls, calls);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    let args = glm53f_api::json::parse(&calls[0].1).unwrap();
+    assert_eq!(args.get("command").and_then(|c| c.as_str()), Some(command.as_str()));
+    assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Let me write it."));
+    assert_eq!(choice.get("finish_reason").and_then(|f| f.as_str()), Some("tool_calls"));
+}
+
+/// Output that flows needs no keepalive: every delta is written, so the stream is never quiet for an
+/// interval, however long the reply takes (here five intervals and more), reasoning and text alike.
+#[test]
+fn output_that_flows_needs_no_keepalive() {
+    use std::time::Duration;
+    let prose = "The quick brown fox jumps over the lazy dog. ".repeat(55);
+    let srv = start_engine_with(
+        SlowGlm { text: prose.clone(), split: by_token, gap: Duration::from_millis(2), keepalive: Duration::from_millis(300) },
+        Arc::new(GlmDialect),
+    );
+    let started = std::time::Instant::now();
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &tool_case_body("", true));
+    let took = started.elapsed();
+    assert_eq!(status, 200, "{}", head(&resp, 300));
+    assert!(took >= Duration::from_millis(1500), "the reply took {took:?}: too short to show anything");
+    assert_eq!(keepalives(&resp), 0, "{}", head(&resp, 300));
+    let g = gather(&resp);
+    // A reply without calls is untouched: its ending whitespace stays.
+    assert_eq!((g.content.concat().as_str(), g.reasoning.as_str()), (prose.as_str(), AGENT_REASONING));
+    assert_eq!(g.finish.as_deref(), Some("stop"));
+}
+
+/// The engine's own keepalive, an empty delta after a long wait for the model, is written as the
+/// comment, and counts as a write: the API adds none to it.
+#[test]
+fn an_engines_empty_delta_is_a_keepalive_comment() {
+    use std::time::Duration;
+    fn with_empty_deltas(text: &str) -> Vec<String> {
+        let mut deltas = vec![String::new()];
+        deltas.extend(by_token(text));
+        deltas.insert(deltas.len() / 2, String::new());
+        deltas
+    }
+    let srv = start_engine_with(
+        SlowGlm { text: "Hello there.".into(), split: with_empty_deltas, gap: Duration::from_millis(1), keepalive: Duration::from_secs(3600) },
+        Arc::new(GlmDialect),
+    );
+    let (status, resp) = http_post(&format!("{}/v1/chat/completions", srv.base), &tool_case_body("", true));
+    assert_eq!(status, 200, "{}", head(&resp, 300));
+    assert_eq!(keepalives(&resp), 2, "{resp}");
+    let g = gather(&resp);
+    assert_eq!((g.content.concat().as_str(), g.reasoning.as_str()), ("Hello there.", AGENT_REASONING));
+}

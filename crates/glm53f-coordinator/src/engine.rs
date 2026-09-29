@@ -144,7 +144,9 @@ pub struct EngineConfig {
     pub max_tokens: usize,
     /// The model's context limit (GLM-5.3-Flash: 1,048,576).
     pub model_max_context: usize,
-    /// How long a caller waits for a token before sending a keep-alive delta.
+    /// How long a caller waits for a token before sending a keep-alive delta. It is also how long
+    /// a stream may write nothing before the API writes a keepalive of its own
+    /// ([`Engine::keepalive`]).
     pub keepalive: Duration,
 }
 
@@ -294,6 +296,12 @@ impl<C: PromptCodec> Engine for CoordinatorEngine<C> {
             return Err("the scheduler stopped (see the log); restart the coordinator".into());
         }
         self.health.as_ref().map_or(Ok(()), |check| check())
+    }
+
+    /// The wait for a token after which `generate` sends an empty delta, which is also how long a
+    /// stream may be silent before the API writes its own keepalive.
+    fn keepalive(&self) -> Duration {
+        self.cfg.keepalive
     }
 
     fn generate(&self, prompt: &str, params: &GenerateParams, on_delta: &mut dyn FnMut(&str))

@@ -67,6 +67,16 @@
 //! its name is not checked against the request's tools, nor its arguments against their schema
 //! (which only types them). Every report of the parse (a lost call, a dropped argument, a
 //! recovered name) is logged to stderr, one line each, under the completion's id.
+//!
+//! # Keepalive
+//!
+//! A streamed reply is never quiet for longer than [`Engine::keepalive`] (15 s by default): once
+//! nothing has been written for that long while the model generates, the API writes an SSE
+//! comment, `: keepalive`, which carries no data and which SSE clients ignore, so a proxy or client
+//! with an idle timeout keeps the connection. A tool call is held back until it is complete (no
+//! markup reaches a live delta), so a long one, a file written whole, would send nothing while the
+//! model writes it. An engine that itself waits that long for the model (a long prefill) has the
+//! same comment written for its empty delta. No event's content or order changes.
 
 pub mod auth;
 pub mod chat;

@@ -164,6 +164,16 @@ glm53f-serve --checkpoint <coordinator-dir> --ranks ... --api-key-file <key-file
   `-H "Authorization: Bearer $KEY"`. Point the gateway's or load balancer's health check at
   `/health`, which needs no key.
 
+### Streaming and idle timeouts
+
+A streamed chat completion holds a tool call back until the model has written all of it (no markup
+reaches a live delta), and a long one, a file written whole, takes many seconds: nothing else is
+sent meanwhile. So that a proxy or client with an idle timeout does not cut the stream, the API
+writes an SSE comment line, `: keepalive`, whenever a stream has written nothing for 15 s while the
+model generates, and for the engine's own wait on a long prefill. The comment carries no data: SSE
+clients ignore it, and every event, its content and its order are what they were. A gateway's idle
+or read timeout only has to exceed 15 s.
+
 ### Numerics defaults
 
 Each option changes the engine's arithmetic and became a default only after the KL gate and speed

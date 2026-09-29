@@ -3,6 +3,7 @@
 
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::dialect::{Dialect, ParseResult, ParsedCall, StreamTags};
 use crate::engine::{Engine, GenerateOutcome, GenerateParams, PromptOptions};
@@ -293,7 +294,9 @@ enum Span {
 /// text sends it first. Before this, think blocks streamed as content and were
 /// then repeated as reasoning after generation. The tags are the dialect's
 /// ([`StreamTags`]); a dialect whose prompt opens the reasoning block starts the
-/// split inside it.
+/// split inside it. What it holds back is not written, so it also keeps the time of
+/// its last write: a stream that has been quiet for [`Engine::keepalive`] while the model
+/// writes a tool call gets a keepalive comment ([`StreamSplit::keepalive_if_idle`]).
 struct StreamSplit {
     hold: String,
     span: Span,
@@ -303,14 +306,40 @@ struct StreamSplit {
     content_bytes: usize,
     tags: StreamTags,
     head: ChunkHead,
+    /// When the last chunk went out (the role chunk, at first).
+    last_write: Instant,
 }
 
 impl StreamSplit {
     fn new(tags: StreamTags, reasoning_first: bool, head: ChunkHead) -> Self {
+        let last_write = Instant::now();
         if reasoning_first {
-            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, content_bytes: 0, tags, head }
+            StreamSplit { hold: String::new(), span: Span::Think, think_blocks: 1, content_bytes: 0, tags, head, last_write }
         } else {
-            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, content_bytes: 0, tags, head }
+            StreamSplit { hold: String::new(), span: Span::Content, think_blocks: 0, content_bytes: 0, tags, head, last_write }
+        }
+    }
+
+    /// Write one chunk, and note when.
+    fn send(&mut self, stream: &mut TcpStream, event: &str) -> std::io::Result<()> {
+        http::write_chunk(stream, event.as_bytes())?;
+        self.last_write = Instant::now();
+        Ok(())
+    }
+
+    /// The comment that keeps a quiet stream open: SSE comments carry no data, and a client or
+    /// proxy with an idle timeout sees bytes.
+    fn keepalive(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
+        self.send(stream, ": keepalive\n\n")
+    }
+
+    /// A keepalive if nothing has been written for `idle`. A tool call is held back until it is
+    /// complete, so while the model writes one the stream writes nothing, however long it takes.
+    fn keepalive_if_idle(&mut self, stream: &mut TcpStream, idle: Duration) -> std::io::Result<()> {
+        if self.last_write.elapsed() >= idle {
+            self.keepalive(stream)
+        } else {
+            Ok(())
         }
     }
 
@@ -323,14 +352,16 @@ impl StreamSplit {
                 Span::Think => {
                     if let Some(p) = self.hold.find(think_close) {
                         if p > 0 {
-                            http::write_chunk(stream, self.head.reasoning_event(&self.hold[..p]).as_bytes())?;
+                            let event = self.head.reasoning_event(&self.hold[..p]);
+                            self.send(stream, &event)?;
                         }
                         self.hold.drain(..p + think_close.len());
                         self.span = Span::Content;
                     } else {
                         let flush = self.hold.len() - held_suffix(&self.hold, &[think_close]);
                         if flush > 0 {
-                            http::write_chunk(stream, self.head.reasoning_event(&self.hold[..flush]).as_bytes())?;
+                            let event = self.head.reasoning_event(&self.hold[..flush]);
+                            self.send(stream, &event)?;
                             self.hold.drain(..flush);
                         }
                         return Ok(());
@@ -342,7 +373,8 @@ impl StreamSplit {
                     match (think, tool) {
                         (Some(p), t) if t.is_none_or(|t| p < t) => {
                             if p > 0 {
-                                http::write_chunk(stream, self.head.content_event(&self.hold[..p]).as_bytes())?;
+                                let event = self.head.content_event(&self.hold[..p]);
+                                self.send(stream, &event)?;
                                 self.content_bytes += p;
                             }
                             self.hold.drain(..p + think_open.len());
@@ -355,8 +387,9 @@ impl StreamSplit {
                             // back.
                             let text = self.hold[..p].trim_end();
                             if !text.is_empty() {
-                                http::write_chunk(stream, self.head.content_event(text).as_bytes())?;
-                                self.content_bytes += text.len();
+                                let (event, len) = (self.head.content_event(text), text.len());
+                                self.send(stream, &event)?;
+                                self.content_bytes += len;
                             }
                             self.hold.drain(..p);
                             self.span = Span::Tool;
@@ -368,7 +401,8 @@ impl StreamSplit {
                             let unheld = self.hold.len() - held_suffix(&self.hold, &[think_open, tool_open]);
                             let flush = self.hold[..unheld].trim_end().len();
                             if flush > 0 {
-                                http::write_chunk(stream, self.head.content_event(&self.hold[..flush]).as_bytes())?;
+                                let event = self.head.content_event(&self.hold[..flush]);
+                                self.send(stream, &event)?;
                                 self.content_bytes += flush;
                                 self.hold.drain(..flush);
                             }
@@ -444,14 +478,17 @@ fn stream_events<E: Engine>(
     // 2. generate, streaming content and reasoning deltas (markup held back).
     let mut split = StreamSplit::new(dialect.stream_tags(), dialect.reasoning_first(params.thinking), head.clone());
     // An empty delta is the engine's keepalive while a long prompt prefills: an
-    // SSE comment keeps the client and any proxy from timing out. A failed write
-    // means the client is gone: tell the engine to stop (perf reset Q2).
+    // SSE comment keeps the client and any proxy from timing out. So is one whenever the
+    // stream has written nothing for the engine's keepalive interval while it generates: a
+    // tool call is held back until it is complete. A failed write means the client is gone:
+    // tell the engine to stop (perf reset Q2).
     let cancel = params.cancel.clone();
+    let keepalive = engine.keepalive();
     let outcome: GenerateOutcome = match engine.generate(prompt, params, &mut |d: &str| {
         let wrote = if d.is_empty() {
-            http::write_chunk(stream, b": keepalive\n\n")
+            split.keepalive(stream)
         } else {
-            split.push(stream, d)
+            split.push(stream, d).and_then(|()| split.keepalive_if_idle(stream, keepalive))
         };
         if wrote.is_err() {
             if let Some(c) = &cancel {

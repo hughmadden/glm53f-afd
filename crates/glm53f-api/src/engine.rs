@@ -3,6 +3,8 @@
 //! model's [`crate::Dialect`]); the engine owns tokenization, the chat template,
 //! image decoding and generation.
 
+use std::time::Duration;
+
 use crate::types::{ChatMessage, Tool};
 
 /// Sampling/control parameters handed to [`Engine::generate`].
@@ -170,9 +172,21 @@ pub trait Engine {
         Ok(())
     }
 
+    /// How long a streamed response may go without a write before the API sends an SSE comment
+    /// (`: keepalive`), so that a client or proxy with an idle timeout does not cut it. Default: 15 s.
+    /// The API counts from its last write to the response, whatever the model is doing: a tool call
+    /// is held back until it is complete, so while the model writes one the stream would otherwise
+    /// be silent. An engine that itself waits this long for the model (a long prefill) sends an
+    /// empty delta ([`Engine::generate`]).
+    fn keepalive(&self) -> Duration {
+        Duration::from_secs(15)
+    }
+
     /// Generate the completion. `on_delta` is called with each incremental text
     /// delta (the API forwards it as an SSE content delta); the returned text is
-    /// the full completion the API parses for tool calls and think blocks.
+    /// the full completion the API parses for tool calls and think blocks. An empty
+    /// delta is a keepalive, for a wait of [`Engine::keepalive`] on the model: the API
+    /// writes an SSE comment for it, no event.
     fn generate(
         &self,
         prompt: &str,

@@ -146,3 +146,19 @@ stays open. Own code; nothing is copied.
 | src/http.rs | The reason phrase of 401 (`Unauthorized`) and its `WWW-Authenticate: Bearer` header (RFC 9110, 11.6.1) | the acceptance tests above | 2026-09-29 |
 | Cargo.toml | The header comment names the key | — | 2026-09-29 |
 | tests/acceptance.rs | `start_keyed` (`start_served` calls it without a key), `raw_request`, and the three tests above | the tests themselves | 2026-09-29 |
+
+## Changed here (a keepalive while a tool call is held back)
+
+The engine sends an empty delta after a wait of 15 s for a token (a long prefill), which the API
+writes as the SSE comment `: keepalive`. A tool call is held back until it is complete, so while the
+model writes one, tokens arrive, nothing is written, and the engine has nothing to send: measured on
+the target hardware, a 3,043-token `write` call left 25.1 s of silence, which proxies and clients with
+a shorter idle timeout cut. The stream now writes the same comment whenever it has written nothing for
+the engine's keepalive interval. Own code; nothing is copied.
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/chat.rs | `StreamSplit` keeps the time of its last write (`send`, which every chunk it writes goes through) and `keepalive_if_idle` writes the comment once that is `Engine::keepalive` ago, after each delta; the engine's empty delta goes through `keepalive` too. Delta content and order are unchanged | tests/acceptance.rs `a_held_back_tool_call_sends_keepalives_and_the_same_reply`, `output_that_flows_needs_no_keepalive`, `an_engines_empty_delta_is_a_keepalive_comment` | 2026-09-29 |
+| src/engine.rs | New `Engine::keepalive`, defaulting to 15 s, so existing engines are unchanged; `generate`'s doc says an empty delta is a keepalive | the acceptance tests above; glm53f-coordinator tests/engine.rs `the_keepalive_is_the_engines_configuration` | 2026-09-29 |
+| src/lib.rs | Crate doc: the keepalive | — | 2026-09-29 |
+| tests/acceptance.rs | `SlowGlm` (GLM-5.3-Flash writing slowly, on an engine with a keepalive interval), `keepalives`, `events_without_id` and the three tests above | the tests themselves | 2026-09-29 |
