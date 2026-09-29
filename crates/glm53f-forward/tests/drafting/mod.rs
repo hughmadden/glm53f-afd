@@ -117,12 +117,17 @@ pub fn drafted_forward(
     let model = DeviceModel::load_with(&ckpt, &shape, loaded, num.weights()).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
-    let d = Dflash::load(&ddir, &model, &embed, &stream).unwrap();
+    let d = Dflash::load_with(&ddir, &model, &embed, &stream, num.drafter_fp8).unwrap();
     eprintln!(
         "45 decoder layers ({} loaded, the rest repeating them) and the head: {:.2} GB; the \
-         drafter {:.2} GB; {:.1} s",
+         drafter ({}) {:.2} GB; {:.1} s",
         loaded.min(45),
         model.bytes as f64 / 1e9,
+        if d.is_fp8() {
+            "FP8, with its own FP8 LM head"
+        } else {
+            "BF16"
+        },
         d.weight_bytes() as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );

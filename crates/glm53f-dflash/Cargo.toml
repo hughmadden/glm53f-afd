@@ -3,8 +3,9 @@
 #   - an f32 CPU reference of the drafter: context features through fc, five Qwen3-style layers
 #     with two-tap dynamic convolutions over a block of 8, the final norm, logits through the
 #     target's LM head, the top-16 candidates and the selector's path;
-#   - a CUDA forward (feature `cuda`): BF16 weights, a batch of requests per block, a per-request
-#     ring of context K/V for the 2,048-token window, cuBLAS GEMMs and this crate's kernels;
+#   - a CUDA forward (feature `cuda`): BF16 weights (or FP8 block-128, the checkpoint's scheme, with
+#     an FP8 copy of the LM head), a batch of requests per block, a per-request ring of context K/V
+#     for the 2,048-token window, cuBLAS GEMMs (glm53f-layers' FP8 GEMMs) and this crate's kernels;
 #   - the seam the target forward and the scheduler will call (`Drafter`).
 #
 #   cargo test -p glm53f-dflash                    CPU only: no CUDA toolkit needed
@@ -28,12 +29,19 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Compile this crate's kernels and link cudart and cuBLAS (build.rs; needs nvcc, and a GPU to run).
-cuda = []
+# Compile this crate's kernels and link cudart and cuBLAS (build.rs; needs nvcc, and a GPU to run),
+# and glm53f-layers' kernels (the FP8 drafter's GEMMs and weight quantization).
+cuda = ["glm53f-layers/cuda"]
 
 [dependencies]
 glm53f-model = { path = "../glm53f-model" }
+# The FP8 block-128 GEMMs, the weight quantizer and their CPU models (the FP8 drafter).
+glm53f-layers = { path = "../glm53f-layers" }
 
 [[example]]
 name = "dflash_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "draft_replay"
 required-features = ["cuda"]

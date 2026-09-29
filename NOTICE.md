@@ -81,8 +81,8 @@ authors under their own terms.
 
 ## glm-5.3-flash-4x-gx10, a public serving recipe (no licence file)
 
-- **Source:** <https://github.com/mmastrac/glm-5.3-flash-4x-gx10> @ `5ea4121`, and its branch `perf-2026-09-27` (`fb15786`). The repository carries no licence file.
-- **What was taken:** nothing is copied. Its real-output tool-call cases and the two spellings of the thinking switch in its chat template are read as shapes and reimplemented with other tool names and values (`crates/glm53f-api/src/dialect/glm.rs`, `src/types.rs`, `tests/acceptance.rs`); the idea of giving a model's cached file pages back before a start is reimplemented in Rust over libc (`crates/glm53f-rank/src/pagecache.rs`). An idea of the performance branch is reimplemented too: the next layer's weights prefetched into L2 while the exchange is out (`crates/glm53f-forward/src/prefetch.rs`). [docs/REUSE.md](docs/REUSE.md) has the rows.
+- **Source:** <https://github.com/mmastrac/glm-5.3-flash-4x-gx10> @ `5ea4121`, and its branch `perf-2026-09-27` (`fb15786`, `2209649`). The repository carries no licence file.
+- **What was taken:** nothing is copied. Its real-output tool-call cases and the two spellings of the thinking switch in its chat template are read as shapes and reimplemented with other tool names and values (`crates/glm53f-api/src/dialect/glm.rs`, `src/types.rs`, `tests/acceptance.rs`); the idea of giving a model's cached file pages back before a start is reimplemented in Rust over libc (`crates/glm53f-rank/src/pagecache.rs`). Two ideas of the performance branch are reimplemented too: the next layer's weights prefetched into L2 while the exchange is out (`crates/glm53f-forward/src/prefetch.rs`), and low-precision weights for the drafter alone (the FP8 drafter, `crates/glm53f-dflash/src/gpu.rs`). [docs/REUSE.md](docs/REUSE.md) has the rows.
 
 ## Published model configurations (test data)
 
@@ -109,4 +109,4 @@ authors under their own terms.
 ## GLM-5.3-Flash-4x-DGX-Spark-TP4: MIT
 
 - **Source:** <https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4> @ `beca637`.
-- **What was taken:** nothing is copied. The L2 prefetch that its README describes is reimplemented (`crates/glm53f-forward/src/prefetch.rs`).
+- **What was taken:** nothing is copied. The L2 prefetch and the block-FP8 drafter with an FP8 draft head that its README describes are reimplemented (`crates/glm53f-forward/src/prefetch.rs`, `crates/glm53f-dflash/src/gpu.rs`).

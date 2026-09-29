@@ -1,5 +1,6 @@
 //! Time the GPU drafter: one draft block for 1, 4 and 16 requests, and the context appends a
-//! verify commit and a prompt tail cost.
+//! verify commit and a prompt tail cost; the BF16 drafter, then the FP8 one (`gpu`, "The FP8
+//! drafter"; `GLM53F_BENCH_DRAFTERS=bf16` or `fp8` for one of them).
 //!
 //! ```sh
 //! GLM53F_DFLASH_DIR=<drafter> GLM53F_CHECKPOINT_DIR=<GLM-5.3-Flash with embed_tokens, lm_head> \
@@ -43,16 +44,42 @@ fn main() -> Result<(), String> {
     let target = Target::open(&cd, &d)?;
     let head = target.lm_head()?;
     let mask = target.embed_rows(&[d.mask_token])?;
-    let (free0, _) = mem_info()?;
-    let mut g = GpuDrafter::new(&w, &head, &mask)?;
-    drop(head);
-    let (free1, total) = mem_info()?;
+    let which = std::env::var("GLM53F_BENCH_DRAFTERS").unwrap_or_default();
+    for fp8 in [false, true] {
+        if which == if fp8 { "bf16" } else { "fp8" } {
+            continue;
+        }
+        let (free0, _) = mem_info()?;
+        let g = if fp8 {
+            GpuDrafter::new_fp8(&w, &head, &mask)?
+        } else {
+            GpuDrafter::new(&w, &head, &mask)?
+        };
+        let (free1, total) = mem_info()?;
+        println!(
+            "\n{} drafter loaded in {:.1} s; weights + LM head on the device: {:.2} GiB ({} bytes by \
+             the drafter's count; device {:.1} GiB, {:.1} GiB free)",
+            if fp8 { "FP8" } else { "BF16" },
+            t0.elapsed().as_secs_f64(),
+            free0.saturating_sub(free1) as f64 / (1u64 << 30) as f64,
+            g.weight_bytes(),
+            total as f64 / (1u64 << 30) as f64,
+            free1 as f64 / (1u64 << 30) as f64
+        );
+        bench(g, &target, context, iters)?;
+    }
+    Ok(())
+}
+
+fn bench(mut g: GpuDrafter, target: &Target, context: usize, iters: usize) -> Result<(), String> {
+    let d = g.dims();
+    // The working memory `glm53f-serve` reserves up front at 16 and 48 slots.
+    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    let (w16, w48) = (g.reserve(16)?, g.reserve(48)?);
     println!(
-        "loaded in {:.1} s; weights + LM head on the device: {:.2} GiB (device {:.1} GiB, {:.1} GiB free)",
-        t0.elapsed().as_secs_f64(),
-        (free0 - free1) as f64 / (1u64 << 30) as f64,
-        total as f64 / (1u64 << 30) as f64,
-        free1 as f64 / (1u64 << 30) as f64
+        "working memory reserved for drafts of 16 requests {:.1} MiB, of 48 {:.1} MiB",
+        mib(w16),
+        mib(w48)
     );
     let n_max = 16;
     let mut slots: Vec<GpuSlot> = Vec::new();

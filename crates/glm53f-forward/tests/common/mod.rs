@@ -10,8 +10,8 @@
 //!   comma-separated list of `kda-fp8`, `kda-fp8-pow2` (FP8 KDA projections with power-of-two
 //!   block-128 scales), `kda-mxfp8` (with MXFP8 scales), `kda-state-bf16`, `prefill-w8a16` and
 //!   `kda-prefill-w8a8` (default none), so a whole suite can run with an option on ([`numerics`]);
-//!   and `l2-prefetch`, which changes no bit (`ForwardConfig::l2_prefetch` at
-//!   [`TEST_L2_PREFETCH`]).
+//!   and two options that change no committed token: `l2-prefetch` (`ForwardConfig::l2_prefetch`
+//!   at [`TEST_L2_PREFETCH`]) and `drafter-fp8` (the FP8 drafter, `drafting::drafted_forward`).
 //!
 //! Anything missing makes the tests print why and pass.
 #![allow(dead_code)]
@@ -65,14 +65,17 @@ pub struct TestNumerics {
     pub kda_prefill_w8a8: bool,
     /// Decode and verify passes prefetch the next layer's weights into L2.
     pub l2_prefetch: bool,
+    /// The drafter in FP8 with its own FP8 copy of the LM head.
+    pub drafter_fp8: bool,
 }
 
 impl TestNumerics {
-    /// The target's arithmetic is the default one: `l2-prefetch` changes no bit of what the
-    /// target computes.
+    /// The target's arithmetic is the default one: `l2-prefetch` and `drafter-fp8` change no bit
+    /// of what the target computes.
     pub fn default_arithmetic(&self) -> bool {
         let target = TestNumerics {
             l2_prefetch: false,
+            drafter_fp8: false,
             ..*self
         };
         target == TestNumerics::default()
@@ -135,6 +138,7 @@ pub fn numerics() -> TestNumerics {
             "prefill-w8a16" => n.prefill_w8a16 = true,
             "kda-prefill-w8a8" => n.kda_prefill_w8a8 = true,
             "l2-prefetch" => n.l2_prefetch = true,
+            "drafter-fp8" => n.drafter_fp8 = true,
             other => panic!("GLM53F_TEST_NUMERICS: unknown option {other:?}"),
         }
     }

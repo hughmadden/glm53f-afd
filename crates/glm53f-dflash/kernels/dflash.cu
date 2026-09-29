@@ -542,6 +542,18 @@ int grid_for(int64_t n, int threads) {
   return (int)b;
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * The K splits of glm53f-layers' FP8 decode GEMM (its f32 partials, [split][rows][n]) summed in
+ * split order into f32 outputs: y[m][o] = p[0][m][o] + p[1][m][o] + ... (the order that GEMM's
+ * own reduction and its CPU model, glm53f_layers::mlp::fp8_linear, use). */
+__global__ void splitk_sum_kernel(const float* __restrict__ p, int ksplit, int64_t elements, float* y) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < elements; i += (int64_t)gridDim.x * blockDim.x) {
+    float s = p[i];
+    for (int k = 1; k < ksplit; ++k) s = __fadd_rn(s, p[(int64_t)k * elements + i]);
+    y[i] = s;
+  }
+}
+
 }  // namespace
 
 extern "C" cudaError_t g53d_rmsnorm(const float* x, int64_t ldx, const uint16_t* w, int rows, int n, float eps,
@@ -654,5 +666,14 @@ extern "C" cudaError_t g53d_select(const float* hproj, const float* vals, const 
   const int threads = (rank + 31) / 32 * 32;
   select_kernel<<<nreq, threads, 0, s>>>(hproj, vals, ids, anchors, pred, succ, rank, slots, temperature, uniforms,
                                          tokens, index, scores, q, conf);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t g53d_splitk_sum(const float* partials, int ksplit, int rows, int n, float* y, cudaStream_t s) {
+  if (rows <= 0 || n <= 0) return cudaSuccess;
+  if (ksplit < 1 || !partials || !y) return cudaErrorInvalidValue;
+  const int64_t elements = (int64_t)rows * n;
+  const int64_t want = (elements + 255) / 256;
+  splitk_sum_kernel<<<(int)(want < 4096 ? want : 4096), 256, 0, s>>>(partials, ksplit, elements, y);
   return cudaGetLastError();
 }

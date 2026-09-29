@@ -26,6 +26,11 @@
 //! - **Drafts.** A batch of requests, each at its committed length with its last verified token
 //!   as the anchor (the anchor's embedding row comes from the host table); the drafter reads the
 //!   forward's LM head in place.
+//! - **The FP8 drafter** ([`Dflash::load_with`] with `fp8`, `glm53f-serve --drafter-fp8`, off by
+//!   default). The drafter's GEMM weights in FP8 E4M3 with 128 x 128 block scales (quantized at
+//!   load) and its own FP8 copy of the LM head for drafting, quantized from the forward's once;
+//!   the forward's head is untouched (`glm53f-dflash`'s `gpu` module, "The FP8 drafter"). It
+//!   changes which drafts are proposed, never a committed token: the verify pass decides.
 //!
 //! The rings live in the KV pool (`KvLayout::new(shape, Some(drafter config))`), one per slot,
 //! and follow the slot's rewinds, forks and restores (`crate::kv`). The forward must run decoder
@@ -97,9 +102,20 @@ impl Dflash {
         embed: &HostEmbedding,
         stream: &Arc<Stream>,
     ) -> Result<Dflash> {
+        Self::load_with(dir, model, embed, stream, false)
+    }
+
+    /// [`Dflash::load`], the FP8 drafter when `fp8` ([`Dflash::new_with`]).
+    pub fn load_with(
+        dir: &Path,
+        model: &DeviceModel,
+        embed: &HostEmbedding,
+        stream: &Arc<Stream>,
+        fp8: bool,
+    ) -> Result<Dflash> {
         let config = DraftConfig::load(&dir.join("config.json"))?;
         let w = Weights::load(dir, Dims::GLM53F).map_err(Error::Other)?;
-        Self::new(&w, config, model, embed, stream)
+        Self::new_with(&w, config, model, embed, stream, fp8)
     }
 
     /// Upload the drafter's weights (2.18 GiB) next to `model`, reading `model`'s LM head in
@@ -113,6 +129,20 @@ impl Dflash {
         model: &DeviceModel,
         embed: &HostEmbedding,
         stream: &Arc<Stream>,
+    ) -> Result<Dflash> {
+        Self::new_with(w, config, model, embed, stream, false)
+    }
+
+    /// [`Dflash::new`]; with `fp8`, the FP8 drafter (module documentation): its weights quantized
+    /// to FP8 block-128 at load (1.17 GiB instead of 2.18) and its own FP8 copy of `model`'s LM
+    /// head (0.59 GiB), quantized from it once on `stream`; `model`'s head is not changed.
+    pub fn new_with(
+        w: &Weights,
+        config: DraftConfig,
+        model: &DeviceModel,
+        embed: &HostEmbedding,
+        stream: &Arc<Stream>,
+        fp8: bool,
     ) -> Result<Dflash> {
         if w.dims != Dims::GLM53F {
             return Err(invalid!(
@@ -140,10 +170,17 @@ impl Dflash {
         let mask = embed.row(w.dims.mask_token as usize);
         // SAFETY: `head` is `model`'s LM head, [154,880][4,096] BF16 on this device, never
         // written; the drafter reads it only once attached to the forward that owns `model`
-        // (`attach_drafter` checks the address), so it outlives every read. `stream` is kept in
-        // `self`, and `gpu` is dropped first.
-        let gpu = unsafe { GpuDrafter::with_borrowed_head_on(w, head, mask, stream.raw()) }
-            .map_err(Error::Other)?;
+        // (`attach_drafter` checks the address), so it outlives every read; the FP8 drafter reads
+        // it once, here, on `stream` (after the upload that wrote it). `stream` is kept in `self`,
+        // and `gpu` is dropped first.
+        let gpu = unsafe {
+            if fp8 {
+                GpuDrafter::fp8_with_head_on(w, head, mask, stream.raw())
+            } else {
+                GpuDrafter::with_borrowed_head_on(w, head, mask, stream.raw())
+            }
+        }
+        .map_err(Error::Other)?;
         Ok(Dflash {
             gpu,
             taps: None,
@@ -162,9 +199,15 @@ impl Dflash {
         &self.config
     }
 
-    /// Device bytes of the drafter's weights (the LM head is the forward's).
+    /// Device bytes of the drafter's weights (the LM head is the forward's; the FP8 drafter's
+    /// own FP8 copy of it included).
     pub fn weight_bytes(&self) -> usize {
         self.gpu.weight_bytes()
+    }
+
+    /// Whether this is the FP8 drafter ([`Dflash::new_with`]).
+    pub fn is_fp8(&self) -> bool {
+        self.gpu.is_fp8()
     }
 
     /// Device bytes of the tap buffer (0 until attached or reserved).

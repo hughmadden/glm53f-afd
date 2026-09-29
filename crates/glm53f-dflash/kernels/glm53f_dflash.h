@@ -106,6 +106,10 @@ cudaError_t g53d_select(const float* hproj, const float* vals, const int32_t* id
                         const float* temperature, const float* uniforms, int32_t* tokens, int32_t* index,
                         float* scores, float* q, float* conf, cudaStream_t stream);
 
+/* The FP8 drafter (src/gpu.rs): y[m][o] = the sum over s < ksplit, in that order, of
+ * partials[(s * rows + m) * n + o] (glm53f-layers' FP8 decode GEMM's K splits), f32. */
+cudaError_t g53d_splitk_sum(const float* partials, int ksplit, int rows, int n, float* y, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

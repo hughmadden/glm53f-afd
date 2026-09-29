@@ -22,6 +22,22 @@
 //! context), split-K attention over the ring, `o_proj`, `finish` added to the residual; the same
 //! for the MLP (fused gate/up GEMM, SiLU x up, down); the final norm; the LM head GEMM over each
 //! block's 7 draft rows; the top-16; the selector's projection and walk.
+//!
+//! **The FP8 drafter** ([`GpuDrafter::new_fp8`], [`GpuDrafter::fp8_with_head_on`]). The GEMM
+//! weights (`fc`, and per layer the fused QKV, `o_proj`, the fused gate/up, `down` and the two
+//! convolutions' kernel projections) are quantized at load to FP8 E4M3 with one f32 scale per
+//! 128 x 128 block, the checkpoint's own scheme for its FP8 weights (`glm53f-layers`'
+//! `glm53f_fp8_quantize_weight`: per block `scale = amax / 448`, `q = e4m3(w / scale)`), and the
+//! drafter gets its own FP8 copy of the LM head, quantized the same way from the target's; the
+//! target's head is untouched. The selector's projection and codebooks, the norms and the
+//! convolutions' base kernels stay BF16. The GEMMs are `glm53f-layers`' FP8 kernels, their outputs
+//! f32 as before: up to 8 rows the decode GEMM (BF16 activations against the FP8 weights, every
+//! product exact in f32), its K splits (at least two) summed in split order into f32
+//! (`g53d_splitk_sum`); over 8 rows the tensor-core GEMM with the activations in E4M3 per row and
+//! 128-group (W8A8, the checkpoint's dynamic scheme) and its f32 output. The drafter's numerics
+//! change only which tokens it proposes: the target verifies every draft.
+
+use glm53f_layers::ffi as lffi;
 
 use crate::blas::Blas;
 use crate::cuda::check;
@@ -33,16 +49,227 @@ use crate::{cpu, Dims};
 
 const TOP_K: usize = 16;
 
+/// A GEMM weight `[n][k]` on the device: BF16 bits, or FP8 E4M3 codes with f32 scales
+/// `[ceil(n / 128)][k / 128]`.
+enum Mat {
+    Bf16(DeviceBuffer),
+    Fp8 {
+        w: DeviceBuffer,
+        scales: DeviceBuffer,
+    },
+}
+
+/// A view of a weight's rows from some row on, for one GEMM.
+#[derive(Clone, Copy)]
+enum W {
+    Bf16(*const u16),
+    Fp8 { w: *const u8, scales: *const f32 },
+}
+
+impl Mat {
+    /// Rows `r0..` of this `[n][k]` weight (for FP8, `r0` a multiple of 128).
+    fn rows_from(&self, r0: usize, k: usize) -> W {
+        match self {
+            Mat::Bf16(b) => W::Bf16(b.ptr(r0 * k)),
+            Mat::Fp8 { w, scales } => {
+                debug_assert!(r0.is_multiple_of(128));
+                W::Fp8 {
+                    w: w.ptr(r0 * k),
+                    scales: scales.ptr((r0 / 128) * (k / 128)),
+                }
+            }
+        }
+    }
+
+    fn all(&self) -> W {
+        self.rows_from(0, 0)
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Mat::Bf16(b) => b.bytes(),
+            Mat::Fp8 { w, scales } => w.bytes() + scales.bytes(),
+        }
+    }
+}
+
+/// `[n][k]` BF16 bits on the device quantized to FP8 E4M3 with 128 x 128 block scales, on `s`
+/// (`glm53f-layers`' `glm53f_fp8_quantize_weight`, the checkpoint's scheme).
+///
+/// # Safety
+///
+/// `src` names `n * k` BF16 values on this device, 16-byte aligned, whose writes are ordered
+/// before `s`'s work.
+unsafe fn quantize(src: *const u16, n: usize, k: usize, s: &Stream) -> Result<Mat, String> {
+    if !k.is_multiple_of(128) || !n.is_multiple_of(8) {
+        return Err(format!(
+            "an FP8 weight of {n} x {k}: needs n % 8 == 0 and k % 128 == 0"
+        ));
+    }
+    let w = DeviceBuffer::alloc(n * k)?;
+    let scales = DeviceBuffer::alloc(n.div_ceil(128) * (k / 128) * 4)?;
+    // SAFETY: the caller's source; `w` holds n x k codes, `scales` the block scales.
+    check(
+        unsafe {
+            lffi::glm53f_fp8_quantize_weight(
+                src,
+                i32c(n, "n")?,
+                i32c(k, "k")?,
+                w.ptr(0),
+                scales.ptr(0),
+                s.raw(),
+            )
+        },
+        "glm53f_fp8_quantize_weight",
+    )?;
+    Ok(Mat::Fp8 { w, scales })
+}
+
+/// A host BF16 weight `[n][k]` on the device, as it is or quantized to FP8 (`fp8`).
+fn mat(data: &[u16], n: usize, k: usize, fp8: bool, s: &Stream) -> Result<Mat, String> {
+    if data.len() != n * k {
+        return Err(format!(
+            "a weight of {} values, expected {n} x {k}",
+            data.len()
+        ));
+    }
+    let b = up(data, s)?;
+    if !fp8 {
+        return Ok(Mat::Bf16(b));
+    }
+    // SAFETY: `b` holds n x k BF16 values, uploaded and synchronized; it is freed after the
+    // quantization completes.
+    let q = unsafe { quantize(b.ptr(0), n, k, s) }?;
+    s.synchronize()?;
+    Ok(q)
+}
+
+/// K splits of the FP8 decode GEMM for an `[n][k]` weight: its own choice
+/// (`glm53f_layers::mlp::decode_ksplit`), at least 2 (the f32 outputs come from its split
+/// partials).
+pub fn fp8_ksplit(n: usize, k: usize) -> Result<usize, String> {
+    let d = glm53f_layers::mlp::decode_ksplit(n, k);
+    if d >= 2 {
+        return Ok(d);
+    }
+    let blocks = k / 128;
+    (2..=blocks)
+        .find(|s| blocks.is_multiple_of(*s))
+        .ok_or_else(|| format!("an FP8 GEMM with k = {k} has one 128-block: no f32 splits"))
+}
+
+/// `y [rows][n] (f32) = x [rows][k] (BF16) . w^T` for an FP8 weight (codes `w`, block scales
+/// `scales`) on `raw`: up to 8 rows `glm53f-layers`' FP8 decode GEMM (BF16 activations, every
+/// product exact in f32) into its split partials, summed in split order into `y`
+/// (`g53d_splitk_sum`); over 8 rows the activations in E4M3 per row and 128-group
+/// (`glm53f_act_quant`) and the tensor-core GEMM (`glm53f_fp8_gemm_prefill`, k32 partial sums
+/// promoted to f32) writing `y` (and its BF16 copy into the scratch).
+///
+/// # Safety
+///
+/// Live device buffers of these shapes; `sc` grown for this GEMM (`Buffers::fp8`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn fp8_gemm(
+    raw: crate::cuda::RawStream,
+    sc: &Fp8Scratch,
+    rows: usize,
+    n: usize,
+    k: usize,
+    x: *const u16,
+    w: *const u8,
+    scales: *const f32,
+    y: *mut f32,
+) -> Result<(), String> {
+    if rows == 0 || n == 0 {
+        return Ok(());
+    }
+    let (ri, ni, ki) = (i32c(rows, "rows")?, i32c(n, "n")?, i32c(k, "k")?);
+    // SAFETY (both branches): the caller's buffers and scratch.
+    unsafe {
+        if rows <= 8 {
+            let ksplit = fp8_ksplit(n, k)?;
+            check(
+                lffi::glm53f_fp8_gemm_decode(
+                    x.cast(),
+                    core::ptr::null(),
+                    0,
+                    w,
+                    scales,
+                    ri,
+                    ni,
+                    ki,
+                    ksplit as i32,
+                    sc.partials,
+                    core::ptr::null_mut(),
+                    raw,
+                ),
+                "glm53f_fp8_gemm_decode",
+            )?;
+            check(
+                ffi::g53d_splitk_sum(sc.partials, ksplit as i32, ri, ni, y, raw),
+                "g53d_splitk_sum",
+            )
+        } else {
+            check(
+                lffi::glm53f_act_quant(x, sc.xq, sc.xs, ri, ki, raw),
+                "glm53f_act_quant",
+            )?;
+            check(
+                lffi::glm53f_fp8_gemm_prefill(
+                    sc.xq,
+                    sc.xs,
+                    w,
+                    scales,
+                    ri,
+                    ni,
+                    ki,
+                    lffi::PREFILL_PROMOTE_K32,
+                    sc.y16,
+                    y,
+                    raw,
+                ),
+                "glm53f_fp8_gemm_prefill",
+            )
+        }
+    }
+}
+
+/// The FP8 drafter's GEMM on host data (tests): `w` `[n][k]` BF16 bits quantized on the device
+/// as the FP8 drafter's weights are, times `x` `[rows][k]` BF16; returns `y` `[rows][n]` f32.
+pub fn fp8_gemm_host(
+    x: &[u16],
+    rows: usize,
+    w: &[u16],
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, String> {
+    if x.len() != rows * k {
+        return Err(format!("{} activations for {rows} x {k}", x.len()));
+    }
+    let s = Stream::new()?;
+    let m = mat(w, n, k, true, &s)?;
+    let W::Fp8 { w, scales } = m.all() else {
+        unreachable!("an FP8 weight")
+    };
+    let mut buf = Buffers::default();
+    let sc = buf.fp8(true, &[(rows, n, k)])?;
+    let xd = up(x, &s)?;
+    let y = DeviceBuffer::alloc(rows * n * 4)?;
+    // SAFETY: the buffers above hold the shapes; the scratch was grown for this GEMM.
+    unsafe { fp8_gemm(s.raw(), &sc, rows, n, k, xd.ptr(0), w, scales, y.ptr(0)) }?;
+    y.download(rows * n, &s)
+}
+
 /// One layer's device weights.
 struct Layer {
     /// `[q_width + 2 kv_width][hidden]`: q, then k, then v rows.
-    qkv: DeviceBuffer,
-    o: DeviceBuffer,
+    qkv: Mat,
+    o: Mat,
     /// `[2 inter][hidden]`: gate, then up rows.
-    gate_up: DeviceBuffer,
-    down: DeviceBuffer,
-    attn_kp: DeviceBuffer,
-    mlp_kp: DeviceBuffer,
+    gate_up: Mat,
+    down: Mat,
+    attn_kp: Mat,
+    mlp_kp: Mat,
     attn_base: DeviceBuffer,
     mlp_base: DeviceBuffer,
     input_ln: DeviceBuffer,
@@ -51,10 +278,12 @@ struct Layer {
     k_norm: DeviceBuffer,
 }
 
-/// The LM head the drafter reads: its own upload, or the target forward's (borrowed).
+/// The LM head the drafter reads: its own upload, the target forward's (borrowed), or its own
+/// FP8 copy (the FP8 drafter).
 enum Head {
     Owned(DeviceBuffer),
     Borrowed(*const u16),
+    Fp8(Mat),
 }
 
 /// Where a slot's ring lives.
@@ -226,10 +455,61 @@ struct Buffers {
     trace: Scratch,
     rope: Scratch,
     topk_ws: Scratch,
+    /// The FP8 GEMMs': the decode GEMM's split partials; the tensor-core GEMM's E4M3 activations,
+    /// their scales and its BF16 output (unused: the f32 one is read).
+    f8_partials: Scratch,
+    f8_xq: Scratch,
+    f8_xs: Scratch,
+    f8_y16: Scratch,
+}
+
+/// The FP8 GEMMs' scratch for one append pass or one draft (null for a BF16 drafter).
+#[derive(Clone, Copy)]
+struct Fp8Scratch {
+    partials: *mut f32,
+    xq: *mut u8,
+    xs: *mut f32,
+    y16: *mut u16,
 }
 
 impl Buffers {
-    fn all(&self) -> [&Scratch; 38] {
+    /// The FP8 GEMMs' scratch for the GEMMs `(rows, n, k)` of a pass (grown to the largest); none
+    /// for a BF16 drafter (`fp8` false).
+    fn fp8(&mut self, fp8: bool, gemms: &[(usize, usize, usize)]) -> Result<Fp8Scratch, String> {
+        if !fp8 {
+            return Ok(Fp8Scratch {
+                partials: core::ptr::null_mut(),
+                xq: core::ptr::null_mut(),
+                xs: core::ptr::null_mut(),
+                y16: core::ptr::null_mut(),
+            });
+        }
+        let (mut p, mut xq, mut xs, mut y) = (0usize, 0usize, 0usize, 0usize);
+        for &(rows, n, k) in gemms {
+            if rows <= 8 {
+                p = p.max(fp8_ksplit(n, k)? * rows * n * 4);
+            } else {
+                xq = xq.max(rows * k);
+                xs = xs.max(rows * (k / 128) * 4);
+                y = y.max(rows * n * 2);
+            }
+        }
+        let get = |sc: &mut Scratch, b: usize| -> Result<*mut u8, String> {
+            if b == 0 {
+                Ok(core::ptr::null_mut())
+            } else {
+                sp(sc, b)
+            }
+        };
+        Ok(Fp8Scratch {
+            partials: get(&mut self.f8_partials, p)?.cast(),
+            xq: get(&mut self.f8_xq, xq)?,
+            xs: get(&mut self.f8_xs, xs)?.cast(),
+            y16: get(&mut self.f8_y16, y)?.cast(),
+        })
+    }
+
+    fn all(&self) -> [&Scratch; 42] {
         [
             &self.taps,
             &self.feat,
@@ -269,6 +549,10 @@ impl Buffers {
             &self.trace,
             &self.rope,
             &self.topk_ws,
+            &self.f8_partials,
+            &self.f8_xq,
+            &self.f8_xs,
+            &self.f8_y16,
         ]
     }
 }
@@ -295,7 +579,7 @@ pub struct GpuDrafter {
     stream: Stream,
     blas: Blas,
     layers: Vec<Layer>,
-    fc: DeviceBuffer,
+    fc: Mat,
     hidden_norm: DeviceBuffer,
     norm: DeviceBuffer,
     hproj: DeviceBuffer,
@@ -316,6 +600,8 @@ pub struct GpuDrafter {
     pub trace: bool,
     buf: Buffers,
     last_nreq: usize,
+    /// FP8 weights and LM head (module documentation).
+    fp8: bool,
 }
 
 // SAFETY: the raw pointers a drafter holds are device addresses (a borrowed LM head) and stream
@@ -364,7 +650,51 @@ impl GpuDrafter {
             ));
         }
         let h = Head::Owned(up(head, &stream)?);
-        Self::build(w, h, mask_row, stream)
+        Self::build(w, h, mask_row, stream, false)
+    }
+
+    /// The FP8 drafter (module documentation) with its own stream: the weights quantized at
+    /// load, and its own FP8 copy of the LM head `head` (`[vocab][hidden]` BF16 bits, uploaded,
+    /// quantized, and freed).
+    pub fn new_fp8(w: &Weights, head: &[u16], mask_row: &[u16]) -> Result<GpuDrafter, String> {
+        let stream = Stream::new()?;
+        let d = w.dims;
+        let b = up(head, &stream)?;
+        if head.len() != d.vocab * d.hidden {
+            return Err(format!(
+                "LM head has {} values, expected {} x {}",
+                head.len(),
+                d.vocab,
+                d.hidden
+            ));
+        }
+        // SAFETY: `b` holds the head, uploaded and synchronized.
+        let q = unsafe { quantize(b.ptr(0), d.vocab, d.hidden, &stream) }?;
+        stream.synchronize()?;
+        drop(b);
+        Self::build(w, Head::Fp8(q), mask_row, stream, true)
+    }
+
+    /// The FP8 drafter on `stream` (the target forward's), its FP8 copy of the LM head quantized
+    /// from the target's `head` at load; the target's head is only read, once.
+    ///
+    /// # Safety
+    ///
+    /// `head` points at `[vocab][hidden]` BF16 values on this device, 16-byte aligned, written
+    /// before `stream`'s work; `stream` is a live stream that outlives the drafter.
+    pub unsafe fn fp8_with_head_on(
+        w: &Weights,
+        head: *const u16,
+        mask_row: &[u16],
+        stream: crate::cuda::RawStream,
+    ) -> Result<GpuDrafter, String> {
+        // SAFETY: the caller keeps the stream alive for the drafter's life.
+        let stream = unsafe { Stream::borrowed(stream) };
+        let d = w.dims;
+        // SAFETY: the caller's head.
+        let q = unsafe { quantize(head, d.vocab, d.hidden, &stream) }?;
+        stream.synchronize()?;
+        Self::build(w, Head::Fp8(q), mask_row, stream, true)
     }
 
     /// As [`GpuDrafter::new`], reading the target forward's LM head in place.
@@ -379,7 +709,7 @@ impl GpuDrafter {
         mask_row: &[u16],
     ) -> Result<GpuDrafter, String> {
         let stream = Stream::new()?;
-        Self::build(w, Head::Borrowed(head), mask_row, stream)
+        Self::build(w, Head::Borrowed(head), mask_row, stream, false)
     }
 
     /// As [`GpuDrafter::with_borrowed_head`], on `stream`, a stream the caller owns (the target
@@ -398,7 +728,7 @@ impl GpuDrafter {
     ) -> Result<GpuDrafter, String> {
         // SAFETY: the caller keeps the stream alive for the drafter's life.
         let stream = unsafe { Stream::borrowed(stream) };
-        Self::build(w, Head::Borrowed(head), mask_row, stream)
+        Self::build(w, Head::Borrowed(head), mask_row, stream, false)
     }
 
     fn build(
@@ -406,6 +736,7 @@ impl GpuDrafter {
         head: Head,
         mask_row: &[u16],
         stream: Stream,
+        fp8: bool,
     ) -> Result<GpuDrafter, String> {
         let d = w.dims;
         d.validate()?;
@@ -424,15 +755,19 @@ impl GpuDrafter {
             return Err("mask row width".into());
         }
         let s = &stream;
+        let (h, qkvw, dw) = (d.hidden, d.q_width() + 2 * d.kv_width(), d.dyn_width());
+        if fp8 && !d.q_width().is_multiple_of(128) {
+            return Err(format!("an FP8 drafter needs q_width % 128 == 0: {d:?}"));
+        }
         let mut layers = Vec::with_capacity(d.layers);
         for lw in &w.layers {
             layers.push(Layer {
-                qkv: up(&cat(&[&lw.q, &lw.k, &lw.v]), s)?,
-                o: up(&lw.o, s)?,
-                gate_up: up(&cat(&[&lw.gate, &lw.up]), s)?,
-                down: up(&lw.down, s)?,
-                attn_kp: up(&lw.attn_kp, s)?,
-                mlp_kp: up(&lw.mlp_kp, s)?,
+                qkv: mat(&cat(&[&lw.q, &lw.k, &lw.v]), qkvw, h, fp8, s)?,
+                o: mat(&lw.o, h, d.q_width(), fp8, s)?,
+                gate_up: mat(&cat(&[&lw.gate, &lw.up]), 2 * d.inter, h, fp8, s)?,
+                down: mat(&lw.down, h, d.inter, fp8, s)?,
+                attn_kp: mat(&lw.attn_kp, dw, h, fp8, s)?,
+                mlp_kp: mat(&lw.mlp_kp, dw, h, fp8, s)?,
                 attn_base: up(&lw.attn_base, s)?,
                 mlp_base: up(&lw.mlp_base, s)?,
                 input_ln: up(&lw.input_ln, s)?,
@@ -450,7 +785,7 @@ impl GpuDrafter {
         };
         Ok(GpuDrafter {
             dims: d,
-            fc: up(&w.fc, s)?,
+            fc: mat(&w.fc, h, d.tap_width(), fp8, s)?,
             hidden_norm: up(&w.hidden_norm, s)?,
             norm: up(&w.norm, s)?,
             hproj: up(&w.hproj, s)?,
@@ -466,9 +801,15 @@ impl GpuDrafter {
             trace: false,
             buf: Buffers::default(),
             last_nreq: 0,
+            fp8,
             blas,
             stream,
         })
+    }
+
+    /// Whether the weights and the LM head the drafter reads are FP8 ([`GpuDrafter::new_fp8`]).
+    pub fn is_fp8(&self) -> bool {
+        self.fp8
     }
 
     pub fn stream(&self) -> &Stream {
@@ -486,49 +827,49 @@ impl GpuDrafter {
             .layers
             .iter()
             .map(|l| {
-                [
-                    &l.qkv,
-                    &l.o,
-                    &l.gate_up,
-                    &l.down,
-                    &l.attn_kp,
-                    &l.mlp_kp,
-                    &l.attn_base,
-                    &l.mlp_base,
-                    &l.input_ln,
-                    &l.post_ln,
-                    &l.q_norm,
-                    &l.k_norm,
-                ]
-                .iter()
-                .map(|b| b.bytes())
-                .sum::<usize>()
+                [&l.qkv, &l.o, &l.gate_up, &l.down, &l.attn_kp, &l.mlp_kp]
+                    .iter()
+                    .map(|m| m.bytes())
+                    .sum::<usize>()
+                    + [
+                        &l.attn_base,
+                        &l.mlp_base,
+                        &l.input_ln,
+                        &l.post_ln,
+                        &l.q_norm,
+                        &l.k_norm,
+                    ]
+                    .iter()
+                    .map(|b| b.bytes())
+                    .sum::<usize>()
             })
             .sum();
-        let own = [
-            &self.fc,
-            &self.hidden_norm,
-            &self.norm,
-            &self.hproj,
-            &self.pred,
-            &self.succ,
-            &self.inv_freq,
-            &self.mask_row,
-        ]
-        .iter()
-        .map(|b| b.bytes())
-        .sum::<usize>();
+        let own = self.fc.bytes()
+            + [
+                &self.hidden_norm,
+                &self.norm,
+                &self.hproj,
+                &self.pred,
+                &self.succ,
+                &self.inv_freq,
+                &self.mask_row,
+            ]
+            .iter()
+            .map(|b| b.bytes())
+            .sum::<usize>();
         let head = match &self.head {
             Head::Owned(b) => b.bytes(),
             Head::Borrowed(_) => 0,
+            Head::Fp8(m) => m.bytes(),
         };
         layers + own + head
     }
 
-    fn head_ptr(&self) -> *const u16 {
+    fn head_w(&self) -> W {
         match &self.head {
-            Head::Owned(b) => b.ptr::<u16>(0),
-            Head::Borrowed(p) => *p,
+            Head::Owned(b) => W::Bf16(b.ptr::<u16>(0)),
+            Head::Borrowed(p) => W::Bf16(*p),
+            Head::Fp8(m) => m.all(),
         }
     }
 
@@ -542,8 +883,9 @@ impl GpuDrafter {
     /// number of rows, passes of at most [`GpuDrafter::append_chunk`]) and drafts of up to `nreq`
     /// requests at any context allocate nothing: one append of a full window of zero taps into a
     /// scratch slot, then one greedy draft of `nreq` requests over it (the most attention splits
-    /// a window gives). The scratch slot's ring is freed on return. Returns
-    /// [`GpuDrafter::scratch_bytes`].
+    /// a window gives); for the FP8 drafter also a draft of one request and an append of one
+    /// block (the FP8 GEMMs' path up to 8 rows, which larger passes do not take). The scratch
+    /// slot's ring is freed on return. Returns [`GpuDrafter::scratch_bytes`].
     pub fn reserve(&mut self, nreq: usize) -> Result<usize, String> {
         let d = self.dims;
         let mut slot = self.new_slot()?;
@@ -562,6 +904,14 @@ impl GpuDrafter {
             .collect();
         self.launch(&reqs)?;
         self.proposals(reqs.len())?;
+        if self.fp8 {
+            self.launch(&reqs[..1])?;
+            self.proposals(1)?;
+            drop(reqs);
+            let block = vec![0u16; d.block * d.tap_width()];
+            // SAFETY: host taps only.
+            unsafe { self.append_taps(&mut [(&mut slot, Taps::Host(&block))]) }?;
+        }
         Ok(self.scratch_bytes())
     }
 
@@ -613,19 +963,34 @@ impl GpuDrafter {
         ))
     }
 
+    /// `y [rows][n] (f32, row stride ldy) = x [rows][k] (BF16) . w^T`: cuBLAS for a BF16 weight;
+    /// for an FP8 one (`ldy == n`), up to 8 rows the FP8 decode GEMM and its splits summed in f32,
+    /// over 8 rows the W8A8 tensor-core GEMM's f32 output (module documentation).
     #[allow(clippy::too_many_arguments)]
     unsafe fn gemm(
         &self,
+        sc: &Fp8Scratch,
         rows: usize,
         n: usize,
         k: usize,
         x: *const u16,
-        w: *const u16,
+        w: W,
         y: *mut f32,
         ldy: usize,
     ) -> Result<(), String> {
-        // SAFETY: forwarded; the caller's buffers hold the shapes.
-        unsafe { self.blas.gemm(rows, n, k, x, k, w, k, y, ldy) }
+        match w {
+            // SAFETY: forwarded; the caller's buffers hold the shapes.
+            W::Bf16(w) => unsafe { self.blas.gemm(rows, n, k, x, k, w, k, y, ldy) },
+            W::Fp8 { w, scales } => {
+                if ldy != n {
+                    return Err(format!(
+                        "an FP8 GEMM writes dense rows: ldy {ldy} for n {n}"
+                    ));
+                }
+                // SAFETY: forwarded; the scratch was grown for this GEMM (`Buffers::fp8`).
+                unsafe { fp8_gemm(self.stream.raw(), sc, rows, n, k, x, w, scales, y) }
+            }
+        }
     }
 
     /// Append rows to slots: `items[i].1` is BF16 taps `[rows][taps * hidden]` (host) at positions
@@ -735,6 +1100,7 @@ impl GpuDrafter {
         let feat_b: *mut u16 = sp(&mut self.buf.feat_b, n * h * 2)?;
         let kv: *mut f32 = sp(&mut self.buf.kv, n * 2 * kvw * 4)?;
         let cs: *mut f32 = sp(&mut self.buf.rope, n * d.head_dim * 4)?;
+        let sc = self.buf.fp8(self.fp8, &[(n, h, tw), (n, 2 * kvw, h)])?;
         let ni = i32c(n, "rows")?;
         let raw = s.raw();
         // SAFETY (whole block): every pointer is a live buffer sized above for n rows.
@@ -743,7 +1109,7 @@ impl GpuDrafter {
                 ffi::g53d_rope_table(pos_d, ni, self.inv_freq.ptr(0), cs, raw),
                 "rope table",
             )?;
-            self.gemm(n, h, tw, taps, self.fc.ptr(0), feat, h)?;
+            self.gemm(&sc, n, h, tw, taps, self.fc.all(), feat, h)?;
             check(
                 ffi::g53d_rmsnorm(
                     feat,
@@ -762,8 +1128,8 @@ impl GpuDrafter {
             )?;
             for (l, lw) in self.layers.iter().enumerate() {
                 // Rows q_width.. of the fused weight are k, then v.
-                let wkv = lw.qkv.ptr::<u16>(d.q_width() * h);
-                self.gemm(n, 2 * kvw, h, feat_b, wkv, kv, 2 * kvw)?;
+                let wkv = lw.qkv.rows_from(d.q_width(), h);
+                self.gemm(&sc, n, 2 * kvw, h, feat_b, wkv, kv, 2 * kvw)?;
                 check(
                     ffi::g53d_head_norm_rope(
                         kv,
@@ -897,13 +1263,24 @@ impl GpuDrafter {
         } else {
             core::ptr::null_mut()
         };
+        let sc = b.fp8(
+            self.fp8,
+            &[
+                (rows, dw, h),
+                (rows, qkvw, h),
+                (rows, h, qw),
+                (rows, 2 * d.inter, h),
+                (rows, h, d.inter),
+                (drows, d.vocab, h),
+            ],
+        )?;
 
         let (ri, hi) = (i32c(rows, "rows")?, h as i32);
         let taps_side = d.conv_taps * d.groups();
         let null_f = core::ptr::null_mut::<f32>();
         let null_b = core::ptr::null_mut::<u16>();
         let raw = s.raw();
-        let hp_ptr = self.head_ptr();
+        let head = self.head_w();
         // SAFETY (whole block): every pointer is a live device buffer sized above for `rows` block
         // rows and `drows` draft rows; the weights hold the checkpoint's shapes.
         unsafe {
@@ -941,7 +1318,7 @@ impl GpuDrafter {
                     ),
                     "input_layernorm",
                 )?;
-                self.gemm(rows, dw, h, xb, lw.attn_kp.ptr(0), dynk, dw)?;
+                self.gemm(&sc, rows, dw, h, xb, lw.attn_kp.all(), dynk, dw)?;
                 check(
                     ffi::g53d_dyn_conv(
                         xn,
@@ -964,7 +1341,7 @@ impl GpuDrafter {
                     ),
                     "attention_conv.prepare",
                 )?;
-                self.gemm(rows, qkvw, h, xb, lw.qkv.ptr(0), qkv, qkvw)?;
+                self.gemm(&sc, rows, qkvw, h, xb, lw.qkv.all(), qkv, qkvw)?;
                 check(
                     ffi::g53d_head_norm_rope(
                         qkv,
@@ -1035,7 +1412,7 @@ impl GpuDrafter {
                     ),
                     "attention",
                 )?;
-                self.gemm(rows, h, qw, att, lw.o.ptr(0), a, h)?;
+                self.gemm(&sc, rows, h, qw, att, lw.o.all(), a, h)?;
                 check(
                     ffi::g53d_dyn_conv(
                         a,
@@ -1088,7 +1465,7 @@ impl GpuDrafter {
                     ),
                     "post_attention_layernorm",
                 )?;
-                self.gemm(rows, dw, h, xb, lw.mlp_kp.ptr(0), dynk, dw)?;
+                self.gemm(&sc, rows, dw, h, xb, lw.mlp_kp.all(), dynk, dw)?;
                 check(
                     ffi::g53d_dyn_conv(
                         xn,
@@ -1111,7 +1488,16 @@ impl GpuDrafter {
                     ),
                     "mlp_conv.prepare",
                 )?;
-                self.gemm(rows, 2 * d.inter, h, xb, lw.gate_up.ptr(0), gu, 2 * d.inter)?;
+                self.gemm(
+                    &sc,
+                    rows,
+                    2 * d.inter,
+                    h,
+                    xb,
+                    lw.gate_up.all(),
+                    gu,
+                    2 * d.inter,
+                )?;
                 check(
                     ffi::g53d_silu_mul(
                         gu,
@@ -1124,7 +1510,7 @@ impl GpuDrafter {
                     ),
                     "silu * up",
                 )?;
-                self.gemm(rows, h, d.inter, wide, lw.down.ptr(0), a, h)?;
+                self.gemm(&sc, rows, h, d.inter, wide, lw.down.all(), a, h)?;
                 check(
                     ffi::g53d_dyn_conv(
                         a,
@@ -1181,7 +1567,7 @@ impl GpuDrafter {
                 ffi::g53d_gather_drafts(fin_b, h as i64, nreq as i32, bl as i32, hi, draft_b, raw),
                 "gather drafts",
             )?;
-            self.gemm(drows, d.vocab, h, draft_b, hp_ptr, logits, d.vocab)?;
+            self.gemm(&sc, drows, d.vocab, h, draft_b, head, logits, d.vocab)?;
             check(
                 ffi::g53d_topk16(
                     logits,
@@ -1195,7 +1581,8 @@ impl GpuDrafter {
                 ),
                 "top-16",
             )?;
-            self.gemm(drows, d.rank, h, draft_b, self.hproj.ptr(0), hp, d.rank)?;
+            let hproj = W::Bf16(self.hproj.ptr(0));
+            self.gemm(&sc, drows, d.rank, h, draft_b, hproj, hp, d.rank)?;
             check(
                 ffi::g53d_select(
                     hp,

@@ -20,6 +20,7 @@ dependencies = [
 name = "glm53f-dflash"
 version = "0.1.0"
 dependencies = [
+ "glm53f-layers",
  "glm53f-model",
 ]
 

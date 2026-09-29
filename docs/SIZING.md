@@ -91,7 +91,7 @@ Byte counts are from the official checkpoint headers.
 | LM head | BF16, 1.27 GB | 1.27 GB |
 | Embedding | BF16, 1.27 GB | 1.27 GB, or 0 if kept in host RAM (row gather) |
 | **Total** | | **14.18 GiB** (13.00 GiB with the embedding in host RAM; 8.64 GiB with FP8 KDA as well) |
-| DFlash2 drafter | BF16, 2.34 GB | 2.18 GiB (shares the target's embedding and LM head) |
+| DFlash2 drafter | BF16, 2.34 GB | 2.18 GiB (shares the target's embedding and LM head); with `--drafter-fp8` 1.76 GiB, its own FP8 LM head included (§11) |
 | MTP layer (optional second drafter) | 0.24 GB here | its experts sit on the Sparks |
 | Vision tower (optional) | BF16, 1.13 GB | paged in per image request |
 
@@ -317,12 +317,40 @@ development model's sensitivity is not the real model's; the KL gate on the targ
 decides.
 
 
-## 11. The L2 prefetch (29 September 2026)
+## 11. The FP8 drafter and the L2 prefetch (29 September 2026)
 
-A speed option that changes no bit, **off by default** and a flag of `glm53f-serve` with an
-environment fallback ([RUNNING.md](RUNNING.md), "The L2 prefetch"). It needs no KL gate; it waits
-for speed measured on the target hardware. Development-GPU figures are an RTX 4090 shared with
-other work.
+Two speed options that change no committed token, each **off by default** and a flag of
+`glm53f-serve` with an environment fallback ([RUNNING.md](RUNNING.md), "The FP8 drafter and the
+L2 prefetch"). Neither needs the KL gate; both wait for speed (and the drafter for acceptance)
+measured on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
+
+**The FP8 drafter** (`--drafter-fp8`, `GLM53F_DRAFTER_FP8=1`; `crates/glm53f-dflash/README.md`,
+"The FP8 drafter").
+- Memory: the drafter's weights 2.18 → 1.17 GiB (FP8 block-128), plus its own FP8 copy of the LM
+  head, 0.59 GiB (the BF16 drafter reads the target's head in place): **0.42 GiB less**. Its
+  working memory grows with the FP8 GEMMs' scratch: reserved for drafts of 16 requests 151.8 →
+  203.5 MiB, of 48 requests 382.8 → 500.7 MiB (`dflash_bench`). Most of that growth (33 and
+  99 MiB) is the BF16 output the tensor-core GEMM writes and the drafter does not read. In all,
+  about 0.37 GiB less at 16 slots and 0.31 GiB less at 48.
+- Speed (`dflash_bench`, contexts of 2,100 rows):
+
+  | | BF16 | FP8 |
+  |---|---:|---:|
+  | draft block, 1 request (8 rows) | 4.26 ms | **2.46 ms** |
+  | draft block, 4 requests (32 rows) | 4.66 ms | 4.76 ms |
+  | draft block, 16 requests (128 rows) | 7.02 ms | 6.27 ms |
+  | append 8 rows, 1 request | 0.39 ms | 0.21 ms |
+  | append 8 rows each, 16 requests | 0.50 ms | 0.78 ms |
+  | append 2,048 rows | 3.54 ms | 3.24 ms |
+
+  Up to 8 rows the FP8 decode GEMM reads half the bytes. Over 8 rows the W8A8 tensor-core GEMM's
+  128 × 128 tiles give the drafter's 4,096-wide projections 32 blocks, too few to fill the GPU, so
+  several requests at once gain little, and a commit of several requests' rows costs more than
+  cuBLAS. A W8A8 GEMM for few rows (K split across blocks) would remove that (not built).
+- Acceptance (five chat cases, the whole target recorded, both drafters replayed on the same
+  contexts: `crates/glm53f-dflash/README.md`): 3.69 drafts kept a round of 7 with either, 4.54
+  tokens a round with the chain cut with either; FP8 − BF16 −0.005 kept a round (standard error
+  0.003). Structured, rewrite and counting keep 6.5–7.0 drafts a round with either.
 
 **The L2 prefetch** (`--l2-prefetch off|auto|<MiB>`, `GLM53F_L2_PREFETCH`;
 `crates/glm53f-forward/src/prefetch.rs`).

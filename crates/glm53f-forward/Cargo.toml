@@ -77,3 +77,7 @@ required-features = ["coordinator"]
 [[example]]
 name = "l2_prefetch_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "draft_record"
+required-features = ["coordinator"]

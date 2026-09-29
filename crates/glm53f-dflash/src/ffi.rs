@@ -147,4 +147,12 @@ unsafe extern "C" {
         conf: *mut f32,
         stream: RawStream,
     ) -> CudaError;
+    pub fn g53d_splitk_sum(
+        partials: *const f32,
+        ksplit: i32,
+        rows: i32,
+        n: i32,
+        y: *mut f32,
+        stream: RawStream,
+    ) -> CudaError;
 }

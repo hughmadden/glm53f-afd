@@ -138,12 +138,24 @@ mod daemon {
             }
             Some(dir) => {
                 let t0 = Instant::now();
-                let d = s(Dflash::load(dir, &model, &embed, &stream))?;
+                let d = s(Dflash::load_with(
+                    dir,
+                    &model,
+                    &embed,
+                    &stream,
+                    o.drafter_fp8,
+                ))?;
                 eprintln!(
-                    "[coordinator] drafter: DFlash2 from {}, {:.2} GiB of weights on the GPU (the \
-                     LM head is the forward's), {:.1} s",
+                    "[coordinator] drafter: DFlash2 from {}, {:.2} GiB of weights on the GPU ({}), \
+                     {:.1} s",
                     dir.display(),
                     d.weight_bytes() as f64 / GIB,
+                    if d.is_fp8() {
+                        "FP8 block-128 with its own FP8 copy of the LM head for drafting: \
+                         --drafter-fp8"
+                    } else {
+                        "BF16; the LM head is the forward's"
+                    },
                     t0.elapsed().as_secs_f64()
                 );
                 Some(d)

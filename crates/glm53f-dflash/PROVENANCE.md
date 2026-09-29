@@ -1,9 +1,10 @@
 # Provenance: glm53f-dflash
 
 Rows in the format of [docs/REUSE.md](../../docs/REUSE.md). Commits are full hashes; each digest is
-the sha256 of the whole source file at that commit. All dates are 28 September 2026. No code is
-copied from any external source: the drafter is reimplemented from the reference's semantics, and
-the kernels are new code (the attention's split-K structure follows a design of mimo26f-afd).
+the sha256 of the whole source file at that commit. All dates are 28 September 2026 (the FP8
+drafter's rows 29 September). No code is copied from any external source: the drafter is
+reimplemented from the reference's semantics, and the kernels are new code (the attention's
+split-K structure follows a design of mimo26f-afd).
 
 Sources:
 
@@ -23,6 +24,10 @@ Sources:
 - **M**: `hughmadden/mimo26f-afd` v1.2.0 @ `bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79`, MIT.
   Design only.
 - **R**: this repository.
+- **G**: `mmastrac/glm-5.3-flash-4x-gx10`, branch `perf-2026-09-27` @ `2209649` (NVFP4 drafter
+  weights), no licence; and **P**: `knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4` @ `beca637`, `README.md`
+  (block-FP8 drafter weights, an FP8 draft head), MIT. The FP8 drafter's idea only; no code
+  copied.
 - **W**: the checkpoint `incoai/GLM-5.3-Flash-DFlash2` @ `bf582e4eacc1810f76656d1811693ff6c6737d2a`
   (`config.json` `c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573`,
   `model.safetensors` `b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac`), CC
@@ -62,4 +67,6 @@ S `python/sglang/srt/layers/logits_processor.py`
 | Weights and target rows (via `glm53f-model`'s safetensors reader and `DraftConfig`); random weights for tests | `src/weights.rs` | `tests/goldens.rs`, `tests/reference.rs` |
 | Synthetic taps (splitmix64, Steele, Lea and Flood 2014) | `src/synth.rs` | `tests/goldens.rs`: `synthetic_taps_match_the_oracle` (digests of the oracle's taps) |
 | SHA-256 (FIPS 180-4), bfloat16 conversion (IEEE 754 round to nearest even), golden-set reader | `src/sha256.rs`, `src/bf16.rs`, `src/goldens.rs` | known-answer unit tests |
-| Benchmark | `examples/dflash_bench.rs` | — |
+| The FP8 drafter (the idea from G and P): the GEMM weights quantized at load to FP8 block-128 by R's `crates/glm53f-layers` quantizer, its own FP8 copy of the LM head, the GEMMs on R's FP8 kernels (up to 8 rows the decode GEMM with its K splits summed in split order, `g53d_splitk_sum`; over 8 rows the W8A8 tensor-core GEMM), their scratch (`Buffers::fp8`, `reserve`) | `src/gpu.rs`, `src/ffi.rs`, `kernels/dflash.cu`, `kernels/glm53f_dflash.h` | `tests/gpu_fp8.rs` (the GEMM bit for bit against R's CPU model up to 8 rows; the drafter against the CPU reference on FP8-exact weights; FP8 against BF16) |
+| Benchmark (the BF16 and the FP8 drafter) | `examples/dflash_bench.rs` | — |
+| The acceptance replay: recorded drafts on real prompts through both drafters (`crates/glm53f-forward`'s `examples/draft_record.rs` records them) | `examples/draft_replay.rs` | — |

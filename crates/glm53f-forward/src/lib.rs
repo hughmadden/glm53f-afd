@@ -76,9 +76,10 @@
 //! `kda_prefill_w8a8` keeping the FP8 KDA projections at E4M3). The model-path tests run with any
 //! of them on through `GLM53F_TEST_NUMERICS`.
 //!
-//! **A speed option that changes no bit**, off by default: the L2 prefetch of decode and verify
-//! passes (`forward::ForwardConfig::l2_prefetch`, `prefetch`). `GLM53F_TEST_NUMERICS` takes it
-//! too (`l2-prefetch`).
+//! **Speed options that change no committed token**, each off by default: the L2 prefetch of
+//! decode and verify passes (`forward::ForwardConfig::l2_prefetch`, `prefetch`; bit for bit the
+//! same) and the FP8 drafter (`draft::Dflash::load_with`; other drafts, the same verified tokens).
+//! `GLM53F_TEST_NUMERICS` takes them too (`l2-prefetch`, `drafter-fp8`).
 //!
 //! # The KV
 //!

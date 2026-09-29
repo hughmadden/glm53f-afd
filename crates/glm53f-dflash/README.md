@@ -14,14 +14,16 @@ seven tokens per step; the target verifies them in one window.
 | `src/cpu.rs` | Threaded GEMM against BF16 weights, RMSNorm, RoPE (the reference's own `inv_freq` rounding), SiLU |
 | `src/weights.rs` | The drafter's tensors and the target rows it borrows, read with `glm53f-model`'s safetensors reader |
 | `src/seam.rs` | The integration seam: `Drafter`, `Append`, `DraftRequest`, `Proposal`; `CpuDrafter` implements it |
-| `src/gpu.rs` | `GpuDrafter` (feature `cuda`): device weights, per-request context rings (its own, or caller-owned: `GpuSlot::external`), `append_taps`, `launch` / `proposals`, rewinds, forks (`GpuSlot::follow`), cold restarts (`GpuSlot::restart`); its own stream or the target forward's (`with_borrowed_head_on`) |
+| `src/gpu.rs` | `GpuDrafter` (feature `cuda`): device weights, per-request context rings (its own, or caller-owned: `GpuSlot::external`), `append_taps`, `launch` / `proposals`, rewinds, forks (`GpuSlot::follow`), cold restarts (`GpuSlot::restart`); its own stream or the target forward's (`with_borrowed_head_on`); the FP8 drafter (`new_fp8`, `fp8_with_head_on`: [The FP8 drafter](#the-fp8-drafter)) |
 | `kernels/glm53f_dflash.h`, `kernels/dflash.cu` | The kernels behind a C ABI: RMSNorm, RoPE table, per-head norm + RoPE, ring stores, the dynamic convolution, split-K attention over the ring, SiLU x up, top-16, the selector walk |
 | `src/blas.rs`, `src/device.rs`, `src/cuda.rs`, `src/ffi.rs` | cuBLAS (BF16 in, f32 accumulate and out), device buffers, runtime and kernel bindings |
 | `src/goldens.rs`, `src/synth.rs`, `src/sha256.rs`, `src/bf16.rs` | Golden-set reader (digests checked), the goldens' synthetic taps, SHA-256, bfloat16 |
 | `tests/reference.rs` | Invariants on a small random model (no data): pieces vs one append, the window, non-causal block and causal convolution, rewinds, the candidate limit, the seam |
 | `tests/goldens.rs` | The CPU reference against the oracle's FP32 goldens (needs data) |
 | `tests/gpu.rs` | Kernels bit for bit against the CPU functions; the forward against the reference on a random model and on the checkpoint (feature `cuda`) |
-| `examples/dflash_bench.rs` | Draft-block and append timings |
+| `tests/gpu_fp8.rs` | The FP8 drafter: its GEMM against `glm53f-layers`' CPU model, the drafter against the reference on weights FP8 holds exactly, FP8 against BF16 (feature `cuda`) |
+| `examples/dflash_bench.rs` | Draft-block and append timings, BF16 and FP8 |
+| `examples/draft_replay.rs` | Acceptance of both drafters on recordings of the whole target (`glm53f-forward`'s `examples/draft_record.rs`) |
 | `../../oracle/golden_dflash.py` | The golden capture: the pinned reference run in the oracle image |
 
 ```sh
@@ -237,6 +239,72 @@ and the LM head's 1.27 GB in 3.69 ms (0.89 TB/s); attention takes 0.24 ms and ev
 attention reads 40 MiB of ring per request per draft (1.22 ms). An estimate from bandwidth alone,
 not a measurement: the 5090's 1.8 TB/s would bring the single-request block near 2 ms.
 
+## The FP8 drafter
+
+`GpuDrafter::new_fp8` (its own stream; the head uploaded, quantized, freed) and
+`GpuDrafter::fp8_with_head_on` (the target forward's stream; the forward's head read once);
+`glm53f-serve --drafter-fp8`. Off by default until its acceptance is measured on the target
+hardware. The idea comes from two public four-Spark recipes (`NOTICE.md`): block-FP8 drafter
+weights with an FP8 draft head, reported with acceptance unchanged, and NVFP4 drafter weights.
+
+- **What changes.** The GEMM weights (`fc`, and per layer the fused QKV, `o_proj`, the fused
+  gate/up, `down` and the two convolutions' kernel projections) are quantized at load to FP8 E4M3
+  with one f32 scale per 128 x 128 block, the checkpoint's own scheme for its FP8 weights
+  (`glm53f-layers`' quantizer: `scale = amax / 448`, `q = e4m3(w / scale)`), and the drafter gets
+  its own FP8 copy of the LM head, quantized the same way; the target's head is not touched. The
+  norms, the convolutions' base kernels and the selector's tensors stay BF16. Up to 8 rows (one
+  request's block or draft rows, a commit of up to 8 rows) the GEMMs are `glm53f-layers`' FP8
+  decode GEMM with BF16 activations, every product exact in f32, its K splits (at least two)
+  summed in split order into f32 (`g53d_splitk_sum`); over 8 rows (several requests, a prompt's
+  context) its W8A8 tensor-core GEMM (E4M3 activations per row and 128-group, k32 promotion).
+- **What it cannot change.** The verify pass keeps a draft only where it equals the target's own
+  pick (greedy, or the target's seeded sample), so the output is the same token for token;
+  `glm53f-forward`'s `tests/draft_lossless.rs` and `tests/copy_windows.rs` pass with
+  `GLM53F_TEST_NUMERICS=drafter-fp8`.
+- **Memory.** 1.76 GiB (1.17 GiB of weights and scales, the head's copy 0.59 GiB) against the BF16
+  drafter's 2.18 GiB, which reads the target's head in place: 0.42 GiB less.
+- **Tests** (`tests/gpu_fp8.rs`):
+  - the GEMM, up to 8 rows, bit for bit `glm53f-layers`' CPU model in its split order; over 8 rows
+    within 2^-10 of the magnitude of exact block products (worst measured 4.3e-4);
+  - on a random model whose weights and head FP8 holds exactly (block scales powers of two), the
+    FP8 drafter against the CPU reference on every path of up to 8 rows, as closely as the BF16
+    drafter: 99.9% of the ring values equal and the rest within one BF16 unit, final rows and
+    logits within 4.9e-3 (the BF16 drafter 3.8e-3 on the model's own weights; bound 1e-2), the
+    same paths;
+  - on arbitrary weights, FP8 against BF16 (what FP8 moves): on the random model rings 5.1e-2,
+    logits 1.2e-1 to 1.7e-1 (relative RMS), 82-87% of the top-16 candidates shared; on the
+    checkpoint with synthetic taps (flat distributions, where the order moves most) logits 1.3e-1
+    to 2.9e-1, 76-89% of the candidates shared.
+- **Acceptance on real prompts** (`examples/draft_replay.rs` over recordings of the whole target
+  by `glm53f-forward`'s `examples/draft_record.rs`: five chat cases, thinking off, all 45 layers
+  with the official FP8 experts and FP8 KDA projections, teacher-forced on a reference reply; a
+  round at every reply position, both drafters on the same contexts; RTX 4090). Drafts kept per
+  round with all 7 verified, and tokens per round with the serving chain cut (τ 0.7):
+
+  | Case (rounds; the target's greedy pick is the reply's next token at) | BF16: kept, tokens | FP8: kept, tokens | FP8 − BF16 kept per round (standard error) |
+  |---|---:|---:|---:|
+  | code (1,974; 64%) | 1.66, 2.41 | 1.65, 2.40 | −0.003 (0.006) |
+  | prose (1,801; 48%) | 0.98, 1.77 | 0.98, 1.77 | +0.000 (0.003) |
+  | counting (1,348; 99%) | 6.48, 7.41 | 6.46, 7.40 | −0.025 (0.009) |
+  | structured (908; 100%) | 6.96, 7.95 | 6.96, 7.96 | +0.007 (0.005) |
+  | rewrite (726; 100%) | 6.67, 7.64 | 6.67, 7.64 | −0.001 (0.013) |
+  | all (6,757) | 3.69, 4.54 | 3.69, 4.54 | −0.005 (0.003) |
+
+  All five drafted at once (the W8A8 path): −0.002 (0.003) in all. Where the reply is not the
+  target's own greedy text (code, prose) a kept draft that leaves the reply ends the count, so
+  those rows are lower bounds for both drafters alike. The one change beyond two standard
+  errors, counting's −0.025 drafts a round, is 0.01 tokens a round with the chain cut.
+- **Speed** (`examples/dflash_bench.rs`, RTX 4090, contexts of 2,100 rows): one draft block 4.26
+  → 2.46 ms at one request, 4.66 → 4.76 ms at 4, 7.02 → 6.27 ms at 16; on the recorded contexts
+  4.23 → 2.56 ms at one request. Context appends of 8 rows 0.39 → 0.21 ms for one request, but
+  0.50 → 0.78 ms for 16 requests at once; a 2,048-row prompt 3.54 → 3.24 ms. Over 8 rows the
+  W8A8 GEMM's 128 × 128 tiles give the 4,096-wide projections 32 blocks, too few to fill the
+  GPU: several requests at once gain little, and a commit of many requests' rows costs more than
+  cuBLAS. A W8A8 GEMM for few rows (K split across blocks) would remove that (not built).
+- **Working memory** (reserved for drafts of 16 / 48 requests): 151.8 → 203.5 MiB / 382.8 →
+  500.7 MiB, mostly the BF16 output the tensor-core GEMM writes and the drafter does not read
+  (33 / 99 MiB).
+
 ## Integration
 
 The target forward and the scheduler drive the drafter through `seam::Drafter` (implemented by
@@ -298,7 +366,7 @@ measured acceptance.
   comparison with a running target. *(29 September 2026: on the whole model the drafter keeps
   51–71% of its verified drafts; `docs/PERFORMANCE.md` §0.)*
 - One CUDA stream (its own, or the target forward's), no graphs, no fused kernels; the GEMMs are
-  cuBLAS. Built and measured for
+  cuBLAS (the FP8 drafter's: `glm53f-layers`' FP8 kernels). Built and measured for
   sm_89 only; sm_120 is untested. *(29 September 2026: it also runs on the RTX 5090, `sm_120`, in
   every drafted measurement of `docs/PERFORMANCE.md` §0; its kernels' own benches there are not
   recorded.)*

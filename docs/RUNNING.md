@@ -285,10 +285,18 @@ v1.3.0 ported it). Greedy output is unchanged; sampled requests never copy.
     cargo run --release -p glm53f-coordinator --example copy_replay
   ```
 
-### The L2 prefetch
+### The FP8 drafter and the L2 prefetch
 
-An option that changes no bit, off until measured on the target hardware:
+Two options that change no committed token, both off until measured on the target hardware:
 
+- **`--drafter-fp8`** (`GLM53F_DRAFTER_FP8=1`, with `--drafter`): the DFlash2 drafter's GEMM
+  weights in FP8 E4M3 with 128 x 128 block scales, quantized at load, and its own FP8 copy of the
+  LM head for drafting; the target's LM head is unchanged (`crates/glm53f-dflash/README.md`, "The
+  FP8 drafter"). It moves only which tokens are drafted: the verify pass keeps a draft only where
+  it equals the target's pick. The drafter takes 0.42 GiB less device memory, 0.37 GiB net of
+  its larger working memory at 16 slots, which the KV pool gets ([SIZING.md](SIZING.md) §11). The
+  start-up log names it; the `[drafter]` lines (drafts kept, tokens a window) measure its
+  acceptance.
 - **`--l2-prefetch off|auto|<MiB>`** (`GLM53F_L2_PREFETCH`): in decode and verify passes of one
   lane (one request, or more rows than the decode lanes take), once a MoE layer's routed experts
   are out and its shared expert is queued, the forward's stream reads the first bytes of the next
@@ -317,10 +325,24 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_BENCH_EXCHANGE_US=360 GLM53F_BENCH_L2_PREFETCH_
 # with the prefetch off and on.
 GLM53F_CHECKPOINT_DIR=... GLM53F_DIGEST_DECODE=6 GLM53F_DIGEST_L2_PREFETCH_MIB=48 \
   cargo run --release -p glm53f-forward --features cuda --example logits_digest
+# The drafter's draft and append times, BF16 then FP8.
+GLM53F_DFLASH_DIR=... GLM53F_CHECKPOINT_DIR=... \
+  cargo run --release -p glm53f-dflash --features cuda --example dflash_bench
+# Acceptance on real prompts, BF16 against FP8: record the whole target teacher-forced on five chat
+# cases (all 45 layers, the official FP8 experts loaded on demand from the full checkpoint; about
+# five minutes a case on an RTX 4090; GLM53F_RECORD_CASES picks some), then replay both drafters
+# over the recordings.
+GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=<the official checkpoint> GLM53F_DFLASH_DIR=... \
+GLM53F_TOKENIZER=... GLM53F_RECORD_OUT=<dir> GLM53F_RECORD_KDA_FP8=1 \
+  cargo run --release -p glm53f-forward --features coordinator --example draft_record
+GLM53F_DFLASH_DIR=... GLM53F_CHECKPOINT_DIR=... \
+  cargo run --release -p glm53f-dflash --features cuda --example draft_replay -- <dir>
 ```
 
-The model-path tests take it through `GLM53F_TEST_NUMERICS` (`l2-prefetch`), and
-`tests/decode_lanes.rs` checks the prefetch against no prefetch bit for bit.
+The model-path tests take both through `GLM53F_TEST_NUMERICS` (`l2-prefetch`, `drafter-fp8`):
+`draft_lossless` and `copy_windows` with `drafter-fp8` check that speculation still changes no
+token. `tests/decode_lanes.rs` checks the prefetch against no prefetch bit for bit, and
+`glm53f-dflash`'s `tests/gpu_fp8.rs` the FP8 drafter's arithmetic.
 
 ## The KL gate
 
@@ -400,9 +422,9 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
 # Any model-path suite with a numerics option on (a comma-separated list of kda-fp8,
-# kda-fp8-pow2, kda-mxfp8, kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8, and l2-prefetch,
-# which changes no bit; the forward's tests otherwise run every option off, whatever
-# glm53f-serve's defaults), for example verify and commit with BF16 KDA states:
+# kda-fp8-pow2, kda-mxfp8, kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8, and l2-prefetch
+# and drafter-fp8, which change no committed token; the forward's tests otherwise run every option
+# off, whatever glm53f-serve's defaults), for example verify and commit with BF16 KDA states:
 GLM53F_TEST_NUMERICS=kda-state-bf16 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test verify_commit -- --nocapture
 
@@ -428,7 +450,8 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
-| `GLM53F_L2_PREFETCH` | `--l2-prefetch` | Decode and verify passes of one lane prefetch the next layer's weights into L2 while a MoE layer's experts are out: `off` (default), `auto` (three quarters of the L2) or MiB ([The L2 prefetch](#the-l2-prefetch)) |
+| `GLM53F_DRAFTER_FP8=1` | `--drafter-fp8` | With `--drafter`: the FP8 drafter, off by default ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
+| `GLM53F_L2_PREFETCH` | `--l2-prefetch` | Decode and verify passes of one lane prefetch the next layer's weights into L2 while a MoE layer's experts are out: `off` (default), `auto` (three quarters of the L2) or MiB ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 8,192) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |

@@ -22,7 +22,7 @@ wires this repository's crates together.
 | src/lib.rs, src/main.rs (snapshots) | `GLM53F_PREFIX_CACHE_ENTRIES` documented as an optional cap (none by default) and the rule snapshots follow without it; the start-up memory line gives a mark's pages and the cap, if any, instead of the banks' size at 24 | 2026-09-29 |
 | src/lib.rs, src/main.rs (numerics defaults) | The chunked KDA prefill and W8A16 on by default, as D8 before them, after the KL gate: `--kda-chain-prefill`, `--prefill-w8a8` and `0` in their variables turn them off; the start-up line names the numerics in force; the tests | 2026-09-29 |
 | src/main.rs, src/lib.rs, tests/dev_mode.rs (health) | The expert wire's first failure (`RemoteExperts::failure`) added to the engine's health (`CoordinatorEngine::with_health`), which the API's `GET /health` answers; its documentation; the end-to-end test: 200 while serving, 503 with the wire's failure after a rank is stopped and a request fails | 2026-09-29 |
-| src/lib.rs, src/main.rs (the L2 prefetch) | `--l2-prefetch off\|auto\|MiB` (`GLM53F_L2_PREFETCH`: `ForwardConfig::l2_prefetch`, `auto` three quarters of `device::l2_bytes`, stated in the start-up log), off by default; its documentation and test | 2026-09-29 |
+| src/lib.rs, src/main.rs (the FP8 drafter and the L2 prefetch) | `--drafter-fp8` (`GLM53F_DRAFTER_FP8=1`: `Dflash::load_with` with `fp8`, named in the start-up log) and `--l2-prefetch off\|auto\|MiB` (`GLM53F_L2_PREFETCH`: `ForwardConfig::l2_prefetch`, `auto` three quarters of `device::l2_bytes`, stated in the start-up log), both off by default; their documentation and test | 2026-09-29 |
 | Cargo.toml | The manifest | 2026-09-28 |
 
 ## Test data

@@ -25,10 +25,11 @@ Sources:
   `driver_types.h`, `library_types.h`, `cublas_api.h`). Function signatures and enumeration
   values only, re-declared in Rust; the libraries are linked from the toolkit.
 - **G**: `mmastrac/glm-5.3-flash-4x-gx10`, branch `perf-2026-09-27` @ `fb15786` (the next
-  kernels' weights prefetched into L2 while waiting for peers). No licence; the idea only, no code
-  copied.
+  kernels' weights prefetched into L2 while waiting for peers) and `2209649` (NVFP4 drafter
+  weights). No licence; ideas only, no code copied.
 - **P**: `knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4` @ `beca637`, `README.md` (an L2 prefetch of the
-  next layer's weights). The idea only, no code copied.
+  next layer's weights; block-FP8 drafter weights and an FP8 draft head). Ideas only, no code
+  copied.
 
 | Unit | Source (repo @ commit : path) | sha256 (source file) | Here | Delta | Pinned by | Date |
 |---|---|---|---|---|---|---|
@@ -55,6 +56,7 @@ Sources:
 | Copy windows through the forward (tests): chat requests rendered with the official template, run plain, speculative, and speculative with copy windows (`glm53f-coordinator`'s `copy`) through the shell's scheduler, token for token; tokens per verify round with copies off and on | this repository : `crates/glm53f-coordinator/src/copy.rs`, `src/scheduler.rs` | (this change) | `tests/copy_windows.rs`; `tests/drafting/mod.rs` (the memory check counts FP8 KDA projections' 4.26 GiB less) | Written here. The forward copies its context only with every layer loaded (`GLM53F_DRAFT_TEST_LAYERS=45`, which fits 24 GB with `GLM53F_TEST_NUMERICS=kda-fp8`); with the development default, which repeats nothing, the tests skip | `tests/copy_windows.rs` (one-lane, and two-lane prefill and decode) | 2026-09-29 |
 | Snapshots and the RAM tier over the real KV (tests): the shell's scheduler with a RAM tier and no bank cap serves the same three 600-token requests twice, on a pool with room for every mark and on one short of the third request's reservation; a running request's mark evicted to RAM, then (2026-09-29) a retained one for the third request's prompt mark, the tokens of the run without pressure, its prompt restored from RAM | this repository : `crates/glm53f-coordinator/src/pool.rs` (the eviction rule) | (this change) | `tests/paging.rs`; `src/serve.rs` (a doc line: admission evicts snapshot points) | Written here | `tests/paging.rs` (also with `GLM53F_TEST_NUMERICS=kda-state-bf16`) | 2026-09-29 |
 | L2 prefetch of the next layer's weights in decode and verify passes of one lane: after the shared expert, while the routed experts are out, the forward's stream reads the first `ForwardConfig::l2_prefetch` bytes of the next layer's weights (the head's after the last layer) in the order the layer reads them, one byte a line through L2 (`ld.global.cg`, `.L2::256B`); the plans, the kernel, `device::l2_bytes` | G, P (the idea) | — | `src/prefetch.rs`, `kernels/prefetch.cu`, `src/forward.rs` (`run_lanes`), `src/device.rs`, `src/cuda.rs`, `src/ffi.rs`, `examples/l2_prefetch_bench.rs`, `examples/decode_bench.rs` (the emulated exchange, the prefetch rounds), `examples/logits_digest.rs` (the decode tail) | **Written here.** Nothing is written; passes of two lanes never prefetch. | `tests/decode_lanes.rs` (`the_l2_prefetch_changes_no_bit`: logits, picks and every slot's state bit for bit, none in two lanes; `the_l2_prefetch_changes_no_bit_with_the_drafter`: rings and drafts too), `prefetch::tests`, `logits_digest` (the same decode digest with the prefetch on and off) | 2026-09-29 |
+| The FP8 drafter in the forward (`Dflash::load_with`, `new_with`, `is_fp8`), the tests' `drafter-fp8` and `l2-prefetch` options (`TestNumerics`, `default_arithmetic`), and recordings of the whole target teacher-forced on chat cases for the drafter's acceptance replay (`examples/draft_record.rs`) | D : `src/gpu.rs` (`GpuDrafter::fp8_with_head_on`); G, P (the idea) | — | `src/draft.rs`, `tests/common/mod.rs`, `tests/drafting/mod.rs`, `tests/lanes.rs`, `tests/goldens_chain.rs`, `examples/draft_record.rs` | **Written here.** | `tests/draft_lossless.rs`, `tests/draft.rs`, `tests/copy_windows.rs` with `GLM53F_TEST_NUMERICS=drafter-fp8` | 2026-09-29 |
 
 ## Test data
 
