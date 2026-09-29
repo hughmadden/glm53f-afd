@@ -7,5 +7,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
+# The rustc the release was built with, on the x86-64 and the arm64 host alike; no older one is tried.
+rust-version = "1.98.1"
 license = "MIT"
 repository = "https://github.com/hughmadden/glm53f-afd"

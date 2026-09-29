@@ -148,6 +148,16 @@ Every option, the environment and the tests: [docs/RUNNING.md](docs/RUNNING.md).
 **Build.** Rust (edition 2021) and the CUDA toolkit. The kernels are compiled ahead of time for one
 architecture, and each binary runs only on that one.
 
+The release was built with these toolchains:
+
+| | Coordinator | Ranks |
+|---|---|---|
+| Host | x86-64, Ubuntu 24.04, gcc 13.3 | DGX Spark (arm64), Ubuntu 24.04, gcc 13.3 |
+| CUDA toolkit | 12.8 (`nvcc` 12.8.93) | 13.0 (`nvcc` 13.0.88) |
+| Rust | 1.98.1 (`48a229cea`, 2026-09-01) | 1.98.1 (the same) |
+
+The workspace manifest's `rust-version` is that Rust; no `rust-toolchain` file pins it.
+
 ```sh
 # The coordinator: x86-64, CUDA 12.8 or later (the build needs no GPU)
 GLM53F_CUDA_ARCH=sm_120 cargo build --release -p glm53f-serve --features cuda,rdma

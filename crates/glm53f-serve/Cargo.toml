@@ -17,6 +17,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Coordinator daemon: GLM-5.3-Flash's coordinator weights on the GPU, the four expert ranks over the wire, the OpenAI-compatible API"
 publish = false
 

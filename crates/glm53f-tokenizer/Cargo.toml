@@ -17,6 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "GLM-5.3-Flash tokenizer (exact tokenizer.json BPE, streaming decode) and chat-template renderer"
 publish = false
 

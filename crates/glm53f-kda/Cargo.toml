@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "GLM-5.3-Flash KDA (Kimi delta attention): fused chain and replay kernels behind a C ABI, and an f32 CPU reference"
 publish = false
 

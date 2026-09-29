@@ -50,7 +50,17 @@ A rank, on a Spark (arm64; `sm_121` needs a CUDA 13 toolkit):
 GLM53F_CUDA_ARCH=sm_121 cargo build --release -p glm53f-rank --features cuda,rdma
 ```
 
+At run time it needs the CUDA 13 runtime (`libcudart.so.13`) and, for `rdma`, `libibverbs.so.1`.
+
 Each binary runs only on the architecture it was built for; the rank checks this at start.
+
+**Toolchains.** The release was built with:
+
+- the coordinator: CUDA 12.8 (`nvcc` 12.8.93) on x86-64;
+- a rank: CUDA 13.0 (`nvcc` 13.0.88) on a DGX Spark (arm64);
+- both: Rust 1.98.1 (`48a229cea`, 2026-09-01) and gcc 13.3, on Ubuntu 24.04.
+
+The workspace manifest's `rust-version` is that Rust; no `rust-toolchain` file pins it.
 
 ## Weights
 
