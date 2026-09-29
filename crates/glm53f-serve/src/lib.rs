@@ -74,6 +74,7 @@
 //! | `--prefill-rows R` | `GLM53F_PREFILL_ROWS` | 8192 | Rows of one prefill pass, every lane's together (at most 4,096 per lane: the wire's request cap) |
 //! | `--prefill-lanes N` | `GLM53F_PREFILL_LANES` | 4 | Lanes of a prefill pass, 1 to 4: from 2, each lane's attention overlaps the other lanes' experts on the ranks (N exchanges in flight over RDMA, as many as the ranks queue); 1 runs the pass serially ([Prefill rows and lanes](#prefill-rows-and-lanes)) |
 //! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | 2-16 | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (the prefill's first two: needs `--prefill-lanes 2` or more); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
+//! | `--decode-share S` | `GLM53F_DECODE_SHARE` | 0.2 | While prompts prefill, the share of the time the running requests keep, 0 to below 1: after each prefill round they step for S / (1 - S) of its time before the next; 0 gives them one step a round ([Decode during a long prefill](#decode-during-a-long-prefill)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--drafter-fp8` | `GLM53F_DRAFTER_FP8=1` | off | With the drafter: its weights in FP8 block-128 (quantized at load) and its own FP8 copy of the LM head for drafting ([The FP8 drafter](#the-fp8-drafter)); the target's head and every committed token unchanged |
@@ -214,6 +215,40 @@
 //! twice. The default range, 2-16 rows, won on the target hardware (C2 +8%, C4 +11%, C8 +3%,
 //! neutral at 16 and 48 streams and single-stream).
 //!
+//! # Decode during a long prefill
+//!
+//! A prefill pass holds the GPU for its whole length (8,192 rows: about 1.6 s on the target
+//! hardware), and running requests step only between passes. On `073b553` they got one step per
+//! prefill round of up to two passes: while a 64,596-token prompt prefilled, a stream generating
+//! 75.5 tok/s fell to 1.0 tok/s, with gaps of up to 3.96 s (docs/PERFORMANCE.md §0). Now a round
+//! runs one segment of each prompt at most (a long prompt's is one pass), and `--decode-share S`
+//! gives the running requests S of the time: after a round of t seconds they step for
+//! t S / (1 - S) seconds before the next round (`glm53f-coordinator`'s
+//! `SchedulerConfig::decode_share`). A stream keeps about S of its rate while a prompt prefills,
+//! and the prompt takes about 1 / (1 - S) times as long.
+//!
+//! - **Why a split of the time.** A pass carries one kind of row, and a decode row riding in a
+//!   prefill pass would wait for the whole pass (the lanes advance layer by layer together) and
+//!   take the prefill's arithmetic. Smaller passes would give one step per pass at a lower
+//!   prefill rate (the exchange sets the pace, and smaller lanes pay more per row) and would move
+//!   the prompt's pass cuts, so its bits. The share moves only when the steps run: the prompt's
+//!   passes are cut where they were (whole multiples of 8,192 rows), and a step computes what it
+//!   would at any other time (which requests share a step always depended on timing).
+//! - **The default, 0.2**, computed from the target's figures (a pass about 1.65 s; a step about
+//!   41 ms and 3.1 tokens, 75.5 tok/s alone; the 64,596-token prompt in 8 passes, about 13 s):
+//!   the stream keeps about 16 tok/s (21%), and the prompt's time to first token grows by about
+//!   24%. 0.15: 12.5 tok/s and +18%; 0.25: 19.5 tok/s and +31%; 0 (one step a round): 1.8 tok/s
+//!   and +2%. A short prompt that arrives meanwhile waits for the pass in hand and the steps
+//!   owed, about 2.2 s at most (3.07 s was measured with rounds of two passes). A prompt with
+//!   nothing decoding prefills as before.
+//! - **On the development GPU** (docs/PERFORMANCE.md §0's probe against `--dev-layers 0-4` and
+//!   four rank daemons on one RTX 4090: its 64,596-token prompt in 8 passes of about 0.6 s, and
+//!   `GLM53F_PREFILL_SEGMENT_MS=756`, so that a round held two passes before, as on the target):
+//!   a stream decoding 198 tok/s kept 35.0 tok/s (17.7%) with 0.2, against 2.3 with 0 and 1.4
+//!   before; its longest gap fell from 1.2 s to one pass (0.58 s); the prompt's first token came
+//!   17% later than before (20% than with 0); the stream's 3,000 tokens and the prompt's reply were
+//!   the same in every run.
+//!
 //! # Copy windows
 //!
 //! Coding agents' output repeats its context: a file written back with an edit, an edit call
@@ -288,6 +323,7 @@ options:
                       Authorization: Bearer <key> (401 otherwise); /health stays open
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
   --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
+  --decode-share <s>  while prompts prefill, the running requests' share of the time (0.2)
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
   --drafter-fp8       with the drafter: FP8 drafter weights and its own FP8 LM head copy (off)
@@ -449,6 +485,9 @@ pub struct Options {
     /// Decode and verify passes of `.0 ..= .1` rows run in two lanes (`.0` 0: never), the
     /// prefill's first two.
     pub decode_lanes: (usize, usize),
+    /// While prompts prefill, the share of the time the running requests keep
+    /// (`glm53f_coordinator::SchedulerConfig::decode_share`).
+    pub decode_share: f64,
     /// The DFlash2 drafter's directory (none: no speculative decoding).
     pub drafter: Option<PathBuf>,
     /// With the drafter: copy windows for greedy requests
@@ -605,6 +644,10 @@ impl Options {
             Some(v) => parse_decode_lanes(&v)?,
             None => (2, 16),
         };
+        let mut decode_share = match env("GLM53F_DECODE_SHARE") {
+            Some(v) => number("GLM53F_DECODE_SHARE", &v)?,
+            None => 0.2,
+        };
         let mut dev_layers = None;
         let mut drafter = env("GLM53F_DFLASH_DIR").map(PathBuf::from);
         let mut copy_windows = match env("GLM53F_COPY_WINDOWS") {
@@ -647,6 +690,7 @@ impl Options {
                     decode_lanes = parse_decode_lanes(&val()?)?;
                     decode_lanes_set = true;
                 }
+                "--decode-share" => decode_share = number(k, &val()?)?,
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--copy-windows" => copy_windows = on_off(k, &val()?)?,
                 "--l2-prefetch" => l2_prefetch = parse_l2_prefetch(&val()?)?,
@@ -701,6 +745,12 @@ impl Options {
                 prefill_lanes * MAX_LANE_ROWS
             ));
         }
+        if !(0.0..1.0).contains(&decode_share) {
+            return Err(format!(
+                "--decode-share {decode_share}: from 0 to below 1 (the running requests' share of \
+                 the time while prompts prefill)"
+            ));
+        }
         if max_context == Some(0) || dev_layers == Some(0) {
             return Err("--max-context and --dev-layers take positive values".into());
         }
@@ -726,6 +776,7 @@ impl Options {
             prefill_rows,
             prefill_lanes,
             decode_lanes,
+            decode_share,
             drafter,
             copy_windows,
             drafter_fp8,
@@ -1286,6 +1337,35 @@ mod tests {
             None,
             "a missing file is read_api_key's error"
         );
+    }
+
+    #[test]
+    fn the_decode_share_is_a_fifth_unless_set() {
+        let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        let share = |a: &str, env: &dyn Fn(&str) -> Option<String>| {
+            Options::parse(&args(&format!("--checkpoint /c {a}")), env).map(|o| o.decode_share)
+        };
+        assert_eq!(share("", &env), Ok(0.2));
+        assert_eq!(share("--decode-share 0", &env), Ok(0.0));
+        let env2 = |k: &str| match k {
+            "GLM53F_DECODE_SHARE" => Some("0.35".to_string()),
+            other => env(other),
+        };
+        assert_eq!(share("", &env2), Ok(0.35));
+        // The flag wins over the environment.
+        assert_eq!(share("--decode-share 0.1", &env2), Ok(0.1));
+        // From 0 to below 1.
+        for bad in ["1", "1.5", "-0.1", "NaN", "inf", "x"] {
+            assert!(
+                share(&format!("--decode-share {bad}"), &env).is_err(),
+                "{bad}"
+            );
+        }
+        let bad_env = |k: &str| match k {
+            "GLM53F_DECODE_SHARE" => Some("1".to_string()),
+            other => env(other),
+        };
+        assert!(share("", &bad_env).is_err());
     }
 
     #[test]

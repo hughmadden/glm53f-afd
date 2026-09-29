@@ -10,10 +10,17 @@
 //! one that does not fit on an idle device is refused. The bounded queue in front of the
 //! scheduler (`crate::queue`) answers 429 before a response starts.
 //!
-//! **Prefill** (perf reset Q1): segments round robin over the prompts in flight until a round
-//! has spent about `segment_ms` (2 s), then one step for the running requests. A burst of short
-//! prompts prefills in one pass (perf reset B1); a long prompt gets one segment per round, in
-//! multiples of `seg_quantum` tokens sized from the measured rate.
+//! **Prefill** (perf reset Q1): segments round robin over the prompts in flight, one each at most,
+//! until a round has spent about `segment_ms` (2 s), then the running requests step. A burst of
+//! short prompts prefills in one pass (perf reset B1); a long prompt gets one segment per round,
+//! in multiples of `seg_quantum` tokens sized from the measured rate.
+//!
+//! **Decode during a long prefill.** The running requests keep a share of the time
+//! ([`SchedulerConfig::decode_share`]): after a prefill round of `t` seconds they step for
+//! `t * share / (1 - share)` seconds (one step at least) before the next round. A stream then
+//! keeps about that share of its rate while a long prompt prefills, and the prompt takes about
+//! `1 / (1 - share)` times as long. Neither changes what a pass computes: the prompt's passes are
+//! cut where they were, and only the steps' timing moves.
 //!
 //! **KV reuse** (perf reset K3, `crate::pool`): every prompt end and completion end of 512+
 //! tokens is kept on the device as a snapshot point (a device copy); a new prompt resumes at its
@@ -105,6 +112,11 @@ pub struct SchedulerConfig {
     pub bank: usize,
     /// The longest a running request waits for its next step while prompts prefill.
     pub segment_ms: f64,
+    /// The share of the time the running requests keep while prompts prefill: after a prefill
+    /// round of `t` seconds they step for `t * decode_share / (1 - decode_share)` seconds (one
+    /// step at least) before the next round. From 0 (one step a round) to below 1. 0 here; the
+    /// daemon's `--decode-share` decides.
+    pub decode_share: f64,
     /// Prefill segments are whole multiples of this (8,192: two 4,096-row chunks in MiMo).
     pub seg_quantum: usize,
     /// The longest prefill segment.
@@ -137,6 +149,7 @@ impl SchedulerConfig {
             min_retain: 512,
             bank: 0,
             segment_ms: 2000.0,
+            decode_share: 0.0,
             seg_quantum: 8192,
             seg_max: 65536,
             out_min: 1024,
@@ -273,6 +286,9 @@ pub struct Scheduler<M: ModelForward> {
     rx: mpsc::Receiver<Job>,
     /// The prefill rate at the current context length, which sizes the next segment.
     sec_per_token: f64,
+    /// Seconds of steps the running requests are owed before the next prefill round
+    /// ([`SchedulerConfig::decode_share`]).
+    owed: f64,
     spec: bool,
     pub stats: SchedStats,
 }
@@ -285,11 +301,15 @@ impl<M: ModelForward> Scheduler<M> {
         let limits = model.limits();
         let spec = cfg.spec && limits.block > 1;
         let pool = Pool::new(slots, cache, cfg.bank, cfg.min_retain, cfg.granularity);
-        eprintln!("[coordinator] decode: {}; {}",
+        eprintln!("[coordinator] decode: {}; {}; {}",
             match (spec, cfg.copy_windows) {
                 (true, true) => format!("speculative (block {}), copy windows for greedy requests", limits.block),
                 (true, false) => format!("speculative (block {})", limits.block),
                 (false, _) => "one token per step".to_string(),
+            },
+            match cfg.decode_share {
+                s if s > 0.0 => format!("while prompts prefill, the running requests keep {:.0}% of the time", 100.0 * s),
+                _ => "one step between prefill rounds".to_string(),
             },
             match cfg.bank {
                 0 => "device snapshots uncapped (to RAM only when an incoming request or a new snapshot needs their \
@@ -308,6 +328,7 @@ impl<M: ModelForward> Scheduler<M> {
             stalled: None,
             rx,
             sec_per_token: 1.0 / 4000.0,
+            owed: 0.0,
             spec,
             stats: SchedStats::default(),
         }
@@ -358,14 +379,26 @@ impl<M: ModelForward> Scheduler<M> {
         (self.cfg.clock)()
     }
 
-    /// One pass of the loop: admission, one prefill round, one step for the running requests.
-    /// With `wait`, blocks for a job while nothing is in flight. False once the job channel is
-    /// closed (the engine is gone).
+    /// One pass of the loop: admission, one prefill round (none while the running requests are
+    /// owed steps, [`SchedulerConfig::decode_share`]), one step for the running requests. With
+    /// `wait`, blocks for a job while nothing is in flight. False once the job channel is closed
+    /// (the engine is gone).
     pub fn step(&mut self, wait: bool) -> bool {
         if !self.admit(wait) {
             return false;
         }
-        self.prefill_round();
+        if self.owed <= 0.0 || self.active.is_empty() {
+            let t0 = self.now();
+            self.prefill_round();
+            // The running requests' share of the round's time, owed while a prompt waits for the
+            // next round.
+            let share = self.cfg.decode_share;
+            self.owed = if self.active.is_empty() || self.prefilling.is_empty() {
+                0.0
+            } else {
+                (self.now() - t0) * share / (1.0 - share)
+            };
+        }
         // With a bank cap: overflow from the last step's retirements goes to RAM.
         self.pool.enforce_banks(&mut self.active);
         // Retire cancelled requests before spending a step on them.
@@ -384,11 +417,13 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let drafts = if self.spec { self.limits.drafts() } else { 0 };
         self.pool.grow_active(&self.model, &mut self.active, &mut self.prefilling, drafts);
+        let t0 = self.now();
         if self.spec {
             self.spec_step();
         } else {
             self.decode_step();
         }
+        self.owed -= self.now() - t0;
         true
     }
 
@@ -491,9 +526,9 @@ impl<M: ModelForward> Scheduler<M> {
         true
     }
 
-    /// Prefill (perf reset Q1): segments round robin over the prompts in flight until this round
-    /// has spent about `segment_ms`. A burst of short prompts prefills in one round (they start
-    /// decoding together); a long prompt gets one segment per round.
+    /// Prefill (perf reset Q1): segments round robin over the prompts in flight, one each at most,
+    /// until this round has spent about `segment_ms`. A burst of short prompts prefills in one
+    /// round (they start decoding together); a long prompt gets one segment per round.
     fn prefill_round(&mut self) {
         let seg_target = self.cfg.segment_ms / 1000.0;
         let round = self.now();
@@ -562,7 +597,12 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
-        while let Some(mut p) = self.prefilling.pop_front() {
+        // One segment of each prompt at most: the running requests step between two segments of
+        // a prompt.
+        for _ in 0..self.prefilling.len() {
+            let Some(mut p) = self.prefilling.pop_front() else {
+                break;
+            };
             if p.cancel.load(Ordering::Relaxed) {
                 eprintln!("[coordinator] client gone: parking a prefill at {} of {} tokens", p.done, p.ids.len());
                 self.pool.park(&self.model, p, &mut self.active, &mut self.prefilling);

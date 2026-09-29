@@ -239,10 +239,13 @@ gate):
   four-plane return over the ranks' TCP mesh, so it is off. The RDMA mesh is built but untested.
 
 **Known limitations:**
-- **A running stream nearly stops while a long prompt prefills.** While a 64.6K-token prompt
-  prefilled (16.5 s), a stream already generating got 1.0 tok/s, with gaps of up to 3.96 s. Short
-  requests sent meanwhile got their first tokens in 1.1–3.1 s. The fix is a scheduler change
-  (bounded prefill slices, or a decode step between prefill passes), not built yet.
+- **A running stream slows while a long prompt prefills.** On `073b553`, while a 64.6K-token
+  prompt prefilled (16.5 s), a stream already generating got 1.0 tok/s, with gaps of up to 3.96 s;
+  short requests sent meanwhile got their first tokens in 1.1–3.1 s. Since then a prefill round
+  holds one pass of a long prompt (about 1.6 s), and the running requests keep a share of the
+  time between rounds (`--decode-share`, 0.2 by default). Computed from that run's figures at
+  today's prefill rate: the stream keeps about 21% of its rate, and the prompt's first token comes
+  about 24% later. Not yet measured on the target hardware.
 - **At 48 slots the default prefill pair costs context:** its workspace grows with the slots, and
   leaves room for about 570K tokens at 48 (computed; 851K without it).
 

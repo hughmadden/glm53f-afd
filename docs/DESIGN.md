@@ -210,7 +210,10 @@ to about C1 throughput. This design rules that out.
 
 **Prefill.**
 - Long prompts run as a chunk × layer wavefront.
-- In segments of about 2 s, decode rounds for the other slots run in between.
+- In rounds of one segment per prompt within about 2 s (a long prompt's is one pass of 8,192
+  rows on the target hardware), with the other slots' decode steps in between: they keep a
+  share of the time (`--decode-share`, 0.2 by default), so a running stream slows but does not
+  stop while a long prompt prefills.
 - Short prompts that arrive together prefill in one pass.
 - **Lanes** (as built). A prefill pass is cut into 2 to 4 lanes
   (`--prefill-lanes`) that take turns on the coordinator's GPU, layer by layer:

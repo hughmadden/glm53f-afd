@@ -183,11 +183,16 @@ The restore itself took 21.4 ms. A 36K-token snapshot's store to RAM took 9.3 ms
 - 20 stores in all, every one such an eviction; one restore; no errors.
 - Not yet exercised on the target: the page-pressure path, where an incoming request needs pages the pool lacks. With 16 slots and 36K-token prompts the slots ran out long before the 1.62M-token pool.
 
-**Known limitation: a running stream nearly stops while a long prompt prefills** (29 Sep, `073b553`, before the prefill pair; the design of the prefill-blocking probe of mmastrac's recipe, `experimental/quality/prefill_block.py` at `0784b1b`, reimplemented):
+**Known limitation: a running stream nearly stopped while a long prompt prefilled** (29 Sep, `073b553`, before the prefill pair; the design of the prefill-blocking probe of mmastrac's recipe, `experimental/quality/prefill_block.py` at `0784b1b`, reimplemented):
 - A 64,596-token prompt, sent while another stream was generating, prefilled in 16.52 s (3,911 tok/s).
 - Meanwhile the running stream got 1.0 tok/s, with gaps of up to 3.96 s (75.5 tok/s before, 67.8 after).
 - Six short requests sent during the prefill got their first tokens in 1.1–3.1 s, all before the long prompt's: new requests are admitted between its passes.
-- The fix belongs to the scheduler and is not built: bounded prefill slices, or a decode step between prefill passes.
+- Why: the running requests got one step per prefill round, and a round went on until it had spent 2 s, so with passes of 1.6–2 s it held two.
+- The fix is built and not yet measured here. A round runs one segment of each prompt at most, so it holds one pass of a long prompt, and the running requests keep a share of the time, `--decode-share` (0.2 by default): after a round of t seconds they step for t × 0.25 seconds. Computed from this run's figures (a pass about 1.65 s; a step about 41 ms and 3.1 tokens; the prompt in 8 passes, about 13 s at today's 5.0K tok/s):
+  - the stream keeps about 16 tok/s (21%);
+  - the prompt's first token comes about 24% later, about 16 s;
+  - a short request waits about 2.2 s at most.
+- `crates/glm53f-serve/src/lib.rs` gives other shares; `--decode-share 0` gives one step a round (about 1.8 tok/s, +2%).
 
 **Against the public four-Spark recipes** (their reported figures; this engine as above). Both
 recipes run on four GB10 systems alone, with no RTX 5090, so the differences belong to the added

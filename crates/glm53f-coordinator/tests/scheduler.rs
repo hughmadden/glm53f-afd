@@ -83,8 +83,8 @@ fn long_prompts_prefill_in_segments_between_decode_steps() {
     assert_eq!(tokens(&rr).unwrap(), greedy(&h, &r, 200));
     assert_eq!(tokens(&rl).unwrap(), greedy(&h, &l, 4));
     // The long prompt went in segments of whole quanta, sized from the measured rate, and the
-    // running request kept stepping: between two of its decode steps, at most one round of
-    // prefill (the 20 ms target, overshot by at most one segment).
+    // running request kept stepping: between two of its decode steps, one round of prefill, which
+    // runs one segment of each prompt at most.
     let calls = h.calls();
     let segs: Vec<usize> = calls
         .iter()
@@ -108,9 +108,92 @@ fn long_prompts_prefill_in_segments_between_decode_steps() {
             _ => {}
         }
     }
-    // 20 ms at 0.25 ms per row plus 1 ms per pass: under 80 rows a round, plus one segment.
-    assert!(worst <= 160, "a decode step waited behind {worst} prefill rows");
-    assert!(gaps >= segs.len() / 2, "decode steps between segments: {gaps} for {} segments", segs.len());
+    // 20 ms at 0.25 ms per row plus 1 ms per pass: segments of 64 rows (17 ms), one a round, and a
+    // decode step after every segment.
+    assert!(worst <= 80, "a decode step waited behind {worst} prefill rows");
+    assert_eq!(gaps, segs.len(), "decode steps between segments: {gaps} for {} segments", segs.len());
+}
+
+/// While a long prompt prefills, a running request keeps its share of the time
+/// (`SchedulerConfig::decode_share`): after each prefill round it steps for `share / (1 - share)`
+/// of the round's time (one step at least), greedy and speculative alike. The prompt's segments
+/// stay the very same (the share moves only when the steps run), no step waits behind more than
+/// one segment, the prompt completes, and every token is serial decoding's. With nothing running,
+/// the prompt prefills without a pause.
+#[test]
+fn running_requests_keep_their_share_of_the_time_while_a_long_prompt_prefills() {
+    type Tweak = fn(&mut glm53f_coordinator::SchedulerConfig);
+    // The mock's simulated cost of a call: 1 ms a pass and 0.25 ms a row (drafts and commits free).
+    let ms = |c: &Call| -> f64 {
+        let rows: usize = match c {
+            Call::Prefill(v) | Call::Verify(v) => v.iter().map(|x| x.1).sum(),
+            Call::Decode(v) => v.len(),
+            Call::Draft(_) | Call::Commit(_) => return 0.0,
+        };
+        1.0 + 0.25 * rows as f64
+    };
+    let (g, l) = (prompt(50, 20), prompt(51, 2000));
+    let shares: [(f64, Tweak); 3] =
+        [(0.0, |c| c.decode_share = 0.0), (0.2, |c| c.decode_share = 0.2), (0.5, |c| c.decode_share = 0.5)];
+    for block in [0, 8] {
+        let mut segments = Vec::new();
+        for (share, tweak) in shares {
+            let mut h = harness(Setup { block, tweak, ..Setup::default() });
+            let rg = h.submit(&g, 1500, None);
+            for _ in 0..3 {
+                h.sched.step(false);
+            }
+            let rl = h.submit(&l, 4, None);
+            h.clear_log();
+            h.run();
+            assert_eq!(tokens(&rg).unwrap(), greedy(&h, &g, 1500), "block {block}, share {share}");
+            assert_eq!(tokens(&rl).unwrap(), greedy(&h, &l, 4), "block {block}, share {share}");
+            // Every prefill pass is the long prompt's (the running request prefilled before).
+            let calls = h.calls();
+            let pre: Vec<usize> = (0..calls.len()).filter(|&i| matches!(calls[i], Call::Prefill(_))).collect();
+            let rows = |i: usize| match &calls[i] {
+                Call::Prefill(v) => v[0].1,
+                _ => 0,
+            };
+            segments.push(pre.iter().map(|&i| rows(i)).collect::<Vec<_>>());
+            // The steps between consecutive segments, and their share of the time over every round
+            // but the last (the prompt then starts; nothing waits for another round).
+            let (mut prefill, mut decode) = (0.0, 0.0);
+            for w in pre.windows(2) {
+                let steps = &calls[w[0] + 1..w[1]];
+                let n = steps.iter().filter(|c| matches!(c, Call::Decode(_) | Call::Verify(_))).count();
+                assert!(n >= 1, "block {block}, share {share}: no step between segments at calls {w:?}");
+                if share == 0.0 {
+                    assert_eq!(n, 1, "block {block}: one step a round without a share");
+                }
+                prefill += ms(&calls[w[0]]);
+                decode += steps.iter().map(ms).sum::<f64>();
+            }
+            let kept = decode / (prefill + decode);
+            eprintln!(
+                "block {block}, share {share}: {} segments, the running request kept {:.1}% of the time",
+                pre.len(),
+                100.0 * kept
+            );
+            if share > 0.0 {
+                // At least the share; at most one step a round more.
+                assert!(kept >= share && kept < share + 0.1, "block {block}, share {share}: kept {kept:.3}");
+            }
+            // One segment at most between two steps (64 rows: 17 ms of the 20 ms target).
+            assert!(pre.iter().all(|&i| rows(i) <= 64), "block {block}, share {share}: {:?}", segments.last());
+        }
+        assert!(segments.iter().all(|s| *s == segments[0]), "block {block}: the segments moved: {segments:?}");
+        assert!(segments[0].len() >= 30 && segments[0].iter().sum::<usize>() == 2000, "{:?}", segments[0]);
+    }
+    // Nothing running: the prompt prefills without a step between its segments.
+    let mut h = harness(Setup { tweak: |c| c.decode_share = 0.5, ..Setup::default() });
+    let rl = h.submit(&l, 4, None);
+    h.run();
+    assert_eq!(tokens(&rl).unwrap(), greedy(&h, &l, 4));
+    let calls = h.calls();
+    let first_step = calls.iter().position(|c| matches!(c, Call::Decode(_))).unwrap();
+    assert!(calls[..first_step].iter().all(|c| matches!(c, Call::Prefill(_))));
+    assert_eq!(calls[..first_step].iter().map(|c| if let Call::Prefill(v) = c { v[0].1 } else { 0 }).sum::<usize>(), 2000);
 }
 
 #[test]

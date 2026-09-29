@@ -226,6 +226,15 @@ names the options on.
   so it changes timing only. It overlaps one lane's coordinator work with the other's routed
   experts, but each lane reads the coordinator's weights and the ranks read the experts each
   lane's rows name, so two lanes of many rows read most experts twice: measure it.
+- **Decode during a long prefill.** A prefill pass holds the GPU for its whole length (about
+  1.6 s for 8,192 rows on the target hardware); running requests step between passes. A round
+  of prefill runs one segment of each prompt at most (a long prompt's is one pass, within
+  `GLM53F_PREFILL_SEGMENT_MS`, 2 s), and `--decode-share S` (0.2 by default) then gives the
+  running requests S of the time: after a round of t seconds they step for t S / (1 - S) seconds
+  before the next. A stream keeps
+  about S of its rate while a long prompt prefills, and the prompt takes about 1 / (1 - S) times
+  as long; `--decode-share 0` gives one step a round. It changes timing only: the prompt's passes
+  are cut where they were. `crates/glm53f-serve/src/lib.rs` gives the numbers behind the default.
 - **Slots.** `--slots` (16 by default) sizes each slot's fixed state (about 113 MiB with the
   drafter and the default BF16 KDA states; 181 MiB with `--kda-state-f32`)
   and, with the drafter, the verify pass: every slot's window of 8 rows, capped by the step's row
@@ -498,6 +507,7 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 8,192) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |
+| `GLM53F_DECODE_SHARE` | `--decode-share` | While prompts prefill, the share of the time the running requests keep, 0 to below 1 (default 0.2; 0: one step a prefill round) ([Decode during a long prefill](#prefill-lanes-and-device-memory)) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
 | `GLM53F_KDA_FP8_POW2=1` | `--kda-fp8-pow2` | Numerics under test, off by default: D2 with power-of-two block scales (the same layout, kernels and bytes; 82-89% of the q, k, v and o weights kept exactly, [SIZING.md](SIZING.md) §10, [KL-GATE.md](KL-GATE.md) §6e) |
 | `GLM53F_KDA_MXFP8=1` | `--kda-mxfp8` | Numerics under test, off by default: D2 as MXFP8, an E8M0 scale per row and 32 values of K (the MXFP8 GEMMs; 4.13 GiB less rather than 4.26; the same error as `--kda-fp8-pow2` on these weights). Of the three KDA flags the last given sets the scales; in the environment `GLM53F_KDA_MXFP8` wins |
