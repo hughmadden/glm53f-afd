@@ -83,6 +83,26 @@ The workspace manifest's `rust-version` is that Rust; no `rust-toolchain` file p
   checkpoint. The EXL3 K4 checkpoint is `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (mirrored at
   `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`).
 
+  **The images the published figures ran on** are listed by SHA-256 in
+  [rank-images.sha256](rank-images.sha256): 168 files (four ranks, layers 3 to 44, 913,932,288
+  bytes each). They were cut from `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` at `25a44fdb`, with
+  `--source "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw@25a44fdb"`.
+
+  - **The pinned checkpoint cuts the same images.** `brandonmusic/GLM-5.3-Flash-tr3-4bpw` at
+    `a5fee929` and the mirror at `25a44fdb` hold the same weights: each of the 123 files stored in
+    Git LFS (the 120 weight shards, `model.safetensors.index.json`, `quantization_config.json`
+    and `tokenizer.json`) has the same SHA-256 and size in both, and so does the revision the
+    mirror's `MIRROR.json` names as its upstream (`brandonmusic` at `5ab363a8`). The Hub lists
+    them: `https://huggingface.co/api/models/<repo>/tree/<revision>?recursive=1` gives each LFS
+    file's `oid`, its SHA-256, and the checkpoint's own `SHA256SUMS` (the same file in both
+    repositories) agrees. A manifest cut from either differs only in the `source` text you
+    pass.
+  - **Slicing is deterministic.** Layers 3 and 4, cut again on x86-64 from a fetch of just those
+    layers (`scripts/fetch_tensors.py --select experts:3,4`), gave the hashes of the Sparks'
+    arm64 cuts.
+  - **Check a cut** with `sha256sum -c <path>/rank-images.sha256` from the directory that
+    holds `rank-0` to `rank-3` (the daemon's own check at start is the manifest's).
+
 - **Drafter** (optional, `--drafter`): the DFlash2 checkpoint `incoai/GLM-5.3-Flash-DFlash2`
   (`config.json`, `model.safetensors`), on the coordinator.
 

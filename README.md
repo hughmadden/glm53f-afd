@@ -179,11 +179,15 @@ target, and build for it with `GLM53F_CUDA_ARCH=sm_89`
 | For | Hugging Face repository | Revision |
 |---|---|---|
 | The coordinator: every non-expert tensor, with `config.json`, `tokenizer.json` and `chat_template.jinja` | [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash), the official FP8 checkpoint. The whole checkpoint works; `python3 scripts/fetch_tensors.py --select nonexpert` fetches only these tensors | `eb9eb208` |
-| The ranks: the routed experts in EXL3 K4 | [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw) (the same weights are mirrored at [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)) | `a5fee929` |
+| The ranks: the routed experts in EXL3 K4 | [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw) (the same weights, byte for byte, are mirrored at [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw), revision `25a44fdb`) | `a5fee929` |
 | The drafter (optional: `--drafter`) | [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) | `bf582e4e` |
 
 Any Hugging Face client fetches them, for example `hf download <repo> --revision <revision>
 --local-dir <dir>`.
+
+The rank images the published figures ran on were cut from the mirror's revision `25a44fdb`; their
+SHA-256 are in [docs/rank-images.sha256](docs/rank-images.sha256), and the pinned revision above cuts
+the same images ([docs/RUNNING.md](docs/RUNNING.md#weights)).
 
 **Run.** The examples use documentation addresses (192.0.2.0/24) for the fabric.
 
