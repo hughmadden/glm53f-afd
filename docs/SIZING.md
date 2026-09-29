@@ -316,3 +316,24 @@ per 128 × 128 and MXFP8) are 1.2e-2 apart in decode, so that is this proxy's fl
 development model's sensitivity is not the real model's; the KL gate on the target hardware
 decides.
 
+
+## 11. The L2 prefetch (29 September 2026)
+
+A speed option that changes no bit, **off by default** and a flag of `glm53f-serve` with an
+environment fallback ([RUNNING.md](RUNNING.md), "The L2 prefetch"). It needs no KL gate; it waits
+for speed measured on the target hardware. Development-GPU figures are an RTX 4090 shared with
+other work.
+
+**The L2 prefetch** (`--l2-prefetch off|auto|<MiB>`, `GLM53F_L2_PREFETCH`;
+`crates/glm53f-forward/src/prefetch.rs`).
+- Memory: none (a plan of device ranges and one kernel on the forward's stream).
+- The kernel against one KDA layer's BF16 GEMVs (`l2_prefetch_bench`, L2 flushed, a 300 µs idle
+  gap): 48 MiB take 0.077 ms and save 0.060 ms of the layer's 0.320 ms at one row (0.056 of 0.368
+  at eight); 96 MiB take 0.151 ms and save 0.079 ms. `prefetch.global.L2` hints save about a
+  seventh as much (the memory system drops most of them).
+- Decode steps of the whole model (45 layers, BF16 KDA projections, `decode_bench`, each MoE
+  layer's routed experts back 360 µs after the call, the prefetch at 48 MiB; median of 9 rounds of
+  30 steps): one request 32.65 → 30.11 ms (−7.8%), four requests in one lane −5.4%, an 8-row
+  verify −4.5%. At 54 MiB (`auto` here): −8.1% and −5.2%; four requests in two lanes, which never
+  prefetch, unchanged. The gain depends on how long the real exchange leaves the GPU idle, which
+  only the target hardware shows.

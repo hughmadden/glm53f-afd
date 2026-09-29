@@ -19,7 +19,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const SOURCES: [&str; 2] = ["gemv_bf16.cu", "glue.cu"];
+const SOURCES: [&str; 3] = ["gemv_bf16.cu", "glue.cu", "prefetch.cu"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

@@ -285,6 +285,43 @@ v1.3.0 ported it). Greedy output is unchanged; sampled requests never copy.
     cargo run --release -p glm53f-coordinator --example copy_replay
   ```
 
+### The L2 prefetch
+
+An option that changes no bit, off until measured on the target hardware:
+
+- **`--l2-prefetch off|auto|<MiB>`** (`GLM53F_L2_PREFETCH`): in decode and verify passes of one
+  lane (one request, or more rows than the decode lanes take), once a MoE layer's routed experts
+  are out and its shared expert is queued, the forward's stream reads the first bytes of the next
+  layer's weights through L2, in the order that layer reads them
+  (`crates/glm53f-forward/src/prefetch.rs`). Every result is bit for bit the same, and the
+  prefetch (77 us at 48 MiB on an RTX 4090) ends long before the exchange it overlaps. Passes
+  of two lanes, where the other lane's attention fills the exchange, never prefetch. `auto` is
+  three quarters of the GPU's L2 (72 MiB on the RTX 5090); the start-up log's `decode and verify
+  passes` line states it. What it gains depends on how long the real exchange leaves the GPU
+  idle, which one GPU can only emulate: compare single-stream tok/s and the `STEP` lines
+  (`GLM53F_PROFILE=1`) with it off and on, on the target hardware.
+
+On one GPU:
+
+```sh
+# The prefetch kernel against one KDA layer's BF16 GEMVs: L2 flushed, a prefetch of 0-96 MiB, an
+# idle gap, the GEMVs at 1 and 8 rows; per prefetch mode and stride.
+cargo run --release -p glm53f-forward --features cuda --example l2_prefetch_bench
+# Decode steps of layers 0-4 (GLM53F_BENCH_LAYERS=45: all) at 1, 4 and 8 requests
+# (GLM53F_BENCH_BATCHES) and an 8-row verify, the exchange emulated (each MoE layer's routed
+# experts back 360 us after the call), the prefetch off against on (GLM53F_BENCH_AB_LANES=1:
+# the decode passes of two requests or more in two lanes, which never prefetch).
+GLM53F_CHECKPOINT_DIR=... GLM53F_BENCH_EXCHANGE_US=360 GLM53F_BENCH_L2_PREFETCH_MIB=48 \
+  cargo run --release -p glm53f-forward --features cuda --example decode_bench
+# Bit for bit: the decode digest (6 decode steps and 6 verify passes after the prompt) is the same
+# with the prefetch off and on.
+GLM53F_CHECKPOINT_DIR=... GLM53F_DIGEST_DECODE=6 GLM53F_DIGEST_L2_PREFETCH_MIB=48 \
+  cargo run --release -p glm53f-forward --features cuda --example logits_digest
+```
+
+The model-path tests take it through `GLM53F_TEST_NUMERICS` (`l2-prefetch`), and
+`tests/decode_lanes.rs` checks the prefetch against no prefetch bit for bit.
+
 ## The KL gate
 
 `glm53f-score` runs the engine's side of the gate against the BF16 teacher panel
@@ -363,9 +400,9 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
 # Any model-path suite with a numerics option on (a comma-separated list of kda-fp8,
-# kda-fp8-pow2, kda-mxfp8, kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8; the forward's tests
-# otherwise run every option off, whatever glm53f-serve's defaults), for example verify and commit
-# with BF16 KDA states:
+# kda-fp8-pow2, kda-mxfp8, kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8, and l2-prefetch,
+# which changes no bit; the forward's tests otherwise run every option off, whatever
+# glm53f-serve's defaults), for example verify and commit with BF16 KDA states:
 GLM53F_TEST_NUMERICS=kda-state-bf16 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test verify_commit -- --nocapture
 
@@ -391,6 +428,7 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
+| `GLM53F_L2_PREFETCH` | `--l2-prefetch` | Decode and verify passes of one lane prefetch the next layer's weights into L2 while a MoE layer's experts are out: `off` (default), `auto` (three quarters of the L2) or MiB ([The L2 prefetch](#the-l2-prefetch)) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 8,192) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |

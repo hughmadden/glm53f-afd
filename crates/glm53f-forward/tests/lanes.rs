@@ -318,7 +318,7 @@ fn the_oracles_prompt_in_lanes() {
             [(en, an), (e1, a1)].into_iter().zip(clear).zip(eight)
         {
             assert!(e < 5e-2, "against the golden: {e:.3e}");
-            if numerics() == TestNumerics::default() && eight {
+            if numerics().default_arithmetic() && eight {
                 assert!(a >= 8, "against the golden: {a}/9");
             } else {
                 assert_eq!(

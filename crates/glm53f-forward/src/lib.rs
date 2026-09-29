@@ -21,6 +21,7 @@
 //! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
 //! | `forward` | [`forward::GlmForward`]: the layer loop in one lane or up to four (a prefill's lanes overlap one lane's attention with the others' routed experts; decode and verify in two), the head, prefill / decode / verify / commit, taps, stage timing and the lane trace; `ForwardBuffers`, every buffer a pass uses, allocated up front |
 //! | `opprof` | The op profile of prefill passes (`GLM53F_PROFILE_OPS=1`): each operation's GPU time in each lane's attention and shared expert, per layer, and the `OPS` table |
+//! | `prefetch` | The L2 prefetch of the next layer's weights while a decode or verify pass waits for a MoE layer's routed experts (`ForwardConfig::l2_prefetch`, off by default) |
 //! | `draft` | The DFlash2 drafter in the forward (`glm53f-dflash`): its taps (the mean of the four streams after layers 5, 14, 24, 33 and 42), the committed rows appended to each slot's ring, the drafts |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
 //! | `device`, `cuda`, `cublas`, `ffi` | Device memory, streams and events; the runtime, cuBLAS and kernel bindings |
@@ -74,6 +75,10 @@
 //! over 8 rows with BF16 activations (`gemm::GemmPolicy::prefill_w8a16`, with
 //! `kda_prefill_w8a8` keeping the FP8 KDA projections at E4M3). The model-path tests run with any
 //! of them on through `GLM53F_TEST_NUMERICS`.
+//!
+//! **A speed option that changes no bit**, off by default: the L2 prefetch of decode and verify
+//! passes (`forward::ForwardConfig::l2_prefetch`, `prefetch`). `GLM53F_TEST_NUMERICS` takes it
+//! too (`l2-prefetch`).
 //!
 //! # The KV
 //!
@@ -136,6 +141,8 @@ pub mod gemm;
 pub mod kv;
 #[cfg(feature = "cuda")]
 pub mod opprof;
+#[cfg(feature = "cuda")]
+pub mod prefetch;
 #[cfg(feature = "coordinator")]
 pub mod remote;
 #[cfg(feature = "coordinator")]

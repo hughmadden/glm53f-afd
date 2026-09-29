@@ -9,7 +9,9 @@
 //! - `GLM53F_TEST_NUMERICS`: numerics under test for every forward these helpers build, a
 //!   comma-separated list of `kda-fp8`, `kda-fp8-pow2` (FP8 KDA projections with power-of-two
 //!   block-128 scales), `kda-mxfp8` (with MXFP8 scales), `kda-state-bf16`, `prefill-w8a16` and
-//!   `kda-prefill-w8a8` (default none), so a whole suite can run with an option on ([`numerics`]).
+//!   `kda-prefill-w8a8` (default none), so a whole suite can run with an option on ([`numerics`]);
+//!   and `l2-prefetch`, which changes no bit (`ForwardConfig::l2_prefetch` at
+//!   [`TEST_L2_PREFETCH`]).
 //!
 //! Anything missing makes the tests print why and pass.
 #![allow(dead_code)]
@@ -48,6 +50,9 @@ pub fn experts_dir() -> Option<PathBuf> {
     env_dir(&["GLM53F_EXPERTS_DIR"]).or_else(checkpoint_dir)
 }
 
+/// The L2 prefetch the `l2-prefetch` option turns on (bytes).
+pub const TEST_L2_PREFETCH: usize = 48 << 20;
+
 /// Numerics under test for the forwards the tests build (`GLM53F_TEST_NUMERICS`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TestNumerics {
@@ -58,9 +63,21 @@ pub struct TestNumerics {
     pub kda_state_bf16: bool,
     pub prefill_w8a16: bool,
     pub kda_prefill_w8a8: bool,
+    /// Decode and verify passes prefetch the next layer's weights into L2.
+    pub l2_prefetch: bool,
 }
 
 impl TestNumerics {
+    /// The target's arithmetic is the default one: `l2-prefetch` changes no bit of what the
+    /// target computes.
+    pub fn default_arithmetic(&self) -> bool {
+        let target = TestNumerics {
+            l2_prefetch: false,
+            ..*self
+        };
+        target == TestNumerics::default()
+    }
+
     /// The weights' load-time options.
     pub fn weights(&self) -> WeightOptions {
         WeightOptions {
@@ -89,10 +106,14 @@ impl TestNumerics {
         l.with_kda_state_bf16(self.kda_state_bf16)
     }
 
-    /// `cfg` with the W8A16 prefill path (and the KDA projections' exception) when asked for.
+    /// `cfg` with the W8A16 prefill path (and the KDA projections' exception) and the L2
+    /// prefetch when asked for.
     pub fn config(&self, mut cfg: ForwardConfig) -> ForwardConfig {
         cfg.policy.prefill_w8a16 |= self.prefill_w8a16;
         cfg.policy.kda_prefill_w8a8 |= self.kda_prefill_w8a8;
+        if self.l2_prefetch {
+            cfg.l2_prefetch = TEST_L2_PREFETCH;
+        }
         cfg
     }
 }
@@ -113,6 +134,7 @@ pub fn numerics() -> TestNumerics {
             "kda-state-bf16" => n.kda_state_bf16 = true,
             "prefill-w8a16" => n.prefill_w8a16 = true,
             "kda-prefill-w8a8" => n.kda_prefill_w8a8 = true,
+            "l2-prefetch" => n.l2_prefetch = true,
             other => panic!("GLM53F_TEST_NUMERICS: unknown option {other:?}"),
         }
     }

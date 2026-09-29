@@ -103,6 +103,23 @@ int32_t glm53f_fwd_moe_combine(const uint16_t* y, const int32_t* ids, const floa
 int32_t glm53f_fwd_stream_mean(const uint16_t* streams, int32_t rows, int32_t hidden,
                                uint16_t* out, int64_t ldo, cudaStream_t stream);
 
+// ---- L2 prefetch ------------------------------------------------------------------------------
+//
+// Bring the `n` device ranges ptrs[i] .. ptrs[i] + bytes[i] into L2, in order, by `blocks`
+// blocks of 256 threads, touching every `stride` bytes (32, 64, 128 or 256) of each range:
+// - GLM53F_FWD_PREFETCH_LOAD: a one-byte `ld.global.cg` with the `.L2::256B` prefetch size, its
+//   value discarded (the kernel waits for the lines);
+// - GLM53F_FWD_PREFETCH_HINT: `prefetch.global.L2` (a hint the memory system may drop).
+// Nothing is written: later loads of the ranges read the same bytes, from L2 while the lines
+// are still there. `ptrs` and `bytes` are host arrays of n <= GLM53F_FWD_PREFETCH_MAX_RANGES
+// entries (passed to the kernel by value); empty ranges are skipped.
+#define GLM53F_FWD_PREFETCH_MAX_RANGES 16
+#define GLM53F_FWD_PREFETCH_LOAD 0
+#define GLM53F_FWD_PREFETCH_HINT 1
+int32_t glm53f_fwd_l2_prefetch(const void* const* ptrs, const int64_t* bytes, int32_t n,
+                               int32_t stride, int32_t blocks, int32_t mode,
+                               cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

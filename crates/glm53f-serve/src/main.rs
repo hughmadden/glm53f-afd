@@ -165,6 +165,8 @@ mod daemon {
         fcfg.policy.prefill_w8a16 = num.prefill_w8a16;
         fcfg.policy.kda_prefill_w8a8 = num.kda_prefill_w8a8;
         fcfg.kda_chunked_prefill = num.kda_chunked_prefill;
+        let l2 = s(device::l2_bytes())?;
+        fcfg.l2_prefetch = o.l2_prefetch.bytes(l2);
         if drafter.is_some() {
             fcfg.max_verify_rows =
                 fcfg.max_verify_rows
@@ -312,11 +314,16 @@ mod daemon {
             );
         }
         eprintln!(
-            "[coordinator]   decode and verify passes: {}",
+            "[coordinator]   decode and verify passes: {}; L2 prefetch of the next layer's \
+             weights {}",
             match o.decode_lanes {
                 (0, _) => "one lane".to_string(),
                 (a, usize::MAX) => format!("two lanes from {a} rows over two requests or more"),
                 (a, b) => format!("two lanes from {a} to {b} rows over two requests or more"),
+            },
+            match fcfg.l2_prefetch {
+                0 => "off".to_string(),
+                b => format!("{} of the {} L2 (--l2-prefetch)", mib(b), mib(l2)),
             }
         );
         eprintln!(

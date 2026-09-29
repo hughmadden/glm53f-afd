@@ -41,6 +41,10 @@
 //! 4. **In a forward of four prefill lanes** (routed experts of zeros): the decode lanes are the
 //!    prefill's first two, so test 1's script (its prompts prefilled in up to four lanes) gives
 //!    the bits of two passes per step, as in a two-lane forward.
+//! 5. **The L2 prefetch** (`ForwardConfig::l2_prefetch`, `glm53f_forward::prefetch`) changes no
+//!    bit: test 1's script with it on against off, everything the passes leave; and with the
+//!    drafter (as test 2), picks, logits, rings and drafts. It prefetched after every MoE layer of
+//!    every decode and verify pass of one lane, and never in a pass of two lanes or a prefill.
 //!
 //! ```sh
 //! GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
@@ -828,5 +832,137 @@ fn decode_lanes_on_four_rank_daemons() {
     assert!(
         failed.is_empty(),
         "two lanes differ from two passes on the ranks: {failed:?}"
+    );
+}
+
+#[test]
+fn the_l2_prefetch_changes_no_bit() {
+    if !gpu_with(9.0) {
+        return;
+    }
+    let Some(edir) = experts_dir() else {
+        return;
+    };
+    let cfg = ForwardConfig {
+        max_rows: 64,
+        lanes: 2,
+        min_lane_rows: 8,
+        decode_lane_rows: 0,
+        max_verify_rows: 32,
+        max_requests: 8,
+        ..ForwardConfig::default()
+    };
+    let local = |st: &Arc<Stream>| -> Box<dyn ExpertBackend> {
+        Box::new(LocalFp8Experts::new(&edir, 3 << 30, 64, st, Fp8Act::Bf16).expect("local experts"))
+    };
+    let Some(mut fwd) = forward_with(LAYERS, cfg, local, 12, 96, 16) else {
+        return;
+    };
+    let budget = 48 << 20;
+    fwd.cfg.l2_prefetch = 0;
+    let off = script(&mut fwd, How::OnePass);
+    fwd.cfg.l2_prefetch = budget;
+    let n0 = fwd.l2_prefetch().launches;
+    let on = script(&mut fwd, How::OnePass);
+    let launched = fwd.l2_prefetch().launches - n0;
+    fwd.set_lane_trace(true, false);
+    fwd.cfg.decode_lane_rows = 2;
+    let n1 = fwd.l2_prefetch().launches;
+    let lanes_on = script(&mut fwd, How::Lanes);
+    let launched_lanes = fwd.l2_prefetch().launches - n1;
+    fwd.cfg.l2_prefetch = 0;
+    let lanes_off = script(&mut fwd, How::Lanes);
+    let same = |a: &Outcome, b: &Outcome| {
+        bits(&a.logits, &b.logits) && a.picks == b.picks && a.kept == b.kept
+    };
+    // Six decode and verify passes of two MoE layers each (3 and 4; after layer 4, the head's)
+    // in one lane; in two lanes, where the other lane's attention fills the exchange, none.
+    eprintln!(
+        "six requests, layers 0-4 and the head, local FP8 experts: the script with the L2 prefetch \
+         at {} MiB against off, logits, picks and the slots' state bit for bit: one lane {}, two \
+         lanes {}; {launched} prefetches in one lane, {launched_lanes} in two",
+        budget >> 20,
+        same(&on, &off),
+        same(&lanes_on, &lanes_off)
+    );
+    assert!(same(&on, &off), "the L2 prefetch changed a bit (one lane)");
+    assert!(
+        same(&lanes_on, &lanes_off),
+        "the L2 prefetch changed a bit (two lanes)"
+    );
+    assert_eq!(
+        (launched, launched_lanes),
+        (12, 0),
+        "one prefetch per MoE layer of each decode and verify pass of one lane, none in two"
+    );
+}
+
+#[test]
+fn the_l2_prefetch_changes_no_bit_with_the_drafter() {
+    let cfg = ForwardConfig {
+        max_rows: 128,
+        lanes: 2,
+        min_lane_rows: 8,
+        decode_lane_rows: 0,
+        max_verify_rows: 32,
+        max_requests: 4,
+        ..ForwardConfig::default()
+    };
+    let Some(mut fwd) = drafting::drafted_forward(cfg, 8, 8, 64, 0.25) else {
+        return;
+    };
+    fwd.set_experts(Box::new(ZeroExperts));
+    let prompts = [ids(1, 20), ids(2, 33), ids(3, 12), ids(4, 45)];
+    let windows = [ids(5, 8), ids(6, 4), ids(7, 6), ids(8, 2)];
+    let keep = [3usize, 4, 1, 2];
+    let run = |fwd: &mut GlmForward| -> (Outcome, Vec<GlmKv>) {
+        let mut kvs: Vec<GlmKv> = prompts
+            .iter()
+            .map(|p| {
+                let mut kv = fwd.kv.slot().unwrap();
+                kv.reserve(p.len() + 16).unwrap();
+                kv
+            })
+            .collect();
+        let mut o = Outcome {
+            picks: Vec::new(),
+            logits: Vec::new(),
+            kept: Vec::new(),
+        };
+        for (kv, p) in kvs.iter_mut().zip(&prompts) {
+            o.picks.extend(fwd.prefill(&mut [(kv, &p[..])]).unwrap());
+        }
+        verify_round(fwd, &mut kvs, &windows, &keep, How::OnePass, &mut o);
+        for s in 0..2 {
+            decode_step(fwd, &mut kvs, &ids(20 + s, 4), How::OnePass, &mut o);
+        }
+        (o, kvs)
+    };
+    fwd.cfg.l2_prefetch = 0;
+    let (off, kv_off) = run(&mut fwd);
+    fwd.cfg.l2_prefetch = 64 << 20;
+    let n0 = fwd.l2_prefetch().launches;
+    let (on, kv_on) = run(&mut fwd);
+    let launched = fwd.l2_prefetch().launches - n0;
+    let exact = bits(&on.logits, &off.logits) && on.picks == off.picks;
+    let rings = kv_on
+        .iter()
+        .zip(&kv_off)
+        .all(|(a, b)| same_context(&fwd, a, b));
+    let drafts = kv_on
+        .iter()
+        .zip(&kv_off)
+        .all(|(a, b)| greedy_draft(&mut fwd, a, 777) == greedy_draft(&mut fwd, b, 777));
+    let moe = fwd.shape().moe_layers().len();
+    eprintln!(
+        "the drafter, 45 layers, a verify round and 2 decode steps with the L2 prefetch at 64 MiB \
+         against off: picks and logits {exact}, contexts and rings {rings}, greedy drafts {drafts}; \
+         {launched} prefetches ({moe} MoE layers a pass)"
+    );
+    assert!(exact && rings && drafts, "the L2 prefetch changed a bit");
+    assert_eq!(
+        launched,
+        3 * moe as u64,
+        "one prefetch per MoE layer of each pass"
     );
 }

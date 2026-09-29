@@ -113,4 +113,14 @@ unsafe extern "C" {
         out: *mut u16,
         stream: RawStream,
     ) -> i32;
+
+    pub fn glm53f_fwd_l2_prefetch(
+        ptrs: *const *const c_void,
+        bytes: *const i64,
+        n: i32,
+        stride: i32,
+        blocks: i32,
+        mode: i32,
+        stream: RawStream,
+    ) -> i32;
 }

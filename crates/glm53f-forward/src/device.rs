@@ -559,6 +559,11 @@ pub fn sm_count() -> Result<i32> {
     attribute(cuda::ATTR_SM_COUNT)
 }
 
+/// Bytes of L2 cache of device 0.
+pub fn l2_bytes() -> Result<usize> {
+    Ok(attribute(cuda::ATTR_L2_BYTES)?.max(0) as usize)
+}
+
 /// The DRAM bandwidth the attributes describe (2 x memory clock x bus width), bytes per second.
 pub fn peak_bandwidth() -> Result<f64> {
     let khz = attribute(cuda::ATTR_MEM_CLOCK_KHZ)? as f64;

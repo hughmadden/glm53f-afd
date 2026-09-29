@@ -1,5 +1,5 @@
 //! One decode step of decoder layers 0-4 and the head, timed by stage, and a per-layer
-//! extrapolation to the model's 45 layers.
+//! extrapolation to the model's 45 layers; optionally the L2 prefetch off against on.
 //!
 //! ```sh
 //! GLM53F_CHECKPOINT_DIR=/path/to/checkpoint \
@@ -8,11 +8,23 @@
 //!
 //! Environment:
 //! - `GLM53F_CHECKPOINT_DIR`: the official checkpoint or its coordinator subset (required);
+//! - `GLM53F_BENCH_LAYERS`: decoder layers loaded and run (default 5, at least 5; 45 is the whole
+//!   model, 13.96 GB of weights, 9.28 GB with `GLM53F_KDA_FP8=1`);
+//! - `GLM53F_BENCH_BATCHES`: the batch sizes timed (default `1,4,8`);
 //! - `GLM53F_BENCH_CONTEXT`: prompt tokens per request before timing (default 4096, so the DSA
 //!   layer attends over its full 2,051-token selection);
 //! - `GLM53F_BENCH_STEPS`: timed steps per batch size (default 40);
 //! - `GLM53F_BENCH_EXPERTS=local` with `GLM53F_EXPERTS_DIR`: run the routed experts of layers 3
 //!   and 4 on this GPU (default: zeros, the coordinator's own work only);
+//! - `GLM53F_BENCH_EXCHANGE_US`: the routed experts' zeros come back this many microseconds after
+//!   the call went out, the GPU idle meanwhile (the exchange with the ranks, emulated: `submit`
+//!   waits for the stream as the wire client does, `finish` spins out the rest); default 0;
+//! - `GLM53F_BENCH_L2_PREFETCH_MIB`: with a value above 0, the step times again with
+//!   `ForwardConfig::l2_prefetch` off and at this many MiB, interleaved over
+//!   `GLM53F_BENCH_AB_ROUNDS` rounds (default 5): per batch size `steps` decode steps, and `steps`
+//!   verify rounds of 8 rows of one request (the single-stream step with the drafter); with
+//!   `GLM53F_BENCH_AB_LANES=1` those decode passes of two requests or more run in two lanes
+//!   (which never prefetch);
 //! - `GLM53F_BENCH_PREFILL_ROWS`: rows of one prefill pass (default 256);
 //! - the numerics options, each off unless set to something other than `0` (`glm53f-serve` has
 //!   D8, W8A16 and the chunked KDA prefill on by default): `GLM53F_KDA_FP8` (FP8 KDA
@@ -24,14 +36,15 @@
 //! The routed experts run on the expert ranks in the engine, so the extrapolation leaves them
 //! out; the router's host copy of the routes (the step's host round trip) stays in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glm53f_forward::device::{self, Event, Stream};
 use glm53f_forward::embed::HostEmbedding;
-use glm53f_forward::experts::{ExpertBackend, LocalFp8Experts, ZeroExperts};
-use glm53f_forward::forward::{ForwardConfig, GlmForward, StageTimes};
+use glm53f_forward::experts::{ExpertBackend, ExpertCall, LocalFp8Experts, ZeroExperts};
+use glm53f_forward::forward::{ForwardConfig, GlmForward, StageTimes, MAX_LANES};
 use glm53f_forward::gemm::Fp8Act;
 use glm53f_forward::kv::{GlmKv, KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
@@ -39,7 +52,31 @@ use glm53f_forward::shape::ModelShape;
 use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
 use glm53f_forward::Fp8Scales;
 
-const LAYERS: usize = 5;
+/// Routed outputs of zeros that come back `delay` after the call went out, the GPU idle
+/// meanwhile, as while the ranks compute: `submit` waits for the stream (the wire client does,
+/// to send the rows it quantized) and notes the time; `finish` spins until the delay has passed.
+struct DelayExperts {
+    delay: Duration,
+    sent: VecDeque<Instant>,
+}
+
+impl ExpertBackend for DelayExperts {
+    fn submit(&mut self, _call: &ExpertCall<'_>, stream: &Stream) -> glm53f_forward::Result<()> {
+        stream.synchronize()?;
+        self.sent.push_back(Instant::now());
+        Ok(())
+    }
+    fn finish(&mut self, call: &ExpertCall<'_>, stream: &Stream) -> glm53f_forward::Result<()> {
+        let t = self.sent.pop_front().expect("a call in flight");
+        while t.elapsed() < self.delay {
+            std::hint::spin_loop();
+        }
+        ZeroExperts.finish(call, stream)
+    }
+    fn depth(&self) -> usize {
+        MAX_LANES
+    }
+}
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k)
@@ -99,6 +136,19 @@ fn main() {
     };
     let context = env_usize("GLM53F_BENCH_CONTEXT", 4096);
     let steps = env_usize("GLM53F_BENCH_STEPS", 40);
+    let layers = env_usize("GLM53F_BENCH_LAYERS", 5).max(5);
+    let batches: Vec<usize> = std::env::var("GLM53F_BENCH_BATCHES")
+        .unwrap_or_else(|_| "1,4,8".into())
+        .split(',')
+        .map(|b| {
+            b.trim()
+                .parse()
+                .expect("GLM53F_BENCH_BATCHES: a list of batch sizes")
+        })
+        .collect();
+    let exchange_us = env_usize("GLM53F_BENCH_EXCHANGE_US", 0);
+    let prefetch_mib = env_usize("GLM53F_BENCH_L2_PREFETCH_MIB", 0);
+    let ab_rounds = env_usize("GLM53F_BENCH_AB_ROUNDS", 5);
     let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
     let (state_bf16, w8a16) = (on("GLM53F_KDA_STATE_BF16"), on("GLM53F_PREFILL_W8A16"));
     let kda_scales = if on("GLM53F_KDA_MXFP8") {
@@ -116,18 +166,23 @@ fn main() {
         if w8a16 { "W8A16" } else { "W8A8" }
     );
     let (cfg, ckpt) = open_checkpoint(&dir).unwrap();
-    let shape = ModelShape::new(&cfg.text, LAYERS).unwrap();
+    let shape = ModelShape::new(&cfg.text, layers).unwrap();
     let wopts = WeightOptions {
         kda_fp8,
         kda_scales,
     };
-    let model = DeviceModel::load_with(&ckpt, &shape, LAYERS, wopts).unwrap();
+    let model = DeviceModel::load_with(&ckpt, &shape, layers, wopts).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
-    let max_req = 8;
-    // Every timed step appends a token: 3 batch sizes x (warm-up + two timed runs), and the
-    // verify rounds.
-    let extra = 3 * (3 + 2 * steps) + 20 * 8 + 64;
+    let max_req = batches.iter().copied().max().unwrap_or(1).max(1);
+    // Every timed step appends a token: each batch size x (warm-up + two timed runs), the verify
+    // rounds (5 kept of 8), and the prefetch rounds (both settings: every batch size's steps and
+    // the verify rounds).
+    let ab = if prefetch_mib > 0 { ab_rounds } else { 0 };
+    let extra = batches.len() * (3 + 2 * steps)
+        + 20 * 8
+        + ab * 2 * (batches.len() * (steps + 1) + (steps + 1) * 5)
+        + 64;
     let pages_per = KvLayout::pages_for(context + extra);
     let kv = KvPool::new(
         KvConfig {
@@ -146,6 +201,14 @@ fn main() {
                 .map(PathBuf::from)
                 .unwrap_or(dir.clone());
             Box::new(LocalFp8Experts::new(&edir, 6 << 30, 64, &stream, Fp8Act::Bf16).unwrap())
+        } else if exchange_us > 0 {
+            println!(
+                "routed experts: zeros, {exchange_us} us after each call (the exchange, emulated)"
+            );
+            Box::new(DelayExperts {
+                delay: Duration::from_micros(exchange_us as u64),
+                sent: VecDeque::new(),
+            })
         } else {
             Box::new(ZeroExperts)
         };
@@ -157,6 +220,11 @@ fn main() {
     };
     fcfg.policy.prefill_w8a16 = w8a16;
     fcfg.policy.kda_prefill_w8a8 = on("GLM53F_KDA_PREFILL_W8A8");
+    // Lane B's buffers for the prefetch rounds' two-lane decode passes.
+    let ab_lanes = on("GLM53F_BENCH_AB_LANES");
+    if ab_lanes {
+        fcfg.lanes = 2;
+    }
     let mut fwd = GlmForward::new(model, embed, kv, experts, fcfg).unwrap();
     let (free, total) = device::mem_info().unwrap();
     println!(
@@ -232,7 +300,7 @@ fn main() {
     let (e0, e1) = (Event::new().unwrap(), Event::new().unwrap());
     let mut results = Vec::new();
     let mut order: Vec<(usize, &'static str)> = Vec::new();
-    for batch in [1usize, 4, 8] {
+    for &batch in &batches {
         let toks = ids(100 + batch as u64, batch);
         // Warm up, then time whole steps (no stage events), then stages.
         for _ in 0..3 {
@@ -289,11 +357,15 @@ fn main() {
     let verify_order: Vec<(usize, &'static str)> =
         vt[0].stages.iter().map(|s| (s.0, s.1)).collect();
 
-    println!("\nOne decode step of layers 0-4 + head, ms per stage (mean of {steps} steps; context {context} tokens per request)");
     println!(
-        "{:<34} {:>9} {:>9} {:>9} {:>11}",
-        "stage", "B = 1", "B = 4", "B = 8", "verify R=8"
+        "\nOne decode step of layers 0-{} + head, ms per stage (mean of {steps} steps; context {context} tokens per request)",
+        layers - 1
     );
+    print!("{:<34}", "stage");
+    for b in &batches {
+        print!(" {:>9}", format!("B = {b}"));
+    }
+    println!(" {:>11}", "verify R=8");
     // Stages in pass order (the order the first timed decode step recorded them), then the
     // verify pass's own (the commit).
     let mut keys: Vec<(usize, &'static str)> = Vec::new();
@@ -331,10 +403,11 @@ fn main() {
     println!();
 
     println!("\nExtrapolation to 45 layers (per-layer costs of layers 0-4 on this card; not a measurement)");
-    println!(
-        "{:<44} {:>9} {:>9} {:>9}",
-        "part", "B = 1", "B = 4", "B = 8"
-    );
+    print!("{:<44}", "part");
+    for b in &batches {
+        print!(" {:>9}", format!("B = {b}"));
+    }
+    println!();
     let kda_layers = [0usize, 1, 2, 4];
     for (label, f) in [
         ("KDA attention, per layer (mean of 0,1,2,4)", 0),
@@ -371,4 +444,95 @@ fn main() {
         );
     }
     println!("  ms per step");
+    if prefetch_mib > 0 {
+        if ab_lanes {
+            // Passes of two requests or more in two lanes, as `glm53f-serve` runs them.
+            fwd.cfg.decode_lane_rows = 2;
+        }
+        prefetch_ab(
+            &mut fwd,
+            &mut kvs,
+            &batches,
+            steps,
+            ab_rounds,
+            prefetch_mib << 20,
+        );
+    }
+}
+
+/// Step times with the L2 prefetch off and at `budget` bytes, interleaved over `rounds` rounds
+/// (off, on, off, on, ...): per batch size `steps` decode steps, then `steps` verify rounds of 8
+/// rows of request 0 with their commits (5 kept). A step's time is the device time from the
+/// first step's start to the last one's end over `steps` (the emulated exchange's idle
+/// included). Prints each setting's median and range over the rounds.
+fn prefetch_ab(
+    fwd: &mut GlmForward,
+    kvs: &mut [GlmKv],
+    batches: &[usize],
+    steps: usize,
+    rounds: usize,
+    budget: usize,
+) {
+    let (e0, e1) = (Event::new().unwrap(), Event::new().unwrap());
+    let l2 = device::l2_bytes().unwrap();
+    println!(
+        "\nL2 prefetch off and at {:.0} MiB (L2 {:.0} MiB), {rounds} interleaved rounds of {steps} steps; ms per step: median [min, max]",
+        budget as f64 / (1 << 20) as f64,
+        l2 as f64 / (1 << 20) as f64
+    );
+    println!(
+        "{:<18} {:>24} {:>24} {:>9} {:>8}",
+        "case", "off", "on", "change", "%"
+    );
+    let cases: Vec<Option<usize>> = batches.iter().map(|&b| Some(b)).chain([None]).collect();
+    for case in cases {
+        let mut t = [Vec::new(), Vec::new()];
+        let before = fwd.l2_prefetch().launches;
+        for r in 0..2 * rounds {
+            let on = r % 2 == 1;
+            fwd.cfg.l2_prefetch = if on { budget } else { 0 };
+            let step = |fwd: &mut GlmForward, kvs: &mut [GlmKv], i: usize| match case {
+                Some(b) => {
+                    let toks = ids(700 + i as u64, b);
+                    let mut rows: Vec<(&mut GlmKv, u32)> =
+                        kvs.iter_mut().take(b).zip(toks).collect();
+                    fwd.decode(&mut rows).unwrap();
+                }
+                None => {
+                    let w = ids(900 + i as u64, 8);
+                    fwd.verify(&mut [(&mut kvs[0], &w[..])]).unwrap();
+                    fwd.commit(&mut [&mut kvs[0]], &[5]).unwrap();
+                }
+            };
+            step(fwd, kvs, 0);
+            e0.record(fwd.stream()).unwrap();
+            for i in 0..steps {
+                step(fwd, kvs, i + 1);
+            }
+            e1.record(fwd.stream()).unwrap();
+            t[usize::from(on)].push(e1.elapsed_ms_since(&e0).unwrap() as f64 / steps as f64);
+        }
+        fwd.cfg.l2_prefetch = 0;
+        let launched = fwd.l2_prefetch().launches - before;
+        let stat = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        let (off, on) = (stat(&mut t[0]), stat(&mut t[1]));
+        let name = match case {
+            Some(b) => format!("decode B = {b}"),
+            None => "verify R = 8".to_string(),
+        };
+        println!(
+            "{name:<18} {:>9.3} [{:.3}, {:.3}] {:>9.3} [{:.3}, {:.3}] {:>+9.3} {:>+7.1}%  ({launched} prefetches)",
+            off.0,
+            off.1,
+            off.2,
+            on.0,
+            on.1,
+            on.2,
+            on.0 - off.0,
+            100.0 * (on.0 - off.0) / off.0
+        );
+    }
 }

@@ -58,6 +58,7 @@
 //! | `--decode-lanes MIN[-MAX]` | `GLM53F_DECODE_LANES` | 2-16 | Decode and verify passes of MIN to MAX rows (no MAX: no upper bound) over two requests or more run in two lanes of whole requests (the prefill's first two: needs `--prefill-lanes 2` or more); `off` or 0 keeps them in one lane ([Decode lanes](#decode-lanes)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
+//! | `--l2-prefetch off\|auto\|MiB` | `GLM53F_L2_PREFETCH` | off | Decode and verify passes of one lane: while a MoE layer's routed experts are out, the next layer's first weights are prefetched into L2 (`auto`: three quarters of the GPU's L2) ([L2 prefetch](#l2-prefetch)); changes no bit |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
 //! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales: the same layout, kernels and bytes, and 82-89% of the q, k, v and o weights kept exactly (docs/SIZING.md §10) |
 //! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8: an E8M0 scale per row and 32 values of K (4.13 GiB of weights less), the MXFP8 GEMMs; the same error as `--kda-fp8-pow2` on these weights. The last of the three KDA flags given sets the scales |
@@ -216,6 +217,18 @@
 //! - **Counters.** Every 64 speculative steps a `[copy]` line gives the windows copied, the copied
 //!   tokens kept, and the tokens a copied and a drafted window delivered.
 //!
+//! # L2 prefetch
+//!
+//! `--l2-prefetch` (`glm53f-forward`'s `ForwardConfig::l2_prefetch`): in a decode or verify pass of
+//! one lane (one request, or more rows than the decode lanes take), once a MoE layer's routed
+//! experts are out and its shared expert is queued, the forward's stream reads the first bytes of
+//! the next layer's weights, in the order that layer reads them, through L2, so the next layer's
+//! GEMVs read those bytes from L2 instead of DRAM. It writes nothing, so every result is the same
+//! bit for bit, and it ends long before the exchange it overlaps. Passes of two lanes, where the
+//! other lane's attention fills the exchange, never prefetch. `auto` takes three quarters of the
+//! GPU's L2 (72 MiB of the RTX 5090's 96 MB); a number is MiB. Off by default until measured on the
+//! target hardware (single-stream tok/s and the `STEP` lines with `GLM53F_PROFILE=1`).
+//!
 //! # Development mode
 //!
 //! `--dev-layers 0-N` runs decoder layers 0 to N only and applies the head to what comes out:
@@ -241,6 +254,7 @@ options:
   --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
+  --l2-prefetch off|auto|<MiB>  decode and verify: prefetch the next layer's weights into L2 (off)
 numerics (each gated by KL; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
   --kda-fp8-pow2      the same with power-of-two block scales
@@ -401,6 +415,8 @@ pub struct Options {
     /// With the drafter: copy windows for greedy requests
     /// (`glm53f_coordinator::SchedulerConfig::copy_windows`).
     pub copy_windows: bool,
+    /// The L2 prefetch of decode and verify passes ([L2 prefetch](#l2-prefetch)).
+    pub l2_prefetch: L2Prefetch,
     /// Development mode: the number of decoder layers run (`--dev-layers 0-N` gives N + 1).
     pub dev_layers: Option<usize>,
     /// Numerics under test.
@@ -444,6 +460,41 @@ pub fn parse_decode_lanes(s: &str) -> Result<(usize, usize), String> {
         return Err(bad());
     }
     Ok((min, max))
+}
+
+/// `--l2-prefetch`: how many bytes of the next layer's weights a decode or verify pass pulls into
+/// L2 while a MoE layer's routed experts are out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L2Prefetch {
+    Off,
+    /// Three quarters of the GPU's L2.
+    Auto,
+    Mib(usize),
+}
+
+impl L2Prefetch {
+    /// Bytes to prefetch on a GPU with `l2` bytes of L2 (0: off).
+    pub fn bytes(self, l2: usize) -> usize {
+        match self {
+            L2Prefetch::Off => 0,
+            L2Prefetch::Auto => l2 / 4 * 3,
+            L2Prefetch::Mib(m) => m << 20,
+        }
+    }
+}
+
+/// `off` (or `0`), `auto`, or a number of MiB.
+pub fn parse_l2_prefetch(s: &str) -> Result<L2Prefetch, String> {
+    match s.trim() {
+        "off" | "0" => Ok(L2Prefetch::Off),
+        "auto" => Ok(L2Prefetch::Auto),
+        v => match v.parse::<usize>() {
+            Ok(m) if m <= 1024 => Ok(L2Prefetch::Mib(m)),
+            _ => Err(format!(
+                "--l2-prefetch {s:?}: expected off, auto or MiB (at most 1024)"
+            )),
+        },
+    }
 }
 
 fn parse_ranks(s: &str) -> Result<Vec<String>, String> {
@@ -518,6 +569,10 @@ impl Options {
             Some(v) => on_off("GLM53F_COPY_WINDOWS", &v)?,
             None => true,
         };
+        let mut l2_prefetch = match env("GLM53F_L2_PREFETCH") {
+            Some(v) => parse_l2_prefetch(&v)?,
+            None => L2Prefetch::Off,
+        };
         let mut numerics = Numerics::from_env(env);
         let mut it = args.iter();
         while let Some(k) = it.next() {
@@ -546,6 +601,7 @@ impl Options {
                 }
                 "--drafter" => drafter = Some(PathBuf::from(val()?)),
                 "--copy-windows" => copy_windows = on_off(k, &val()?)?,
+                "--l2-prefetch" => l2_prefetch = parse_l2_prefetch(&val()?)?,
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -616,6 +672,7 @@ impl Options {
             decode_lanes,
             drafter,
             copy_windows,
+            l2_prefetch,
             dev_layers,
             numerics,
         })
@@ -967,6 +1024,35 @@ mod tests {
             other => env(other),
         };
         assert!(Options::parse(&args("--checkpoint /c"), &bad_env).is_err());
+    }
+
+    #[test]
+    fn the_l2_prefetch_is_off_unless_asked_for() {
+        let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        let o = Options::parse(&args("--checkpoint /c"), &env).unwrap();
+        assert_eq!(o.l2_prefetch, L2Prefetch::Off);
+        let o = Options::parse(&args("--checkpoint /c --l2-prefetch auto"), &env).unwrap();
+        assert_eq!(o.l2_prefetch, L2Prefetch::Auto);
+        assert_eq!(o.l2_prefetch.bytes(96 << 20), 72 << 20);
+        let o = Options::parse(&args("--checkpoint /c --l2-prefetch 48"), &env).unwrap();
+        assert_eq!(o.l2_prefetch, L2Prefetch::Mib(48));
+        assert_eq!(o.l2_prefetch.bytes(96 << 20), 48 << 20);
+        assert_eq!(L2Prefetch::Off.bytes(96 << 20), 0);
+        let on = |k: &str| match k {
+            "GLM53F_L2_PREFETCH" => Some("64".to_string()),
+            other => env(other),
+        };
+        let o = Options::parse(&args("--checkpoint /c"), &on).unwrap();
+        assert_eq!(o.l2_prefetch, L2Prefetch::Mib(64));
+        // The flag wins over the environment.
+        let o = Options::parse(&args("--checkpoint /c --l2-prefetch off"), &on).unwrap();
+        assert_eq!(o.l2_prefetch, L2Prefetch::Off);
+        for bad in ["--l2-prefetch", "--l2-prefetch lots", "--l2-prefetch 5000"] {
+            assert!(
+                Options::parse(&args(&format!("--checkpoint /c {bad}")), &env).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

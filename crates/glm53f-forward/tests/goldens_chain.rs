@@ -951,7 +951,7 @@ fn layers_0_to_4_against_the_goldens() {
             picks_ok, 9,
             "{what}: the device argmax disagrees with the host"
         );
-        if num == TestNumerics::default() {
+        if num.default_arithmetic() {
             assert!(agree >= 8, "{what}: argmax agrees on only {agree}/9 rows");
         } else {
             assert_eq!(

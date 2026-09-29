@@ -73,3 +73,7 @@ required-features = ["cuda"]
 [[example]]
 name = "wire_paths"
 required-features = ["coordinator"]
+
+[[example]]
+name = "l2_prefetch_bench"
+required-features = ["cuda"]

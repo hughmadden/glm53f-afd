@@ -27,6 +27,8 @@ pub const ATTR_MEM_BUS_BITS: c_int = 37;
 /// `cudaDevAttrComputeCapabilityMajor` / `Minor`.
 pub const ATTR_CC_MAJOR: c_int = 75;
 pub const ATTR_CC_MINOR: c_int = 76;
+/// `cudaDevAttrL2CacheSize` (bytes).
+pub const ATTR_L2_BYTES: c_int = 38;
 
 unsafe extern "C" {
     pub fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError;

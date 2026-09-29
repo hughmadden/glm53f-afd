@@ -107,6 +107,15 @@
 //! lane, in lane order (a request split by a cut gets each lane's part in turn), with the calls
 //! one-lane passes of the same rows would make, so the rings hold the same bits.
 //!
+//! # L2 prefetch (decode and verify)
+//!
+//! With [`ForwardConfig::l2_prefetch`] above 0, a decode or verify pass of one lane (the GPU
+//! otherwise waits for the ranks) queues, on the forward's stream after each MoE layer's shared
+//! expert, a prefetch of the first `l2_prefetch` bytes of the next layer's weights (after the last
+//! layer, the head's; `crate::prefetch`). It writes nothing, so every bit is the same
+//! (`tests/decode_lanes.rs`); the next layer's GEMVs find those bytes in L2. Passes of two lanes,
+//! where the other lane's attention fills the exchange, and prefill passes never prefetch.
+//!
 //! # Scoring
 //!
 //! [`GlmForward::score`] feeds a teacher-forced sequence through prefill passes of a chosen size
@@ -156,6 +165,7 @@ use crate::gemm::{act_quant, Fp8Input, Gemm, GemmPolicy};
 use crate::kv::{GlmKv, KvPool};
 use crate::kvplan::{KvLayout, LAYER_PAGE_BYTES, TAIL};
 use crate::opprof::{LayerKind, OpProfile, OpTrace, Segment};
+use crate::prefetch::L2Prefetch;
 use crate::shape::*;
 use crate::weights::{AttnW, DeviceModel, DsaW, FfnW, HcW, KdaW, LayerW, MlpW, ProjW};
 
@@ -207,6 +217,9 @@ pub struct ForwardConfig {
     /// block, shared by the lanes, instead of for a whole lane. The core is row-independent, so
     /// the blocks change no bit. At least 8 (a decode or verify window runs in one block).
     pub mla_block_rows: usize,
+    /// Decode and verify passes of one lane: bytes of the next layer's weights pulled into L2 while
+    /// a MoE layer's routed experts are out (`crate::prefetch`); 0 turns it off. Changes no bit.
+    pub l2_prefetch: usize,
 }
 
 impl ForwardConfig {
@@ -234,6 +247,7 @@ impl Default for ForwardConfig {
             kda_prefill_rows: 256,
             kda_prefill_value_blocks: 2,
             mla_block_rows: 512,
+            l2_prefetch: 0,
         }
     }
 }
@@ -1438,6 +1452,8 @@ pub struct GlmForward {
     lane_bases: Vec<usize>,
     /// Decode and verify passes run in two lanes so far.
     decode_lane_passes: u64,
+    /// The L2 prefetch's plan ([`ForwardConfig::l2_prefetch`]).
+    prefetch: L2Prefetch,
 }
 
 fn pack<T: Copy>(bytes: &mut Vec<u8>, v: &[T]) -> usize {
@@ -1493,6 +1509,7 @@ impl GlmForward {
         }
         // SAFETY: one-time kernel setup (shared-memory limits).
         device::launched(unsafe { dffi::glm53f_dsa_init() }, "glm53f_dsa_init")?;
+        let prefetch = L2Prefetch::for_model(&model)?;
         let ForwardBuffers {
             cfg,
             sms,
@@ -1526,6 +1543,7 @@ impl GlmForward {
             draft: None,
             lane_bases: Vec::new(),
             decode_lane_passes: 0,
+            prefetch,
         };
         if std::env::var("GLM53F_PROFILE_OPS").is_ok_and(|v| !v.is_empty() && v != "0") {
             // Every prefill pass prints its `PIPE` line and its `OPS` table.
@@ -1578,6 +1596,11 @@ impl GlmForward {
     /// Decode and verify passes run in two lanes so far ([`ForwardConfig::decode_lane_rows`]).
     pub fn decode_lane_passes(&self) -> u64 {
         self.decode_lane_passes
+    }
+
+    /// The L2 prefetch ([`ForwardConfig::l2_prefetch`]): its plan and counter.
+    pub fn l2_prefetch(&self) -> &L2Prefetch {
+        &self.prefetch
     }
 
     /// The last traced prefill pass's timings.
@@ -2764,6 +2787,7 @@ impl GlmForward {
             // The backend's own record of the pass's calls (`LaneTrace::wire`).
             self.experts.trace_begin();
         }
+        let end = layers.end;
         for l in layers {
             let lw = &model.layers[l];
             if let Some(t) = self.trace.as_mut().filter(|t| t.active) {
@@ -2814,6 +2838,18 @@ impl GlmForward {
                         self.mlp(lanes[x].rows, shared, shared_out)?;
                         self.mark(l, "shared")?;
                         self.trace_event(l, x, At::SharedEnd)?;
+                        // Decode and verify in one lane: the GPU waits for the ranks; the next
+                        // layer's first weights go to L2 meanwhile, on this stream
+                        // (`crate::prefetch`; the head's after the last layer).
+                        if self.cfg.l2_prefetch > 0 && mode != Mode::Prefill && lanes.len() == 1 {
+                            let next = if l + 1 < end {
+                                l + 1
+                            } else {
+                                model.layers.len()
+                            };
+                            self.prefetch
+                                .layer(&self.stream, next, self.cfg.l2_prefetch)?;
+                        }
                     }
                 }
             }
