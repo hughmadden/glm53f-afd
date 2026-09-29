@@ -24,7 +24,7 @@ and adds the incomplete tail pool. Sparse attention therefore reads at most
 | CUDA: latent write, absorb, sparse attention, un-absorb | `kernels/dsa_mla.cu` |
 | C ABI | `kernels/include/glm53f_dsa.h` |
 | Rust FFI, device buffers, timing (feature `cuda`) | `src/ffi.rs`, `src/gpu.rs` |
-| Benchmarks | `examples/dsa_bench.rs`; before/after of the decode path: `examples/dsa_ab.rs` |
+| Benchmarks | `examples/dsa_bench.rs`; before/after of the decode path, and the mid-sized passes' head groups: `examples/dsa_ab.rs` |
 
 ## Semantics
 
@@ -295,8 +295,12 @@ all 64 heads per block) changed where measurements disagreed:
 The same entry points take prefill-sized row counts. `index_select` puts one
 block per row and chunk (the plan gives one chunk per row at 4,096 rows);
 `sparse_attn` runs unsplit with 2 or 4 head groups per block, so each decoded
-tile serves 32 or 64 heads. Unsplit, 1, 2 and 4 head groups give the same bits
-(`tests/gpu.rs`, `sparse_attn_head_groups_are_bitwise`). Two entry points are
+tile serves 32 or 64 heads. Unsplit, 1, 2 and 4 head groups give the same bits,
+at 1 to 256 rows (`tests/gpu.rs`, `sparse_attn_head_groups_are_bitwise`), so a
+pass too small to fill the multiprocessors with 4 groups takes fewer: one block
+per 16-head group up to a quarter as many rows as the GPU has multiprocessors, 2
+groups up to half (`mla_head_groups` in `glm53f-forward`;
+`docs/PERFORMANCE.md` §5b). Two entry points are
 for prefill-sized passes, each with the bits of the one it replaces
 (`prefill_absorb_and_unabsorb_match_bitwise`, 1 to 257 rows):
 
@@ -344,9 +348,10 @@ GLM53F_CHECKPOINT_DIR=/path/to/checkpoint cargo test --release -p glm53f-dsa --t
 # Oracle fixtures (oracle/goldens/layer03-*; skip when absent)
 GLM53F_CHECKPOINT_DIR=/path/to/checkpoint cargo test --release -p glm53f-dsa --test goldens -- --nocapture
 
-# Kernel timings; before/after of the decode path
+# Kernel timings; before/after of the decode path; sparse attention of 9 to 512 rows by head groups
 cargo run --release -p glm53f-dsa --features cuda --example dsa_bench
 cargo run --release -p glm53f-dsa --features cuda --example dsa_ab
+cargo run --release -p glm53f-dsa --features cuda --example dsa_ab -- mid
 ```
 
 `GLM53F_NVCC` (default `/usr/local/cuda/bin/nvcc`), `GLM53F_CUDA_ARCH` (default

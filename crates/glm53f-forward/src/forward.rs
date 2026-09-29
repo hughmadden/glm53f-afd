@@ -190,7 +190,8 @@ pub struct ForwardConfig {
     /// Sparse MLA splits for passes of at most 8 rows (fixed, so a row's result does not
     /// depend on the pass).
     pub decode_splits: usize,
-    /// Sparse MLA head groups per block for passes of at most 8 rows, and for larger passes.
+    /// Sparse MLA head groups per block for passes of at most 8 rows, and, for larger passes, at
+    /// most: a pass too small to fill the multiprocessors takes fewer (`mla_head_groups`).
     pub decode_head_groups: usize,
     pub prefill_head_groups: usize,
     /// Prefill passes of more than 8 rows run KDA through the chunked kernel
@@ -1164,6 +1165,21 @@ fn lanes_for(total: usize, n: usize, min_rows: usize, first: usize, rows: usize)
         k += 1;
     }
     k
+}
+
+/// Head groups per block of the sparse MLA kernel for a pass of `rows` rows in one split (a pass
+/// of more than 8 rows), at most `cap`. The grid is `rows * 4 / groups` blocks and a block takes
+/// over half a multiprocessor's shared memory, so blocks run one to a multiprocessor: at `cap`
+/// groups a small pass leaves most of the `sms` multiprocessors idle. Fewer groups make more,
+/// faster blocks (2,051 tokens on the RTX 4090: 316 us at 4 groups, 160 at 2, 109 at 1; see
+/// `docs/PERFORMANCE.md` 5b), so the pass takes the fewest groups whose grid still fits one wave,
+/// and a pass that fills the multiprocessors at `cap` groups keeps `cap`. A head group's heads
+/// are computed the same way whichever groups share its block, so the choice moves no bit.
+fn mla_head_groups(rows: usize, sms: i32, cap: usize) -> usize {
+    (rows * (MLA_HEADS / 16))
+        .div_ceil(sms.max(1) as usize)
+        .next_power_of_two()
+        .min(cap)
 }
 
 /// Pipeline timings of the last traced pass (with [`GlmForward::set_lane_trace`] on): per MoE
@@ -3989,7 +4005,10 @@ impl GlmForward {
         let (splits, groups) = if small {
             (self.cfg.decode_splits, self.cfg.decode_head_groups)
         } else {
-            (1, self.cfg.prefill_head_groups)
+            (
+                1,
+                mla_head_groups(rows, self.sms, self.cfg.prefill_head_groups),
+            )
         };
         // SAFETY: a host function.
         let mla_need =
@@ -4377,5 +4396,45 @@ mod tests {
         assert_eq!([250, 257, 300, 301].map(small), [1, 3, 3, 4]);
         // Four lanes of 100 hold 400 rows; the caller refuses more.
         assert_eq!(small(401), 4);
+    }
+
+    /// Passes of more than 8 rows take the fewest head groups per block whose grid (`rows * 4 /
+    /// groups` blocks) fits one wave of the multiprocessors, and never more than the configured
+    /// number: 1 for up to a quarter as many rows as the GPU has multiprocessors, 2 up to half
+    /// as many, then the prefill setting.
+    #[test]
+    fn the_head_groups_of_a_pass() {
+        let rows = [
+            9, 32, 33, 42, 43, 64, 65, 85, 86, 128, 170, 171, 2048, 100_000,
+        ];
+        // 128 multiprocessors (the RTX 4090) and 170 (the RTX 5090).
+        assert_eq!(
+            rows.map(|r| mla_head_groups(r, 128, 4)),
+            [1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4, 4, 4]
+        );
+        assert_eq!(
+            rows.map(|r| mla_head_groups(r, 170, 4)),
+            [1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4]
+        );
+        // A configured 2 or 1 is the cap.
+        assert_eq!(
+            rows.map(|r| mla_head_groups(r, 170, 2)),
+            [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        );
+        assert_eq!(rows.map(|r| mla_head_groups(r, 170, 1)), [1; 14]);
+        // Whatever the GPU: the grid fits one wave unless the configured groups make it, and one
+        // group fewer would not fit.
+        for sms in [1, 2, 24, 84, 128, 170, 188] {
+            for cap in [1, 2, 4] {
+                for rows in 9..600 {
+                    let g = mla_head_groups(rows, sms, cap);
+                    let fits = |g: usize| rows * 4 / g <= sms as usize;
+                    let what = format!("{rows} rows, {sms} SMs, cap {cap}");
+                    assert!([1, 2, 4].contains(&g) && g <= cap, "{what}");
+                    assert!(g == cap || fits(g), "{what}");
+                    assert!(g == 1 || !fits(g / 2), "{what}");
+                }
+            }
+        }
     }
 }

@@ -412,6 +412,53 @@ above):
   8 rows) costs 12–14 µs a token, and D2 with `--kda-prefill-w8a8` saves about 12 µs a token net
   (estimated).
 
+### 5b. Sparse MLA in passes of 9 to 170 rows (development GPU, 29 September 2026)
+
+A decode, verify or short prefill pass of more than 8 rows runs the sparse attention in one split
+(the split count moves bits, so it stays fixed) and, until now, with 4 head groups per block: one
+512-thread block per row. A block holds over half of a multiprocessor's shared memory, so such a
+pass filled as many multiprocessors as it had rows: 41 of the 5090's 170 for the verify windows of
+16 streams, 32 of the 4090's 128 at 32 rows.
+
+The head groups only partition the heads, so 1, 2 and 4 give the same bits at every row count
+(`sparse_attn_head_groups_are_bitwise`, 1 to 256 rows; and the same logits digest, before and
+after, for two-lane prefills in lanes of 12, 32, 48, 64 and 100 rows). The forward now takes the
+fewest groups whose grid (`rows × 4 / groups` blocks) still fits one wave of the multiprocessors
+(`mla_head_groups`): 1 group up to a quarter as many rows as the GPU has multiprocessors (42 rows
+on the 5090, 32 on the 4090), 2 up to half (85, 64), then 4 as before. Passes that fill the GPU
+with 4 groups, prefill lanes of hundreds of rows among them, are unchanged, and there is no new
+setting (`prefill_head_groups` is the most).
+
+Measured with `dsa_ab -- mid` on the RTX 4090 (128 multiprocessors): 2,051 selected tokens per
+row, one call after an L2 flush, best of three, µs. "Before" is the previous build, 4 groups:
+
+| Rows | Groups now | Blocks | 128K context: before → after | 1M context: before → after |
+|---:|---:|---|---:|---:|
+| 9 | 1 | 9 → 36 | 314 → 108 (2.9×) | 317 → 114 (2.8×) |
+| 16 | 1 | 16 → 64 | 315 → 109 (2.9×) | 317 → 111 (2.9×) |
+| 32 | 1 | 32 → 128 | 316 → 113 (2.8×) | 320 → 115 (2.8×) |
+| 41 | 2 | 41 → 82 | 317 → 166 (1.9×) | 321 → 167 (1.9×) |
+| 48 | 2 | 48 → 96 | 317 → 171 (1.9×) | 322 → 180 (1.8×) |
+| 64 | 2 | 64 → 128 | 322 → 187 (1.7×) | 333 → 197 (1.7×) |
+
+- A block over 2,051 tokens takes 316, 160 and 109 µs with 4, 2 and 1 groups (9 to 32 rows: one
+  block to a multiprocessor). So 2 groups cost the same multiprocessor time per row as 4, and 1
+  group about 40% more; once the blocks outnumber the multiprocessors that extra time is lost,
+  which is why the choice stops at one wave. Over the 11 DSA layers, 16 rows save about 2.3 ms a
+  pass on the 4090 (inferred from this table, not measured end to end).
+- In the forward (`prefill_bench`: one lane, all 45 layers on the weights of layers 0–4, a
+  2,880-token prompt so that the last pass selects 2,051 tokens, op profile on) a DSA layer's
+  sparse attention in the last pass fell from 0.310 to 0.102 ms at 16 rows, from 0.308 to 0.105 ms
+  at 32 and from 0.310 to 0.161 ms at 48, and the median pass from 32.1 to 29.5, 33.8 to 32.1 and
+  35.3 to 34.5 ms (the median counts the early passes, which select few tokens).
+- Above half as many rows as multiprocessors the settings are close: at 96 and 128 rows 4 groups
+  is within 11% of the best; at 170 rows, just over one wave, 2 groups timed 15–21% faster; at 256
+  and 512 rows the winner changes with the context. Those passes keep the prefill setting.
+- Not measured on the 5090, which has 170 multiprocessors and whose 4-group kernel spills more
+  registers than on the 4090 (the DSA crate's README): run `dsa_ab -- mid` there. If 2 groups win
+  above half the multiprocessors' rows, set `prefill_head_groups` to 2 for it; the rule takes it
+  as the most.
+
 ## 6. Start-up
 
 - **Sparks:** each rank loads its 38–43 GB expert quarter from local NVMe in parallel.

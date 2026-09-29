@@ -1093,8 +1093,12 @@ fn prefill_absorb_and_unabsorb_match_bitwise() {
     }
 }
 
-/// Unsplit sparse attention (the prefill plan) gives the same bits with 1, 2 or 4 head groups
-/// per block: a group's heads are computed the same way whichever groups share its tiles.
+/// Unsplit sparse attention (the plan of every pass of more than 8 rows) gives the same bits with
+/// 1, 2 or 4 head groups per block: a group's heads are computed the same way whichever groups
+/// share its tiles. The forward takes fewer groups for a smaller pass, to fill the multiprocessors
+/// (`mla_head_groups`), so the row counts run from a decode pass to a prefill lane, on both sides
+/// of the points where its choice changes on 128 and 170 multiprocessors (the RTX 4090 and 5090),
+/// with selections of every length in each pass.
 #[test]
 fn sparse_attn_head_groups_are_bitwise() {
     let Some(_gpu) = gpu_ready() else {
@@ -1104,37 +1108,38 @@ fn sparse_attn_head_groups_are_bitwise() {
     let tokens = 2400;
     let case = build_attn_case(&mut rng, tokens);
     let dev = DevCache::upload(&case.layer, &case.table, case.table.len());
-    let rows = 12;
-    let mut toks = vec![-1i32; rows * 2051];
-    let mut counts = vec![0i32; rows * 2];
-    for r in 0..rows {
-        let n = [2051usize, 2048, 777, 64, 1, 33][r % 6];
-        for (i, t) in random_token_list(&mut rng, tokens, n).iter().enumerate() {
-            toks[r * 2051 + i] = *t as i32;
+    for rows in [1usize, 9, 12, 16, 32, 33, 41, 43, 48, 64, 65, 85, 86, 128, 170, 171, 256] {
+        let mut toks = vec![-1i32; rows * 2051];
+        let mut counts = vec![0i32; rows * 2];
+        for r in 0..rows {
+            let n = [2051usize, 2048, 777, 64, 1, 33][r % 6];
+            for (i, t) in random_token_list(&mut rng, tokens, n).iter().enumerate() {
+                toks[r * 2051 + i] = *t as i32;
+            }
+            counts[2 * r + 1] = n as i32;
         }
-        counts[2 * r + 1] = n as i32;
-    }
-    let q: Vec<u16> = rng.normals(rows * 64 * 512, 1.0).into_iter().map(f32_to_bf16_bits).collect();
-    let (dq, dt, dc) = (DeviceBuffer::from_slice(&q).unwrap(), DeviceBuffer::from_slice(&toks).unwrap(), DeviceBuffer::from_slice(&counts).unwrap());
-    let dreq = DeviceBuffer::from_slice(&vec![0i32; rows]).unwrap();
-    let mut outs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
-    for groups in [1, 2, 4] {
-        let (o_lat, lse) = (DeviceBuffer::zeroed(rows * 64 * 512 * 4).unwrap(), DeviceBuffer::zeroed(rows * 64 * 4).unwrap());
-        check(
-            unsafe {
-                ffi::glm53f_dsa_mla_sparse_attn(
-                    dq.as_ptr(), dt.as_ptr(), 2051, dc.as_ptr(), dreq.as_ptr(), rows as i32, 0.0625, dev.view(), 1, groups, ptr::null_mut(), 0, o_lat.as_mut_ptr(), lse.as_mut_ptr(), ptr::null_mut(),
-                )
-            },
-            "sparse_attn",
-        )
-        .unwrap();
-        gpu::sync().unwrap();
-        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
-        outs.push((bits(o_lat.download(rows * 64 * 512).unwrap()), bits(lse.download(rows * 64).unwrap())));
-    }
-    for g in 1..outs.len() {
-        assert!(outs[g] == outs[0], "head groups {} against 1", [1, 2, 4][g]);
+        let q: Vec<u16> = rng.normals(rows * 64 * 512, 1.0).into_iter().map(f32_to_bf16_bits).collect();
+        let (dq, dt, dc) = (DeviceBuffer::from_slice(&q).unwrap(), DeviceBuffer::from_slice(&toks).unwrap(), DeviceBuffer::from_slice(&counts).unwrap());
+        let dreq = DeviceBuffer::from_slice(&vec![0i32; rows]).unwrap();
+        let mut outs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+        for groups in [1, 2, 4] {
+            let (o_lat, lse) = (DeviceBuffer::zeroed(rows * 64 * 512 * 4).unwrap(), DeviceBuffer::zeroed(rows * 64 * 4).unwrap());
+            check(
+                unsafe {
+                    ffi::glm53f_dsa_mla_sparse_attn(
+                        dq.as_ptr(), dt.as_ptr(), 2051, dc.as_ptr(), dreq.as_ptr(), rows as i32, 0.0625, dev.view(), 1, groups, ptr::null_mut(), 0, o_lat.as_mut_ptr(), lse.as_mut_ptr(), ptr::null_mut(),
+                    )
+                },
+                "sparse_attn",
+            )
+            .unwrap();
+            gpu::sync().unwrap();
+            let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+            outs.push((bits(o_lat.download(rows * 64 * 512).unwrap()), bits(lse.download(rows * 64).unwrap())));
+        }
+        for g in 1..outs.len() {
+            assert!(outs[g] == outs[0], "{rows} rows: head groups {} against 1", [1, 2, 4][g]);
+        }
     }
 }
 

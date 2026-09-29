@@ -18,6 +18,12 @@
 //! Sparse attention runs every (splits, head groups) plan and reports the best,
 //! and the current kernel also with `glm53f_dsa_mla_plan`'s plan.
 //! Allocates about 0.8 GiB.
+//!
+//!   cargo run --release --features cuda --example dsa_ab -- mid [quick]
+//!
+//! runs only the sparse attention of the mid-sized passes (9 to 512 rows, one split, 1, 2 and
+//! 4 head groups per block) at 128K and 1M tokens of context, graph and cold (each the best of
+//! three; the fastest cold time of each row count in bold).
 
 use std::ptr;
 
@@ -216,7 +222,7 @@ struct AttnCase {
     rows: usize,
 }
 
-fn attn_case(rng: &mut Rng, rows: usize, context: usize) -> Result<AttnCase, String> {
+fn attn_case(rng: &mut Rng, rows: usize, context: usize, max_splits: i32) -> Result<AttnCase, String> {
     let mut toks = vec![-1i32; rows * 2051];
     let mut counts = vec![0i32; rows * 2];
     let pools = context / 4;
@@ -236,7 +242,7 @@ fn attn_case(rng: &mut Rng, rows: usize, context: usize) -> Result<AttnCase, Str
         counts[2 * r + 1] = 2051;
     }
     let q: Vec<u16> = rng.normals(rows * 64 * 512, 0.5).iter().map(|v| glm53f_dsa::num::f32_to_bf16_bits(*v)).collect();
-    let ws_bytes = unsafe { ffi::glm53f_dsa_mla_workspace_bytes(rows as i32, 64) } as usize;
+    let ws_bytes = unsafe { ffi::glm53f_dsa_mla_workspace_bytes(rows as i32, max_splits) } as usize;
     Ok(AttnCase {
         q: DeviceBuffer::from_slice(&q)?,
         tokens: DeviceBuffer::from_slice(&toks)?,
@@ -306,6 +312,36 @@ fn main() -> Result<(), String> {
     let cache = build_cache(&mut rng);
     let flush = Flusher::new()?;
     let rows_set: &[usize] = &[1, 2, 4, 8];
+
+    if std::env::args().any(|a| a == "mid") {
+        println!("\n## Sparse MLA of mid-sized passes: 2,051 selected tokens per row, one split, µs\n");
+        println!("A block holds `groups` 16-head groups (128 x groups threads), so a pass runs rows x 4 / groups blocks on {sms} SMs.\n");
+        println!("| rows | context | groups | blocks | graph | cold |");
+        println!("|---:|---|---:|---:|---:|---:|");
+        let mid: &[usize] = if quick { &[16, 64, 170] } else { &[9, 12, 16, 24, 32, 41, 48, 64, 96, 128, 170, 256, 512] };
+        let v2 = ffi::glm53f_dsa_mla_sparse_attn as AttnFn;
+        for &(ctx, label) in &CONTEXTS[1..] {
+            for &rows in mid {
+                let c = attn_case(&mut rng, rows, ctx, 1)?;
+                let mut times = Vec::new();
+                for groups in [1, 2, 4] {
+                    // The best of three: another job on the GPU only slows a run.
+                    let (mut graph, mut cold) = (f64::INFINITY, f64::INFINITY);
+                    for _ in 0..3 {
+                        graph = graph.min(time_attn(&stream, &cache, v2, &c, 1, groups, Mode::Graph)?);
+                        cold = cold.min(time_attn(&stream, &cache, v2, &c, 1, groups, Mode::Cold(&flush))?);
+                    }
+                    times.push((groups, graph, cold));
+                }
+                let fastest = times.iter().map(|t| t.2).fold(f64::INFINITY, f64::min);
+                for (groups, graph, cold) in times {
+                    let bold = if cold == fastest { "**" } else { "" };
+                    println!("| {rows} | {label} | {groups} | {} | {graph:.1} | {bold}{cold:.1}{bold} |", rows * 4 / groups as usize);
+                }
+            }
+        }
+        return Ok(());
+    }
 
     if std::env::args().any(|a| a == "sweep") {
         println!("\n## Indexer chunk-plan sweep (graph replay), µs: chunks -> v1 / v2 prepared\n");
@@ -385,7 +421,7 @@ fn main() -> Result<(), String> {
     println!("|---:|---|---:|---:|---:|---:|---:|---:|---:|");
     for &(ctx, label) in &CONTEXTS {
         for &rows in rows_set {
-            let c = attn_case(&mut rng, rows, ctx)?;
+            let c = attn_case(&mut rng, rows, ctx, 64)?;
             let (v1, v2) = (ffi::glm53f_dsa_mla_sparse_attn_v1 as AttnFn, ffi::glm53f_dsa_mla_sparse_attn as AttnFn);
             let v1e = best_attn(&stream, &cache, v1, &c, Mode::Eager, quick)?;
             let v2e = best_attn(&stream, &cache, v2, &c, Mode::Eager, quick)?;
