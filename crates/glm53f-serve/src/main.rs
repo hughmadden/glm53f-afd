@@ -54,7 +54,10 @@ mod daemon {
     use glm53f_forward::shape::{ModelShape, SAMPLE_VOCAB};
     use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
     use glm53f_forward::Fp8Scales;
-    use glm53f_serve::{admission_line, dev_banner, kv_pages, verify_rows, Experts, Options};
+    use glm53f_serve::{
+        admission_line, api_key_file_warning, dev_banner, kv_pages, read_api_key, verify_rows,
+        Experts, Options,
+    };
 
     const GIB: f64 = (1u64 << 30) as f64;
     const MIB: f64 = (1u64 << 20) as f64;
@@ -74,7 +77,19 @@ mod daemon {
     }
 
     pub fn run(o: &Options) -> Result<(), String> {
-        // The text side first (the scheduler's configuration feeds the memory plan below).
+        // The API key first: a file that is missing or holds no key stops the daemon now, not
+        // after the weights load.
+        let api_key = match &o.api_key_file {
+            Some(path) => {
+                let key = read_api_key(path)?;
+                if let Some(w) = api_key_file_warning(path) {
+                    eprintln!("[coordinator] warning: {w}");
+                }
+                Some(key)
+            }
+            None => None,
+        };
+        // The text side next (the scheduler's configuration feeds the memory plan below).
         let codec = GlmPrompts::load(&o.tokenizer, &o.chat_template)?;
         if codec.id_bound() != SAMPLE_VOCAB {
             return Err(format!(
@@ -415,15 +430,20 @@ mod daemon {
         // The API listens only from here, once the engine is ready: before, a probe's connection
         // is refused, so `GET /health` never has to answer "not yet".
         eprintln!(
-            "[coordinator] serving the API on {}{}",
+            "[coordinator] serving the API on {}{}{}",
             o.listen,
+            if api_key.is_some() {
+                ", /v1/* with an API key (GET /health is open)"
+            } else {
+                ""
+            },
             if banner.is_some() {
                 " (DEVELOPMENT MODE: the output is meaningless text)"
             } else {
                 ""
             }
         );
-        glm53f_api::serve(&o.listen, Arc::new(engine), Arc::new(GlmDialect))
+        glm53f_api::serve_with_key(&o.listen, Arc::new(engine), Arc::new(GlmDialect), api_key)
             .map_err(|e| format!("serve on {}: {e}", o.listen))
     }
 }

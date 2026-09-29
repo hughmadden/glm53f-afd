@@ -47,6 +47,7 @@ to mimo26f-afd's design records and are kept verbatim as provenance.
 | tests/acceptance.rs (last section) | `GlmScript`, a scripted GLM-5.3-Flash stand-in served with `GlmDialect` (a small GLM-like prompt whose length is its token count, answers to the contract harness's prompts, three-character deltas); `reasoning_is_reasoning_content_whole_and_streamed`, `every_chunk_carries_the_completion_head`, and `api_contract_harness_passes_against_the_glm_script`, which runs `harness/api_contract.py` against it and requires every row to pass. | 2026-09-28 |
 | src/dialect/glm.rs | `GlmDialect`, GLM-5.3-Flash's completion markup: reasoning first when the prompt opened the think block (`reasoning_first(thinking) = thinking`), thinking on by default; the tool-call envelope read in the order the streaming splitter walks it; argument values typed by the tool's JSON schema, inverting the chat template (a string property keeps its text exactly; other values are JSON when the schema allows); every loss reported, a nameless call with arguments an error, the tool-call cap. Written here; the tool-call format and the schema-typed values follow the GLM-5.3-Flash chat template (sha256 `0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5`) and were cross-read with tpurtell/glmrt-5.3-1rtx-4spark @ `dc6d9b8` : `rust/crates/glmrt-api/src/tooling.rs` (sha256 `cb657995662cbca79bbb2515f822de2d8d3e14ec11a7987d185a61db38eed93f`), no code copied. Tests in the file: parser cases (reasoning, parallel calls, nested JSON, strings holding tags, malformed calls, cap, schema typing, template round trip), request-field mapping, two server tests (a call split across stream deltas; thinking off end to end) and a source-hygiene check. | 2026-09-28 |
 | src/health.rs | `GET /health`: 200 `{"status":"ok"}` while `Engine::health` passes, 503 `{"status":"unavailable","reason":...}` with its reason when not; own code, in the shape of `models.rs`. | 2026-09-29 |
+| src/auth.rs | The API key: `ApiKey` (never empty, a `Debug` that shows nothing of it), `ApiKey::check` (a request for `/v1...` must send `Authorization: Bearer <key>`, the scheme in any case), the constant-time comparison; own code, in the style of vLLM's `--api-key`. | 2026-09-29 |
 | PROVENANCE.md | This ledger. | 2026-09-28 |
 
 ## Changed here (the GLM dialect and its request fields)
@@ -130,3 +131,18 @@ request queue or the model. Own code; nothing is copied.
 | src/http.rs | The reason phrase of 503 (`Service Unavailable`) | the 503 test | 2026-09-29 |
 | Cargo.toml | The header comment lists the route | — | 2026-09-29 |
 | tests/acceptance.rs | `start_served` (the crate's own routes on a loopback port), `raw_get`, the `WireDown` stub and the two health tests | the tests themselves | 2026-09-29 |
+
+## Changed here (an optional API key)
+
+The API served every request that reached it, and the engine has no accounts, so anything on the
+network could use it directly. `glm53f-serve --api-key-file` now gives it one key, the file's first
+line; every `/v1/*` request must then carry it as `Authorization: Bearer <key>`, and `GET /health`
+stays open. Own code; nothing is copied.
+
+| File | Change | Pinned by | Date |
+|---|---|---|---|
+| src/lib.rs | New `serve_with_key` and `serve_listener_with_key`, which check the key before routing (a refusal reaches no handler); `serve` and `serve_listener` call them without a key, so their behaviour is unchanged; `ApiKey` re-exported; crate doc | tests/acceptance.rs `a_keyed_api_refuses_v1_requests_without_the_key`, `a_keyed_api_leaves_health_open`, `an_api_without_a_key_is_open` | 2026-09-29 |
+| src/types.rs | New `ApiError::unauthorized` (401, code `invalid_api_key`); `ApiError::body` gives a 401 the type `invalid_request_error`, as OpenAI answers a bad key (the other errors keep their code as their type) | auth.rs unit tests; the acceptance tests above | 2026-09-29 |
+| src/http.rs | The reason phrase of 401 (`Unauthorized`) and its `WWW-Authenticate: Bearer` header (RFC 9110, 11.6.1) | the acceptance tests above | 2026-09-29 |
+| Cargo.toml | The header comment names the key | — | 2026-09-29 |
+| tests/acceptance.rs | `start_keyed` (`start_served` calls it without a key), `raw_request`, and the three tests above | the tests themselves | 2026-09-29 |

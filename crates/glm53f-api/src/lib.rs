@@ -13,6 +13,13 @@
 //! `{"status":"unavailable","reason":...}` once it cannot ([`Engine::health`]); it
 //! reads the engine's state only, so it answers at once however busy the engine is.
 //!
+//! # API key
+//!
+//! The API serves every request that reaches it, unless it is served with an [`ApiKey`]
+//! ([`serve_with_key`]; `glm53f-serve --api-key-file`): every `/v1/*` request must then carry it as
+//! `Authorization: Bearer <key>` and is answered 401 otherwise, in OpenAI's error shape (type
+//! `invalid_request_error`, code `invalid_api_key`; [`auth`]). `GET /health` needs no key.
+//!
 //! # Reasoning and the thinking switch
 //!
 //! Reasoning goes out under one name in both modes, [`chat::REASONING_FIELD`]
@@ -61,6 +68,7 @@
 //! (which only types them). Every report of the parse (a lost call, a dropped argument, a
 //! recovered name) is logged to stderr, one line each, under the completion's id.
 
+pub mod auth;
 pub mod chat;
 pub mod dialect;
 pub mod engine;
@@ -74,6 +82,7 @@ use std::io;
 use std::net::TcpListener;
 use std::sync::Arc;
 
+pub use auth::ApiKey;
 pub use dialect::{Dialect, ParseResult, ParsedCall, StreamTags};
 pub use engine::{Engine, GenerateOutcome, GenerateParams};
 pub use types::{ApiError, ChatMessage, ChatRequest, Tool, ToolCall, MODEL_ID};
@@ -83,13 +92,32 @@ use http::Request;
 /// Run the API on `addr` (e.g. `0.0.0.0:8000`) with the given engine and the
 /// model's completion dialect.
 pub fn serve<E: Engine + Send + Sync + 'static>(addr: &str, engine: Arc<E>, dialect: Arc<dyn Dialect>) -> io::Result<()> {
-    serve_listener(TcpListener::bind(addr)?, engine, dialect)
+    serve_with_key(addr, engine, dialect, None)
+}
+
+/// [`serve`] behind an API key: with `Some(key)`, every `/v1/*` request must carry it ([`auth`]).
+pub fn serve_with_key<E: Engine + Send + Sync + 'static>(addr: &str, engine: Arc<E>, dialect: Arc<dyn Dialect>,
+    key: Option<ApiKey>) -> io::Result<()> {
+    serve_listener_with_key(TcpListener::bind(addr)?, engine, dialect, key)
 }
 
 /// [`serve`] on an already-bound listener (lets tests bind an ephemeral port).
 pub fn serve_listener<E: Engine + Send + Sync + 'static>(listener: TcpListener, engine: Arc<E>,
     dialect: Arc<dyn Dialect>) -> io::Result<()> {
-    http::serve_listener(listener, move |req| route(engine.clone(), dialect.clone(), req))
+    serve_listener_with_key(listener, engine, dialect, None)
+}
+
+/// [`serve_with_key`] on an already-bound listener.
+pub fn serve_listener_with_key<E: Engine + Send + Sync + 'static>(listener: TcpListener, engine: Arc<E>,
+    dialect: Arc<dyn Dialect>, key: Option<ApiKey>) -> io::Result<()> {
+    http::serve_listener(listener, move |req| {
+        // Checked before the request is routed: a refused one reaches no handler, so nothing of it
+        // is parsed, tokenized or queued.
+        match key.as_ref().map_or(Ok(()), |k| k.check(&req)) {
+            Ok(()) => route(engine.clone(), dialect.clone(), req),
+            Err(e) => http::json_response(e.status, &json::serialize(&e.body())),
+        }
+    })
 }
 
 fn route<E: Engine + Send + Sync + 'static>(engine: Arc<E>, dialect: Arc<dyn Dialect>, req: Request) -> http::Response {

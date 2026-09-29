@@ -62,6 +62,7 @@ fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         429 => "Too Many Requests",
@@ -105,8 +106,10 @@ fn write_response(stream: &mut TcpStream, resp: Response, keep_alive: bool) -> s
         ResponseBody::Bytes(body) => {
             // A 429 (the engine's queue is full, perf reset V3) asks the client to retry in a second.
             let retry = if resp.status == 429 { "Retry-After: 1\r\n" } else { "" };
+            // A 401 (no valid API key) names the scheme that would do (RFC 9110, 11.6.1).
+            let challenge = if resp.status == 401 { "WWW-Authenticate: Bearer\r\n" } else { "" };
             let head = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{retry}Connection: {}\r\n\r\n",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{retry}{challenge}Connection: {}\r\n\r\n",
                 resp.status, status_reason(resp.status), resp.content_type, body.len(), conn,
             );
             stream.write_all(head.as_bytes())?;

@@ -4,7 +4,8 @@
 //! HTTP -> queue -> scheduler -> forward (layers 0-4, the MoE layers on the ranks) -> sampler ->
 //! SSE. The text is meaningless by design (5 of 45 layers); the test checks the loop, not the
 //! words. Then `GET /health`: 200 while serving; after a rank is stopped and a request fails on
-//! the wire, 503 with the wire's failure.
+//! the wire, 503 with the wire's failure. The daemon runs with an API key (`--api-key-file`):
+//! every `/v1/*` request carries it, one without it is a 401, and `/health` needs none.
 //!
 //! Needs `GLM53F_CHECKPOINT_DIR` (the coordinator's weights, with the tokenizer and the official
 //! chat template), `GLM53F_RANK_BIN` (a `glm53f-rank` binary built with `--features cuda`) and
@@ -20,6 +21,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -39,6 +41,28 @@ impl Drop for Procs {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+/// The API key the daemon is started with: a test value.
+const KEY: &str = "dev-mode-test-key";
+
+/// A file (mode 600) that holds a key, removed when dropped.
+struct KeyFile(PathBuf);
+
+impl KeyFile {
+    fn new(tag: &str, contents: &str) -> KeyFile {
+        let path =
+            std::env::temp_dir().join(format!("glm53f-dev-mode-{}-{tag}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        KeyFile(path)
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -102,13 +126,21 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
     }
 }
 
-/// One request with a whole (not chunked) response: its status and body.
-fn request(api: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+/// One request with a whole (not chunked) response: its status and body. `authorization` is the
+/// value of its `Authorization` header, if it sends one.
+fn request(
+    api: &str,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    body: &str,
+) -> (u16, String) {
     let mut s = TcpStream::connect(api).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+    let auth = authorization.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: {api}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {api}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -166,6 +198,7 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
         return;
     }
 
+    let key_file = KeyFile::new("key", &format!("{KEY}\n"));
     let (mut ranks, addrs) = spawn_ranks(&bin, &dirs);
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -198,6 +231,8 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
             ])
             .args(["--listen", &api, "--slots", "2", "--max-context", "4096"])
             .args(["--kv-gib", "0.25", "--prefill-rows", "64"])
+            .arg("--api-key-file")
+            .arg(&key_file.0)
             .env("GLM53F_HOST_CACHE_GB", "0")
             .env("GLM53F_WIRE_ALLOW_LAN", "1")
             .stdout(Stdio::null())
@@ -236,7 +271,7 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
     let t1 = Instant::now();
     write!(
         s,
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {api}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {api}\r\nAuthorization: Bearer {KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -297,9 +332,31 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
     );
     assert!(usage.is_some_and(|n| n >= 1.0), "usage {usage:?}");
 
+    // The key: without it, or with another, a `/v1/*` request is a 401 and reaches nothing; with
+    // it, served (the completion above). Health checks carry no key.
+    let bearer = format!("Bearer {KEY}");
+    for sent in [None, Some("Bearer not-the-key")] {
+        for (method, path, body) in [
+            ("GET", "/v1/models", ""),
+            (
+                "POST",
+                "/v1/chat/completions",
+                r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Hi"}],"max_tokens":2}"#,
+            ),
+        ] {
+            let (status, resp) = request(&api, method, path, sent, body);
+            assert_eq!(status, 401, "{method} {path} sending {sent:?}: {resp}");
+            assert!(resp.contains(r#""code":"invalid_api_key""#), "{resp}");
+        }
+    }
+    let (status, models) = request(&api, "GET", "/v1/models", Some(&bearer), "");
+    assert!(
+        status == 200 && models.contains("glm-5.3-flash"),
+        "{status}: {models}"
+    );
     // Health while serving.
     assert_eq!(
-        request(&api, "GET", "/health", ""),
+        request(&api, "GET", "/health", None, ""),
         (200, r#"{"status":"ok"}"#.to_string())
     );
     // A rank gone: the next request fails on the expert wire, the forward refuses every pass
@@ -307,9 +364,9 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
     let _ = ranks.children[0].kill();
     let _ = ranks.children[0].wait();
     let body = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Name three birds."}],"max_tokens":4}"#;
-    let (status, resp) = request(&api, "POST", "/v1/chat/completions", body);
+    let (status, resp) = request(&api, "POST", "/v1/chat/completions", Some(&bearer), body);
     assert_eq!(status, 500, "a request with a rank gone: {resp}");
-    let (status, health) = request(&api, "GET", "/health", "");
+    let (status, health) = request(&api, "GET", "/health", None, "");
     assert_eq!(status, 503, "{health}");
     let h = json::parse(&health).expect("a JSON body");
     assert_eq!(
@@ -329,9 +386,41 @@ fn a_streamed_chat_completion_through_four_ranks_in_development_mode() {
         "the development mode was not announced"
     );
     assert!(
+        log.contains(", /v1/* with an API key (GET /health is open)"),
+        "the key was not announced"
+    );
+    assert!(!log.contains(KEY), "the key reached the log");
+    assert!(
         log.contains("[coordinator] numerics: BF16 KDA states (D8), W8A16 prefill projections, chunked KDA prefill"),
         "the default numerics were not logged"
     );
     drop(serve);
     drop(ranks);
+    drop(key_file);
+}
+
+/// A key file that is missing, or holds no key on its first line, stops the daemon before it loads
+/// anything: the flag would otherwise leave the API open, or stop it after the weights load.
+#[test]
+fn a_key_file_without_a_key_stops_the_daemon_at_once() {
+    let empty = KeyFile::new("empty", "\n");
+    let missing =
+        std::env::temp_dir().join(format!("glm53f-dev-mode-{}-missing", std::process::id()));
+    for (file, why) in [(&empty.0, "first line"), (&missing, "No such file")] {
+        let t0 = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_glm53f-serve"))
+            .args(["--checkpoint", "/nonexistent", "--experts", "local"])
+            .arg("--api-key-file")
+            .arg(file)
+            .output()
+            .expect("run glm53f-serve");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.contains("--api-key-file") && err.contains(why), "{err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "it stopped after {:?}",
+            t0.elapsed()
+        );
+    }
 }

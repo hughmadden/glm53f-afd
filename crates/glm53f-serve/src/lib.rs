@@ -37,6 +37,23 @@
 //! The API listens only once the engine is ready (step 5 above), so before that a probe's
 //! connection is refused: there is no "starting" answer.
 //!
+//! # API key
+//!
+//! The API has no accounts. With `--api-key-file FILE` (or `GLM53F_API_KEY_FILE`) it holds one key,
+//! the first line of the file, trimmed, and every `/v1/*` request must carry it as
+//! `Authorization: Bearer <key>`. Without it, or with another key, the answer is 401,
+//! `{"error": {"message": ..., "type": "invalid_request_error", "code": "invalid_api_key"}}`, sent
+//! before anything of the request is parsed or queued. The key is compared in constant time and
+//! never logged. `GET /health` stays open, so health checks carry no key. Without the option every
+//! request that reaches the API is served, as before: keep it on a network only its users reach, or
+//! put a proxy that holds the users' keys in front of it and give the proxy this key as the
+//! backend's.
+//!
+//! The key is read from a file, never from the command line, which `ps` shows. The daemon reads
+//! it once, first of all (a missing or empty file stops it before the weights load), and warns
+//! when other users can read the file: `chmod 600` it. To change the key, replace the file and
+//! restart.
+//!
 //! # Options
 //!
 //! | Option | Environment | Default | What |
@@ -49,6 +66,7 @@
 //! | `--experts-dir DIR` | `GLM53F_EXPERTS_DIR` | the checkpoint | `local`: a checkpoint holding the routed experts of the layers run |
 //! | `--local-experts-gib G` | | 4 | `local`: device memory for the experts, loaded on demand |
 //! | `--listen ADDR` | `GLM53F_API_ADDR` | `127.0.0.1:8100` | The API's address |
+//! | `--api-key-file FILE` | `GLM53F_API_KEY_FILE` | none | The API key: the file's first line, trimmed. With it every `/v1/*` request must send `Authorization: Bearer <key>` (401 otherwise; `GET /health` stays open); without it the API serves every request that reaches it ([API key](#api-key)) |
 //! | `--slots N` | `GLM53F_MAX_SLOTS` | 16 | Requests with device state at once (1-64) |
 //! | `--max-context T` | | the model's (1,048,576) | Tokens one request can hold |
 //! | `--kv-gib G` | | the free memory less the reserve | The KV page pool |
@@ -256,7 +274,7 @@
 //! is the output of layer 42, read at the entry of layer 43); with fewer layers the daemon says
 //! so and runs without it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use glm53f_forward::Fp8Scales;
 
@@ -266,6 +284,8 @@ pub const USAGE: &str = "usage:
   glm53f-serve --checkpoint <dir> --experts local [--experts-dir <dir>] [--dev-layers 0-N] [options]
 options:
   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
+  --api-key-file <file>  the API key, the file's first line: /v1/* then needs the header
+                      Authorization: Bearer <key> (401 otherwise); /health stays open
   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
   --prefill-rows <r>  --prefill-lanes 1-4  --decode-lanes off|<min>[-<max>]
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
@@ -415,6 +435,8 @@ pub struct Options {
     pub chat_template: PathBuf,
     pub experts: Experts,
     pub listen: String,
+    /// The file whose first line is the API key (none: the API serves every request).
+    pub api_key_file: Option<PathBuf>,
     pub slots: usize,
     /// None: the model's maximum context.
     pub max_context: Option<usize>,
@@ -564,6 +586,7 @@ impl Options {
         let mut experts_dir = env("GLM53F_EXPERTS_DIR").map(PathBuf::from);
         let mut local_gib = 4.0;
         let mut listen = env("GLM53F_API_ADDR").unwrap_or_else(|| "127.0.0.1:8100".into());
+        let mut api_key_file = env("GLM53F_API_KEY_FILE").map(PathBuf::from);
         let mut slots = match env("GLM53F_MAX_SLOTS") {
             Some(v) => number("GLM53F_MAX_SLOTS", &v)?,
             None => 16,
@@ -613,6 +636,7 @@ impl Options {
                 "--experts-dir" => experts_dir = Some(PathBuf::from(val()?)),
                 "--local-experts-gib" => local_gib = number(k, &val()?)?,
                 "--listen" => listen = val()?,
+                "--api-key-file" => api_key_file = Some(PathBuf::from(val()?)),
                 "--slots" => slots = number(k, &val()?)?,
                 "--max-context" => max_context = Some(number(k, &val()?)?),
                 "--kv-gib" => kv_gib = Some(number(k, &val()?)?),
@@ -629,6 +653,13 @@ impl Options {
                 "--dev-layers" => dev_layers = Some(parse_dev_layers(&val()?)?),
                 other => return Err(format!("unknown argument {other}")),
             }
+        }
+        // An empty path is refused, not read as "no key": the API must not start open by mistake.
+        if api_key_file
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("--api-key-file (or GLM53F_API_KEY_FILE): an empty path".into());
         }
         let checkpoint = checkpoint
             .ok_or("--checkpoint (or GLM53F_CHECKPOINT_DIR): the coordinator's weights")?;
@@ -687,6 +718,7 @@ impl Options {
             checkpoint,
             experts,
             listen,
+            api_key_file,
             slots,
             max_context,
             kv_gib,
@@ -702,6 +734,37 @@ impl Options {
             numerics,
         })
     }
+}
+
+/// The API key in `--api-key-file`: the file's first line, trimmed.
+pub fn read_api_key(path: &Path) -> Result<glm53f_api::ApiKey, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("--api-key-file {}: {e}", path.display()))?;
+    glm53f_api::ApiKey::new(text.lines().next().unwrap_or("").trim()).map_err(|e| {
+        format!(
+            "--api-key-file {}: {e} (the key is the file's first line, trimmed)",
+            path.display()
+        )
+    })
+}
+
+/// What to warn about the key file at `path`: it can be read by users other than its owner. None
+/// when it is private (or its mode cannot be read; not on Unix).
+#[cfg(unix)]
+pub fn api_key_file_warning(path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "--api-key-file {}: its mode {mode:03o} lets other users read the key; chmod 600 it",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+pub fn api_key_file_warning(_: &Path) -> Option<String> {
+    None
 }
 
 /// Rows one verify pass holds with a drafter: every slot's window of `block` rows, capped by the
@@ -1086,6 +1149,143 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_api_key_file_is_a_flag_or_a_variable_and_never_empty() {
+        let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+        let key_file = |o: Result<Options, String>| o.unwrap().api_key_file;
+        // No file by default: the API serves every request.
+        assert_eq!(
+            key_file(Options::parse(&args("--checkpoint /c"), &env)),
+            None
+        );
+        let with = |k: &str| match k {
+            "GLM53F_API_KEY_FILE" => Some("/k".to_string()),
+            other => env(other),
+        };
+        assert_eq!(
+            key_file(Options::parse(&args("--checkpoint /c"), &with)),
+            Some(PathBuf::from("/k"))
+        );
+        // The flag wins over the variable.
+        assert_eq!(
+            key_file(Options::parse(
+                &args("--checkpoint /c --api-key-file /f"),
+                &with
+            )),
+            Some(PathBuf::from("/f"))
+        );
+        // An empty path is refused: the API must not start open by mistake.
+        let empty = |k: &str| match k {
+            "GLM53F_API_KEY_FILE" => Some(String::new()),
+            other => env(other),
+        };
+        let e = Options::parse(&args("--checkpoint /c"), &empty).unwrap_err();
+        assert!(e.contains("empty path"), "{e}");
+        assert!(Options::parse(&args("--checkpoint /c --api-key-file /f"), &empty).is_ok());
+        // The key is a file: the flag needs its value, and no flag takes the key itself (`ps`
+        // would show it).
+        assert!(Options::parse(&args("--checkpoint /c --api-key-file"), &env).is_err());
+        for bad in ["--api-key sekret", "--api-key=sekret"] {
+            let a = format!("--checkpoint /c {bad}");
+            assert!(
+                Options::parse(&args(&a), &env).is_err(),
+                "{bad} was accepted"
+            );
+        }
+    }
+
+    /// A file of `text` in the temporary directory (`tag` tells the tests' files apart).
+    fn temp_file(tag: &str, text: &[u8]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("glm53f-serve-test-{}-{tag}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// Whether `key` lets a request through that sends `token`.
+    fn accepts(key: &glm53f_api::ApiKey, token: &str) -> bool {
+        let req = glm53f_api::http::Request {
+            method: "GET".into(),
+            path: "/v1/models".into(),
+            headers: vec![("Authorization".into(), format!("Bearer {token}"))],
+            body: Vec::new(),
+        };
+        key.check(&req).is_ok()
+    }
+
+    #[test]
+    fn the_key_is_the_first_line_of_its_file_trimmed() {
+        for (tag, text, want) in [
+            ("plain", "abc\n", "abc"),
+            ("bare", "abc", "abc"),
+            ("crlf", "abc\r\n", "abc"),
+            ("padded", "  abc \t\nnot the key\n", "abc"),
+            ("spaced", "abc def\n", "abc def"),
+        ] {
+            let path = temp_file(tag, text.as_bytes());
+            let key = read_api_key(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(accepts(&key, want), "{tag}");
+            assert!(!accepts(&key, "not the key") && !accepts(&key, ""), "{tag}");
+        }
+        // No key on the first line is no key, whatever follows.
+        for (tag, text) in [
+            ("empty", ""),
+            ("blank", "  \n"),
+            ("late", "\nabc\n"),
+            ("crlf-blank", "\r\nabc\r\n"),
+        ] {
+            let path = temp_file(tag, text.as_bytes());
+            let e = read_api_key(&path).unwrap_err();
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                e.contains("--api-key-file") && e.contains("first line"),
+                "{tag}: {e}"
+            );
+            assert!(!e.contains("abc"), "{tag}: {e}");
+        }
+        // A file that is not there, or not text, names itself in the error.
+        let path = temp_file("binary", &[0xff, 0xfe, b'\n']);
+        let e = read_api_key(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(e.contains(path.to_str().unwrap()), "{e}");
+        let e = read_api_key(&path).unwrap_err();
+        assert!(e.contains(path.to_str().unwrap()), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_read_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_file("mode", b"abc\n");
+        for (mode, warned) in [
+            (0o600, false),
+            (0o400, false),
+            (0o700, false),
+            (0o640, true),
+            (0o604, true),
+            (0o644, true),
+            (0o666, true),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let w = api_key_file_warning(&path);
+            assert_eq!(w.is_some(), warned, "{mode:o}: {w:?}");
+            if let Some(w) = w {
+                assert!(
+                    w.contains(&format!("mode {mode:o}")) && w.contains("chmod 600"),
+                    "{w}"
+                );
+                assert!(!w.contains("abc\n"), "{w}");
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            api_key_file_warning(&path),
+            None,
+            "a missing file is read_api_key's error"
+        );
     }
 
     #[test]

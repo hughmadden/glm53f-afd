@@ -29,11 +29,18 @@ impl ApiError {
     pub fn too_many_requests(msg: impl Into<String>) -> Self {
         ApiError { status: 429, message: msg.into(), code: "rate_limit_exceeded".into() }
     }
+    /// No valid API key ([`crate::auth`]): 401, sent with `WWW-Authenticate: Bearer`.
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        ApiError { status: 401, message: msg.into(), code: "invalid_api_key".into() }
+    }
     pub fn body(&self) -> Json {
+        // The type is the code, but for a bad key: OpenAI answers one with type
+        // `invalid_request_error` and code `invalid_api_key`.
+        let kind = if self.status == 401 { "invalid_request_error" } else { self.code.as_str() };
         Json::Object(vec![
             ("error".into(), Json::Object(vec![
                 ("message".into(), Json::Str(self.message.clone())),
-                ("type".into(), Json::Str(self.code.clone())),
+                ("type".into(), Json::Str(kind.into())),
                 ("code".into(), Json::Str(self.code.clone())),
             ])),
         ])

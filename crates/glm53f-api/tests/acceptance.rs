@@ -1016,11 +1016,18 @@ fn a_full_queue_is_429_with_retry_after() {
 
 /// The API as `glm53f_api::serve` routes it, on a loopback port.
 fn start_served<E: Engine + Send + Sync + 'static>(engine: E) -> Server {
+    start_keyed(engine, None)
+}
+
+/// The API as `glm53f_api::serve_with_key` routes it (`key`: what every `/v1/*` request must
+/// carry), on a loopback port.
+fn start_keyed<E: Engine + Send + Sync + 'static>(engine: E, key: Option<&str>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let engine = Arc::new(engine);
+    let key = key.map(|k| glm53f_api::ApiKey::new(k).expect("a key"));
     let handle = std::thread::spawn(move || {
-        let _ = glm53f_api::serve_listener(listener, engine, Arc::new(MimoDialect));
+        let _ = glm53f_api::serve_listener_with_key(listener, engine, Arc::new(MimoDialect), key);
     });
     Server { base: format!("http://127.0.0.1:{port}"), _handle: handle }
 }
@@ -1086,6 +1093,130 @@ fn health_is_503_with_the_reason_once_the_engine_cannot_serve() {
     );
     let (status, _) = http_get(&format!("{}/v1/models", srv.base));
     assert_eq!(status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// The API key (added in glm53f-afd): `serve_with_key`.
+// ---------------------------------------------------------------------------
+
+/// A request's whole response, head and body: `authorization` is the value of its
+/// `Authorization` header, if it sends one.
+fn raw_request(srv: &Server, method: &str, path: &str, authorization: Option<&str>, body: &str) -> String {
+    let hostport = srv.base.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(hostport).expect("connect");
+    use std::io::Write;
+    let auth = authorization.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: {hostport}\r\n{auth}Content-Type: application/json\r\n\
+        Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+const CHAT_WHOLE: &str = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Calculate 17 times 23. Reply with only the integer answer."}]}"#;
+const CHAT_STREAM: &str = r#"{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Calculate 17 times 23. Reply with only the integer answer."}],"stream":true}"#;
+
+/// The requests a key guards: the model list, a chat completion whole and streamed, and a path
+/// the API does not serve (a client without the key learns nothing about which paths exist).
+const GUARDED: [(&str, &str, &str); 4] = [
+    ("GET", "/v1/models", ""),
+    ("POST", "/v1/chat/completions", CHAT_WHOLE),
+    ("POST", "/v1/chat/completions", CHAT_STREAM),
+    ("GET", "/v1/nothing", ""),
+];
+
+/// With a key, every `/v1/*` request must send `Authorization: Bearer <key>`: without it, with
+/// another key or in another scheme it is a 401 in OpenAI's error shape, a streamed request too,
+/// and the answer never repeats what was sent. The right key is served, the scheme in any case.
+#[test]
+fn a_keyed_api_refuses_v1_requests_without_the_key() {
+    let key = "test-key-4f1c";
+    let srv = start_keyed(Stub, Some(key));
+    let refused = [
+        None,
+        Some("Bearer test-key-9d9d".to_string()),
+        Some(format!("Bearer {}x", key)),
+        Some(format!("Bearer {}", &key[..key.len() - 1])),
+        Some(format!("Basic {key}")),
+        Some(key.to_string()),
+        Some("Bearer".to_string()),
+    ];
+    for (method, path, body) in GUARDED {
+        for sent in &refused {
+            let resp = raw_request(&srv, method, path, sent.as_deref(), body);
+            let what = format!("{method} {path} sending {sent:?}: {resp}");
+            assert!(resp.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{what}");
+            assert!(resp.contains("\r\nContent-Type: application/json\r\n"), "{what}");
+            assert!(resp.contains("\r\nWWW-Authenticate: Bearer\r\n"), "{what}");
+            let v = glm53f_api::json::parse(resp.split("\r\n\r\n").nth(1).unwrap()).expect("a JSON body");
+            let err = v.get("error").unwrap_or_else(|| panic!("{what}"));
+            assert_eq!(err.get("type").and_then(|t| t.as_str()), Some("invalid_request_error"), "{what}");
+            assert_eq!(err.get("code").and_then(|c| c.as_str()), Some("invalid_api_key"), "{what}");
+            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            assert!(!message.is_empty(), "{what}");
+            // No key of the server's, no key of the client's in the answer.
+            assert!(!resp.contains("test-key"), "{what}");
+            assert!(!resp.contains("data:"), "a refused stream sends no event: {what}");
+        }
+        // The message says which it is: nothing sent, or something that is not the key.
+        let none = raw_request(&srv, method, path, None, body);
+        let wrong = raw_request(&srv, method, path, Some("Bearer test-key-9d9d"), body);
+        assert!(none.contains("no API key") && !none.contains("not valid"), "{none}");
+        assert!(wrong.contains("not valid") && !wrong.contains("no API key"), "{wrong}");
+    }
+    // A query string does not hide a path from the key.
+    let resp = raw_request(&srv, "GET", "/v1/models?x=1", None, "");
+    assert!(resp.starts_with("HTTP/1.1 401 "), "{resp}");
+
+    for auth in [format!("Bearer {key}"), format!("bearer {key}"), format!("BEARER  {key}")] {
+        let resp = raw_request(&srv, "GET", "/v1/models", Some(&auth), "");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains(MODEL_ID), "{resp}");
+        let resp = raw_request(&srv, "POST", "/v1/chat/completions", Some(&auth), CHAT_WHOLE);
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains("\"content\":\"391\""), "{resp}");
+        let resp = raw_request(&srv, "POST", "/v1/chat/completions", Some(&auth), CHAT_STREAM);
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains("data: [DONE]") && resp.contains("391"), "{resp}");
+    }
+    // A path that exists nowhere is a 404 for a client with the key.
+    let resp = raw_request(&srv, "GET", "/v1/nothing", Some(&format!("Bearer {key}")), "");
+    assert!(resp.starts_with("HTTP/1.1 404 "), "{resp}");
+}
+
+/// `GET /health` and every path outside `/v1` stay open on a keyed API: health checks carry no
+/// key, and a key sent with one is not judged. The engine's answer is what it always was.
+#[test]
+fn a_keyed_api_leaves_health_open() {
+    let srv = start_keyed(Stub, Some("test-key-4f1c"));
+    for auth in [None, Some("Bearer wrong"), Some("Bearer test-key-4f1c")] {
+        let resp = raw_request(&srv, "GET", "/health", auth, "");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{auth:?}: {resp}");
+        assert!(resp.ends_with("\r\n\r\n{\"status\":\"ok\"}"), "{auth:?}: {resp}");
+        let resp = raw_request(&srv, "GET", "/health?probe=1", auth, "");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{auth:?}: {resp}");
+    }
+    let resp = raw_request(&srv, "GET", "/metrics", None, "");
+    assert!(resp.starts_with("HTTP/1.1 404 "), "outside /v1 the key is not asked for: {resp}");
+
+    // A failing engine is as visible as before: 503 with its reason, still without a key.
+    let srv = start_keyed(WireDown, Some("test-key-4f1c"));
+    let resp = raw_request(&srv, "GET", "/health", None, "");
+    assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n") && resp.contains("rank 2 closed"), "{resp}");
+}
+
+/// With no key the API behaves as it always did: every request is served, whatever
+/// `Authorization` header it carries, and there is no 401.
+#[test]
+fn an_api_without_a_key_is_open() {
+    let srv = start_keyed(Stub, None);
+    for auth in [None, Some("Bearer anything"), Some("Basic dXNlcjpwYXNz"), Some("garbage")] {
+        for (method, path, body) in GUARDED {
+            let resp = raw_request(&srv, method, path, auth, body);
+            let status = if path == "/v1/nothing" { "404 Not Found" } else { "200 OK" };
+            assert!(resp.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{method} {path} sending {auth:?}: {resp}");
+            assert!(!resp.contains("WWW-Authenticate"), "{resp}");
+        }
+        let resp = raw_request(&srv, "GET", "/health", auth, "");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    }
 }
 
 // ---------------------------------------------------------------------------

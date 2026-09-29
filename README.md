@@ -192,6 +192,10 @@ template renders it.
   once it cannot (the expert wire failed or the scheduler stopped: restart the coordinator). It
   reads that state only, so it answers at once under any load. The API listens only once the
   engine is ready.
+- `--api-key-file <file>` (or `GLM53F_API_KEY_FILE`) gives the API a key, the file's first line:
+  every `/v1/*` request then needs `Authorization: Bearer <key>` and is a 401 without it;
+  `GET /health` stays open. Without the option the API serves every request that reaches it
+  ([docs/RUNNING.md](docs/RUNNING.md#api-key)).
 - The template has no thinking-off mode; it renders a reasoning effort of Low, High or Max, Max by
   default. The server renders only those efforts, never an empty think block.
 - A request that turns thinking off (`chat_template_kwargs.enable_thinking: false` or its alias

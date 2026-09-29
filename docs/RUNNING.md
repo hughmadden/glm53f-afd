@@ -132,6 +132,38 @@ describes each.
 - Before the engine is ready (loading, connecting the ranks, sizing the pool) nothing listens, so a
   probe's connection is refused: there is no "starting" answer.
 
+### API key
+
+The API has no accounts, and by default it serves every request that reaches it. Give it a key with
+`--api-key-file <key-file>` (or `GLM53F_API_KEY_FILE`): the file's first line, trimmed, is the key.
+
+```sh
+( umask 077; head -c 32 /dev/urandom | base64 > <key-file> )   # a random key, readable by its owner only
+glm53f-serve --checkpoint <coordinator-dir> --ranks ... --api-key-file <key-file>
+```
+
+- Every `/v1/*` request must then send `Authorization: Bearer <key>` (the scheme in any case).
+  Without it, or with another key, the answer is `401`, with `WWW-Authenticate: Bearer` and
+  `{"error": {"message": ..., "type": "invalid_request_error", "code": "invalid_api_key"}}`, streamed
+  requests too. The check comes before the request is routed, so a refused request is never parsed,
+  tokenized or queued. The key is compared in constant time and never logged, and no answer repeats
+  what a client sent.
+- `GET /health` stays open: health checks carry no key. Nothing outside `/v1` needs one.
+- The key is a file, never a command-line argument (`ps` shows those). The daemon reads it once,
+  before it loads the weights: a file that is missing or has nothing on its first line stops it at
+  once. It warns when other users can read the file (`chmod 600` it). To change the key, replace the
+  file and restart the coordinator.
+- Without the option nothing changes: every request is served. Keep such an API on a network only
+  its users reach. The key is access control, not hardening: the API's small HTTP layer reads a
+  request, its body up to its `Content-Length`, before the key is checked, as it always has.
+- **Behind a proxy.** A gateway that holds the users' keys sends this one as the backend's: the
+  API-key setting of an OpenAI-compatible backend, which arrives as `Authorization: Bearer`.
+  In LiteLLM it is `api_key: os.environ/<VARIABLE>` in the model's `litellm_params`, beside
+  `api_base: http://<api-host>:8100/v1`; in the OpenAI SDK,
+  `OpenAI(base_url="http://<api-host>:8100/v1", api_key=...)`; with curl,
+  `-H "Authorization: Bearer $KEY"`. Point the gateway's or load balancer's health check at
+  `/health`, which needs no key.
+
 ### Numerics defaults
 
 Each option changes the engine's arithmetic and became a default only after the KL gate and speed
@@ -417,7 +449,7 @@ GLM53F_DRAFT_TEST_LAYERS=45 GLM53F_TEST_NUMERICS=kda-fp8 GLM53F_TOKENIZER=... \
 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... GLM53F_DFLASH_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test copy_windows -- --nocapture --test-threads=1
 
-# One streamed chat completion through glm53f-serve in development mode.
+# One streamed chat completion through glm53f-serve in development mode, behind an API key.
 GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
@@ -447,6 +479,7 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_SPARK_ADDRS` | `--ranks` | The four ranks, `host:port` in rank order |
 | `GLM53F_EXPERTS_DIR` | `--experts-dir` | `--experts local`: the routed experts' checkpoint |
 | `GLM53F_API_ADDR` | `--listen` | The API's address (default `127.0.0.1:8100`) |
+| `GLM53F_API_KEY_FILE` | `--api-key-file` | A file whose first line is the API key: every `/v1/*` request must then send `Authorization: Bearer <key>` (default: no key) ([API key](#api-key)) |
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
