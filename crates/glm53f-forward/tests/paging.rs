@@ -8,7 +8,9 @@
 //!    RAM traffic.
 //! 2. On a pool that lacks pages for C's reservation, C's admission evicts exactly one point, the
 //!    least recently used: B's prompt mark, while B is running. It is stored to RAM and its pool
-//!    pages freed; B runs on. Every request's tokens equal the run without pressure.
+//!    pages freed; B runs on. C's prompt mark, at the end of its prefill in the same step, finds
+//!    too few pages too and evicts the next least recently used point the same way: A's prompt
+//!    mark (it used to be skipped). Every request's tokens equal the run without pressure.
 //! 3. B's prompt again restores from RAM (no prefill) and gives B's tokens.
 //!
 //! The forward allocates no device memory while serving: eviction, the RAM copies and the restore
@@ -169,17 +171,22 @@ fn a_running_request_s_mark_goes_to_ram_under_pool_pressure() {
     assert_eq!(calm.points, 6, "every mark on the device");
     drop((sched, tx));
 
-    // 2. Ten pages spare once B and A hold theirs: C's 27 need one mark's pages.
+    // 2. Ten pages spare once B and A hold theirs: C's 27 need one mark's pages, and C's prompt
+    // mark then another's.
     let Some((mut sched, tx)) = serve(2 * REQUEST + 3 * mark + 10) else {
         return;
     };
     let tight = scene(&mut sched, &tx);
-    assert_eq!(tight.evicted, (1, 1), "one point, a running request's");
-    assert_eq!(tight.captures, 1);
+    assert_eq!(
+        tight.evicted,
+        (2, 1),
+        "a running request's point for C's admission, a retained one for C's prompt mark"
+    );
+    assert_eq!(tight.captures, 2);
     assert_eq!(
         tight.held,
-        vec![(ids(11, 600), Kind::Prompt)],
-        "B's prompt mark, in RAM"
+        vec![(ids(11, 600), Kind::Prompt), (ids(12, 600), Kind::Prompt)],
+        "B's prompt mark, then A's, in RAM"
     );
     assert_eq!(
         tight.outs, calm.outs,
@@ -201,9 +208,9 @@ fn a_running_request_s_mark_goes_to_ram_under_pool_pressure() {
     assert_eq!(device::allocations(), before);
     eprintln!(
         "{mark}-page marks: without pressure 6 marks on the device, 0 RAM stores; with a pool 10 pages \
-         short of C's {REQUEST}, C's admission stored B's prompt mark to RAM while B ran (1 point \
-         evicted), every request's tokens unchanged; B's prompt restored from RAM with the same {} \
-         tokens",
+         short of C's {REQUEST}, C's admission stored B's prompt mark to RAM while B ran and C's \
+         prompt mark stored A's (2 points evicted), every request's tokens unchanged; B's prompt \
+         restored from RAM with the same {} tokens",
         again.len()
     );
 }

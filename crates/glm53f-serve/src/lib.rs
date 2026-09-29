@@ -144,10 +144,11 @@
 //! each; 195), so admission, which
 //! counts free pages, counts them too. Snapshots cost nothing unless loaded: they stay in the
 //! pool, uncopied, as many as fit, and only an incoming request that needs their pages (a prompt,
-//! a restore, a running request's growth) evicts them, least recently used first, finished
-//! conversations' and running requests' alike (a request runs on without its snapshot), each
-//! stored to the host tier first, until the request fits. A mark the pool has no room for is
-//! refused (that snapshot is skipped) instead of running the device out of memory. The start-up
+//! a restore, a running request's growth, a new snapshot's mark) evicts them, least recently used
+//! first, finished conversations' and running requests' alike (a request runs on without its
+//! snapshot), each stored to the host tier first, until the request fits. A mark the pool still
+//! has no room for is refused (that snapshot is skipped) instead of running the device out of
+//! memory. The start-up
 //! log lists what was allocated for what, and
 //! the largest request the pool admits: when that is less than `--max-context` (the model's
 //! 1,048,576 tokens by default), it says so.

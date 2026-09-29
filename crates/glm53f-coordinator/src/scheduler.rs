@@ -19,12 +19,12 @@
 //! tokens is kept on the device as a snapshot point (a device copy); a new prompt resumes at its
 //! longest exact point, on the device (in place or forked) or restored from RAM, else prefills
 //! cold. No tax unless loaded: points stay on the device, uncopied, until an incoming request
-//! (an admission, a running request's growth, the image encoder) needs their memory or a slot;
-//! then they are evicted least recently used first, wherever they live (retained slots, running
-//! and prefilling requests, which run on), each copied to RAM first when the tier is on, until
-//! the request fits. An optional bank cap ([`SchedulerConfig::bank`]) moves the oldest points to
-//! RAM whatever the load. A prompt that extends one still prefilling waits for it and then forks
-//! its point.
+//! (an admission, a running request's growth, the image encoder) or a new point's mark needs
+//! their memory or a slot; then they are evicted least recently used first, wherever they live
+//! (retained slots, running and prefilling requests, which run on), each copied to RAM first when
+//! the tier is on, until it fits. An optional bank cap ([`SchedulerConfig::bank`]) moves the
+//! oldest points to RAM whatever the load. A prompt that extends one still prefilling waits for it
+//! and then forks its point.
 //!
 //! **Speculation** (perf reset S1 and S2, DS41RT's sample-and-match): drafts are verified in one
 //! target pass per step; a draft is accepted while it equals the target's own pick at that
@@ -228,22 +228,31 @@ fn extends(ids: &[Token], inflight: &[Token], min_retain: usize) -> bool {
 }
 
 /// A prefilled request starts decoding with its first token `next`; its prompt-end snapshot
-/// (with `p.after`) joins the device bank (a device copy, no RAM traffic).
-fn start<S: KvSlot>(pool: &mut Pool<S>, active: &mut Vec<Active<S>>, p: Prefilling<S>, next: Token, eos: &[Token]) {
+/// (with `p.after`) joins the device bank (a device copy, no RAM traffic; room made for its mark
+/// over retained slots and the `active` and `prefilling` requests, `Pool::save_point`).
+fn start<M: ModelForward>(
+    pool: &mut Pool<M::Slot>,
+    model: &M,
+    active: &mut Vec<Active<M::Slot>>,
+    prefilling: &mut VecDeque<Prefilling<M::Slot>>,
+    p: Prefilling<M::Slot>,
+    next: Token,
+    eos: &[Token],
+) {
     let Prefilling { mut slot, ids, mut points, max, tx, cancel, after, sampling, .. } = p;
     // The prefill is done: its working set goes back (outside the forward).
     slot.end_prefill();
     let plen = ids.len();
     if let Some(after) = after.filter(|_| plen >= pool.min_retain && points.iter().all(|x| x.len != plen)) {
         let now = pool.now();
-        points.extend(pool.save_point(&slot, &ids, after, Kind::Prompt, now));
+        points.extend(pool.save_point(model, &slot, &ids, after, Kind::Prompt, now, active, prefilling));
     }
     let done = eos.contains(&next) || max <= 1;
     let mut hist = ids;
     hist.push(next);
     let a = Active { slot, last: next, generated: 1, max, tx, cancel, hist, points, sampling, copy: CopyIndex::default() };
     if a.tx.send(Ok(next)).is_err() || done {
-        pool.retire(a);
+        pool.retire(model, a, active, prefilling);
     } else {
         active.push(a);
     }
@@ -283,7 +292,8 @@ impl<M: ModelForward> Scheduler<M> {
                 (false, _) => "one token per step".to_string(),
             },
             match cfg.bank {
-                0 => "device snapshots uncapped (to RAM only when an incoming request needs their memory or slot)"
+                0 => "device snapshots uncapped (to RAM only when an incoming request or a new snapshot needs their \
+                      memory or slot)"
                     .to_string(),
                 n => format!("device snapshot banks {n} prompt + {n} turn"),
             });
@@ -364,7 +374,7 @@ impl<M: ModelForward> Scheduler<M> {
             if self.active[i].cancel.load(Ordering::Relaxed) {
                 let a = self.active.swap_remove(i);
                 eprintln!("[coordinator] client gone: ending a request after {} of {} tokens", a.generated, a.max);
-                self.pool.retire(a);
+                self.pool.retire(&self.model, a, &mut self.active, &mut self.prefilling);
             } else {
                 i += 1;
             }
@@ -453,11 +463,12 @@ impl<M: ModelForward> Scheduler<M> {
                     let p = Prefilling { slot, ids: job.ids, done: n, after: Some(after), points, max: job.max_tokens,
                         tx: job.tx, cancel: job.cancel, images: Vec::new(), sampling: job.sampling };
                     match first {
-                        Ok(first) => start(&mut self.pool, &mut self.active, p, first, &self.cfg.eos),
+                        Ok(first) => start(&mut self.pool, &self.model, &mut self.active, &mut self.prefilling, p, first,
+                            &self.cfg.eos),
                         Err(e) => {
                             eprintln!("[coordinator] first token from a snapshot failed: {e}");
                             let _ = p.tx.send(Err(e));
-                            self.pool.park(p);
+                            self.pool.park(&self.model, p, &mut self.active, &mut self.prefilling);
                         }
                     }
                 }
@@ -529,7 +540,8 @@ impl<M: ModelForward> Scheduler<M> {
                                 Some(l) => After::from_logits(&l, bound, true),
                                 None => After { greedy: p.sampling.is_none().then_some(out.next as usize), logits: None },
                             });
-                            start(&mut self.pool, &mut self.active, p, out.next, &self.cfg.eos);
+                            start(&mut self.pool, &self.model, &mut self.active, &mut self.prefilling, p, out.next,
+                                &self.cfg.eos);
                         }
                     }
                     other => {
@@ -553,7 +565,7 @@ impl<M: ModelForward> Scheduler<M> {
         while let Some(mut p) = self.prefilling.pop_front() {
             if p.cancel.load(Ordering::Relaxed) {
                 eprintln!("[coordinator] client gone: parking a prefill at {} of {} tokens", p.done, p.ids.len());
-                self.pool.park(p);
+                self.pool.park(&self.model, p, &mut self.active, &mut self.prefilling);
                 continue;
             }
             // Alone, a longer segment (fewer pipeline restarts); a new arrival still waits at most
@@ -611,7 +623,8 @@ impl<M: ModelForward> Scheduler<M> {
                     if !last {
                         self.prefilling.push_back(p);
                     } else {
-                        start(&mut self.pool, &mut self.active, p, out.next, &self.cfg.eos);
+                        start(&mut self.pool, &self.model, &mut self.active, &mut self.prefilling, p, out.next,
+                            &self.cfg.eos);
                     }
                 }
                 Err(e) => {
@@ -646,6 +659,20 @@ impl<M: ModelForward> Scheduler<M> {
         a.tx.send(Ok(next)).is_err() || done
     }
 
+    /// Retire the running requests that `done` flags (one flag per request, in order), each while
+    /// the others are still in `active`: their marks are candidates when its turn point needs room.
+    fn retire_done(&mut self, done: &[bool]) {
+        let mut i = 0;
+        for &d in done {
+            if d {
+                let a = self.active.remove(i);
+                self.pool.retire(&self.model, a, &mut self.active, &mut self.prefilling);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// One decode step for every running request: its last token in, its next token out.
     fn decode_step(&mut self) {
         let result = {
@@ -660,15 +687,9 @@ impl<M: ModelForward> Scheduler<M> {
         self.stats.decode_rows += self.active.len() as u64;
         match result {
             Ok(nexts) if nexts.len() == self.active.len() => {
-                let mut keep = Vec::with_capacity(self.active.len());
-                for (mut a, next) in std::mem::take(&mut self.active).into_iter().zip(nexts) {
-                    if Self::deliver(&mut a, next, &self.cfg.eos) {
-                        self.pool.retire(a);
-                    } else {
-                        keep.push(a);
-                    }
-                }
-                self.active = keep;
+                let eos = &self.cfg.eos;
+                let done: Vec<bool> = self.active.iter_mut().zip(nexts).map(|(a, next)| Self::deliver(a, next, eos)).collect();
+                self.retire_done(&done);
             }
             Ok(nexts) => self.fail_active("decode step", format!("decode returned {} tokens for {} rows", nexts.len(),
                 self.active.len())),
@@ -812,15 +833,7 @@ impl<M: ModelForward> Scheduler<M> {
         if let Err(e) = committed {
             return self.fail_active("commit", e);
         }
-        let mut keep = Vec::with_capacity(self.active.len());
-        for (a, finished) in std::mem::take(&mut self.active).into_iter().zip(done) {
-            if finished {
-                self.pool.retire(a);
-            } else {
-                keep.push(a);
-            }
-        }
-        self.active = keep;
+        self.retire_done(&done);
         if self.cfg.copy_windows && self.stats.spec_steps.is_multiple_of(COPY_LOG_STEPS) {
             let st = &self.stats;
             let (copied, drafted) = st.tokens_per_window();

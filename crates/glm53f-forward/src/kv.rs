@@ -41,8 +41,9 @@
 //! [`KvLayout::mark_pages`] pages of the pool (376), each of its three parts from a page of its
 //! own, copied in and out by the row gather and scatter kernels. So a mark never allocates device
 //! memory: it counts against the same free pages admission counts, and when the pool has no room
-//! [`GlmKv::mark`] refuses (the shell then goes without that snapshot) instead of running the
-//! device out of memory. Dropping a mark gives its pages back.
+//! [`GlmKv::mark`] refuses (the shell then evicts snapshots for [`GlmKv::mark_bytes`] and tries
+//! once more, or goes without that snapshot) instead of running the device out of memory.
+//! Dropping a mark gives its pages back.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -284,6 +285,12 @@ impl GlmKv {
     /// working set is its own).
     pub fn need_bytes(&self, tokens: usize) -> usize {
         KvLayout::pages_for(tokens).saturating_sub(self.pages.len()) * self.layout().page_bytes
+    }
+
+    /// Device bytes a mark takes: its [`KvLayout::mark_pages`] pages of the pool, which
+    /// [`GlmKv::mark`] needs free.
+    pub fn mark_bytes(&self) -> usize {
+        self.layout().mark_pages() * self.layout().page_bytes
     }
 
     /// Grow to hold at least `tokens` tokens; keeps every row.

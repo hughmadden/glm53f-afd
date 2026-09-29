@@ -5,19 +5,20 @@
 //! A point is an exact position in a slot's token history: the slot's appendable rows
 //! `[0, len)` are the point's (append-only, so they stay valid while the slot runs on), and its
 //! positional state at `len` is a [`KvSlot::Mark`]. Saving one is a device-side copy, never RAM
-//! traffic; a mark the device has no room for is skipped (the point is not saved).
+//! traffic; a mark the device has no room for makes room like an incoming request (below) and is
+//! tried once more, and the point is skipped only if it still does not fit (`Pool::save_point`).
 //!
 //! **No tax unless loaded.** A point stays on the device, uncopied, while nothing needs its
 //! memory; there is no count cap by default. The device evicts points only for an incoming
-//! request that does not fit:
+//! request, or a new point, that does not fit:
 //!
 //! - **Memory** (`Pool::make_room`): an admission (a prefill, a restore, an in-place resume
-//!   growing its slot), a running request growing its reservation (`Pool::grow_active`) or the
-//!   image encoder's buffers need device memory the admission check does not find. Points are
-//!   evicted one at a time, least recently used first, wherever they live: a retained slot's
-//!   points and the marks of running and prefilling requests (`Pool::evict_point`), until the
-//!   check passes, and no further. The points the incoming request itself holds in hand (an
-//!   in-place resume's) are not candidates.
+//!   growing its slot), a running request growing its reservation (`Pool::grow_active`), the
+//!   image encoder's buffers or a new point's mark need device memory the check does not find.
+//!   Points are evicted one at a time, least recently used first, wherever they live: a retained
+//!   slot's points and the marks of running and prefilling requests (`Pool::evict_point`), until
+//!   the check passes, and no further. The points the incoming request itself holds in hand (an
+//!   in-place resume's, or the saving request's own) are not candidates.
 //! - **A slot**: none is free, so the least recently used retained slot is evicted whole
 //!   (`Pool::take_free`); or a prompt resuming at an earlier point of a retained slot finds no
 //!   free slot that fits to fork into, so that slot rewinds in place and its later points go
@@ -151,8 +152,8 @@ pub struct PoolStats {
     /// Retained slots freed by eviction under pressure: evicted whole for a slot, or with their
     /// last point for memory.
     pub evictions: u64,
-    /// Points evicted from the device because an incoming request needed their memory or their
-    /// slot, each stored to RAM first when the tier is on.
+    /// Points evicted from the device because an incoming request (or a new point's mark) needed
+    /// their memory or their slot, each stored to RAM first when the tier is on.
     pub evicted_points: u64,
     /// Of those, marks of running or prefilling requests (the requests ran on).
     pub evicted_in_flight: u64,
@@ -173,6 +174,8 @@ pub(crate) enum Want {
     Grow { rows: usize },
     /// The image encoder's buffers for a `prompt`-token prompt.
     Images { prompt: usize },
+    /// The mark of a new snapshot point at `tokens` tokens (`Pool::save_point`).
+    Snapshot { tokens: usize },
 }
 
 impl std::fmt::Display for Want {
@@ -181,6 +184,7 @@ impl std::fmt::Display for Want {
             Want::Admit { prompt, rows } => write!(f, "a {prompt}-token prompt reserving {rows} tokens"),
             Want::Grow { rows } => write!(f, "a running request growing to {rows} tokens"),
             Want::Images { prompt } => write!(f, "the image encoder of a {prompt}-token prompt"),
+            Want::Snapshot { tokens } => write!(f, "a new {tokens}-token snapshot"),
         }
     }
 }
@@ -193,6 +197,7 @@ impl Want {
             Want::Images { .. } => {
                 format!("the image encoder needs {} MiB of GPU memory; {} MiB is free", need >> 20, free >> 20)
             }
+            Want::Snapshot { .. } => format!("a snapshot mark needs {} of GPU memory; {} is free", mib(need), mib(free)),
         }
     }
 }
@@ -262,12 +267,31 @@ impl<S: KvSlot> Pool<S> {
         self.index.len()
     }
 
-    /// A point at `slot`'s current position, indexed under `hist[..slot.tokens()]`; none when the
-    /// device has no room for its mark.
-    pub(crate) fn save_point(&mut self, slot: &S, hist: &[Token], after: After, kind: Kind, now: u64)
-        -> Option<Point<S::Mark>> {
+    /// A point at `slot`'s current position, indexed under `hist[..slot.tokens()]`. A mark the
+    /// device has no room for makes room as an admission does ([`Self::make_room`] for
+    /// [`KvSlot::mark_bytes`]: points evicted least recently used first, over retained slots and
+    /// the `active` and `prefilling` requests, each stored to RAM first when the tier is on; the
+    /// saving request's own points are in hand, not candidates), then is tried once more; none
+    /// when it still fails.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn save_point<M: ModelForward<Slot = S>>(
+        &mut self,
+        model: &M,
+        slot: &S,
+        hist: &[Token],
+        after: After,
+        kind: Kind,
+        now: u64,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+    ) -> Option<Point<S::Mark>> {
         let len = slot.tokens();
-        match slot.mark() {
+        let mark = slot.mark().or_else(|_| {
+            // Whatever room eviction found, the mark itself decides.
+            let _ = self.make_room(model, slot.mark_bytes(), Want::Snapshot { tokens: len }, active, prefilling);
+            slot.mark()
+        });
+        match mark {
             Ok(mark) => {
                 let id = self.next_point;
                 self.next_point += 1;
@@ -639,7 +663,8 @@ impl<S: KvSlot> Pool<S> {
             match restored {
                 Ok((n, after, kind)) => {
                     // The rebuilt snapshot joins the device bank (the design's restore).
-                    let points = self.save_point(&slot, ids, after.clone(), kind, now).into_iter().collect();
+                    let points =
+                        self.save_point(model, &slot, ids, after.clone(), kind, now, active, prefilling).into_iter().collect();
                     self.stats.host_restores += 1;
                     resumed(self, n);
                     return Ok((slot, points, Some((n, after))));
@@ -655,8 +680,16 @@ impl<S: KvSlot> Pool<S> {
     }
 
     /// Retire a finished request: its slot stays on the device with its points plus a
-    /// completion-end turn point (device copies only), or is freed when it has none.
-    pub(crate) fn retire(&mut self, mut a: Active<S>) {
+    /// completion-end turn point (device copies only; room made for its mark over retained slots
+    /// and the `active` and `prefilling` requests, [`Self::save_point`]), or is freed when it has
+    /// none.
+    pub(crate) fn retire<M: ModelForward<Slot = S>>(
+        &mut self,
+        model: &M,
+        mut a: Active<S>,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+    ) {
         let n = a.hist.len() - 1;
         let cancelled = a.cancel.load(Ordering::Relaxed);
         // The slot holds the history but its last token: the scheduler commits exactly the rows
@@ -679,7 +712,7 @@ impl<S: KvSlot> Pool<S> {
             } else {
                 // A sampled request's last token is a draw, not the argmax there (perf reset V3).
                 let after = After { greedy: a.sampling.is_none().then_some(a.hist[n] as usize), logits: None };
-                if let Some(p) = self.save_point(&a.slot, &a.hist, after, Kind::Turn, now) {
+                if let Some(p) = self.save_point(model, &a.slot, &a.hist, after, Kind::Turn, now, active, prefilling) {
                     a.points.push(p);
                 }
             }
@@ -694,14 +727,20 @@ impl<S: KvSlot> Pool<S> {
 
     /// A prefill abandoned at `done` tokens (client gone, or an error after the forward): its
     /// position is kept as a snapshot, so a retry of the same prompt resumes there instead of
-    /// prefilling again.
-    pub(crate) fn park(&mut self, p: Prefilling<S>) {
+    /// prefilling again (room made for its mark as in [`Self::retire`]).
+    pub(crate) fn park<M: ModelForward<Slot = S>>(
+        &mut self,
+        model: &M,
+        p: Prefilling<S>,
+        active: &mut [Active<S>],
+        prefilling: &mut VecDeque<Prefilling<S>>,
+    ) {
         let Prefilling { mut slot, mut ids, done, after, mut points, .. } = p;
         slot.end_prefill();
         if let Some(after) = after.filter(|_| slot.tokens() == done && done >= self.min_retain) {
             if points.iter().all(|x| x.len < done) {
                 let now = self.now();
-                points.extend(self.save_point(&slot, &ids, after, Kind::Prompt, now));
+                points.extend(self.save_point(model, &slot, &ids, after, Kind::Prompt, now, active, prefilling));
             }
         }
         if points.is_empty() {

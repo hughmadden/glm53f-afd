@@ -4,7 +4,8 @@
 //! mark:
 //!
 //! 1. a 600-token prompt is admitted and served; its prompt-end mark takes 486 pages of the pool,
-//!    and its turn-end mark, which no longer fits, is skipped (the request completes);
+//!    and its turn-end mark, which no longer fits and finds no point to evict but the request's
+//!    own, is skipped (the request completes);
 //! 2. the same prompt again resumes from the prompt-end mark (a rewind out of pool pages) and
 //!    gives the same tokens;
 //! 3. a prompt the pool cannot hold even after evicting everything is refused at admission with

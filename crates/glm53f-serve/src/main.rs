@@ -333,8 +333,8 @@ mod daemon {
             layout.mark_pages(),
             mib(mark),
             match sched.bank {
-                0 => "as many as fit: they leave only when an incoming request needs their pages, \
-                      least recently used first, to RAM when the tier is on"
+                0 => "as many as fit: they leave only when an incoming request or a new snapshot \
+                      needs their pages, least recently used first, to RAM when the tier is on"
                     .to_string(),
                 n => format!(
                     "at most {n} prompt + {n} turn (GLM53F_PREFIX_CACHE_ENTRIES), {} if full",

@@ -241,10 +241,10 @@ to about C1 throughput. This design rules that out.
   - A match resumes from the longest snapshot that lies within the match.
   - Optional periodic checkpoints (D4) cover divergent branches.
 - **Eviction.** No tax unless loaded: snapshots stay on the device, uncopied,
-  until an incoming request needs their memory or a slot, and no count caps them
-  by default. Then they go least recently used first, one at a time until the
-  request fits, over every snapshot on the device: finished conversations' and
-  the running requests' own, which run on without them. Evicted pages and
+  until an incoming request or a newer snapshot needs their memory or a slot, and
+  no count caps them by default. Then they go least recently used first, one at a
+  time until it fits, over every snapshot on the device: finished conversations'
+  and the running requests' own, which run on without them. Evicted pages and
   snapshots move to a page-locked host RAM tier, and exact or extending repeats
   restore from it.
 - **Memory plan.** Computed at start-up: weights, drafter, per-slot state,

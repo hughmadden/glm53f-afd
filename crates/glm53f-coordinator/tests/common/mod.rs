@@ -252,6 +252,10 @@ impl KvSlot for MockSlot {
         Ok(MockMark { len: self.toks.len(), state: self.state, dev: self.dev.clone() })
     }
 
+    fn mark_bytes(&self) -> usize {
+        MARK_BYTES
+    }
+
     fn rewind(&mut self, to: usize, mark: &MockMark) -> Result<(), String> {
         if to > self.toks.len() || mark.len != to || !self.pending.is_empty() {
             return Err(format!("slot {}: rewind to {to} (mark at {}) from {}", self.id, mark.len, self.toks.len()));

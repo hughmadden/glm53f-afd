@@ -1,8 +1,9 @@
 //! KV snapshots and the RAM tier under the rule "no tax unless loaded": a snapshot point stays on
-//! the device, uncopied, while nothing needs its memory; when an incoming request needs memory
-//! the device lacks, points are evicted least recently used first wherever they live (retained
-//! slots, running and prefilling requests), each stored to RAM first when the tier is on, until
-//! the request fits and no further. A running request whose point is evicted runs on.
+//! the device, uncopied, while nothing needs its memory; when an incoming request, or a new
+//! point's mark, needs memory the device lacks, points are evicted least recently used first
+//! wherever they live (retained slots, running and prefilling requests), each stored to RAM first
+//! when the tier is on, until it fits and no further. A running request whose point is evicted
+//! runs on.
 //!
 //! Against the toy model in `common`: device memory is 100 B per token of slot capacity (grown
 //! in steps of 64 tokens from a base of 64) and 1,000 B per mark, so every eviction frees a known
@@ -151,7 +152,11 @@ fn scene(host: bool, short: Option<usize>) -> Scene {
 /// recently used first (the three conversations' prompt and turn points, then the older running
 /// request's mark; 7,000 B), each stored to RAM, and the newer running request's mark stays. The
 /// running requests go on with the tokens of a run without pressure, and a later repeat of an
-/// evicted conversation, and of the running request's prompt, restores from RAM.
+/// evicted conversation, and of the running request's prompt, restores from RAM. The points saved
+/// afterwards make room the same way, one eviction each: the incoming prompt's own prompt point
+/// takes the newer running request's mark; its turn point finds nothing else to evict (its prompt
+/// point is its own) and is skipped; the first long request's turn point then takes that prompt
+/// point, and its slot.
 #[test]
 fn an_incoming_prompt_evicts_exactly_enough_least_recently_used_points() {
     let calm = scene(true, None);
@@ -162,14 +167,18 @@ fn an_incoming_prompt_evicts_exactly_enough_least_recently_used_points() {
     assert_eq!(s.outs, calm.outs, "the tokens of the run without pressure");
     let st = s.at_admission;
     assert_eq!((st.evicted_points, st.evicted_in_flight, st.evictions), (7, 1, 3), "{st:?}");
-    // In eviction order: the conversations' points, oldest first, then the first request's mark.
+    // In eviction order: the conversations' points, oldest first, then the first request's mark;
+    // then the two evicted for later points.
     use Kind::{Prompt, Turn};
     let order = [(40, Prompt), (43, Turn), (40, Prompt), (43, Turn), (40, Prompt), (43, Turn), (40, Prompt)];
-    assert_eq!(held(&s.h), order);
+    let held = held(&s.h);
+    assert_eq!(held[..7], order);
     let stored: Vec<Vec<Token>> = s.h.sched.host_cache().unwrap().snapshots().into_iter().map(|(t, _)| t).collect();
     assert_eq!(stored[0], s.convs[0]);
     assert_eq!(stored[6], s.runs[0], "the older running request's mark; the newer one's stayed");
-    assert_eq!(s.h.sched.pool_stats().evicted_points, 7, "nothing more once the prompt fitted");
+    assert_eq!(held[7..], [(40, Prompt), (X_LEN, Prompt)]);
+    assert_eq!(stored[7], s.runs[1], "the newer running request's mark, for the incoming prompt's point");
+    assert_eq!(s.h.sched.pool_stats().evicted_points, 9, "one eviction for each point that did not fit");
 
     // The first conversation and the first long request's prompt again: restored from RAM.
     s.h.clear_log();
@@ -182,8 +191,8 @@ fn an_incoming_prompt_evicts_exactly_enough_least_recently_used_points() {
     assert_eq!(s.h.prefilled(), 0, "both restored");
     assert_eq!(s.h.sched.pool_stats().host_restores, 2);
     eprintln!(
-        "pressure: 7 points evicted to RAM for a 6,500 B shortfall (6 retained, 1 running mark); outputs \
-         unchanged; 2 restores"
+        "pressure: 7 points evicted to RAM for a 6,500 B shortfall (6 retained, 1 running mark), 2 more for \
+         later points' marks; outputs unchanged; 2 restores"
     );
 }
 
@@ -285,6 +294,60 @@ fn a_growing_request_makes_room_the_same_way() {
     use Kind::{Prompt, Turn};
     assert_eq!(held(&h), [(40, Prompt), (43, Turn), (40, Prompt), (43, Turn), (40, Prompt)]);
     assert_eq!(h.sched.host_cache().unwrap().snapshots()[4].0, r, "its own prompt mark, last");
+}
+
+/// A long prompt's snapshots on a device its reservation filled (a mark that found no room used to
+/// be skipped, so an identical repeat prefilled the whole prompt again). Twenty short conversations
+/// are retained (a prompt and a turn point each), then a 600-token prompt's reservation takes the
+/// device's last free bytes. Its prompt and turn marks make room as an admission does: the least
+/// recently used points go, the first conversation's prompt and turn points (its slot freed), each
+/// stored to RAM first, and nothing more. A repeat of the long prompt resumes from its prompt point
+/// on the device, nothing prefilled, and the first conversation restores from RAM. With the tier
+/// off the same two points are dropped.
+#[test]
+fn a_snapshot_without_room_makes_room_like_an_admission() {
+    for host in [true, false] {
+        let mut h = harness(Setup { slots: 24, host: host.then(|| tier(1024, 64)), tweak: no_cap, ..Setup::default() });
+        let convs: Vec<Vec<Token>> = (0..20u64).map(|i| prompt(800 + i, 40)).collect();
+        let outs: Vec<Vec<Token>> = convs
+            .iter()
+            .map(|c| {
+                let rx = h.submit(c, 4, None);
+                h.run();
+                tokens(&rx).unwrap()
+            })
+            .collect();
+        assert_eq!(h.sched.device_points(), 40, "a prompt and a turn point per conversation");
+        // 600 tokens reserve 616: 640 of capacity, 576 past the slot's base. Nothing is left for a mark.
+        tighten(&h, (640 - 64) * TOKEN_BYTES, 0);
+        let long = prompt(900, 600);
+        let r1 = h.submit(&long, 4, None);
+        h.run();
+        let out = tokens(&r1).unwrap();
+        assert_eq!(out, serial(&long, 4));
+        let st = h.sched.pool_stats();
+        let stored = if host { held(&h) } else { Vec::new() };
+
+        h.clear_log();
+        let r2 = h.submit(&long, 4, None);
+        h.run();
+        assert_eq!(tokens(&r2).unwrap(), out);
+        assert_eq!(h.prefilled(), 0, "the repeat prefilled again: the long prompt's snapshot was not kept");
+        assert_eq!(h.sched.pool_stats().device_hits, 1);
+        // Room for its two marks: the first conversation's two points, and no more.
+        assert_eq!((st.evicted_points, st.evicted_in_flight, st.evictions), (2, 0, 1), "{st:?}");
+        if host {
+            assert_eq!(stored, [(40, Kind::Prompt), (43, Kind::Turn)]);
+        }
+
+        // The first conversation again: restored from RAM; with the tier off, prefilled again.
+        h.clear_log();
+        let r3 = h.submit(&convs[0], 4, None);
+        h.run();
+        assert_eq!(tokens(&r3).unwrap(), outs[0]);
+        assert_eq!(h.prefilled(), if host { 0 } else { 40 });
+        assert_eq!(h.sched.pool_stats().host_restores, u64::from(host));
+    }
 }
 
 /// With the RAM tier off (`GLM53F_HOST_CACHE_GB=0`) the same seven points are evicted and dropped:

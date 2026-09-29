@@ -79,6 +79,9 @@ impl KvSlot for GlmKv {
     fn mark(&self) -> Result<KvMark, String> {
         s(GlmKv::mark(self))
     }
+    fn mark_bytes(&self) -> usize {
+        GlmKv::mark_bytes(self)
+    }
     fn rewind(&mut self, to: usize, mark: &KvMark) -> Result<(), String> {
         s(GlmKv::rewind(self, to, mark))
     }

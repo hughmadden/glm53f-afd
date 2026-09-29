@@ -239,12 +239,13 @@ there instead of prefilling them. The rule is **no tax unless loaded**:
 - **No load.** A snapshot stays on the GPU, uncopied, however many there are. Nothing is copied to
   RAM while nothing needs the memory.
 - **Load.** When an incoming request needs pool pages the pool does not have (a prompt being
-  admitted or restored, a running request's growing reservation), snapshots are evicted one at a
-  time, least recently used first, wherever they are: finished conversations' and running or
-  prefilling requests' own. Each is copied to the RAM tier first, then its pages are freed.
-  Eviction stops as soon as the request fits. A request whose snapshot is evicted runs on; only
-  the snapshot moves. When a request needs a slot and none is free, the least recently used
-  finished conversation's slot is evicted whole.
+  admitted or restored, a running request's growing reservation, a new snapshot's KDA state copy),
+  snapshots are evicted one at a time, least recently used first, wherever they are: finished
+  conversations' and running or prefilling requests' own. Each is copied to the RAM tier first,
+  then its pages are freed. Eviction stops as soon as the request fits. A request whose snapshot is
+  evicted runs on; only the snapshot moves. A new snapshot is skipped only if it still does not
+  fit once no other request's snapshot is left. When a request needs a slot and none is free, the
+  least recently used finished conversation's slot is evicted whole.
 - **Restore.** A prompt that misses the GPU but matches a RAM snapshot restores from it instead of
   prefilling.
 - `GLM53F_HOST_CACHE_GB` sizes the RAM tier. With `GLM53F_HOST_CACHE_GB=0` evicted snapshots are

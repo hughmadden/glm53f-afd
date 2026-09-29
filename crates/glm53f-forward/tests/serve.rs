@@ -129,5 +129,12 @@ fn model_forward_through_the_shell_traits() {
     assert_eq!(KvSlot::pending(&a), 4);
     m.commit(&mut [&mut a], &[2]).unwrap();
     assert_eq!((KvSlot::tokens(&a), KvSlot::pending(&a)), (23, 0));
-    eprintln!("ModelForward through the shell: prefill (greedy and sampled, logits kept), decode (greedy and masked), verify and commit");
+
+    // A mark takes `mark_bytes` of what admission counts (its pool pages), and gives them back.
+    let before = m.free_bytes().unwrap();
+    let mark = KvSlot::mark(&a).unwrap();
+    assert_eq!(before - m.free_bytes().unwrap(), KvSlot::mark_bytes(&a));
+    drop(mark);
+    assert_eq!(m.free_bytes().unwrap(), before);
+    eprintln!("ModelForward through the shell: prefill (greedy and sampled, logits kept), decode (greedy and masked), verify and commit; a mark takes mark_bytes");
 }

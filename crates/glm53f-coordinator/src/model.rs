@@ -65,7 +65,9 @@
 //! snapshot points, least recently used first, wherever they live (retained slots', and running
 //! requests' marks, which the requests do without), each stored to the host RAM tier first when
 //! it is on, until it fits; if nothing is left to evict, the request waits for running requests
-//! to finish. Nothing is evicted while nothing needs the memory.
+//! to finish. A snapshot mark that finds too little room ([`KvSlot::mark_bytes`]) makes room the
+//! same way, and is skipped only if it still does not fit. Nothing is evicted while nothing needs
+//! the memory.
 //!
 //! # Selection
 //!
@@ -277,8 +279,13 @@ pub trait KvSlot {
     // ---- Marks and rewind --------------------------------------------------------------
 
     /// Save the positional state at the current position (`tokens()`, with no pending rows).
-    /// `Err` when the device has no room for the copy; the caller then goes without the point.
+    /// `Err` when the device has no room for the copy: the pool then makes room
+    /// ([`KvSlot::mark_bytes`]) and tries once more, and goes without the point if that fails too.
     fn mark(&self) -> Result<Self::Mark, String>;
+
+    /// Device bytes a mark takes, as [`ModelForward::free_bytes`] counts them: a [`KvSlot::mark`]
+    /// that finds too little room has snapshot points evicted until this much is free.
+    fn mark_bytes(&self) -> usize;
 
     /// Go back to `to` tokens, where `mark` was taken in this slot: restore the mark's
     /// positional state and drop the appendable rows past `to`. `to <= tokens()`. The rows
