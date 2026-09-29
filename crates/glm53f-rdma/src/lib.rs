@@ -128,11 +128,19 @@ impl Drop for AlignedBuf {
 /// Find the RoCE v2 GID whose value is the IPv4-mapped `ip`: `(device, port,
 /// gid_index)`, scanning `/sys/class/infiniband/*/ports/*/gids`.
 pub fn find_roce_v2(ip: std::net::Ipv4Addr) -> Option<(String, u8, i32)> {
+    find_roce_v2_in(std::path::Path::new("/sys/class/infiniband"), ip)
+}
+
+/// [`find_roce_v2`] under `root`, a directory laid out as `/sys/class/infiniband`. A GID table can
+/// have empty slots below used ones (an address removed, or GIDs added out of order): an empty
+/// slot reads as the zero GID and its type cannot be read, so the scan skips every slot it cannot
+/// read instead of stopping there.
+pub fn find_roce_v2_in(root: &std::path::Path, ip: std::net::Ipv4Addr) -> Option<(String, u8, i32)> {
     let mut want = [0u8; 16];
     want[10] = 0xff;
     want[11] = 0xff;
     want[12..16].copy_from_slice(&ip.octets());
-    let devs = std::fs::read_dir("/sys/class/infiniband").ok()?;
+    let devs = std::fs::read_dir(root).ok()?;
     for dev in devs.flatten() {
         let name = dev.file_name().to_string_lossy().into_owned();
         let Ok(ports) = std::fs::read_dir(dev.path().join("ports")) else { continue };
@@ -141,7 +149,7 @@ pub fn find_roce_v2(ip: std::net::Ipv4Addr) -> Option<(String, u8, i32)> {
             for idx in 0..256i32 {
                 let gid = std::fs::read_to_string(port.path().join(format!("gids/{idx}")));
                 let ty = std::fs::read_to_string(port.path().join(format!("gid_attrs/types/{idx}")));
-                let (Ok(gid), Ok(ty)) = (gid, ty) else { break };
+                let (Ok(gid), Ok(ty)) = (gid, ty) else { continue };
                 if !ty.trim().eq_ignore_ascii_case("RoCE v2") {
                     continue;
                 }
@@ -444,5 +452,53 @@ mod tests {
         // A documentation address (192.0.2.0/24), IPv4-mapped.
         let g = parse_gid("0000:0000:0000:0000:0000:ffff:c000:0203").unwrap();
         assert_eq!(&g[10..16], &[0xff, 0xff, 192, 0, 2, 3]);
+    }
+
+    /// A GID table slot: `(gid, type)`, or `None` for an empty slot.
+    type Slot<'a> = Option<(&'a str, &'a str)>;
+
+    /// A tree laid out as `/sys/class/infiniband` in a temporary directory: per device and port,
+    /// `gids/N` and `gid_attrs/types/N` for each slot of its table. An empty slot reads as the
+    /// zero GID and has no type to read, as the kernel shows one.
+    fn sysfs(name: &str, ports: &[(&str, u8, &[Slot])]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("glm53f-rdma-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for &(dev, port, table) in ports {
+            let p = root.join(dev).join("ports").join(port.to_string());
+            std::fs::create_dir_all(p.join("gids")).unwrap();
+            std::fs::create_dir_all(p.join("gid_attrs/types")).unwrap();
+            for (i, slot) in table.iter().enumerate() {
+                let gid = slot.map_or("0000:0000:0000:0000:0000:0000:0000:0000", |s| s.0);
+                std::fs::write(p.join(format!("gids/{i}")), format!("{gid}\n")).unwrap();
+                if let Some((_, ty)) = slot {
+                    std::fs::write(p.join(format!("gid_attrs/types/{i}")), format!("{ty}\n")).unwrap();
+                }
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn find_roce_v2_skips_empty_gid_slots() {
+        let (v1, v2) = ("IB/RoCE v1", "RoCE v2");
+        let link = "fe80:0000:0000:0000:0000:0000:0000:0001";
+        // Documentation addresses 192.0.2.10 and 192.0.2.11, IPv4-mapped.
+        let (a, b) = ("0000:0000:0000:0000:0000:ffff:c000:020a", "0000:0000:0000:0000:0000:ffff:c000:020b");
+        // A contiguous table, as a port lists its GIDs: link-local then the address, v1 and v2.
+        let full: [Slot; 4] = [Some((link, v1)), Some((link, v2)), Some((a, v1)), Some((a, v2))];
+        // A table with a hole: an address removed from slots 2 and 3, another added after it.
+        let holed: [Slot; 6] = [Some((link, v1)), Some((link, v2)), None, None, Some((b, v1)), Some((b, v2))];
+        let root = sysfs("gids", &[("mlx5_0", 1, &full[..]), ("mlx5_1", 1, &holed[..])]);
+        let ip = |d| std::net::Ipv4Addr::new(192, 0, 2, d);
+        assert_eq!(find_roce_v2_in(&root, ip(10)), Some(("mlx5_0".to_string(), 1, 3)));
+        // Past the empty slots.
+        assert_eq!(find_roce_v2_in(&root, ip(11)), Some(("mlx5_1".to_string(), 1, 5)));
+        assert_eq!(find_roce_v2_in(&root, ip(12)), None);
+        // Only RoCE v2 GIDs count: the address's v1 GID alone is not found.
+        let v1_only = sysfs("gids-v1", &[("mlx5_0", 1, &full[..3])]);
+        assert_eq!(find_roce_v2_in(&v1_only, ip(10)), None);
+        assert_eq!(find_roce_v2_in(&root.join("absent"), ip(10)), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&v1_only);
     }
 }
