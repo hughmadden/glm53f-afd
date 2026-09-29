@@ -37,6 +37,16 @@
 //! sequence), the conv, the norms, `A_log` and `dt_bias` stay as shipped. Resident KDA bytes:
 //! 275.5 MB a layer in BF16, 141.0 MB with the option (9.37 GB and 4.80 GB over 34 layers: 4.26
 //! GiB less).
+//!
+//! **The scales** ([`WeightOptions::kda_scales`]). The checkpoint's scheme (`amax / 448`) rounds
+//! nearly every weight to E4M3 (2.3-2.8% relative RMS per tensor). But 82-89% of the q, k, v and
+//! o weights have at most 3 significant mantissa bits, E4M3's: with a power-of-two scale they are
+//! kept exactly, and the tensors move by 3.2e-4 to 6.2e-4 (every KDA layer, docs/KL-GATE.md §6e;
+//! layers 0 and 4 in `glm53f-layers`' `tests/real_weights.rs`; `b_proj`, 64 rows, is the
+//! exception at 2.7e-2). Power-of-two scales per 128 x 128 block keep the layout and the
+//! kernels of D2; MXFP8 (an E8M0 scale per row and 32 values of K, the OCP Microscaling layout)
+//! adds a byte per 32 weights (145.2 MB a layer, 4.13 GiB less than BF16) and its own GEMM
+//! paths, for the same error on these weights.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +55,8 @@ use glm53f_model::catalog::{Catalog, CheckpointFormat, Coverage, LAYERS};
 use glm53f_model::config::{AttnKind, ModelConfig};
 use glm53f_model::dtype::DType;
 use glm53f_model::safetensors::Checkpoint;
+
+use glm53f_layers::fp8::{weight_bytes, Fp8Scales, ScaleLayout};
 
 use crate::device::{launched, DeviceBuffer, Stream};
 use crate::error::{invalid, Result};
@@ -55,16 +67,22 @@ use crate::shape::*;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WeightOptions {
     /// Decision D2: the KDA layers' q|k|v|b and `o_proj` quantized at load to FP8 E4M3 with
-    /// 128 x 128 block scales (module documentation). Off: BF16 as the checkpoint ships them.
+    /// `kda_scales` (module documentation). Off: BF16 as the checkpoint ships them.
     pub kda_fp8: bool,
+    /// The FP8 KDA projections' scales: 128 x 128 blocks of `amax / 448` (D2 as first built, the
+    /// default), 128 x 128 blocks of powers of two, or MXFP8 (an E8M0 scale per row and 32 values
+    /// of K). Nothing without `kda_fp8`.
+    pub kda_scales: Fp8Scales,
 }
 
-/// An FP8 block-128 weight on the device.
+/// An FP8 weight on the device: codes, and scales in `layout` (f32 per 128 x 128 block, or
+/// E8M0 bytes per row and 32 values of K).
 pub struct Fp8W {
     pub w: DeviceBuffer,
     pub scales: DeviceBuffer,
     pub n: usize,
     pub k: usize,
+    pub layout: ScaleLayout,
 }
 
 impl Fp8W {
@@ -74,6 +92,7 @@ impl Fp8W {
             scales: self.scales.ptr(0),
             n: self.n,
             k: self.k,
+            layout: self.layout,
         }
     }
 }
@@ -99,8 +118,8 @@ impl Bf16W {
     }
 }
 
-/// A projection the checkpoint ships in BF16: as shipped, or quantized to FP8 block-128 at load
-/// ([`WeightOptions::kda_fp8`]).
+/// A projection the checkpoint ships in BF16: as shipped, or quantized to FP8 at load
+/// ([`WeightOptions::kda_fp8`], with [`WeightOptions::kda_scales`]).
 pub enum ProjW {
     Bf16(Bf16W),
     Fp8(Fp8W),
@@ -240,6 +259,14 @@ impl<'a> Loader<'a> {
     /// A BF16 weight quantized on the device to FP8 E4M3 with 128 x 128 block scales
     /// (`glm53f_fp8_quantize_weight`); the BF16 copy is freed.
     pub fn quantize(&mut self, w: Bf16W) -> Result<Fp8W> {
+        self.quantize_as(w, Fp8Scales::Block128)
+    }
+
+    /// A BF16 weight quantized on the device to FP8 E4M3 with `scales`: `amax / 448` or
+    /// power-of-two scales per 128 x 128 block (`glm53f_fp8_quantize_weight`, `_pow2`), or MXFP8
+    /// E8M0 scales per row and 32 values of K (`glm53f_fp8_quantize_weight_mx`); the BF16 copy is
+    /// freed.
+    pub fn quantize_as(&mut self, w: Bf16W, scales: Fp8Scales) -> Result<Fp8W> {
         if w.groups != 1 || !w.k.is_multiple_of(128) || !w.n.is_multiple_of(8) {
             return Err(invalid!(
                 "FP8 quantization needs one group, k % 128 == 0 and n % 8 == 0 ({} x {} x {})",
@@ -252,26 +279,35 @@ impl<'a> Loader<'a> {
             self.stream = Some(Stream::new()?);
         }
         let st = self.stream.as_ref().unwrap();
+        let layout = scales.layout();
         let q = Fp8W {
             w: DeviceBuffer::alloc(w.n * w.k)?,
-            scales: DeviceBuffer::alloc(w.n.div_ceil(128) * (w.k / 128) * 4)?,
+            scales: DeviceBuffer::alloc(weight_bytes(w.n, w.k, layout) - w.n * w.k)?,
             n: w.n,
             k: w.k,
+            layout,
         };
-        // SAFETY: `w` holds [n][k] BF16, `q` [n][k] codes and [ceil(n/128)][k/128] scales.
-        launched(
-            unsafe {
-                glm53f_layers::ffi::glm53f_fp8_quantize_weight(
-                    w.buf.ptr(0),
-                    w.n as i32,
-                    w.k as i32,
-                    q.w.ptr(0),
-                    q.scales.ptr(0),
-                    st.raw().cast(),
-                )
-            },
-            "glm53f_fp8_quantize_weight",
-        )?;
+        let (n, k, raw) = (w.n as i32, w.k as i32, st.raw().cast());
+        let (src, codes) = (w.buf.ptr(0), q.w.ptr(0));
+        // SAFETY: `w` holds [n][k] BF16, `q` [n][k] codes and the scales of `layout`.
+        let (code, what) = unsafe {
+            use glm53f_layers::ffi as l;
+            match scales {
+                Fp8Scales::Block128 => (
+                    l::glm53f_fp8_quantize_weight(src, n, k, codes, q.scales.ptr(0), raw),
+                    "glm53f_fp8_quantize_weight",
+                ),
+                Fp8Scales::Block128Pow2 => (
+                    l::glm53f_fp8_quantize_weight_pow2(src, n, k, codes, q.scales.ptr(0), raw),
+                    "glm53f_fp8_quantize_weight_pow2",
+                ),
+                Fp8Scales::Mx32 => (
+                    l::glm53f_fp8_quantize_weight_mx(src, n, k, codes, q.scales.ptr(0), raw),
+                    "glm53f_fp8_quantize_weight_mx",
+                ),
+            }
+        };
+        launched(code, what)?;
         st.synchronize()?;
         self.bytes = self.bytes - w.buf.bytes() + q.w.bytes() + q.scales.bytes();
         Ok(q)
@@ -280,7 +316,7 @@ impl<'a> Loader<'a> {
     /// A projection that ships in BF16: as shipped, or quantized when `fp8`.
     fn proj(&mut self, w: Bf16W, fp8: bool) -> Result<ProjW> {
         Ok(if fp8 {
-            ProjW::Fp8(self.quantize(w)?)
+            ProjW::Fp8(self.quantize_as(w, self.opts.kda_scales)?)
         } else {
             ProjW::Bf16(w)
         })
@@ -373,6 +409,7 @@ impl<'a> Loader<'a> {
             scales: self.upload(&sp)?,
             n: rows.iter().sum(),
             k,
+            layout: ScaleLayout::Block128,
         })
     }
 

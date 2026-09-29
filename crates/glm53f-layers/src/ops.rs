@@ -885,3 +885,195 @@ pub fn fp8_gemm_decode_fused(
         "glm53f_fp8_gemm_decode_fused",
     )
 }
+
+// ---- Power-of-two block-128 scales and MXFP8 weights --------------------------------------------
+
+/// Quantize a BF16 weight `w` `[n][k]` with `scales` (the host's `fp8::quantize_weight_bf16_as`,
+/// bit for bit): codes `q` `[n][k]`, and `w_scales` in the scheme's layout (f32
+/// `[ceil(n/128)][k/128]`, or E8M0 bytes `[n][k/32]`).
+pub fn quantize_weight_as(
+    w: &DeviceBuffer,
+    n: usize,
+    k: usize,
+    scales: crate::fp8::Fp8Scales,
+    q: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    use crate::fp8::{weight_bytes, Fp8Scales};
+    need(w, n * k * 2, "w")?;
+    need(q, n * k, "q")?;
+    need(w_scales, weight_bytes(n, k, scales.layout()) - n * k, "scales")?;
+    let (ni, ki) = (i(n, "n")?, i(k, "k")?);
+    let (code, what) = unsafe {
+        match scales {
+            Fp8Scales::Block128 => (
+                ffi::glm53f_fp8_quantize_weight(
+                    w.ptr(),
+                    ni,
+                    ki,
+                    q.mut_ptr(),
+                    w_scales.mut_ptr(),
+                    s.0,
+                ),
+                "glm53f_fp8_quantize_weight",
+            ),
+            Fp8Scales::Block128Pow2 => (
+                ffi::glm53f_fp8_quantize_weight_pow2(
+                    w.ptr(),
+                    ni,
+                    ki,
+                    q.mut_ptr(),
+                    w_scales.mut_ptr(),
+                    s.0,
+                ),
+                "glm53f_fp8_quantize_weight_pow2",
+            ),
+            Fp8Scales::Mx32 => (
+                ffi::glm53f_fp8_quantize_weight_mx(
+                    w.ptr(),
+                    ni,
+                    ki,
+                    q.mut_ptr(),
+                    w_scales.mut_ptr(),
+                    s.0,
+                ),
+                "glm53f_fp8_quantize_weight_mx",
+            ),
+        }
+    };
+    check(code, what)
+}
+
+/// The MXFP8 decode GEMM (`fp8_gemm_decode_fused` with E8M0 scales `[n][k/32]`).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_decode_mx(
+    x: &GemmInput<'_>,
+    w: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    rows: usize,
+    n: usize,
+    k: usize,
+    ksplit: usize,
+    partials: Option<&DeviceBuffer>,
+    sync: Option<&DeviceBuffer>,
+    out: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    need(w, n * k, "w")?;
+    need(w_scales, n * (k / 32), "w_scales")?;
+    need(out, rows * n * 2, "out")?;
+    let (xp, xs, a8): (*const c_void, *const f32, i32) = match x {
+        GemmInput::Bf16(b) => {
+            need(b, rows * k * 2, "x")?;
+            (b.ptr(), null(), 0)
+        }
+        GemmInput::Fp8 { q, scales } => {
+            need(q, rows * k, "x")?;
+            need(scales, rows * (k / 128) * 4, "x_scales")?;
+            (q.ptr(), scales.ptr(), 1)
+        }
+    };
+    if ksplit > 1 {
+        need(
+            partials.ok_or("K splits need partials")?,
+            ksplit * rows * n * 4,
+            "partials",
+        )?;
+        need(sync.ok_or("K splits need sync")?, n.div_ceil(8) * 4, "sync")?;
+    }
+    check(
+        unsafe {
+            ffi::glm53f_fp8_gemm_decode_mx(
+                xp,
+                xs,
+                a8,
+                w.ptr(),
+                w_scales.ptr(),
+                i(rows, "rows")?,
+                i(n, "n")?,
+                i(k, "k")?,
+                i(ksplit, "ksplit")?,
+                opt_mut(partials),
+                opt_mut(sync),
+                out.mut_ptr(),
+                s.0,
+            )
+        },
+        "glm53f_fp8_gemm_decode_mx",
+    )
+}
+
+/// The MXFP8 prefill GEMM (W8A8, E4M3 activations per 128; the k32 structure).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_prefill_mx(
+    xq: &DeviceBuffer,
+    x_scales: &DeviceBuffer,
+    w: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    rows: usize,
+    n: usize,
+    k: usize,
+    out: &DeviceBuffer,
+    out_f32: Option<&DeviceBuffer>,
+    s: &Stream,
+) -> R {
+    need(xq, rows * k, "xq")?;
+    need(x_scales, rows * (k / 128) * 4, "x_scales")?;
+    need(w, n * k, "w")?;
+    need(w_scales, n * (k / 32), "w_scales")?;
+    need(out, rows * n * 2, "out")?;
+    if let Some(o) = out_f32 {
+        need(o, rows * n * 4, "out_f32")?;
+    }
+    check(
+        unsafe {
+            ffi::glm53f_fp8_gemm_prefill_mx(
+                xq.ptr(),
+                x_scales.ptr(),
+                w.ptr(),
+                w_scales.ptr(),
+                i(rows, "rows")?,
+                i(n, "n")?,
+                i(k, "k")?,
+                out.mut_ptr(),
+                opt_mut(out_f32),
+                s.0,
+            )
+        },
+        "glm53f_fp8_gemm_prefill_mx",
+    )
+}
+
+/// Rows `row0 .. row0 + rows` of an MXFP8 weight `[n][k]` as BF16 `out` `[rows][k]`
+/// (`fp8::dequant_bf16`, bit for bit).
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_bf16_mx(
+    w: &DeviceBuffer,
+    w_scales: &DeviceBuffer,
+    n: usize,
+    k: usize,
+    row0: usize,
+    rows: usize,
+    out: &DeviceBuffer,
+    s: &Stream,
+) -> R {
+    need(w, n * k, "w")?;
+    need(w_scales, n * (k / 32), "w_scales")?;
+    need(out, rows * k * 2, "out")?;
+    check(
+        unsafe {
+            ffi::glm53f_fp8_dequant_bf16_mx(
+                w.ptr(),
+                w_scales.ptr(),
+                i(n, "n")?,
+                i(k, "k")?,
+                i(row0, "row0")?,
+                i(rows, "rows")?,
+                out.mut_ptr(),
+                s.0,
+            )
+        },
+        "glm53f_fp8_dequant_bf16_mx",
+    )
+}

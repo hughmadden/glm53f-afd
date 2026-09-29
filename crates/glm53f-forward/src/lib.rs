@@ -67,7 +67,8 @@
 //! (decision D1). `tests/goldens_chain.rs` reports every stage against the oracle.
 //!
 //! **Numerics under test**, each off by default (`docs/SIZING.md` §10): the KDA projections
-//! quantized to FP8 block-128 at load (`weights::WeightOptions::kda_fp8`, decision D2); the KDA
+//! quantized to FP8 at load (`weights::WeightOptions::kda_fp8`, decision D2) with `amax / 448`,
+//! power-of-two or MXFP8 scales (`WeightOptions::kda_scales`, [`Fp8Scales`]); the KDA
 //! states stored in BF16 (`kvplan::KvLayout::with_kda_state_bf16`, decision D8; the state is
 //! rounded after every row, so verify and commit keep the bits of serial steps); FP8 projections
 //! over 8 rows with BF16 activations (`gemm::GemmPolicy::prefill_w8a16`, with
@@ -143,6 +144,8 @@ pub mod serve;
 pub mod weights;
 
 pub use error::{Error, Result};
+/// The scales of FP8 weights quantized at load, and their layouts (`weights::WeightOptions`).
+pub use glm53f_layers::fp8::{Fp8Scales, ScaleLayout};
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {

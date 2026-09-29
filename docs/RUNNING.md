@@ -145,6 +145,8 @@ names the options on.
 | Chunked KDA prefill | on | `--kda-chain-prefill`, `GLM53F_KDA_CHUNKED_PREFILL=0` | passed with W8A16 (§6d); failed without it (§6b) |
 | W8A16 prefill projections | on | `--prefill-w8a8`, `GLM53F_PREFILL_W8A16=0` | passed with the chunked prefill (§6d) |
 | FP8 KDA projections (D2) | off | (on with `--kda-fp8`) | failed (§6b) |
+| D2 with power-of-two block scales | off | (on with `--kda-fp8-pow2`, `GLM53F_KDA_FP8_POW2=1`) | not yet gated (§6e) |
+| D2 as MXFP8 (an E8M0 scale per row and 32 values of K) | off | (on with `--kda-mxfp8`, `GLM53F_KDA_MXFP8=1`) | not yet gated (§6e) |
 | D2's KDA projections at W8A8 in prefill | off | (on with `--kda-prefill-w8a8`, with D2) | not gated alone; D2 failed (§6b) |
 
 - The chunked KDA prefill and W8A16 passed as a pair, so turn them off together:
@@ -301,11 +303,12 @@ GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 glm53f-score --checkpoint <coordinator-dir> \
 The gate runs both pass sizes (the prefill path, and 8 rows or fewer: the decode path);
 [KL-GATE.md](KL-GATE.md) section 4.3 has the whole sequence, from `klgate.py plan` to `compare`.
 `glm53f-score` cuts a prefill pass into two lanes unless `--prefill-lanes` says otherwise (the
-coordinator's default is four). The numerics options (`--kda-fp8`, `--kda-state-bf16` or
-`--kda-state-f32`, `--prefill-w8a16` or `--prefill-w8a8`, `--kda-chunked-prefill` or
-`--kda-chain-prefill`, `--kda-prefill-w8a8`, as `glm53f-serve` takes them, with its defaults:
-[Numerics defaults](#numerics-defaults)) are scored the same way into their own directories and
-compared with the baseline at `--margin 0.002`; the engine line in every output names them.
+coordinator's default is four). The numerics options (`--kda-fp8`, `--kda-fp8-pow2`, `--kda-mxfp8`,
+`--kda-state-bf16` or `--kda-state-f32`, `--prefill-w8a16` or `--prefill-w8a8`,
+`--kda-chunked-prefill` or `--kda-chain-prefill`, `--kda-prefill-w8a8`, as `glm53f-serve` takes
+them, with its defaults: [Numerics defaults](#numerics-defaults)) are scored the same way into their
+own directories and compared with the baseline at `--margin 0.002`; the engine line in every output
+names them.
 `--experts local` runs the official FP8 experts on the coordinator's GPU instead of the ranks;
 `--dev-layers`, `--dev-load-layers` and `--experts zero` make a development run on one GPU, whose
 logits are meaningless.
@@ -360,8 +363,9 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
 # Any model-path suite with a numerics option on (a comma-separated list of kda-fp8,
-# kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8; the forward's tests otherwise run every
-# option off, whatever glm53f-serve's defaults), for example verify and commit with BF16 KDA states:
+# kda-fp8-pow2, kda-mxfp8, kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8; the forward's tests
+# otherwise run every option off, whatever glm53f-serve's defaults), for example verify and commit
+# with BF16 KDA states:
 GLM53F_TEST_NUMERICS=kda-state-bf16 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test verify_commit -- --nocapture
 
@@ -391,6 +395,8 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
+| `GLM53F_KDA_FP8_POW2=1` | `--kda-fp8-pow2` | Numerics under test, off by default: D2 with power-of-two block scales (the same layout, kernels and bytes; 82-89% of the q, k, v and o weights kept exactly, [SIZING.md](SIZING.md) §10, [KL-GATE.md](KL-GATE.md) §6e) |
+| `GLM53F_KDA_MXFP8=1` | `--kda-mxfp8` | Numerics under test, off by default: D2 as MXFP8, an E8M0 scale per row and 32 values of K (the MXFP8 GEMMs; 4.13 GiB less rather than 4.26; the same error as `--kda-fp8-pow2` on these weights). Of the three KDA flags the last given sets the scales; in the environment `GLM53F_KDA_MXFP8` wins |
 | `GLM53F_KDA_STATE_BF16` | `--kda-state-bf16` / `--kda-state-f32` | D8, **on by default** (passed the KL gate, docs/KL-GATE.md §6b): the KDA recurrent states stored in BF16, computed in f32; `0` or `--kda-state-f32` for F32 |
 | `GLM53F_PREFILL_W8A16` | `--prefill-w8a16` / `--prefill-w8a8` | **On by default** with the chunked KDA prefill (the pair passed the KL gate, docs/KL-GATE.md §6d): FP8 projections over 8 rows with BF16 activations (W8A16); `0` or `--prefill-w8a8` for E4M3 activations (W8A8) |
 | `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows |

@@ -53,6 +53,7 @@ mod daemon {
     use glm53f_forward::serve::{ServedForward, DRAFTS};
     use glm53f_forward::shape::{ModelShape, SAMPLE_VOCAB};
     use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
+    use glm53f_forward::Fp8Scales;
     use glm53f_serve::{admission_line, dev_banner, kv_pages, verify_rows, Experts, Options};
 
     const GIB: f64 = (1u64 << 30) as f64;
@@ -100,6 +101,7 @@ mod daemon {
         let t0 = Instant::now();
         let wopts = WeightOptions {
             kda_fp8: num.kda_fp8,
+            kda_scales: num.kda_fp8_scales,
         };
         let model = s(DeviceModel::load_with(&ckpt, &shape, layers, wopts))?;
         let embed = s(HostEmbedding::load(&ckpt))?;
@@ -109,7 +111,13 @@ mod daemon {
             layers - 1,
             model.bytes as f64 / 1e9,
             if num.kda_fp8 {
-                "FP8 block-128, quantized at load"
+                match num.kda_fp8_scales {
+                    Fp8Scales::Block128 => "FP8 block-128, quantized at load",
+                    Fp8Scales::Block128Pow2 => {
+                        "FP8 block-128 with power-of-two scales, quantized at load"
+                    }
+                    Fp8Scales::Mx32 => "MXFP8 (E8M0 scales per 1 x 32), quantized at load",
+                }
             } else {
                 "BF16"
             },

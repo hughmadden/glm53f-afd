@@ -2,13 +2,15 @@
 //! exact products, over more than 8 rows: the W8A8 path (E4M3 activations per 128-group, the FP8
 //! tensor cores) and the W8A16 path (`GemmPolicy::prefill_w8a16`: BF16 tiles of the weight and
 //! cuBLAS). Shapes with a partial last block of rows (the fused KDA q|k|v|b projection's 64-row
-//! beta block) and weights wider than one tile. Up to 8 rows the option changes nothing.
+//! beta block) and weights wider than one tile. Up to 8 rows the option changes nothing. MXFP8
+//! weights (`ScaleLayout::Mx32`) through the same dispatch, in every path.
 #![cfg(feature = "cuda")]
 
 use glm53f_forward::device::{self, DeviceBuffer, Stream};
 use glm53f_forward::gemm::{act_quant, Fp8Input, Fp8Mat, Gemm, GemmPolicy, DEQUANT_BYTES};
 use glm53f_layers::bf16;
-use glm53f_layers::fp8::{self, e4m3_to_f32};
+use glm53f_layers::fp8::{self, e4m3_to_f32, ActScheme};
+use glm53f_layers::mlp;
 use glm53f_layers::testkit::Rng;
 
 fn gpu() -> Option<Stream> {
@@ -32,7 +34,7 @@ fn run(g: &Gemm, s: &Stream, x: &[u16], rows: usize, w: &fp8::Fp8Matrix) -> Vec<
     }
     let (dw, ds) = (
         DeviceBuffer::from_slice(&w.data).unwrap(),
-        DeviceBuffer::from_slice(&w.scale_inv).unwrap(),
+        DeviceBuffer::from_slice(&w.scale_bytes()).unwrap(),
     );
     let out = DeviceBuffer::zeroed(rows * n * 2).unwrap();
     let mat = Fp8Mat {
@@ -40,6 +42,7 @@ fn run(g: &Gemm, s: &Stream, x: &[u16], rows: usize, w: &fp8::Fp8Matrix) -> Vec<
         scales: ds.ptr(0),
         n,
         k,
+        layout: w.layout,
     };
     let input = Fp8Input {
         bf16: dx.ptr(0),
@@ -149,7 +152,7 @@ fn w8a16_prefill_is_the_exact_products_within_bf16_rounding() {
 }
 
 /// `GemmPolicy::kda_prefill_w8a8`: with W8A16 on, the FP8 KDA projections (`Gemm::fp8_kda`)
-/// keep the W8A8 GEMM, bit for bit, and the others take W8A16.
+/// keep the W8A8 GEMM, bit for bit, and the others take W8A16; for block-128 and MXFP8 weights.
 #[test]
 fn kda_projections_can_keep_w8a8() {
     let Some(s) = gpu() else { return };
@@ -170,22 +173,96 @@ fn kda_projections_can_keep_w8a8() {
     );
     let mut rng = Rng::new(121);
     let (rows, n, k) = (40usize, 320usize, 1024usize);
-    let w = rng.fp8_matrix(n, k);
     let x = rng.bf16_vec(rows * k, 1.0);
     let bits = |v: Vec<f32>| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-    // Gemm::fp8 is the non-KDA projection; run_kda below the KDA one.
-    assert_eq!(
-        bits(run(&hybrid, &s, &x, rows, &w)),
-        bits(run(&w8a16, &s, &x, rows, &w))
-    );
-    assert_eq!(
-        bits(run_kda(&hybrid, &s, &x, rows, &w)),
-        bits(run(&w8a8, &s, &x, rows, &w))
-    );
-    assert_eq!(
-        bits(run_kda(&w8a16, &s, &x, rows, &w)),
-        bits(run(&w8a16, &s, &x, rows, &w))
-    );
+    for w in [rng.fp8_matrix(n, k), rng.fp8_matrix_mx(n, k)] {
+        // Gemm::fp8 is the non-KDA projection; run_kda below the KDA one.
+        assert_eq!(
+            bits(run(&hybrid, &s, &x, rows, &w)),
+            bits(run(&w8a16, &s, &x, rows, &w))
+        );
+        assert_eq!(
+            bits(run_kda(&hybrid, &s, &x, rows, &w)),
+            bits(run(&w8a8, &s, &x, rows, &w))
+        );
+        assert_eq!(
+            bits(run_kda(&w8a16, &s, &x, rows, &w)),
+            bits(run(&w8a16, &s, &x, rows, &w))
+        );
+    }
+}
+
+/// MXFP8 weights (`ScaleLayout::Mx32`) through the dispatch, in all three paths: up to 8 rows the
+/// MX decode GEMM, bit for bit the CPU model of the decode order (each 16-value step scaled by its
+/// row's 32-block scale) at every row count; over 8 rows the MX W8A8 GEMM within the k32 bound of
+/// exact 32-block products, and the MX W8A16 tiles within BF16 rounding of the exact products.
+#[test]
+fn mx_weights_take_every_path() {
+    let Some(s) = gpu() else { return };
+    let w8a8 = Gemm::new(&s, GemmPolicy::default()).unwrap();
+    let w8a16 = Gemm::new(
+        &s,
+        GemmPolicy {
+            prefill_w8a16: true,
+            ..GemmPolicy::default()
+        },
+    )
+    .unwrap();
+    let mut rng = Rng::new(122);
+    // A partial last 128-row block (as q|k|v|b), a weight three W8A16 tiles wide, a plain shape.
+    for (rows, n, k) in [
+        (100usize, 320usize, 512usize),
+        (24, 4160, 16384),
+        (200, 256, 4096),
+    ] {
+        let w = rng.fp8_matrix_mx(n, k);
+        let x = rng.bf16_vec(rows * k, 1.0);
+        let (ex, mag) = exact(&x, rows, &w);
+        let (ex8, mag8) = mlp::fp8_linear_f64(&x, rows, &w, ActScheme::Fp8Dynamic128);
+        let a8 = run(&w8a8, &s, &x, rows, &w);
+        let a16 = run(&w8a16, &s, &x, rows, &w);
+        for i in 0..rows * n {
+            let e8 = (a8[i] as f64 - ex8[i]).abs();
+            assert!(
+                e8 <= mag8[i] * 2f64.powi(-12) + ex8[i].abs() * 2f64.powi(-8),
+                "W8A8 {rows} x {n} x {k} [{i}]: {} vs {}",
+                a8[i],
+                ex8[i]
+            );
+            let e16 = (a16[i] as f64 - ex[i]).abs();
+            assert!(
+                e16 <= mag[i] * 2f64.powi(-8),
+                "W8A16 {rows} x {n} x {k} [{i}]: {} vs {}",
+                a16[i],
+                ex[i]
+            );
+        }
+        let (m8, _) = errs(&a8, &ex, &mag);
+        let (m16, w16) = errs(&a16, &ex, &mag);
+        eprintln!(
+            "MXFP8 {rows} x {n} x {k}: against exact W8A16, error / sum|x w|: W8A8 mean {m8:.2e}; W8A16 mean {m16:.2e} worst {w16:.2e}"
+        );
+        assert!(m16 * 4.0 < m8, "W8A16 {m16:.2e} vs W8A8 {m8:.2e}");
+        // Up to 8 rows: the decode GEMM, bit for bit its CPU model, whatever the policy.
+        let ksplit = mlp::decode_ksplit(n, k);
+        let cpu = bf16::widen(&bf16::narrow(&mlp::fp8_linear(
+            &x[..8 * k],
+            8,
+            &w,
+            ActScheme::Bf16,
+            ksplit,
+        )));
+        for r in [1usize, 3, 8] {
+            for g in [&w8a8, &w8a16] {
+                let d = run(g, &s, &x[..r * k], r, &w);
+                assert_eq!(
+                    d.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    cpu[..r * n].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{r} rows"
+                );
+            }
+        }
+    }
 }
 
 /// `Gemm::fp8_kda` over `rows` rows, with the E4M3 activations when the policy needs them for a
@@ -202,7 +279,7 @@ fn run_kda(g: &Gemm, s: &Stream, x: &[u16], rows: usize, w: &fp8::Fp8Matrix) -> 
     }
     let (dw, ds) = (
         DeviceBuffer::from_slice(&w.data).unwrap(),
-        DeviceBuffer::from_slice(&w.scale_inv).unwrap(),
+        DeviceBuffer::from_slice(&w.scale_bytes()).unwrap(),
     );
     let out = DeviceBuffer::zeroed(rows * n * 2).unwrap();
     let mat = Fp8Mat {
@@ -210,6 +287,7 @@ fn run_kda(g: &Gemm, s: &Stream, x: &[u16], rows: usize, w: &fp8::Fp8Matrix) -> 
         scales: ds.ptr(0),
         n,
         k,
+        layout: w.layout,
     };
     let input = Fp8Input {
         bf16: dx.ptr(0),

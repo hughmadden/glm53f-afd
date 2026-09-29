@@ -16,9 +16,10 @@
 //! - `GLM53F_BENCH_PREFILL_ROWS`: rows of one prefill pass (default 256);
 //! - the numerics options, each off unless set to something other than `0` (`glm53f-serve` has
 //!   D8, W8A16 and the chunked KDA prefill on by default): `GLM53F_KDA_FP8` (FP8 KDA
-//!   projections), `GLM53F_KDA_STATE_BF16` (BF16 KDA states), `GLM53F_PREFILL_W8A16` (FP8
-//!   projections over 8 rows with BF16 activations), `GLM53F_KDA_PREFILL_W8A8` (with the two
-//!   above, the FP8 KDA projections keep E4M3).
+//!   projections), `GLM53F_KDA_FP8_POW2` (with power-of-two block-128 scales), `GLM53F_KDA_MXFP8`
+//!   (MXFP8), `GLM53F_KDA_STATE_BF16` (BF16 KDA states), `GLM53F_PREFILL_W8A16` (FP8
+//!   projections over 8 rows with BF16 activations), `GLM53F_KDA_PREFILL_W8A8` (with FP8 KDA
+//!   projections and W8A16, the FP8 KDA projections keep E4M3).
 //!
 //! The routed experts run on the expert ranks in the engine, so the extrapolation leaves them
 //! out; the router's host copy of the routes (the step's host round trip) stays in.
@@ -36,6 +37,7 @@ use glm53f_forward::kv::{GlmKv, KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::shape::ModelShape;
 use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
+use glm53f_forward::Fp8Scales;
 
 const LAYERS: usize = 5;
 
@@ -98,20 +100,28 @@ fn main() {
     let context = env_usize("GLM53F_BENCH_CONTEXT", 4096);
     let steps = env_usize("GLM53F_BENCH_STEPS", 40);
     let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
-    let (kda_fp8, state_bf16, w8a16) = (
-        on("GLM53F_KDA_FP8"),
-        on("GLM53F_KDA_STATE_BF16"),
-        on("GLM53F_PREFILL_W8A16"),
-    );
+    let (state_bf16, w8a16) = (on("GLM53F_KDA_STATE_BF16"), on("GLM53F_PREFILL_W8A16"));
+    let kda_scales = if on("GLM53F_KDA_MXFP8") {
+        Fp8Scales::Mx32
+    } else if on("GLM53F_KDA_FP8_POW2") {
+        Fp8Scales::Block128Pow2
+    } else {
+        Fp8Scales::Block128
+    };
+    let kda_fp8 = on("GLM53F_KDA_FP8") || kda_scales != Fp8Scales::Block128;
     println!(
         "numerics: KDA projections {}, KDA states {}, FP8 projections over 8 rows {}",
-        if kda_fp8 { "FP8" } else { "BF16" },
+        if kda_fp8 { kda_scales.describe() } else { "BF16" },
         if state_bf16 { "BF16" } else { "FP32" },
         if w8a16 { "W8A16" } else { "W8A8" }
     );
     let (cfg, ckpt) = open_checkpoint(&dir).unwrap();
     let shape = ModelShape::new(&cfg.text, LAYERS).unwrap();
-    let model = DeviceModel::load_with(&ckpt, &shape, LAYERS, WeightOptions { kda_fp8 }).unwrap();
+    let wopts = WeightOptions {
+        kda_fp8,
+        kda_scales,
+    };
+    let model = DeviceModel::load_with(&ckpt, &shape, LAYERS, wopts).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let stream = Arc::new(Stream::new().unwrap());
     let max_req = 8;

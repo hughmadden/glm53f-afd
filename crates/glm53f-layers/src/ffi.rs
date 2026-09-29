@@ -166,6 +166,65 @@ unsafe extern "C" {
         stream: CudaStream,
     ) -> CudaError;
 
+    // Power-of-two block-128 scales and MXFP8 weights (E8M0 scales per row and 32 of K).
+    pub fn glm53f_fp8_quantize_weight_pow2(
+        w: *const u16,
+        n: i32,
+        k: i32,
+        q: *mut u8,
+        scales: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+    pub fn glm53f_fp8_quantize_weight_mx(
+        w: *const u16,
+        n: i32,
+        k: i32,
+        q: *mut u8,
+        scales: *mut u8,
+        stream: CudaStream,
+    ) -> CudaError;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_fp8_gemm_decode_mx(
+        x: *const c_void,
+        x_scales: *const f32,
+        a8: i32,
+        w: *const u8,
+        w_scales: *const u8,
+        rows: i32,
+        n: i32,
+        k: i32,
+        ksplit: i32,
+        partials: *mut f32,
+        sync: *mut u32,
+        out: *mut u16,
+        stream: CudaStream,
+    ) -> CudaError;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_fp8_gemm_prefill_mx(
+        xq: *const u8,
+        x_scales: *const f32,
+        w: *const u8,
+        w_scales: *const u8,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out: *mut u16,
+        out_f32: *mut f32,
+        stream: CudaStream,
+    ) -> CudaError;
+    pub fn glm53f_fp8_gemm_prefill_mx_smem_bytes() -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn glm53f_fp8_dequant_bf16_mx(
+        w: *const u8,
+        w_scales: *const u8,
+        n: i32,
+        k: i32,
+        row0: i32,
+        rows: i32,
+        out: *mut u16,
+        stream: CudaStream,
+    ) -> CudaError;
+
     // Second revision: single-launch variants (see the header's `sync` convention).
     #[allow(clippy::too_many_arguments)]
     pub fn glm53f_hc_boundary_decode(

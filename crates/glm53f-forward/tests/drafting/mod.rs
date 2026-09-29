@@ -99,9 +99,9 @@ pub fn drafted_forward(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    // Plus the marks' pages (0.6 GiB); FP8 KDA projections take 4.26 GiB less.
+    // Plus the marks' pages (0.6 GiB); FP8 KDA projections take 4.26 GiB less (MXFP8 4.13).
     let num = numerics();
-    let need = if loaded >= 45 { 20.6 } else { 7.6 } + expert_gib - if num.kda_fp8 { 4.26 } else { 0.0 };
+    let need = if loaded >= 45 { 20.6 } else { 7.6 } + expert_gib - num.kda_saved_gib();
     if !gpu_with(need) {
         return None;
     }

@@ -3,11 +3,13 @@
 //! head). Prints microseconds per call and the weight bandwidth reached. With the argument
 //! `prefill`: the FP8 projections over 2,048 and 4,096 rows instead, W8A8 (the FP8 tensor-core
 //! GEMM on E4M3 activations) against W8A16 (`GemmPolicy::prefill_w8a16`: BF16 tiles of the weight
-//! and cuBLAS), with the KDA projections also as the BF16 cuBLAS GEMM they are today, and the
-//! totals over one pass of the model's 45 layers.
+//! and cuBLAS), with the KDA projections also as the BF16 cuBLAS GEMM they are today and as
+//! MXFP8, and the totals over one pass of the model's 45 layers. With `fp8decode`: the KDA
+//! projections at 1, 4 and 8 rows as the BF16 GEMV, the FP8 block-128 decode GEMM and the MXFP8
+//! decode GEMM.
 //!
 //! ```sh
-//! cargo run --release -p glm53f-forward --features cuda --example gemm_bench [-- prefill]
+//! cargo run --release -p glm53f-forward --features cuda --example gemm_bench [-- prefill|fp8decode]
 //! ```
 //!
 //! Each decode shape is given enough weight copies to exceed the L2 cache several times over,
@@ -18,6 +20,7 @@ use core::ffi::c_void;
 
 use glm53f_forward::device::{self, DeviceBuffer, Event, Stream};
 use glm53f_forward::gemm::{act_quant, Bf16Mat, Fp8Input, Fp8Mat, Gemm, GemmPolicy};
+use glm53f_forward::ScaleLayout;
 
 struct Shape {
     name: &'static str,
@@ -104,18 +107,21 @@ fn fill_random(buf: &DeviceBuffer, seed: u64) {
     }
 }
 
-/// The coordinator's FP8 projections: name, n, k, and how many a pass of the model runs.
-const FP8_SHAPES: [(&str, usize, usize, usize); 10] = [
-    ("DSA q_a", 1536, 4096, 11),
-    ("DSA kv_a", 512, 4096, 11),
-    ("DSA q_b", 16384, 1536, 11),
-    ("DSA o", 4096, 16384, 11),
-    ("shared gate+up", 4096, 4096, 42),
-    ("shared down", 4096, 2048, 42),
-    ("dense gate+up", 24576, 4096, 3),
-    ("dense down", 4096, 12288, 3),
-    ("KDA q|k|v|b (D2)", 24640, 4096, 34),
-    ("KDA o (D2)", 4096, 8192, 34),
+/// The coordinator's FP8 projections: name, n, k, how many a pass of the model runs, and the
+/// scales' layout (the KDA projections twice: block-128 as D2 loads them, and MXFP8).
+const FP8_SHAPES: [(&str, usize, usize, usize, ScaleLayout); 12] = [
+    ("DSA q_a", 1536, 4096, 11, ScaleLayout::Block128),
+    ("DSA kv_a", 512, 4096, 11, ScaleLayout::Block128),
+    ("DSA q_b", 16384, 1536, 11, ScaleLayout::Block128),
+    ("DSA o", 4096, 16384, 11, ScaleLayout::Block128),
+    ("shared gate+up", 4096, 4096, 42, ScaleLayout::Block128),
+    ("shared down", 4096, 2048, 42, ScaleLayout::Block128),
+    ("dense gate+up", 24576, 4096, 3, ScaleLayout::Block128),
+    ("dense down", 4096, 12288, 3, ScaleLayout::Block128),
+    ("KDA q|k|v|b (D2)", 24640, 4096, 34, ScaleLayout::Block128),
+    ("KDA o (D2)", 4096, 8192, 34, ScaleLayout::Block128),
+    ("KDA q|k|v|b (MX)", 24640, 4096, 34, ScaleLayout::Mx32),
+    ("KDA o (MX)", 4096, 8192, 34, ScaleLayout::Mx32),
 ];
 
 /// Milliseconds per call of `f`: 2 warm-up calls, then the mean of `reps`.
@@ -159,10 +165,11 @@ fn prefill(stream: &Stream) {
     );
     for rows in [2048usize, 4096] {
         // Per pass of the model: W8A8 (with its activation quantizations where the forward runs
-        // one), W8A16, and the KDA projections in BF16.
+        // one), W8A16, and the KDA projections in BF16; the MXFP8 KDA projections on their own.
         let (mut t8, mut t16, mut tq, mut kda8, mut kda16, mut kda_bf) =
             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        for &(name, n, k, per_pass) in &FP8_SHAPES {
+        let (mut mx8, mut mx16) = (0.0, 0.0);
+        for &(name, n, k, per_pass, layout) in &FP8_SHAPES {
             let wq = DeviceBuffer::alloc(n * k).unwrap();
             fill_random(&wq, 11);
             // E4M3 codes with bits 0x7F/0xFF would be NaN: clear bit 6 of every byte (codes of
@@ -171,13 +178,19 @@ fn prefill(stream: &Stream) {
                 .map(|i| ((i * 37 + 11) % 0x3F) as u8 | ((i as u8 & 1) << 7))
                 .collect();
             wq.upload(&codes).unwrap();
-            let scales =
-                DeviceBuffer::from_slice(&vec![0.01f32; n.div_ceil(128) * (k / 128)]).unwrap();
+            let mx = layout == ScaleLayout::Mx32;
+            let scales = if mx {
+                // E8M0 2^-7 per row and 32 values of K.
+                DeviceBuffer::from_slice(&vec![120u8; n * (k / 32)]).unwrap()
+            } else {
+                DeviceBuffer::from_slice(&vec![0.01f32; n.div_ceil(128) * (k / 128)]).unwrap()
+            };
             let mat = Fp8Mat {
                 w: wq.ptr(0),
                 scales: scales.ptr(0),
                 n,
                 k,
+                layout,
             };
             let input = Fp8Input {
                 bf16: x.ptr(0),
@@ -195,7 +208,7 @@ fn prefill(stream: &Stream) {
                 unsafe { w8a16.fp8(&input, &mat, rows, out.ptr(0), stream) }.unwrap()
             });
             let kda = name.starts_with("KDA");
-            let bf = if kda {
+            let bf = if kda && !mx {
                 let wb = DeviceBuffer::alloc(n * k * 2).unwrap();
                 fill_random(&wb, 13);
                 let m = Bf16Mat {
@@ -218,9 +231,12 @@ fn prefill(stream: &Stream) {
             // with the mHC boundary.
             let quant = matches!(
                 name,
-                "DSA q_b" | "DSA o" | "KDA o (D2)" | "shared down" | "dense down"
+                "DSA q_b" | "DSA o" | "KDA o (D2)" | "KDA o (MX)" | "shared down" | "dense down"
             );
-            if kda {
+            if mx {
+                mx8 += per_pass as f64 * (a + if quant { q } else { 0.0 });
+                mx16 += per_pass as f64 * b;
+            } else if kda {
                 kda8 += per_pass as f64 * (a + if quant { q } else { 0.0 });
                 kda16 += per_pass as f64 * b;
                 kda_bf += per_pass as f64 * bf;
@@ -238,7 +254,7 @@ fn prefill(stream: &Stream) {
                 q,
                 a,
                 b,
-                if kda {
+                if kda && !mx {
                     format!("{bf:.3}")
                 } else {
                     "-".to_string()
@@ -247,9 +263,116 @@ fn prefill(stream: &Stream) {
             );
         }
         println!(
-            "one pass of {rows} rows, 45 layers: FP8 projections today W8A8 {:.1} ms (+ {:.1} ms of activation quantization), W8A16 {:.1} ms; KDA projections BF16 {:.1} ms, FP8 W8A8 {:.1} ms, FP8 W8A16 {:.1} ms",
-            t8, tq, t16, kda_bf, kda8, kda16
+            "one pass of {rows} rows, 45 layers: FP8 projections today W8A8 {:.1} ms (+ {:.1} ms of activation quantization), W8A16 {:.1} ms; KDA projections BF16 {:.1} ms, FP8 W8A8 {:.1} ms, FP8 W8A16 {:.1} ms; MXFP8 W8A8 {:.1} ms, MXFP8 W8A16 {:.1} ms",
+            t8, tq, t16, kda_bf, kda8, kda16, mx8, mx16
         );
+    }
+}
+
+/// The KDA projections at decode sizes: the BF16 GEMV (as shipped), the FP8 block-128 decode GEMM
+/// (D2) and the MXFP8 decode GEMM, each over weight copies that exceed the L2 cache.
+fn fp8_decode(stream: &Stream) {
+    let gemm = Gemm::new(stream, GemmPolicy::default()).unwrap();
+    let x = DeviceBuffer::alloc(8 * 8192 * 2).unwrap();
+    fill_random(&x, 7);
+    let out = DeviceBuffer::alloc(8 * 24640 * 2).unwrap();
+    let (e0, e1) = (Event::new().unwrap(), Event::new().unwrap());
+    println!(
+        "{:<12} {:>4} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "shape", "rows", "BF16 us", "FP8 us", "MXFP8 us", "BF16 GB/s", "FP8 GB/s", "MX GB/s"
+    );
+    for (name, n, k) in [("KDA q|k|v|b", 24640usize, 4096usize), ("KDA o", 4096, 8192)] {
+        let copies = ((256usize << 20) / (n * k)).clamp(1, 8);
+        let bf: Vec<DeviceBuffer> = (0..copies)
+            .map(|i| {
+                let b = DeviceBuffer::alloc(n * k * 2).unwrap();
+                fill_random(&b, 100 + i as u64);
+                b
+            })
+            .collect();
+        let codes: Vec<u8> = (0..n * k)
+            .map(|i| ((i * 37 + 11) % 0x3F) as u8 | ((i as u8 & 1) << 7))
+            .collect();
+        let fp8: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer)> = (0..copies)
+            .map(|_| {
+                (
+                    DeviceBuffer::from_slice(&codes).unwrap(),
+                    DeviceBuffer::from_slice(&vec![0.01f32; n.div_ceil(128) * (k / 128)]).unwrap(),
+                    DeviceBuffer::from_slice(&vec![120u8; n * (k / 32)]).unwrap(),
+                )
+            })
+            .collect();
+        let mat = |i: usize, layout: ScaleLayout| {
+            let (w, s128, smx) = &fp8[i % copies];
+            Fp8Mat {
+                w: w.ptr(0),
+                scales: if layout == ScaleLayout::Mx32 {
+                    smx.ptr(0)
+                } else {
+                    s128.ptr(0)
+                },
+                n,
+                k,
+                layout,
+            }
+        };
+        let input = Fp8Input {
+            bf16: x.ptr(0),
+            q: core::ptr::null(),
+            scales: core::ptr::null(),
+        };
+        for rows in [1usize, 4, 8] {
+            let iters = 200;
+            // 0: BF16 GEMV; 1: FP8 block-128; 2: MXFP8.
+            let time = |which: usize| -> f64 {
+                let run = |i: usize| match which {
+                    0 => {
+                        let w = Bf16Mat {
+                            ptr: bf[i % copies].ptr(0),
+                            n,
+                            k,
+                            ld: k,
+                            groups: 1,
+                            gstride: n * k,
+                        };
+                        unsafe {
+                            gemm.gemv(x.ptr(0), k, 0, &w, rows, out.ptr(0), n, 0, false, stream)
+                        }
+                        .unwrap()
+                    }
+                    _ => {
+                        let l = if which == 1 {
+                            ScaleLayout::Block128
+                        } else {
+                            ScaleLayout::Mx32
+                        };
+                        unsafe { gemm.fp8(&input, &mat(i, l), rows, out.ptr(0), stream) }.unwrap()
+                    }
+                };
+                for i in 0..5 {
+                    run(i);
+                }
+                e0.record(stream).unwrap();
+                for i in 0..iters {
+                    run(i);
+                }
+                e1.record(stream).unwrap();
+                e1.elapsed_ms_since(&e0).unwrap() as f64 * 1e3 / iters as f64
+            };
+            let (tb, t8, tm) = (time(0), time(1), time(2));
+            let gbs = |bytes: usize, us: f64| bytes as f64 / us / 1e3;
+            println!(
+                "{:<12} {:>4} {:>9.2} {:>9.2} {:>9.2} {:>9.0} {:>9.0} {:>9.0}",
+                name,
+                rows,
+                tb,
+                t8,
+                tm,
+                gbs(n * k * 2, tb),
+                gbs(mat(0, ScaleLayout::Block128).bytes(), t8),
+                gbs(mat(0, ScaleLayout::Mx32).bytes(), tm)
+            );
+        }
     }
 }
 
@@ -261,6 +384,10 @@ fn main() {
     let stream = Stream::new().unwrap();
     if std::env::args().any(|a| a == "prefill") {
         prefill(&stream);
+        return;
+    }
+    if std::env::args().any(|a| a == "fp8decode") {
+        fp8_decode(&stream);
         return;
     }
     let gemm = Gemm::new(&stream, GemmPolicy::default()).unwrap();

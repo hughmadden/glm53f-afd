@@ -1,5 +1,5 @@
 // glm53f-layers: C ABI of the GLM-5.3-Flash coordinator layer kernels (mHC, router,
-// RMSNorm, SwiGLU, FP8 block-128 projection GEMMs).
+// RMSNorm, SwiGLU, FP8 block-128 and MXFP8 projection GEMMs).
 //
 // Conventions for every entry point:
 // - returns a cudaError_t value (0 = success); invalid arguments return
@@ -212,6 +212,51 @@ int32_t glm53f_fp8_quantize_weight(const uint16_t* w, int32_t n, int32_t k, uint
 // (k % 128 == 0, row0 + rows <= n). The W8A16 prefill path feeds these tiles to a BF16 GEMM.
 int32_t glm53f_fp8_dequant_bf16(const uint8_t* w, const float* w_scales, int32_t n, int32_t k,
                                 int32_t row0, int32_t rows, uint16_t* out, cudaStream_t stream);
+
+// glm53f_fp8_quantize_weight with power-of-two scales (added with the MXFP8 entry points): per
+// 128 x 128 block, scale = the smallest power of two >= amax / 448 (an E8M0 value held as f32,
+// in [2^-126, 2^127]; 1 for an all-zero block), so the block's maximum never saturates and every
+// weight with at most 3 significant mantissa bits in range is kept exactly. The layout, and the
+// GEMMs that read it, are block-128's. Bit for bit src/fp8.rs quantize_weight_bf16_as with
+// Fp8Scales::Block128Pow2.
+int32_t glm53f_fp8_quantize_weight_pow2(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, float* scales,
+                                        cudaStream_t stream);
+
+// ---- MXFP8 weights: the same E4M3 codes W [n][k] with one E8M0 scale per row and 32 values of
+// K (the OCP Microscaling layout): `w_scales` uint8_t [n][k/32], byte b meaning 2^(b - 127). The
+// quantizer writes bytes 1..254 only (scales 2^-126 .. 2^127), which is all the kernels read.
+// n % 8 == 0 and k % 128 == 0 for the GEMMs, as above. -------------------------------------------
+
+// Quantize a BF16 weight w [n][k] (k % 128 == 0, any n >= 1): per row and 32-block, scale = the
+// smallest power of two >= amax / 448 (1 for an all-zero block), q = e4m3_rn_satfinite(w / scale)
+// (an exact quotient). Bit for bit src/fp8.rs quantize_weight_bf16_as with Fp8Scales::Mx32.
+int32_t glm53f_fp8_quantize_weight_mx(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, uint8_t* scales,
+                                      cudaStream_t stream);
+
+// glm53f_fp8_gemm_decode_fused for MXFP8 weights: each 16-value step of a row takes its row's
+// scale of that 32-block, in the same operation order (src/mlp.rs fp8_linear models it bit for
+// bit, whatever `rows` is).
+int32_t glm53f_fp8_gemm_decode_mx(const void* x, const float* x_scales, int32_t a8, const uint8_t* w,
+                                  const uint8_t* w_scales, int32_t rows, int32_t n, int32_t k,
+                                  int32_t ksplit, float* partials, uint32_t* sync, uint16_t* out,
+                                  cudaStream_t stream);
+
+// glm53f_fp8_gemm_prefill for MXFP8 weights (W8A8, E4M3 activations per 128 as there), with the
+// k32 structure of GLM53F_PREFILL_PROMOTE_K32: each k32 product sum is added to the 128-block sum
+// with fma(t, sw, c), sw the column's scale of that 32-block (exact: a power of two), and the
+// block sum to the output with fma(c, sx, acc). `w_scales` 16-byte aligned. 101,376 bytes of
+// shared memory (the most a block may have on sm_89 and sm_120).
+int32_t glm53f_fp8_gemm_prefill_mx(const uint8_t* xq, const float* x_scales, const uint8_t* w,
+                                   const uint8_t* w_scales, int32_t rows, int32_t n, int32_t k,
+                                   uint16_t* out, float* out_f32, cudaStream_t stream);
+
+// Shared memory glm53f_fp8_gemm_prefill_mx needs (bytes); it opts in on first use.
+int32_t glm53f_fp8_gemm_prefill_mx_smem_bytes(void);
+
+// glm53f_fp8_dequant_bf16 for MXFP8 weights: out = bf16(e4m3(W) * scale), exact for a normal
+// result (a power of two times at most 4 significant bits).
+int32_t glm53f_fp8_dequant_bf16_mx(const uint8_t* w, const uint8_t* w_scales, int32_t n, int32_t k,
+                                   int32_t row0, int32_t rows, uint16_t* out, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

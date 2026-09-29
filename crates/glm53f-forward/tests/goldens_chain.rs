@@ -931,11 +931,12 @@ fn layers_0_to_4_against_the_goldens() {
 
     // Bounds. With numerics under test (GLM53F_TEST_NUMERICS) the argmax must agree on every row
     // whose golden top-2 gap is at least 0.25 (the golden's rows 0 and 2 are near-ties, 0.042 and
-    // 0.006). FP8 KDA projections (D2) move the projections by 1.4e-2 to 1.9e-2 (relative RMS;
-    // the reference in BF16: 2.2e-3), which the KDA layers' outputs carry: the 8-row bounds are
-    // then 3e-2.
+    // 0.006). FP8 KDA projections with the checkpoint's amax / 448 scales (D2) move the
+    // projections by 1.4e-2 to 1.9e-2 (relative RMS; the reference in BF16: 2.2e-3), which the
+    // KDA layers' outputs carry: the 8-row bounds are then 3e-2. Power-of-two and MXFP8 scales
+    // keep the default bounds.
     let num = numerics();
-    let (chain8, layer8) = if num.kda_fp8 {
+    let (chain8, layer8) = if num.kda_fp8_amax() {
         (3e-2, 3e-2)
     } else {
         (2e-2, 1e-2)

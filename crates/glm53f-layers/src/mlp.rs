@@ -15,13 +15,14 @@
 //! - [`fp8_linear`]: the decode kernel's order (`fp8_gemm_decode` in
 //!   `kernels/fp8_gemm.cu`), exact to the bit. Lane `l` of a warp takes 16 consecutive
 //!   values at `k = k_lo + 16 * l + 512 * i`, forms their dot product with `fma` from 0,
-//!   multiplies it by the block scale (`sw`, or `sw * sx` for W8A8) with `fma` into its
+//!   multiplies it by the block scale (`sw`, or `sw * sx` for W8A8; for MXFP8 weights the row's
+//!   scale of the 32-block the 16 values lie in, `glm53f_fp8_gemm_decode_mx`) with `fma` into its
 //!   accumulator; lanes reduce by butterfly; K splits (see [`decode_ksplit`]) add in order.
 //! - [`fp8_linear_f64`]: exact block products in f64, the baseline for the tensor-core
 //!   prefill kernel, whose in-block summation order is the hardware's.
 
 use crate::bf16;
-use crate::fp8::{self, e4m3_to_f32, ActScheme, Fp8Matrix, BLOCK};
+use crate::fp8::{self, e4m3_to_f32, ActScheme, Fp8Matrix, ScaleLayout, BLOCK, MX_BLOCK};
 use crate::math::{silu, warp_sum};
 
 /// `swiglu_limit`.
@@ -185,9 +186,10 @@ pub fn fp8_linear(
     fp8_linear_prepared(&prepare_acts(x, rows, scheme), rows, w, ksplit)
 }
 
-/// `x @ W^T` with each 128-block's dot product and the scales exact in f64:
-/// `sum_blocks (sx * sw) * sum_{k in block} x_k w_k`. Also returns, per output, the same sum
-/// over absolute values (an error scale for tolerance checks).
+/// `x @ W^T` with each weight block's dot product and the scales exact in f64:
+/// `sum_blocks (sx * sw) * sum_{k in block} x_k w_k`, the blocks 128 wide (32 for MXFP8
+/// weights, whose scale changes every 32 values; the activation scale every 128). Also returns,
+/// per output, the same sum over absolute values (an error scale for tolerance checks).
 pub fn fp8_linear_f64(
     x: &[u16],
     rows: usize,
@@ -197,21 +199,25 @@ pub fn fp8_linear_f64(
     let a = prepare_acts(x, rows, scheme);
     let (n, k) = (w.rows, w.cols);
     let groups = k / BLOCK;
+    let wb = match w.layout {
+        ScaleLayout::Block128 => BLOCK,
+        ScaleLayout::Mx32 => MX_BLOCK,
+    };
     let mut out = vec![0f64; rows * n];
     let mut mag = vec![0f64; rows * n];
     for m in 0..rows {
         for o in 0..n {
             let (mut acc, mut abs) = (0f64, 0f64);
-            for g in 0..groups {
+            for b in 0..k / wb {
                 let (mut d, mut da) = (0f64, 0f64);
-                for kk in g * BLOCK..(g + 1) * BLOCK {
+                for kk in b * wb..(b + 1) * wb {
                     let p = a.values[m * k + kk] as f64 * w.value(o, kk) as f64;
                     d += p;
                     da += p.abs();
                 }
-                let mut s = w.scale(o, g * BLOCK) as f64;
+                let mut s = w.scale(o, b * wb) as f64;
                 if let Some(sx) = &a.scales {
-                    s *= sx[m * groups + g] as f64;
+                    s *= sx[m * groups + b * wb / BLOCK] as f64;
                 }
                 acc += d * s;
                 abs += da * s.abs();

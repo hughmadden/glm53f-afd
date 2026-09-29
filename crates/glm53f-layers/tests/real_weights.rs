@@ -1,12 +1,12 @@
 //! The CPU reference on the official checkpoint's tensors (layers 0, 3 and 4): invariants,
-//! and agreement with direct f64 transcriptions of the reference formulas. Needs
-//! `GLM53F_CHECKPOINT_DIR` (see tests/common); skips cleanly without it. Run with
-//! `--release --nocapture` to see the weights' statistics.
+//! and agreement with direct f64 transcriptions of the reference formulas; and the error of the
+//! KDA projections quantized to FP8 at load. Needs `GLM53F_CHECKPOINT_DIR` (see tests/common);
+//! skips cleanly without it. Run with `--release --nocapture` to see the weights' statistics.
 
 mod common;
 
 use glm53f_layers::bf16;
-use glm53f_layers::fp8::{ActScheme, Fp8Matrix};
+use glm53f_layers::fp8::{self, ActScheme, Fp8Matrix, Fp8Scales};
 use glm53f_layers::math::sigmoid;
 use glm53f_layers::mhc::{self, HcParams, HC_EPS};
 use glm53f_layers::mlp;
@@ -287,6 +287,78 @@ fn layers3_4_router_and_shared_expert() {
                 "layer {layer} shared down [{i}]"
             );
             assert_eq!(got.out[i], bf16::from_f32(dn[i]));
+        }
+    }
+}
+
+#[test]
+fn kda_projection_scales_on_real_weights() {
+    // The KDA projections of layers 0 and 4 (BF16 in the checkpoint) quantized to FP8 as the
+    // forward's `WeightOptions::kda_scales` quantizes them at load, against the BF16 weights
+    // (relative RMS error). 82-89% of the q, k, v and o weights have at most 3 significant
+    // mantissa bits, E4M3's: power-of-two scales keep them exactly, whether per 128 x 128 block
+    // or per 1 x 32 (MXFP8), where the checkpoint's `amax / 448` rounds nearly every weight.
+    // `b_proj` has no such structure (6%): every scheme rounds it alike. The two power-of-two
+    // layouts differ only where a 1 x 32 block keeps a weight in E4M3's normal range that its
+    // 128 x 128 block's scale takes below it.
+    let Some(ck) = common::checkpoint() else {
+        return;
+    };
+    for layer in [0usize, 4] {
+        for (name, rows, cols) in [
+            ("q_proj", 8192usize, 4096usize),
+            ("k_proj", 8192, 4096),
+            ("v_proj", 8192, 4096),
+            ("b_proj", 64, 4096),
+            ("o_proj", 4096, 8192),
+        ] {
+            let full = format!("{}layers.{layer}.self_attn.{name}.weight", common::PREFIX);
+            let Ok((w, shape)) = ck.read_bf16(&full) else {
+                eprintln!("skip: {full} not present");
+                return;
+            };
+            assert_eq!(shape, vec![rows, cols], "{full}");
+            if w.iter().all(|&v| v == 0) {
+                eprintln!("skip: {full} is all zero (not downloaded?)");
+                return;
+            }
+            let three_bits = w.iter().filter(|&&v| v & 0x0F == 0).count() as f64 / w.len() as f64;
+            let quantized = |scales: Fp8Scales| {
+                let m = fp8::quantize_weight_bf16_as(&w, rows, cols, scales);
+                let (mut num, mut den) = (0f64, 0f64);
+                for (i, &v) in w.iter().enumerate() {
+                    let (r, c) = (i / cols, i % cols);
+                    let x = bf16::to_f32(v) as f64;
+                    let d = (m.value(r, c) * m.scale(r, c)) as f64 - x;
+                    num += d * d;
+                    den += x * x;
+                }
+                ((num / den).sqrt(), m)
+            };
+            let [(d2, _), (pow2, p), (mx, x)] = std::thread::scope(|s| {
+                [Fp8Scales::Block128, Fp8Scales::Block128Pow2, Fp8Scales::Mx32]
+                    .map(|scales| s.spawn(move || quantized(scales)))
+                    .map(|h| h.join().unwrap())
+            });
+            let differ = (0..rows * cols)
+                .filter(|&i| {
+                    let (r, c) = (i / cols, i % cols);
+                    p.value(r, c) * p.scale(r, c) != x.value(r, c) * x.scale(r, c)
+                })
+                .count();
+            eprintln!(
+                "layer {layer} {name}: {:.1}% of the weights with at most 3 mantissa bits; \
+                 relative RMS error: amax / 448 per 128 x 128 {d2:.3e}, powers of two per \
+                 128 x 128 {pow2:.3e}, MXFP8 {mx:.3e}; the two power-of-two layouts differ on \
+                 {differ} weights",
+                100.0 * three_bits
+            );
+            if name == "b_proj" {
+                assert!(pow2 <= 1.02 * d2 && mx <= 1.02 * d2, "layer {layer} {name}");
+            } else {
+                assert!(pow2 * 20.0 < d2 && mx * 20.0 < d2, "layer {layer} {name}");
+            }
+            assert!(differ * 1000 < rows * cols, "layer {layer} {name}: {differ} differ");
         }
     }
 }

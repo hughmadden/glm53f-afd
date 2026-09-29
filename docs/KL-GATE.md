@@ -5,7 +5,8 @@ pass** (section 6a). The decode path scores 0.0245 nats against the BF16 teacher
 standard error to the published figure for the same 4-bit experts. On 29 September the numerics
 options were gated (section 6b): BF16 KDA states (D8) passed and are now the default; FP8 KDA
 projections (D2) failed. A 125-window panel for paired comparisons (section 6c) had its first
-result the same day (section 6d).
+result the same day (section 6d). D2 with power-of-two or MXFP8 scales awaits the gate (section
+6e).
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -274,7 +275,7 @@ routed experts as `glm53f-serve` does, and builds the forward as `glm53f-serve -
 ```text
 glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir>
              [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1-4]
-             [--fp8-act bf16|dynamic] [--no-promote-k32] [--kda-fp8]
+             [--fp8-act bf16|dynamic] [--no-promote-k32] [--kda-fp8|--kda-fp8-pow2|--kda-mxfp8]
              [--kda-state-bf16|--kda-state-f32] [--prefill-w8a16|--prefill-w8a8]
              [--kda-chunked-prefill|--kda-chain-prefill] [--kda-prefill-w8a8]
 ```
@@ -390,10 +391,10 @@ python3 harness/klgate.py compare decode.json prefill.json
 Each run prints its engine line and, per window, the tokens, passes, rows and times; `run.json`
 keeps them next to the windows' files. A numerics change is scored the same way into its own
 directory and compared with `compare <candidate>.json <baseline>.json --margin 0.002`
-(section 3). The numerics options (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
-`--kda-chunked-prefill`, `--kda-prefill-w8a8` and the flags that turn the defaults off;
-[SIZING.md](SIZING.md) §10) are flags of both binaries, with the same defaults
-([RUNNING.md](RUNNING.md), "Numerics defaults"), and the engine line names them.
+(section 3). The numerics options (`--kda-fp8`, `--kda-fp8-pow2`, `--kda-mxfp8`,
+`--kda-state-bf16`, `--prefill-w8a16`, `--kda-chunked-prefill`, `--kda-prefill-w8a8` and the flags
+that turn the defaults off; [SIZING.md](SIZING.md) §10) are flags of both binaries, with the same
+defaults ([RUNNING.md](RUNNING.md), "Numerics defaults"), and the engine line names them.
 
 ## 5. Cost
 
@@ -766,6 +767,76 @@ hardware the same day with the same engine (`073b553`; [PERFORMANCE.md](PERFORMA
 otherwise. B, the defaults this comparison was made against, is `--kda-chain-prefill
 --prefill-w8a8`; adding `--kda-state-f32` gives section 6a's configuration. The chunked kernel
 without W8A16 failed section 6b's gate (+0.0021), so the two are turned off together.
+
+## 6e. D2 with power-of-two scales: the next arm (built 29 September 2026; not yet gated)
+
+**Why.** D2's scales are the checkpoint's scheme for its FP8 tensors, `amax / 448` per 128 × 128
+block. But the KDA projections ship in BF16, and most of their weights already fit E4M3: 82–89% of
+the q, k, v and o weights have at most 3 significant mantissa bits (6% of `b_proj`'s). A
+power-of-two scale only shifts the exponent, so it keeps those weights exactly; `amax / 448` rounds
+nearly all of them.
+
+**The weights**, relative RMS error against the BF16 checkpoint over all 34 KDA layers (layers 0
+and 4: `crates/glm53f-layers/tests/real_weights.rs`, the same quantizer):
+
+| Projection | D2 (`amax / 448` per 128 × 128) | f32 `amax / 448` per 1 × 32 | Powers of two (per 128 × 128, or MXFP8's per 1 × 32) |
+|---|---:|---:|---:|
+| q | 2.48–2.74e-2 | 2.29–2.34e-2 | 3.2–5.9e-4 |
+| k | 2.55–2.77e-2 | 2.29–2.35e-2 | 3.4–6.0e-4 |
+| v | 2.38–2.73e-2 | 2.26–2.33e-2 | 3.6–5.1e-4 |
+| b | 2.63–2.66e-2 | 2.33–2.41e-2 | 2.65–2.67e-2 |
+| o | 2.33–2.77e-2 | 2.20–2.37e-2 | 3.9–6.2e-4 |
+
+- Powers of two move q, k, v and o 43–83 times less than D2. `b_proj` (64 rows) stays where D2
+  has it.
+- **The scale's form matters, not its block size.** Powers of two per 128 × 128 and per 1 × 32 agree
+  to four digits in every layer. Finer scales that are not powers of two gain only 1–17% on D2:
+  f32 per 1 × 32 above, and BF16 per 1 × 32 (rounded up) 2.2–2.4e-2.
+- The scale is the smallest power of two ≥ amax / 448, so a block's maximum never saturates. The
+  OCP MX rule, 2^(floor(log2 amax) − 8), saturates maxima whose mantissa exceeds 1.75: 0.9–1.1e-2
+  on these weights.
+
+**Two arms**, each off by default ([SIZING.md](SIZING.md) §10):
+- `--kda-mxfp8` (`GLM53F_KDA_MXFP8=1`): MXFP8, an E8M0 scale per row and 32 values of K, with its
+  own GEMM kernels; 0.13 GiB more weights than D2.
+- `--kda-fp8-pow2` (`GLM53F_KDA_FP8_POW2=1`): D2's blocks, kernels and bytes, with power-of-two
+  scales.
+
+The two give the same weights except one in 7,000–18,000 on layers 0 and 4 (the smallest, which a
+1 × 32 scale keeps in E4M3's normal range and a 128 × 128 one does not; `real_weights.rs`). So a
+result on one is expected to hold for the other (an inference, not a measurement).
+
+**The runs**, as section 6c runs an arm (its panel and plan; `score` over the whole panel for
+`compare`, and over `--roles final` for the absolute gate), each compared with the defaults' own run
+at the same pass size:
+
+```sh
+glm53f-score --checkpoint <coordinator-dir> --ranks <a,b,c,d> --plan plan-125.json \
+    --pass-rows 4096 --kda-mxfp8 --out mx-4096      # and --pass-rows 8 --out mx-8
+python3 harness/klgate.py score --teacher <teacher-dir> --engine mx-4096 --json mx-4096.json
+python3 harness/klgate.py compare mx-4096.json defaults-4096.json --margin 0.002
+```
+
+- The option runs on top of today's defaults (BF16 KDA states, the chunked KDA prefill and W8A16).
+- **At 8 rows** the projections take BF16 activations, so only the weights change.
+- **At 4,096 rows** with W8A16 (the default) the MXFP8 weights are dequantized to BF16 tiles and
+  multiplied by cuBLAS: again only the weights change. With `--prefill-w8a8` (or
+  `--kda-prefill-w8a8`) they take E4M3 activations instead, which dominate the error there. In the
+  oracle chain (`goldens_chain`), layer 0's q|k|v|b output over the prompt with MXFP8 weights is
+  1.3e-2 from the FP32 goldens in one W8A8 pass, against 2.3e-3 in 8-row passes (BF16 weights:
+  2.2e-3 both ways; D2: 1.9e-2 and 1.4e-2).
+
+**Result: pending.** Nothing has been measured on the target hardware yet.
+
+**On the development GPU** (not the gate): SIZING.md §10's development-model proxy, 7 windows ×
+189 rows, KL against the same engine without the option; these runs predate today's defaults (the
+KDA chain prefill).
+- In 8-row passes: D2 5.1e-2 (top-1 0.78), powers of two 1.15e-2 (0.88), MXFP8 0.97e-2 (0.89).
+- That is this model's floor: the two power-of-two arms, whose weights differ in one of 10,000, are
+  1.2e-2 apart.
+- At 4,096 rows with W8A16 on both sides: D2 4.7e-2, MXFP8 1.4e-2. With W8A8 (E4M3 activations):
+  D2 8.1e-2, powers of two 4.6e-2, MXFP8 4.8e-2; the W8A8 prefill path is itself 3.5e-2 from the
+  decode path.
 
 ## 7. Open points
 

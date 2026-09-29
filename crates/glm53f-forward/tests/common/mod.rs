@@ -7,8 +7,9 @@
 //!   or a subset); defaults to the checkpoint directory;
 //! - `GLM53F_GOLDENS`: the oracle's golden sets (default `oracle/goldens` in this repository);
 //! - `GLM53F_TEST_NUMERICS`: numerics under test for every forward these helpers build, a
-//!   comma-separated list of `kda-fp8`, `kda-state-bf16`, `prefill-w8a16` and `kda-prefill-w8a8`
-//!   (default none), so a whole suite can run with an option on ([`numerics`]).
+//!   comma-separated list of `kda-fp8`, `kda-fp8-pow2` (FP8 KDA projections with power-of-two
+//!   block-128 scales), `kda-mxfp8` (with MXFP8 scales), `kda-state-bf16`, `prefill-w8a16` and
+//!   `kda-prefill-w8a8` (default none), so a whole suite can run with an option on ([`numerics`]).
 //!
 //! Anything missing makes the tests print why and pass.
 #![allow(dead_code)]
@@ -27,7 +28,7 @@ use glm53f_forward::kv::{GlmKv, KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::shape::{ModelShape, INDEX_DIM, TOP_K, VOCAB};
 use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
-use glm53f_forward::Result;
+use glm53f_forward::{Fp8Scales, Result};
 use glm53f_layers::testkit::goldens::{self, GoldenSet};
 use glm53f_layers::testkit::json;
 
@@ -51,6 +52,9 @@ pub fn experts_dir() -> Option<PathBuf> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TestNumerics {
     pub kda_fp8: bool,
+    /// The FP8 KDA projections' scales (`kda-fp8`: the checkpoint's; `kda-fp8-pow2`,
+    /// `kda-mxfp8`).
+    pub kda_scales: Fp8Scales,
     pub kda_state_bf16: bool,
     pub prefill_w8a16: bool,
     pub kda_prefill_w8a8: bool,
@@ -61,6 +65,22 @@ impl TestNumerics {
     pub fn weights(&self) -> WeightOptions {
         WeightOptions {
             kda_fp8: self.kda_fp8,
+            kda_scales: self.kda_scales,
+        }
+    }
+
+    /// FP8 KDA projections with the checkpoint's `amax / 448` scales (D2 as first built), whose
+    /// error the model-path tests bound more loosely.
+    pub fn kda_fp8_amax(&self) -> bool {
+        self.kda_fp8 && self.kda_scales == Fp8Scales::Block128
+    }
+
+    /// GiB of weights the FP8 KDA projections save over all 34 KDA layers (0 without them).
+    pub fn kda_saved_gib(&self) -> f64 {
+        match (self.kda_fp8, self.kda_scales) {
+            (false, _) => 0.0,
+            (true, Fp8Scales::Mx32) => 4.13,
+            (true, _) => 4.26,
         }
     }
 
@@ -88,6 +108,8 @@ pub fn numerics() -> TestNumerics {
     {
         match name {
             "kda-fp8" => n.kda_fp8 = true,
+            "kda-fp8-pow2" => (n.kda_fp8, n.kda_scales) = (true, Fp8Scales::Block128Pow2),
+            "kda-mxfp8" => (n.kda_fp8, n.kda_scales) = (true, Fp8Scales::Mx32),
             "kda-state-bf16" => n.kda_state_bf16 = true,
             "prefill-w8a16" => n.prefill_w8a16 = true,
             "kda-prefill-w8a8" => n.kda_prefill_w8a8 = true,

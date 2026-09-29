@@ -54,6 +54,8 @@
 //! | `--fp8-act bf16\|dynamic` | | `bf16` | FP8 projections of up to 8 rows: BF16 activations (W8A16) or the checkpoint's dynamic E4M3 (W8A8) |
 //! | `--no-promote-k32` | | off | The FP8 tensor-core GEMM accumulates whole 128-blocks in the tensor core |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (as `glm53f-serve`) |
+//! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales (as `glm53f-serve`) |
+//! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8, an E8M0 scale per row and 32 values of K (as `glm53f-serve`) |
 //! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states in BF16 (as `glm53f-serve`) |
 //! | `--prefill-w8a16` / `--prefill-w8a8` | `GLM53F_PREFILL_W8A16` (`0`: W8A8) | on | FP8 projections over 8 rows with BF16 activations (W8A16) instead of E4M3 (as `glm53f-serve`) |
 //! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows |
@@ -82,7 +84,9 @@ pub mod engine;
 
 use std::path::PathBuf;
 
-use glm53f_serve::{parse_dev_layers, Numerics, MAX_LANE_ROWS, MAX_PREFILL_LANES, RANKS};
+use glm53f_serve::{
+    parse_dev_layers, Fp8Scales, Numerics, MAX_LANE_ROWS, MAX_PREFILL_LANES, RANKS,
+};
 
 /// Usage, for `--help` and errors.
 pub const USAGE: &str = "usage:
@@ -96,6 +100,8 @@ options:
   --fp8-act bf16|dynamic  --no-promote-k32
 numerics (as glm53f-serve; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8              KDA projections quantized to FP8 block-128 at load (D2)
+  --kda-fp8-pow2         the same with power-of-two block scales
+  --kda-mxfp8            KDA projections quantized to MXFP8 at load (E8M0 scales per 32)
   --kda-state-bf16       KDA recurrent states stored in BF16 (D8; the default)
   --kda-state-f32        KDA recurrent states stored in F32 (the reference)
   --prefill-w8a16        FP8 projections over 8 rows with BF16 activations (the default)
@@ -370,10 +376,16 @@ pub fn engine_line(o: &Options, b: &Build) -> String {
         "non-expert weights: the official FP8 checkpoint (FP8 block-128 projections {small} up to \
          8 rows ({act} activations), {beyond}; {} KDA projections; BF16 indexer projections: \
          GEMV up to 8 rows, cuBLAS beyond)",
-        if n.kda_fp8 {
-            "FP8 block-128 (quantized at load)"
-        } else {
-            "BF16"
+        match (n.kda_fp8, n.kda_fp8_scales) {
+            (false, _) => "BF16",
+            (true, Fp8Scales::Block128) => "FP8 block-128 (quantized at load)",
+            (true, Fp8Scales::Block128Pow2) => {
+                "FP8 block-128 with power-of-two scales (quantized at load)"
+            }
+            (true, Fp8Scales::Mx32) => {
+                "MXFP8 with E8M0 scales per 1 x 32 (quantized at load; their W8A8 GEMM always \
+                 k32-promoted)"
+            }
         }
     ));
     let local = b.moe_layers - b.zero_moe_layers;
@@ -548,6 +560,19 @@ mod tests {
                 && reference.contains("KDA states F32"),
             "{reference}"
         );
+        // The FP8 KDA projections' scales, named in the engine line.
+        for (flag, what) in [
+            (
+                "--kda-fp8-pow2",
+                "FP8 block-128 with power-of-two scales (quantized at load) KDA projections",
+            ),
+            ("--kda-mxfp8", "MXFP8 with E8M0 scales per 1 x 32 (quantized at load"),
+        ] {
+            let o = Options::parse(&args(&format!("--plan p --out o {flag}")), &env).unwrap();
+            assert!(o.numerics.kda_fp8, "{flag}");
+            let line = engine_line(&o, &b);
+            assert!(line.contains(what), "{line}");
+        }
         // Local experts default to the checkpoint.
         let o = Options::parse(
             &args("--checkpoint /c --plan p --out o --experts local"),

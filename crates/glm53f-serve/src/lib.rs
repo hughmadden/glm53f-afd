@@ -59,6 +59,8 @@
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
+//! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales: the same layout, kernels and bytes, and 82-89% of the q, k, v and o weights kept exactly (docs/SIZING.md §10) |
+//! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8: an E8M0 scale per row and 32 values of K (4.13 GiB of weights less), the MXFP8 GEMMs; the same error as `--kda-fp8-pow2` on these weights. The last of the three KDA flags given sets the scales |
 //! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states stored in BF16, computed in f32 (68 MiB less per slot and per snapshot); passed the KL gate on the target hardware (docs/KL-GATE.md §6b) |
 //! | `--prefill-w8a16` / `--prefill-w8a8` | `GLM53F_PREFILL_W8A16` (`0`: W8A8) | on | FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (W8A8; 64 MiB of GEMM scratch); with the chunked KDA prefill, passed the KL gate on the target hardware (docs/KL-GATE.md §6d) |
 //! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
@@ -85,8 +87,9 @@
 //! only after the KL gate (`docs/KL-GATE.md`) and speed runs on the target hardware. D8 (BF16 KDA
 //! states) passed and is on. The chunked KDA prefill with W8A16 projections passed as a pair (it
 //! prefilled 21-28% faster, decode unchanged) and is on; the chunked kernel without W8A16 failed
-//! the gate, so `--prefill-w8a8` goes with `--kda-chain-prefill`. D2 and `--kda-prefill-w8a8` are
-//! off. `glm53f-score` takes the same flags. The start-up log names the ones on.
+//! the gate, so `--prefill-w8a8` goes with `--kda-chain-prefill`. D2, with any of its scales
+//! (`--kda-fp8`, `--kda-fp8-pow2`, `--kda-mxfp8`), and `--kda-prefill-w8a8` are off.
+//! `glm53f-score` takes the same flags. The start-up log names the ones on.
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
 //! reached through an address without a RoCE v2 device at the floor rate. `GLM53F_WIRE_ALLOW_LAN=1`
@@ -226,6 +229,8 @@
 
 use std::path::PathBuf;
 
+pub use glm53f_forward::Fp8Scales;
+
 /// Usage, for `--help` and errors.
 pub const USAGE: &str = "usage:
   glm53f-serve --checkpoint <dir> --ranks <a,b,c,d> [--listen <addr:port>] [options]
@@ -238,6 +243,8 @@ options:
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
 numerics (each gated by KL; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
+  --kda-fp8-pow2      the same with power-of-two block scales
+  --kda-mxfp8         KDA projections quantized to MXFP8 at load (E8M0 scales per 32)
   --kda-state-bf16    KDA recurrent states stored in BF16 (D8; the default)
   --kda-state-f32     KDA recurrent states stored in F32 (the reference)
   --prefill-w8a16     FP8 projections over 8 rows with BF16 activations (the default)
@@ -271,8 +278,14 @@ pub enum Experts {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Numerics {
     /// D2: the KDA layers' q|k|v|b and o projections quantized at load to FP8 E4M3 with
-    /// 128 x 128 block scales (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
+    /// `kda_fp8_scales` (`--kda-fp8`, `GLM53F_KDA_FP8=1`; `--kda-fp8-pow2` and `--kda-mxfp8` turn
+    /// it on too).
     pub kda_fp8: bool,
+    /// The FP8 KDA projections' scales: `amax / 448` per 128 x 128 block (the default),
+    /// powers of two per 128 x 128 block (`--kda-fp8-pow2`, `GLM53F_KDA_FP8_POW2=1`), or MXFP8,
+    /// an E8M0 power of two per row and 32 values of K (`--kda-mxfp8`, `GLM53F_KDA_MXFP8=1`; over
+    /// `GLM53F_KDA_FP8_POW2` when both are set).
+    pub kda_fp8_scales: Fp8Scales,
     /// D8: the KDA recurrent states stored in BF16, computed in f32. On unless
     /// `--kda-state-f32` or `GLM53F_KDA_STATE_BF16=0` (it passed the KL gate).
     pub kda_state_bf16: bool,
@@ -295,8 +308,16 @@ impl Numerics {
     pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Numerics {
         let on = |k: &str| env(k).is_some_and(|v| v != "0");
         let on_unless_0 = |k: &str| env(k).map_or(true, |v| v != "0");
+        let kda_fp8_scales = if on("GLM53F_KDA_MXFP8") {
+            Fp8Scales::Mx32
+        } else if on("GLM53F_KDA_FP8_POW2") {
+            Fp8Scales::Block128Pow2
+        } else {
+            Fp8Scales::Block128
+        };
         Numerics {
-            kda_fp8: on("GLM53F_KDA_FP8"),
+            kda_fp8: on("GLM53F_KDA_FP8") || kda_fp8_scales != Fp8Scales::Block128,
+            kda_fp8_scales,
             kda_state_bf16: on_unless_0("GLM53F_KDA_STATE_BF16"),
             prefill_w8a16: on_unless_0("GLM53F_PREFILL_W8A16"),
             kda_prefill_w8a8: on("GLM53F_KDA_PREFILL_W8A8"),
@@ -308,6 +329,8 @@ impl Numerics {
     pub fn flag(&mut self, flag: &str) -> bool {
         match flag {
             "--kda-fp8" => self.kda_fp8 = true,
+            "--kda-fp8-pow2" => (self.kda_fp8, self.kda_fp8_scales) = (true, Fp8Scales::Block128Pow2),
+            "--kda-mxfp8" => (self.kda_fp8, self.kda_fp8_scales) = (true, Fp8Scales::Mx32),
             "--kda-state-bf16" => self.kda_state_bf16 = true,
             "--kda-state-f32" => self.kda_state_bf16 = false,
             "--prefill-w8a16" => self.prefill_w8a16 = true,
@@ -323,7 +346,7 @@ impl Numerics {
     /// The options on, for logs and engine lines (`none` when all are off).
     pub fn describe(&self) -> String {
         let on: Vec<&str> = [
-            (self.kda_fp8, "FP8 KDA projections (D2)"),
+            (self.kda_fp8, self.kda_fp8_what()),
             (self.kda_state_bf16, "BF16 KDA states (D8)"),
             (self.prefill_w8a16, "W8A16 prefill projections"),
             (
@@ -340,6 +363,15 @@ impl Numerics {
             "none".to_string()
         } else {
             on.join(", ")
+        }
+    }
+
+    /// The FP8 KDA projections by their scales, for logs.
+    pub fn kda_fp8_what(&self) -> &'static str {
+        match self.kda_fp8_scales {
+            Fp8Scales::Block128 => "FP8 KDA projections (D2)",
+            Fp8Scales::Block128Pow2 => "FP8 KDA projections (D2) with power-of-two block scales",
+            Fp8Scales::Mx32 => "MXFP8 KDA projections (D2 with E8M0 scales per 1 x 32)",
         }
     }
 }
@@ -853,6 +885,39 @@ mod tests {
         };
         let o = Options::parse(&args("--checkpoint /c"), &env2).unwrap();
         assert_eq!(o.numerics, Numerics { kda_fp8: true, ..Numerics::default() });
+        // The FP8 KDA projections' scales: each flag turns the projections on; the last one given
+        // sets the scales, and --kda-fp8 keeps them. They take the defaults' other numerics.
+        for (a, want) in [
+            ("--kda-fp8-pow2", Fp8Scales::Block128Pow2),
+            ("--kda-mxfp8", Fp8Scales::Mx32),
+            ("--kda-mxfp8 --kda-fp8", Fp8Scales::Mx32),
+            ("--kda-mxfp8 --kda-fp8-pow2", Fp8Scales::Block128Pow2),
+        ] {
+            let o = Options::parse(&args(&format!("--checkpoint /c {a}")), &env).unwrap();
+            assert_eq!(
+                o.numerics,
+                Numerics {
+                    kda_fp8: true,
+                    kda_fp8_scales: want,
+                    ..defaults
+                },
+                "{a}"
+            );
+        }
+        let o = Options::parse(&args("--checkpoint /c --kda-mxfp8"), &env).unwrap();
+        assert_eq!(
+            o.numerics.describe(),
+            "MXFP8 KDA projections (D2 with E8M0 scales per 1 x 32), BF16 KDA states (D8), W8A16 \
+             prefill projections, chunked KDA prefill"
+        );
+        for (k, want) in [
+            ("GLM53F_KDA_FP8_POW2", Fp8Scales::Block128Pow2),
+            ("GLM53F_KDA_MXFP8", Fp8Scales::Mx32),
+        ] {
+            let env4 = |x: &str| if x == k { Some("1".to_string()) } else { env(x) };
+            let o = Options::parse(&args("--checkpoint /c"), &env4).unwrap();
+            assert!(o.numerics.kda_fp8 && o.numerics.kda_fp8_scales == want, "{k}");
+        }
         // The flags win over the environment, either way.
         let o = Options::parse(
             &args("--checkpoint /c --prefill-w8a16 --kda-chunked-prefill"),

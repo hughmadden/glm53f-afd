@@ -184,7 +184,8 @@ Each rank holds a quarter of every routed expert, split over the expert's
 
 ## 10. D2, D8 and the prefill activations as built (28 September 2026)
 
-Three numerics options (and a variant of the third), each **off by default** when built and each a flag of
+Three numerics options (the first with three kinds of scales, the third with a variant), each
+**off by default** when built and each a flag of
 `glm53f-serve` and `glm53f-score` (with an environment fallback). Each becomes a default only after the KL gate
 ([KL-GATE.md](KL-GATE.md) §6, `compare --margin 0.002` against the same engine without it) and
 speed runs on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
@@ -228,6 +229,40 @@ a slot and W8A16's scratch 64 MiB.*
   relative RMS (0.2% for the reference in BF16); head logits 1.55e-2 (8-row passes) and 2.7e-2
   (one pass) against 0.97e-2 and 2.4e-2 without it; argmax 7/9, the two rows that differ being the
   golden's near-ties (top-2 logit gaps 0.042 and 0.006).
+
+**D2 with power-of-two scales** (`--kda-fp8-pow2`, `GLM53F_KDA_FP8_POW2=1`) **and as MXFP8**
+(`--kda-mxfp8`, `GLM53F_KDA_MXFP8=1`), built 29 September 2026 after D2 failed the KL gate
+([KL-GATE.md](KL-GATE.md) §6e has why, and the weights' error).
+- 82–89% of the q, k, v and o weights have at most 3 significant mantissa bits, and a power-of-two
+  scale (the smallest ≥ amax / 448) keeps them exactly. Against the BF16 weights, q, k, v and o
+  move by 3.2–6.2e-4 (relative RMS) instead of D2's 2.3–2.8e-2; `b_proj` stays at 2.7e-2.
+- `--kda-fp8-pow2` keeps D2's 128 × 128 blocks, layout, kernels and bytes.
+- `--kda-mxfp8` is the OCP Microscaling layout: an E8M0 scale (one byte) per row and 32 values of K.
+  - Memory: 141.0 → 145.2 MB a layer, 4.94 GB over 34 layers, **4.13 GiB less** than BF16 (0.13
+    GiB more than D2).
+  - Its own GEMM entry points: the decode GEMM scales each 16-value step by its row's scale; the
+    W8A8 prefill GEMM scales each k32 product sum by its column's scale as it adds it to the block
+    sum (the k32 structure, always); the W8A16 path's BF16 tiles take the scale in the product.
+  - Activations as D2's: BF16 in decode and with W8A16 (the default since 29 September), E4M3
+    per 128 with f32 scales in W8A8 (`--prefill-w8a8`). The weights are in the layout of sm_120's
+    block-scaled MMA, which would need MXFP8 activations as well (not built).
+- Speed on the 4090 (`gemm_bench`, five runs, minima; `prefill_bench`, three runs; `decode_bench`,
+  two runs). Powers of two run D2's kernels at D2's speed.
+  - Decode: the MXFP8 GEMMs take D2's time within 3%. Per KDA layer at one row, `kda_proj` 0.127
+    ms and `kda_o` 0.042 ms (D2 0.122 and 0.040, BF16 0.229 and 0.076).
+  - Prefill GEMMs, W8A8 per 2,048 rows: q|k|v|b 1.93 ms (D2 1.90), `o_proj` 0.61 ms (D2 0.52: 18%
+    slower). The 34 KDA layers' projections in one pass: 87.4 ms (D2 83.0, BF16 121.6).
+  - A whole prefill (`prefill_bench`, four lanes of 2,048 rows, 45 layers, with the KDA chain and
+    W8A8 as the bench then ran): 3,770 tok/s, against 3,910 with D2, 3,880 with powers of two and
+    3,550 with BF16 KDA projections.
+- Error against the oracle (layers 0–4, `goldens_chain`, the prompt's rows; MXFP8, with BF16 and
+  D2 in brackets):
+  - In 8-row passes q, k and v are where BF16 has them: layer 0's q|k|v|b output 2.3e-3 (2.2e-3,
+    1.4e-2). Its `b_logits`, whose weights keep D2's error, 5.4e-3 (1.8e-3, 5.3e-3). Head logits
+    0.95e-2 (0.97e-2, 1.55e-2), argmax 9/9 (9/9, 8/9).
+  - In one pass the E4M3 activations dominate: q|k|v|b 1.3e-2 (2.2e-3, 1.9e-2), head logits
+    2.5e-2 (2.4e-2, 2.7e-2), argmax 8/9 (9/9, 7/9).
+  - Powers of two per 128 × 128: the same per layer; head logits 1.02e-2 and 2.6e-2 in the chain.
 
 **D8, BF16 KDA states** (`--kda-state-bf16`, `GLM53F_KDA_STATE_BF16=1`).
 - The state is stored in BF16 and every kernel computes in f32. The chain and the replay round
@@ -273,6 +308,11 @@ September, with the chunked KDA prefill; `--prefill-w8a8` or `GLM53F_PREFILL_W8A
 KL in nats against the same engine with every option off. The prefill path against the decode path
 is 3.6e-2 (top-1 0.81); with `--prefill-w8a16` 0.79e-2 (0.90). Against the decode path, D2 is
 4.9e-2 (0.77) in decode, 6.7e-2 in prefill, 5.0e-2 in prefill with W8A16 and 5.7e-2 with
-`--kda-prefill-w8a8`; D8 1.6e-2 (0.85). The development model's sensitivity is not the real
-model's; the KL gate on the target hardware decides.
+`--kda-prefill-w8a8`; D8 1.6e-2 (0.85). On 29 September, with BF16 states, against the decode
+path: powers of two 1.15e-2 (0.88) and MXFP8 0.97e-2 (0.89) in decode, where D2 is 5.1e-2 (0.78);
+both 4.6e-2 (0.79) in prefill (D2 6.9e-2, neither 3.5e-2); MXFP8 in prefill with W8A16 1.2e-2
+(0.88; D2 4.8e-2, neither 0.86e-2). Two arms whose weights differ in one of 10,000 (powers of two
+per 128 × 128 and MXFP8) are 1.2e-2 apart in decode, so that is this proxy's floor. The
+development model's sensitivity is not the real model's; the KL gate on the target hardware
+decides.
 

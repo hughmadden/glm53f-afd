@@ -8,7 +8,7 @@
 
 use glm53f_layers::bf16;
 use glm53f_layers::cuda::{DeviceBuffer, Stream};
-use glm53f_layers::fp8::{self, ActScheme, Fp8Matrix};
+use glm53f_layers::fp8::{self, ActScheme, Fp8Matrix, Fp8Scales, ScaleLayout};
 use glm53f_layers::layer::{self, LayerParams};
 use glm53f_layers::mhc::{self, HcParams, HC_MULT, HC_PROJ, PARTIAL};
 use glm53f_layers::mlp::{self, Fp8Mlp};
@@ -382,6 +382,248 @@ fn weight_quantization_and_dequantization_match_the_host() {
                 "dequant n={n} k={k} rows {row0}+{rows}"
             );
         }
+    }
+}
+
+// ---- MXFP8 weights and power-of-two block-128 scales ------------------------------------------
+
+/// An MXFP8 weight on the device: codes and E8M0 scale bytes.
+fn dev_weight_mx(m: &Fp8Matrix) -> DevWeight {
+    assert_eq!(m.layout, ScaleLayout::Mx32);
+    DevWeight {
+        w: up(&m.data),
+        s: up(&m.scale_bytes()),
+    }
+}
+
+/// The MXFP8 decode GEMM (K splits reduced in the launch) for `rows` BF16 rows.
+fn gpu_decode_mx(
+    x: &[u16],
+    rows: usize,
+    w: &Fp8Matrix,
+    dw: &DevWeight,
+    scheme: ActScheme,
+    ksplit: usize,
+    s: &Stream,
+) -> Vec<u16> {
+    let (n, k) = (w.rows, w.cols);
+    let dx = up(x);
+    let (dq, ds) = (zeros(rows * k), zeros(rows * k / 128 * 4));
+    let input = match scheme {
+        ActScheme::Bf16 => GemmInput::Bf16(&dx),
+        ActScheme::Fp8Dynamic128 => {
+            ops::act_quant(&dx, &dq, &ds, rows, k, s).unwrap();
+            GemmInput::Fp8 {
+                q: &dq,
+                scales: &ds,
+            }
+        }
+    };
+    let out = zeros(rows * n * 2);
+    let (p, sync) = (zeros(ksplit * rows * n * 4), ops::sync_buffer(n / 8).unwrap());
+    ops::fp8_gemm_decode_mx(
+        &input,
+        &dw.w,
+        &dw.s,
+        rows,
+        n,
+        k,
+        ksplit,
+        Some(&p),
+        Some(&sync),
+        &out,
+        s,
+    )
+    .unwrap();
+    down(&out, rows * n)
+}
+
+#[test]
+fn mx_decode_gemm_is_bitwise_and_row_independent() {
+    // The MXFP8 decode GEMM against the CPU model of the decode order (each 16-value step scaled
+    // by its row's 32-block scale), bit for bit, both activation schemes, every split; each row
+    // the same bits whatever the launch's other rows. 320 and 136 rows: MX scales are per row,
+    // so a partial last 128-row block needs nothing of its own.
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(112);
+    for (n, k, ksplits) in [
+        (256, 1024, vec![1, 2, 4, 8]),
+        (512, 4096, vec![1, 4]),
+        (320, 2048, vec![1, 2]),
+        (136, 512, vec![1]),
+    ] {
+        let w = rng.fp8_matrix_mx(n, k);
+        let dw = dev_weight_mx(&w);
+        let x = rng.bf16_vec(8 * k, 1.0);
+        for scheme in [ActScheme::Bf16, ActScheme::Fp8Dynamic128] {
+            for &ksplit in &ksplits {
+                let cpu = bf16::narrow(&mlp::fp8_linear(&x, 8, &w, scheme, ksplit));
+                let all = gpu_decode_mx(&x, 8, &w, &dw, scheme, ksplit, &s);
+                assert_eq!(all, cpu, "n={n} k={k} {scheme:?} ksplit={ksplit}");
+                for rows in 1..8 {
+                    let part = gpu_decode_mx(&x[..rows * k], rows, &w, &dw, scheme, ksplit, &s);
+                    assert_eq!(
+                        &part[..],
+                        &all[..rows * n],
+                        "rows={rows} n={n} k={k} {scheme:?} ksplit={ksplit}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mx_prefill_gemm_is_within_bound_of_exact() {
+    // The MXFP8 prefill GEMM (the k32 structure, each k32 sum scaled by its column's scale)
+    // against exact f64 32-block products, within the K32 bounds of the block-128 kernel:
+    // worst 2^-12 and mean 2^-16 of m = sum |sx sw x w|.
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(113);
+    assert_eq!(
+        unsafe { glm53f_layers::ffi::glm53f_fp8_gemm_prefill_mx_smem_bytes() },
+        101_376
+    );
+    for (rows, n, k) in [
+        (1, 128, 128),
+        (100, 256, 512),
+        (300, 384, 1024),
+        (256, 128, 4096),
+        (100, 320, 512),
+        (130, 136, 1024),
+    ] {
+        let w = rng.fp8_matrix_mx(n, k);
+        let dw = dev_weight_mx(&w);
+        let x = rng.bf16_vec(rows * k, 1.0);
+        let dx = up(&x);
+        let (dq, ds) = (zeros(rows * k), zeros(rows * k / 128 * 4));
+        ops::act_quant(&dx, &dq, &ds, rows, k, &s).unwrap();
+        let (exact, mag) = mlp::fp8_linear_f64(&x, rows, &w, ActScheme::Fp8Dynamic128);
+        let (out, out32) = (zeros(rows * n * 2), zeros(rows * n * 4));
+        ops::fp8_gemm_prefill_mx(&dq, &ds, &dw.w, &dw.s, rows, n, k, &out, Some(&out32), &s)
+            .unwrap();
+        let got32: Vec<f32> = down(&out32, rows * n);
+        let got: Vec<u16> = down(&out, rows * n);
+        let mut mean = 0f64;
+        for i in 0..rows * n {
+            let rel = (got32[i] as f64 - exact[i]).abs() / mag[i];
+            mean += rel;
+            assert!(
+                rel <= 2f64.powi(-12),
+                "rows={rows} n={n} k={k} [{i}]: {} vs {} (rel {rel:.2e})",
+                got32[i],
+                exact[i]
+            );
+            assert_eq!(got[i], bf16::from_f32(got32[i]));
+        }
+        mean /= (rows * n) as f64;
+        assert!(mean <= 2f64.powi(-16), "rows={rows} n={n} k={k}: mean error {mean:.2e}");
+        // The decode GEMM (f32 order) agrees within both errors and one BF16 rounding.
+        let r = rows.min(8);
+        let dec = gpu_decode_mx(&x[..r * k], r, &w, &dw, ActScheme::Fp8Dynamic128, 1, &s);
+        for i in 0..r * n {
+            let d = (bf16::to_f32(dec[i]) as f64 - got32[i] as f64).abs();
+            assert!(
+                d <= got32[i].abs() as f64 * 2f64.powi(-8) + 2f64.powi(-12) * mag[i],
+                "decode vs prefill [{i}]"
+            );
+        }
+    }
+}
+
+#[test]
+fn mx_prefill_gemm_is_exact_on_integer_data() {
+    // Small-integer E4M3 values with power-of-two scales per 128 (activations) and per 32
+    // (weights, E8M0): every partial sum is exact, so any correct accumulation gives the exact
+    // result and a wrong scale index, fragment or swizzle cannot hide in a tolerance.
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(114);
+    let codes: Vec<u8> = [-3.0f32, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+        .iter()
+        .map(|&v| fp8::f32_to_e4m3(v))
+        .collect();
+    for (rows, n, k) in [
+        (1usize, 128usize, 128usize),
+        (77, 256, 384),
+        (130, 384, 1024),
+        (77, 200, 384),
+    ] {
+        let pick = |rng: &mut Rng| codes[(rng.next_u64() % codes.len() as u64) as usize];
+        let xq: Vec<u8> = (0..rows * k).map(|_| pick(&mut rng)).collect();
+        let wq: Vec<u8> = (0..n * k).map(|_| pick(&mut rng)).collect();
+        let pow2 = |rng: &mut Rng| 2f32.powi((rng.next_u64() % 5) as i32 - 2);
+        let xs: Vec<f32> = (0..rows * k / 128).map(|_| pow2(&mut rng)).collect();
+        let ws: Vec<f32> = (0..n * k / 32).map(|_| pow2(&mut rng)).collect();
+        let w = Fp8Matrix::with_layout(n, k, wq.clone(), ws.clone(), ScaleLayout::Mx32);
+        let dw = dev_weight_mx(&w);
+        let (dq, dxs) = (up(&xq), up(&xs));
+        let (out, out32) = (zeros(rows * n * 2), zeros(rows * n * 4));
+        ops::fp8_gemm_prefill_mx(&dq, &dxs, &dw.w, &dw.s, rows, n, k, &out, Some(&out32), &s)
+            .unwrap();
+        let got: Vec<f32> = down(&out32, rows * n);
+        for m in 0..rows {
+            for o in 0..n {
+                let mut want = 0f64;
+                for kk in 0..k {
+                    let sc =
+                        xs[m * (k / 128) + kk / 128] as f64 * ws[o * (k / 32) + kk / 32] as f64;
+                    want += fp8::e4m3_to_f32(xq[m * k + kk]) as f64
+                        * fp8::e4m3_to_f32(wq[o * k + kk]) as f64
+                        * sc;
+                }
+                assert_eq!(got[m * n + o] as f64, want, "rows={rows} n={n} k={k} ({m}, {o})");
+            }
+        }
+    }
+}
+
+#[test]
+fn pow2_and_mx_weight_quantization_match_the_host() {
+    // The load-time quantizers with power-of-two scales (block-128 and MXFP8) and the MXFP8
+    // BF16 tiles, bit for bit against src/fp8.rs, on shapes with a partial last block of rows.
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(115);
+    for (n, k) in [(128usize, 128usize), (320, 1024), (200, 384), (24640, 256)] {
+        let mut w = rng.bf16_vec(n * k, 0.02);
+        for r in 0..n.min(128) {
+            for c in 0..128 {
+                w[r * k + c] = 0;
+            }
+        }
+        w[(n - 1) * k + k - 1] = bf16::from_f32(-3.0);
+        w[k + 1] = 0x8000;
+        if n > 128 {
+            // A block maximum of exactly 448: scale 1, code 0x7E, no saturation.
+            w[(n - 2) * k] = bf16::from_f32(448.0);
+        }
+        let dw = up(&w);
+        for scales in [Fp8Scales::Block128Pow2, Fp8Scales::Mx32] {
+            let host = fp8::quantize_weight_bf16_as(&w, n, k, scales);
+            let sb = host.scale_bytes();
+            let (q, sc) = (zeros(n * k), zeros(sb.len()));
+            ops::quantize_weight_as(&dw, n, k, scales, &q, &sc, &s).unwrap();
+            assert_eq!(down::<u8>(&q, n * k), host.data, "codes {scales:?} n={n} k={k}");
+            assert_eq!(down::<u8>(&sc, sb.len()), sb, "scales {scales:?} n={n} k={k}");
+            for (row0, rows) in [(0usize, n), (n / 2, n - n / 2), (n - 1, 1)] {
+                let out = zeros(rows * k * 2);
+                match scales {
+                    Fp8Scales::Mx32 => ops::dequant_bf16_mx(&q, &sc, n, k, row0, rows, &out, &s),
+                    _ => ops::dequant_bf16(&q, &sc, n, k, row0, rows, &out, &s),
+                }
+                .unwrap();
+                assert_eq!(
+                    down::<u16>(&out, rows * k),
+                    fp8::dequant_bf16(&host, row0, rows),
+                    "dequant {scales:?} n={n} k={k} rows {row0}+{rows}"
+                );
+            }
+        }
+        // The checkpoint's scheme through the same entry: glm53f_fp8_quantize_weight's bits.
+        let host = fp8::quantize_weight_bf16(&w, n, k);
+        let (q, sc) = (zeros(n * k), zeros(host.scale_bytes().len()));
+        ops::quantize_weight_as(&dw, n, k, Fp8Scales::Block128, &q, &sc, &s).unwrap();
+        assert_eq!(down::<u8>(&q, n * k), host.data);
+        assert_bits_f32(&down::<f32>(&sc, host.scale_inv.len()), &host.scale_inv, "scales");
     }
 }
 

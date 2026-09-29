@@ -13,10 +13,15 @@
 //!   (W8A16): the weight dequantized to BF16 tiles of rows (`glm53f_fp8_dequant_bf16`, one
 //!   rounded product per weight) in [`DEQUANT_BYTES`] of scratch, each multiplied by cuBLAS as
 //!   the BF16 GEMMs are.
+//! - **MXFP8** (the KDA projections loaded with `Fp8Scales::Mx32`: an E8M0 scale per row and 32
+//!   values of K, [`ScaleLayout::Mx32`]): the same three paths through the kernels' `_mx` entry
+//!   points (`glm53f_fp8_gemm_decode_mx`, `glm53f_fp8_gemm_prefill_mx`, which always has the k32
+//!   structure, and `glm53f_fp8_dequant_bf16_mx`).
 
 use core::ffi::c_void;
 
 use glm53f_layers::ffi as lffi;
+use glm53f_layers::fp8::ScaleLayout;
 use glm53f_layers::mlp::decode_ksplit;
 
 use crate::cublas::{Blas, GemmDesc};
@@ -42,18 +47,21 @@ impl Bf16Mat {
     }
 }
 
-/// An FP8 E4M3 weight `[n][k]` with f32 scales `[n / 128][k / 128]` on the device.
+/// An FP8 E4M3 weight `[n][k]` on the device with f32 scales `[ceil(n / 128)][k / 128]`
+/// ([`ScaleLayout::Block128`]), or E8M0 scale bytes `[n][k / 32]` ([`ScaleLayout::Mx32`],
+/// MXFP8).
 #[derive(Clone, Copy, Debug)]
 pub struct Fp8Mat {
     pub w: *const u8,
-    pub scales: *const f32,
+    pub scales: *const c_void,
     pub n: usize,
     pub k: usize,
+    pub layout: ScaleLayout,
 }
 
 impl Fp8Mat {
     pub fn bytes(&self) -> usize {
-        self.n * self.k + self.n.div_ceil(128) * self.k.div_ceil(128) * 4
+        glm53f_layers::fp8::weight_bytes(self.n, self.k, self.layout)
     }
 }
 
@@ -84,7 +92,8 @@ pub struct GemmPolicy {
     /// FP8 decode GEMM activations.
     pub fp8_act: Fp8Act,
     /// The FP8 tensor-core GEMM adds every k32 partial sum in f32 (more accurate, about 9%
-    /// slower) instead of accumulating whole 128-blocks in the tensor core.
+    /// slower) instead of accumulating whole 128-blocks in the tensor core. MXFP8 weights always
+    /// take the k32 structure (their scale changes every 32 values of K).
     pub prefill_promote_k32: bool,
     /// FP8 GEMMs over more than 8 rows take BF16 activations (W8A16) through BF16 tiles of the
     /// weight and cuBLAS, instead of E4M3 activations (W8A8) on the FP8 tensor cores. Needs
@@ -314,7 +323,7 @@ impl Gemm {
         })
     }
 
-    /// `out [rows][n] = x . w^T` (BF16 output) for an FP8 block-128 weight.
+    /// `out [rows][n] = x . w^T` (BF16 output) for an FP8 weight (block-128 or MXFP8 scales).
     ///
     /// # Safety
     ///
@@ -379,27 +388,67 @@ impl Gemm {
                 (x.bf16.cast(), core::ptr::null(), 0)
             };
             // SAFETY: live device buffers sized by the caller; scratch checked above.
-            let code = unsafe {
-                lffi::glm53f_fp8_gemm_decode_fused(
-                    xp,
-                    xs,
-                    a8,
-                    w.w,
-                    w.scales,
-                    rows as i32,
-                    w.n as i32,
-                    w.k as i32,
-                    ksplit as i32,
-                    self.partials.ptr(0),
-                    self.sync.ptr(0),
-                    out,
-                    stream.raw().cast(),
-                )
+            let (code, what) = unsafe {
+                match w.layout {
+                    ScaleLayout::Block128 => (
+                        lffi::glm53f_fp8_gemm_decode_fused(
+                            xp,
+                            xs,
+                            a8,
+                            w.w,
+                            w.scales.cast(),
+                            rows as i32,
+                            w.n as i32,
+                            w.k as i32,
+                            ksplit as i32,
+                            self.partials.ptr(0),
+                            self.sync.ptr(0),
+                            out,
+                            stream.raw().cast(),
+                        ),
+                        "glm53f_fp8_gemm_decode_fused",
+                    ),
+                    ScaleLayout::Mx32 => (
+                        lffi::glm53f_fp8_gemm_decode_mx(
+                            xp,
+                            xs,
+                            a8,
+                            w.w,
+                            w.scales.cast(),
+                            rows as i32,
+                            w.n as i32,
+                            w.k as i32,
+                            ksplit as i32,
+                            self.partials.ptr(0),
+                            self.sync.ptr(0),
+                            out,
+                            stream.raw().cast(),
+                        ),
+                        "glm53f_fp8_gemm_decode_mx",
+                    ),
+                }
             };
-            launched(code, "glm53f_fp8_gemm_decode_fused")
+            launched(code, what)
         } else if self.policy.w8a16(kda) {
             // SAFETY: as documented; the tiles' scratch is the engine's.
             unsafe { self.fp8_w8a16(x.bf16, w, rows, out, stream) }
+        } else if w.layout == ScaleLayout::Mx32 {
+            // SAFETY: live device buffers sized by the caller.
+            let code = unsafe {
+                lffi::glm53f_fp8_gemm_prefill_mx(
+                    x.q,
+                    x.scales,
+                    w.w,
+                    w.scales.cast(),
+                    rows as i32,
+                    w.n as i32,
+                    w.k as i32,
+                    out,
+                    core::ptr::null_mut(),
+                    stream.raw().cast(),
+                )
+            };
+            launched(code, "glm53f_fp8_gemm_prefill_mx")
         } else {
             let flags = if self.policy.prefill_promote_k32 {
                 lffi::PREFILL_PROMOTE_K32
@@ -412,7 +461,7 @@ impl Gemm {
                     x.q,
                     x.scales,
                     w.w,
-                    w.scales,
+                    w.scales.cast(),
                     rows as i32,
                     w.n as i32,
                     w.k as i32,
@@ -428,9 +477,9 @@ impl Gemm {
 }
 
 impl Gemm {
-    /// `out [rows][n] = x . w^T` with BF16 activations for an FP8 block-128 weight: tiles of the
-    /// weight's rows dequantized to BF16 (`glm53f_fp8_dequant_bf16`), each multiplied by cuBLAS
-    /// into its columns of `out`.
+    /// `out [rows][n] = x . w^T` with BF16 activations for an FP8 weight: tiles of the weight's
+    /// rows dequantized to BF16 (`glm53f_fp8_dequant_bf16`, or `_mx` for MXFP8 scales), each
+    /// multiplied by cuBLAS into its columns of `out`.
     ///
     /// # Safety
     ///
@@ -455,19 +504,37 @@ impl Gemm {
         while n0 < w.n {
             let nt = tile.min(w.n - n0);
             // SAFETY: rows n0 .. n0 + nt of the weight; the tile buffer holds nt x k BF16.
-            let code = unsafe {
-                lffi::glm53f_fp8_dequant_bf16(
-                    w.w,
-                    w.scales,
-                    w.n as i32,
-                    w.k as i32,
-                    n0 as i32,
-                    nt as i32,
-                    tiles.ptr(0),
-                    stream.raw().cast(),
-                )
+            let (code, what) = unsafe {
+                match w.layout {
+                    ScaleLayout::Block128 => (
+                        lffi::glm53f_fp8_dequant_bf16(
+                            w.w,
+                            w.scales.cast(),
+                            w.n as i32,
+                            w.k as i32,
+                            n0 as i32,
+                            nt as i32,
+                            tiles.ptr(0),
+                            stream.raw().cast(),
+                        ),
+                        "glm53f_fp8_dequant_bf16",
+                    ),
+                    ScaleLayout::Mx32 => (
+                        lffi::glm53f_fp8_dequant_bf16_mx(
+                            w.w,
+                            w.scales.cast(),
+                            w.n as i32,
+                            w.k as i32,
+                            n0 as i32,
+                            nt as i32,
+                            tiles.ptr(0),
+                            stream.raw().cast(),
+                        ),
+                        "glm53f_fp8_dequant_bf16_mx",
+                    ),
+                }
             };
-            launched(code, "glm53f_fp8_dequant_bf16")?;
+            launched(code, what)?;
             let t = Bf16Mat {
                 ptr: tiles.ptr(0),
                 n: nt,

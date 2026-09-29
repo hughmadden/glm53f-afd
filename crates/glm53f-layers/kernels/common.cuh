@@ -212,6 +212,19 @@ __device__ __forceinline__ float group_scale(float amax) {
   return amax > 0.0f ? __fdiv_rn(amax, kE4m3Max) : 1.0f;
 }
 
+// The smallest power of two s >= amax / 448, clamped to [2^-126, 2^127] (1 for amax 0 or NaN): the
+// E8M0 scale of a weight block, rounded up so the block's maximum never saturates (src/fp8.rs
+// pow2_scale). amax = m * 2^e with m in [1, 2): s = 2^(e - 8), or 2^(e - 7) when m > 1.75.
+__device__ __forceinline__ float pow2_scale(float amax) {
+  if (!(amax > 0.0f)) return 1.0f;
+  const uint32_t b = __float_as_uint(amax);
+  int x = int(b >> 23) - 135 + ((b & 0x7fffffu) > 0x600000u ? 1 : 0);
+  x = x < -126 ? -126 : (x > 127 ? 127 : x);
+  return __uint_as_float(uint32_t(x + 127) << 23);
+}
+// An E8M0 scale byte (1..254, as the quantizers write them) as f32: 2^(b - 127).
+__device__ __forceinline__ float e8m0_to_f32(uint32_t b) { return __uint_as_float(b << 23); }
+
 // ---- Memory ----------------------------------------------------------------------------------
 // The single-launch kernels' hand-off: after a CTA barrier, thread 0 adds to a counter in one
 // atomic with acquire-release semantics at GPU scope. Its release covers the writes every

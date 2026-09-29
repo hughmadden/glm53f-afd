@@ -18,6 +18,13 @@
 // cores accumulate FP8 products with fewer bits than f32, so the block sum is either left
 // to them (the reference kernels' choice) or, with GLM53F_PREFILL_PROMOTE_K32, formed in
 // f32 from the four k32 partial sums.
+//
+// MXFP8 weights (the `_mx` entry points): the same E4M3 codes with one E8M0 scale (a power of
+// two, one byte) per row and 32-wide block of K, the OCP Microscaling layout. The decode GEMM
+// takes each row's scale per 16-value step (a step lies in one 32-block); the prefill GEMM scales
+// each k32 product sum by its column's scale as it adds it to the block sum (the k32 structure),
+// then by the activation scale per 128-block; the W8A16 tiles multiply by the scale. A power of
+// two scales exactly, so these add no rounding to the block-128 kernels' arithmetic.
 #include "glm53f_layers.h"
 #include "common.cuh"
 
@@ -30,10 +37,15 @@ constexpr int kDecodeRowsPerCta = kDecodeWarps * kRowsPerWarp;
 
 // FuseReduce: the K splits are added by the last CTA of each 8-output block to finish (a
 // per-block counter in `sync`), in split order, exactly as splitk_reduce_kernel adds them.
-template <bool A8, int M, bool FuseReduce = false>
+//
+// Mx: MXFP8 weight scales, one E8M0 byte per row and 32-wide block of K (`wsv` is uint8_t
+// [n][k/32]) instead of an f32 per 128 x 128 block. A lane's 16 values lie in one 32-block, so
+// each row's step takes its own scale; the arithmetic is otherwise the same (the scale, a power of
+// two, times the activation scale for W8A8 is exact).
+template <bool A8, int M, bool FuseReduce = false, bool Mx = false>
 __global__ void __launch_bounds__(32 * kDecodeWarps) fp8_gemm_decode_kernel(
     const void* __restrict__ xv, const float* __restrict__ xs, const uint8_t* __restrict__ w,
-    const float* __restrict__ ws, int n, int k, int kc, float* partials, uint16_t* __restrict__ out,
+    const void* __restrict__ wsv, int n, int k, int kc, float* partials, uint16_t* __restrict__ out,
     unsigned* __restrict__ sync = nullptr) {
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int n0 = (blockIdx.x * kDecodeWarps + warp) * kRowsPerWarp;
@@ -44,7 +56,10 @@ __global__ void __launch_bounds__(32 * kDecodeWarps) fp8_gemm_decode_kernel(
     const int kb_count = k >> 7;
     const uint8_t* w0 = w + size_t(n0) * k;
     const uint8_t* w1 = w0 + k;
-    const float* ws0 = ws + size_t(n0 >> 7) * kb_count;  // both rows share a 128-row block
+    // Block-128: both rows share a 128-row block. MX: each row has its own scales.
+    const float* ws0 = static_cast<const float*>(wsv) + size_t(n0 >> 7) * kb_count;
+    const uint8_t* wm0 = static_cast<const uint8_t*>(wsv) + size_t(n0) * (k >> 5);
+    const uint8_t* wm1 = wm0 + (k >> 5);
     float acc[kRowsPerWarp][M];
 #pragma unroll
     for (int r = 0; r < kRowsPerWarp; ++r)
@@ -57,7 +72,13 @@ __global__ void __launch_bounds__(32 * kDecodeWarps) fp8_gemm_decode_kernel(
       unpack_e4m3x16(ld_stream(w0 + k0), wf[0]);
       unpack_e4m3x16(ld_stream(w1 + k0), wf[1]);
       const int kb = k0 >> 7;
-      const float sw = __ldg(ws0 + kb);
+      float sw0, sw1;
+      if (Mx) {
+        sw0 = e8m0_to_f32(__ldg(wm0 + (k0 >> 5)));
+        sw1 = e8m0_to_f32(__ldg(wm1 + (k0 >> 5)));
+      } else {
+        sw0 = sw1 = __ldg(ws0 + kb);
+      }
 #pragma unroll
       for (int m = 0; m < M; ++m) {
         float xf[16];
@@ -71,13 +92,15 @@ __global__ void __launch_bounds__(32 * kDecodeWarps) fp8_gemm_decode_kernel(
 #pragma unroll
           for (int j = 0; j < 8; ++j) { xf[j] = a[j]; xf[8 + j] = b[j]; }
         }
-        const float s = A8 ? __fmul_rn(sw, __ldg(xs + size_t(m) * kb_count + kb)) : sw;
+        const float sx = A8 ? __ldg(xs + size_t(m) * kb_count + kb) : 1.0f;
+        const float s0 = A8 ? __fmul_rn(sw0, sx) : sw0;
+        const float s1 = Mx ? (A8 ? __fmul_rn(sw1, sx) : sw1) : s0;
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
           float d = 0.0f;
 #pragma unroll
           for (int j = 0; j < 16; ++j) d = __fmaf_rn(xf[j], wf[r][j], d);
-          acc[r][m] = __fmaf_rn(d, s, acc[r][m]);
+          acc[r][m] = __fmaf_rn(d, r == 0 ? s0 : s1, acc[r][m]);
         }
       }
     }
@@ -127,22 +150,32 @@ constexpr int kBM = 128, kBN = 128, kBK = 128, kStages = 3;
 constexpr int kTileBytes = kBM * kBK;                         // 16 KB (A) and 16 KB (B)
 constexpr int kStageBytes = 2 * kTileBytes + kBM * 4;         // + 128 activation scales
 constexpr int kPrefillSmem = kStages * kStageBytes;           // 99,840 bytes
+// MX: + the tile's 128 weight rows' four E8M0 scales of the K block (one word a row).
+constexpr int kStageBytesMx = kStageBytes + kBN * 4;
+constexpr int kPrefillSmemMx = kStages * kStageBytesMx;       // 101,376 bytes (99 KB)
 
 // Byte offset of 16-byte chunk `col` (0..7) of row `row` in a swizzled 128 x 128 tile.
 __device__ __forceinline__ int swz(int row, int col) { return row * 128 + ((col ^ (row & 7)) << 4); }
 
-template <bool PromoteK32>
+// Mx: MXFP8 weight scales (`wsv` uint8_t [n][k/32], E8M0), with the k32 structure of PromoteK32:
+// each k32 product sum starts from zero and is added to the block sum with fma(t, sw, c), sw its
+// column's scale for that k32 (a power of two: the product is exact); the block sum is then added
+// to the output with fma(c, sx, acc).
+template <bool PromoteK32, bool Mx = false>
 __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
     const uint8_t* __restrict__ xq, const float* __restrict__ xs, const uint8_t* __restrict__ w,
-    const float* __restrict__ ws, int rows, int n, int k, uint16_t* __restrict__ out, float* __restrict__ out32) {
+    const void* __restrict__ wsv, int rows, int n, int k, uint16_t* __restrict__ out, float* __restrict__ out32) {
+  static_assert(PromoteK32 || !Mx, "MX scales need the k32 structure");
+  constexpr int kStage = Mx ? kStageBytesMx : kStageBytes;
   extern __shared__ __align__(128) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int wm = warp >> 2, wn = warp & 3;
   const int m0 = blockIdx.y * kBM, n0 = blockIdx.x * kBN;
   const int kbs = k / kBK;
+  const float* ws = static_cast<const float*>(wsv);
 
   auto load_stage = [&](int slot, int kb) {
-    uint8_t* a = smem + slot * kStageBytes;
+    uint8_t* a = smem + slot * kStage;
     uint8_t* b = a + kTileBytes;
     float* sx = reinterpret_cast<float*>(b + kTileBytes);
 #pragma unroll
@@ -157,6 +190,12 @@ __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
     if (tid < kBM) {
       const bool valid = m0 + tid < rows;
       cp_async4(sx + tid, xs + size_t(valid ? m0 + tid : 0) * kbs + kb, valid);
+    } else if (Mx) {
+      // Weight row n0 + r's four scale bytes of this K block (zeros past row n).
+      const int r = tid - kBM;
+      const bool wvalid = n0 + r < n;
+      cp_async4(sx + kBM + r, static_cast<const uint8_t*>(wsv) + size_t(wvalid ? n0 + r : 0) * (k >> 5) + kb * 4,
+                wvalid);
     }
   };
 
@@ -184,9 +223,18 @@ __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
       cp_async_commit();
     }
     const int slot = kb % kStages;
-    const uint8_t* a_s = smem + slot * kStageBytes;
+    const uint8_t* a_s = smem + slot * kStage;
     const uint8_t* b_s = a_s + kTileBytes;
     const float* sx = reinterpret_cast<const float*>(b_s + kTileBytes);
+    // MX: this thread's 8 output columns' scale words (byte ks: the k32 step's E8M0 scale).
+    uint32_t wsw[4][2];
+    if (Mx) {
+      const uint32_t* sw_s = reinterpret_cast<const uint32_t*>(sx + kBM);
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) wsw[j][h] = sw_s[wn * 32 + j * 8 + (lane & 3) * 2 + h];
+    }
 
     float c[4][4][4];
 #pragma unroll
@@ -211,7 +259,28 @@ __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
         const int col = ks * 2 + ((lane >> 3) & 1);
         ldmatrix_x4(bf[2 * jj][0], bf[2 * jj][1], bf[2 * jj + 1][0], bf[2 * jj + 1][1], b_s + swz(row, col));
       }
-      if (PromoteK32) {
+      if (Mx) {
+        // Each k32 product sum starts from zero and is added to the block sum times its
+        // column's scale for this k32 (exact products: powers of two).
+        float swk[4][2];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+          for (int h = 0; h < 2; ++h) swk[j][h] = e8m0_to_f32((wsw[j][h] >> (8 * ks)) & 0xffu);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          float t[4][4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            t[j][0] = t[j][1] = t[j][2] = t[j][3] = 0.0f;
+            mma_e4m3_16832(t[j], af[i], bf[j]);
+          }
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) c[i][j][e] = __fmaf_rn(t[j][e], swk[j][e & 1], c[i][j][e]);
+        }
+      } else if (PromoteK32) {
         // Each k32 product sum starts from zero and is added to the block sum in f32.
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -234,11 +303,13 @@ __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
       }
     }
 
-    const float sw = __ldg(ws + size_t(n0 >> 7) * kbs + kb);
+    // Block-128: the weight block's scale times the row's activation scale; MX: the weight scales
+    // are in the block sum already.
+    const float sw = Mx ? 1.0f : __ldg(ws + size_t(n0 >> 7) * kbs + kb);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int r = wm * 64 + i * 16 + g;
-      const float s_lo = __fmul_rn(sx[r], sw), s_hi = __fmul_rn(sx[r + 8], sw);
+      const float s_lo = Mx ? sx[r] : __fmul_rn(sx[r], sw), s_hi = Mx ? sx[r + 8] : __fmul_rn(sx[r + 8], sw);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         acc[i][j][0] = __fmaf_rn(c[i][j][0], s_lo, acc[i][j][0]);
@@ -267,8 +338,8 @@ __global__ void __launch_bounds__(256, 1) fp8_gemm_prefill_kernel(
     }
 }
 
-template <bool A8>
-cudaError_t launch_decode(const void* x, const float* xs, const uint8_t* w, const float* ws, int rows, int n, int k,
+template <bool A8, bool Mx = false>
+cudaError_t launch_decode(const void* x, const float* xs, const uint8_t* w, const void* ws, int rows, int n, int k,
                           int ksplit, float* partials, uint16_t* out, cudaStream_t stream) {
   const dim3 grid((n + kDecodeRowsPerCta - 1) / kDecodeRowsPerCta, ksplit);
   const dim3 block(32 * kDecodeWarps);
@@ -276,7 +347,7 @@ cudaError_t launch_decode(const void* x, const float* xs, const uint8_t* w, cons
   float* p = ksplit > 1 ? partials : nullptr;
   switch (rows) {
 #define GLM53F_DECODE_CASE(M) \
-  case M: fp8_gemm_decode_kernel<A8, M><<<grid, block, 0, stream>>>(x, xs, w, ws, n, k, kc, p, out); break;
+  case M: fp8_gemm_decode_kernel<A8, M, false, Mx><<<grid, block, 0, stream>>>(x, xs, w, ws, n, k, kc, p, out); break;
     GLM53F_DECODE_CASE(1)
     GLM53F_DECODE_CASE(2)
     GLM53F_DECODE_CASE(3)
@@ -292,17 +363,17 @@ cudaError_t launch_decode(const void* x, const float* xs, const uint8_t* w, cons
 }
 
 // The decode GEMM with its K splits reduced by the last CTA of each output block.
-template <bool A8>
-cudaError_t launch_decode_fused(const void* x, const float* xs, const uint8_t* w, const float* ws, int rows, int n,
+template <bool A8, bool Mx = false>
+cudaError_t launch_decode_fused(const void* x, const float* xs, const uint8_t* w, const void* ws, int rows, int n,
                                 int k, int ksplit, float* partials, unsigned* sync, uint16_t* out, cudaStream_t stream) {
-  if (ksplit == 1) return launch_decode<A8>(x, xs, w, ws, rows, n, k, 1, nullptr, out, stream);
+  if (ksplit == 1) return launch_decode<A8, Mx>(x, xs, w, ws, rows, n, k, 1, nullptr, out, stream);
   const dim3 grid((n + kDecodeRowsPerCta - 1) / kDecodeRowsPerCta, ksplit);
   const dim3 block(32 * kDecodeWarps);
   const int kc = k / ksplit;
   switch (rows) {
-#define GLM53F_DECODE_CASE(M)                                                                               \
-  case M:                                                                                                    \
-    fp8_gemm_decode_kernel<A8, M, true><<<grid, block, 0, stream>>>(x, xs, w, ws, n, k, kc, partials, out, sync); \
+#define GLM53F_DECODE_CASE(M)                                                                                   \
+  case M:                                                                                                        \
+    fp8_gemm_decode_kernel<A8, M, true, Mx><<<grid, block, 0, stream>>>(x, xs, w, ws, n, k, kc, partials, out, sync); \
     break;
     GLM53F_DECODE_CASE(1)
     GLM53F_DECODE_CASE(2)
@@ -321,8 +392,10 @@ cudaError_t launch_decode_fused(const void* x, const float* xs, const uint8_t* w
 // ---- Weight quantization and dequantization -------------------------------------------------
 
 // One CTA per 128 x 128 block of a BF16 weight: the block's |w| maximum, its scale
-// group_scale(amax) and the codes f32_to_e4m3(w / scale) (src/fp8.rs quantize_weight_bf16).
-// Thread t reads 16 bytes (8 values) of rows t / 16 + 16 i (i < 8), columns 8 (t % 16) .. + 8.
+// group_scale(amax) (Pow2: pow2_scale(amax)) and the codes f32_to_e4m3(w / scale) (src/fp8.rs
+// quantize_weight_bf16, quantize_weight_bf16_as). Thread t reads 16 bytes (8 values) of rows
+// t / 16 + 16 i (i < 8), columns 8 (t % 16) .. + 8.
+template <bool Pow2>
 __global__ void __launch_bounds__(256) quantize_weight_kernel(const uint16_t* __restrict__ w, int n, int k,
                                                               uint8_t* __restrict__ q, float* __restrict__ scales) {
   __shared__ float wmax[8];
@@ -347,7 +420,7 @@ __global__ void __launch_bounds__(256) quantize_weight_kernel(const uint16_t* __
   __syncthreads();
 #pragma unroll
   for (int i = 0; i < 8; ++i) amax = fmaxf(amax, wmax[i]);
-  const float sc = group_scale(amax);
+  const float sc = Pow2 ? pow2_scale(amax) : group_scale(amax);
   if (t == 0) scales[size_t(blockIdx.y) * (k >> 7) + blockIdx.x] = sc;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -363,8 +436,48 @@ __global__ void __launch_bounds__(256) quantize_weight_kernel(const uint16_t* __
   }
 }
 
-// out[r][c] = bf16(e4m3(w[row0 + r][c]) * scale) for r < rows: 16 codes per thread.
-__global__ void __launch_bounds__(256) dequant_bf16_kernel(const uint8_t* __restrict__ w, const float* __restrict__ ws,
+// MXFP8 weights: one E8M0 scale per row and 32 values of K (src/fp8.rs quantize_weight_bf16_as
+// with Fp8Scales::Mx32). Four consecutive threads take a 32-group, 8 values (16 bytes) each: the
+// group's |w| maximum by two shuffles, its scale pow2_scale(amax) (the exponent byte stored), the
+// codes f32_to_e4m3(w / scale) (an exact quotient). `chunks` = n * k / 8; k % 32 == 0, so a group
+// never crosses a row.
+__global__ void __launch_bounds__(256) quantize_weight_mx_kernel(const uint16_t* __restrict__ w, long chunks,
+                                                                 uint8_t* __restrict__ q, uint8_t* __restrict__ scales) {
+  const long stride = long(gridDim.x) * blockDim.x;
+  // Whole warps run every iteration (the shuffles need all their lanes); groups are lane-aligned.
+  for (long base = long(blockIdx.x) * blockDim.x + (threadIdx.x & ~31); base < chunks; base += stride) {
+    const long i = base + (threadIdx.x & 31);
+    const bool valid = i < chunks;
+    float v[8];
+    if (valid) {
+      unpack_bf16x8(ld_cached(w + i * 8), v);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = 0.0f;
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(v[j]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float sc = pow2_scale(amax);
+    if (!valid) continue;
+    uint32_t lo = 0, hi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      lo |= f32_to_e4m3(__fdiv_rn(v[j], sc)) << (8 * j);
+      hi |= f32_to_e4m3(__fdiv_rn(v[4 + j], sc)) << (8 * j);
+    }
+    *reinterpret_cast<uint2*>(q + i * 8) = make_uint2(lo, hi);
+    if ((i & 3) == 0) scales[i >> 2] = uint8_t(__float_as_uint(sc) >> 23);
+  }
+}
+
+// out[r][c] = bf16(e4m3(w[row0 + r][c]) * scale) for r < rows: 16 codes per thread. Mx: the
+// scale is the row's E8M0 byte of the code's 32-block (`wsv` uint8_t [n][k/32]); else an f32 per
+// 128 x 128 block.
+template <bool Mx>
+__global__ void __launch_bounds__(256) dequant_bf16_kernel(const uint8_t* __restrict__ w, const void* __restrict__ wsv,
                                                            int k, int row0, int rows, uint16_t* __restrict__ out) {
   const long chunks = long(rows) * (k >> 4);
   const int kb = k >> 7;
@@ -374,7 +487,8 @@ __global__ void __launch_bounds__(256) dequant_bf16_kernel(const uint8_t* __rest
     const long row = row0 + r;
     float f[16];
     unpack_e4m3x16(ld_stream(w + size_t(row) * k + c), f);
-    const float sc = __ldg(ws + size_t(row >> 7) * kb + (c >> 7));
+    const float sc = Mx ? e8m0_to_f32(__ldg(static_cast<const uint8_t*>(wsv) + size_t(row) * (k >> 5) + (c >> 5)))
+                        : __ldg(static_cast<const float*>(wsv) + size_t(row >> 7) * kb + (c >> 7));
     uint32_t o[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) o[j] = pack_bf16x2(__fmul_rn(f[2 * j], sc), __fmul_rn(f[2 * j + 1], sc));
@@ -412,6 +526,17 @@ extern "C" int32_t glm53f_fp8_gemm_decode_fused(const void* x, const float* x_sc
             : launch_decode_fused<false>(x, nullptr, w, w_scales, rows, n, k, ksplit, partials, sync, out, stream);
 }
 
+extern "C" int32_t glm53f_fp8_gemm_decode_mx(const void* x, const float* x_scales, int32_t a8, const uint8_t* w,
+                                             const uint8_t* w_scales, int32_t rows, int32_t n, int32_t k, int32_t ksplit,
+                                             float* partials, uint32_t* sync, uint16_t* out, cudaStream_t stream) {
+  if (rows < 1 || rows > 8 || n < 8 || n % 8 || k < 128 || k % 128 || ksplit < 1 || (k / 128) % ksplit)
+    return cudaErrorInvalidValue;
+  if (!aligned16(x) || !aligned16(w) || !w_scales || (a8 && !x_scales) || !out) return cudaErrorInvalidValue;
+  if (ksplit > 1 && (!partials || !sync)) return cudaErrorInvalidValue;
+  return a8 ? launch_decode_fused<true, true>(x, x_scales, w, w_scales, rows, n, k, ksplit, partials, sync, out, stream)
+            : launch_decode_fused<false, true>(x, nullptr, w, w_scales, rows, n, k, ksplit, partials, sync, out, stream);
+}
+
 extern "C" int32_t glm53f_splitk_reduce(const float* partials, uint16_t* out, int32_t ksplit, int32_t rows, int32_t n,
                                         cudaStream_t stream) {
   if (!partials || !out || ksplit < 1 || rows < 1 || n < 1) return cudaErrorInvalidValue;
@@ -442,10 +567,44 @@ extern "C" int32_t glm53f_fp8_gemm_prefill(const uint8_t* xq, const float* x_sca
   return cudaGetLastError();
 }
 
+extern "C" int32_t glm53f_fp8_gemm_prefill_mx_smem_bytes(void) { return kPrefillSmemMx; }
+
+extern "C" int32_t glm53f_fp8_gemm_prefill_mx(const uint8_t* xq, const float* x_scales, const uint8_t* w,
+                                              const uint8_t* w_scales, int32_t rows, int32_t n, int32_t k, uint16_t* out,
+                                              float* out_f32, cudaStream_t stream) {
+  if (rows < 1 || n < 8 || n % 8 || k < 128 || k % 128 || !aligned16(xq) || !aligned16(w) || !x_scales ||
+      !aligned16(w_scales) || !aligned16(out) || !aligned16_or_null(out_f32))
+    return cudaErrorInvalidValue;
+  const cudaError_t e = cudaFuncSetAttribute(fp8_gemm_prefill_kernel<true, true>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, kPrefillSmemMx);
+  if (e != cudaSuccess) return e;
+  const dim3 grid((n + kBN - 1) / kBN, (rows + kBM - 1) / kBM);
+  fp8_gemm_prefill_kernel<true, true><<<grid, 256, kPrefillSmemMx, stream>>>(xq, x_scales, w, w_scales, rows, n, k, out,
+                                                                             out_f32);
+  return cudaGetLastError();
+}
+
 extern "C" int32_t glm53f_fp8_quantize_weight(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, float* scales,
                                               cudaStream_t stream) {
   if (n < 1 || k < 128 || k % 128 || !aligned16(w) || !aligned16(q) || !scales) return cudaErrorInvalidValue;
-  quantize_weight_kernel<<<dim3(k / 128, (n + 127) / 128), 256, 0, stream>>>(w, n, k, q, scales);
+  quantize_weight_kernel<false><<<dim3(k / 128, (n + 127) / 128), 256, 0, stream>>>(w, n, k, q, scales);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_fp8_quantize_weight_pow2(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, float* scales,
+                                                   cudaStream_t stream) {
+  if (n < 1 || k < 128 || k % 128 || !aligned16(w) || !aligned16(q) || !scales) return cudaErrorInvalidValue;
+  quantize_weight_kernel<true><<<dim3(k / 128, (n + 127) / 128), 256, 0, stream>>>(w, n, k, q, scales);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_fp8_quantize_weight_mx(const uint16_t* w, int32_t n, int32_t k, uint8_t* q, uint8_t* scales,
+                                                 cudaStream_t stream) {
+  if (n < 1 || k < 128 || k % 128 || !aligned16(w) || !aligned16(q) || !scales) return cudaErrorInvalidValue;
+  const long chunks = long(n) * (k / 8);
+  const long want = (chunks + 255) / 256;
+  const int blocks = int(want < 16384 ? want : 16384);
+  quantize_weight_mx_kernel<<<blocks, 256, 0, stream>>>(w, chunks, q, scales);
   return cudaGetLastError();
 }
 
@@ -456,6 +615,17 @@ extern "C" int32_t glm53f_fp8_dequant_bf16(const uint8_t* w, const float* w_scal
     return cudaErrorInvalidValue;
   const long want = (long(rows) * (k / 16) + 255) / 256;
   const int blocks = int(want < 16384 ? want : 16384);
-  dequant_bf16_kernel<<<blocks, 256, 0, stream>>>(w, w_scales, k, row0, rows, out);
+  dequant_bf16_kernel<false><<<blocks, 256, 0, stream>>>(w, w_scales, k, row0, rows, out);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t glm53f_fp8_dequant_bf16_mx(const uint8_t* w, const uint8_t* w_scales, int32_t n, int32_t k,
+                                              int32_t row0, int32_t rows, uint16_t* out, cudaStream_t stream) {
+  if (n < 1 || k < 128 || k % 128 || row0 < 0 || rows < 1 || row0 + rows > n || !aligned16(w) || !w_scales ||
+      !aligned16(out))
+    return cudaErrorInvalidValue;
+  const long want = (long(rows) * (k / 16) + 255) / 256;
+  const int blocks = int(want < 16384 ? want : 16384);
+  dequant_bf16_kernel<true><<<blocks, 256, 0, stream>>>(w, w_scales, k, row0, rows, out);
   return cudaGetLastError();
 }

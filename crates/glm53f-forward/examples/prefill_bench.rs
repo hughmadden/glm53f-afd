@@ -23,10 +23,14 @@
 //! - `GLM53F_BENCH_OPS=0`: the same passes without the op profile (its overhead);
 //! - `GLM53F_BENCH_KDA_CHUNKED=1`: KDA through the chunked prefill kernel instead of the chain
 //!   (`ForwardConfig::kda_chunked_prefill`; with W8A16 it passed the KL gate and is on by
-//!   default in `glm53f-serve`, while this bench runs the FP8 projections W8A8);
+//!   default in `glm53f-serve`, while this bench runs the FP8 projections W8A8 unless
+//!   `GLM53F_PREFILL_W8A16` is set);
 //! - `GLM53F_BENCH_HEAD_GROUPS`, `GLM53F_BENCH_MLA_BLOCK`: `ForwardConfig::prefill_head_groups`
 //!   and `mla_block_rows` (neither changes a bit);
-//! - `GLM53F_BENCH_TABLES=all`: every pass's `OPS` table (default: the first and the last).
+//! - `GLM53F_BENCH_TABLES=all`: every pass's `OPS` table (default: the first and the last);
+//! - the projections' numerics options, each off unless set to something other than `0` (in
+//!   `glm53f-serve` W8A16 is on by default): `GLM53F_KDA_FP8`, `GLM53F_KDA_FP8_POW2`,
+//!   `GLM53F_KDA_MXFP8`, `GLM53F_PREFILL_W8A16`, `GLM53F_KDA_PREFILL_W8A8`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,13 +43,33 @@ use glm53f_forward::forward::{ForwardConfig, GlmForward};
 use glm53f_forward::kv::{KvConfig, KvPool};
 use glm53f_forward::kvplan::KvLayout;
 use glm53f_forward::shape::ModelShape;
-use glm53f_forward::weights::{open_checkpoint, DeviceModel};
+use glm53f_forward::weights::{open_checkpoint, DeviceModel, WeightOptions};
+use glm53f_forward::Fp8Scales;
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)
+}
+
+fn on(k: &str) -> bool {
+    std::env::var(k).is_ok_and(|v| v != "0")
+}
+
+/// The KDA projections' load-time options from the environment (as `glm53f-serve` reads them).
+fn weight_options() -> WeightOptions {
+    let kda_scales = if on("GLM53F_KDA_MXFP8") {
+        Fp8Scales::Mx32
+    } else if on("GLM53F_KDA_FP8_POW2") {
+        Fp8Scales::Block128Pow2
+    } else {
+        Fp8Scales::Block128
+    };
+    WeightOptions {
+        kda_fp8: on("GLM53F_KDA_FP8") || kda_scales != Fp8Scales::Block128,
+        kda_scales,
+    }
 }
 
 fn ids(seed: u64, n: usize) -> Vec<u32> {
@@ -117,7 +141,8 @@ fn run(
 ) {
     let (_, ckpt) = open_checkpoint(dir).unwrap();
     let t0 = Instant::now();
-    let model = DeviceModel::load_repeating(&ckpt, shape, loaded).unwrap();
+    let wopts = weight_options();
+    let model = DeviceModel::load_with(&ckpt, shape, loaded, wopts).unwrap();
     let embed = HostEmbedding::load(&ckpt).unwrap();
     let weights = model.bytes;
     let stream = Arc::new(Stream::new().unwrap());
@@ -135,7 +160,7 @@ fn run(
         stream.clone(),
     )
     .unwrap();
-    let fcfg = ForwardConfig {
+    let mut fcfg = ForwardConfig {
         max_rows: pass,
         lanes,
         max_requests: 1,
@@ -148,13 +173,15 @@ fn run(
         ),
         ..ForwardConfig::default()
     };
+    fcfg.policy.prefill_w8a16 = on("GLM53F_PREFILL_W8A16");
+    fcfg.policy.kda_prefill_w8a8 = on("GLM53F_KDA_PREFILL_W8A8");
     let mut fwd = GlmForward::new(model, embed, kv, Box::new(ZeroExperts), fcfg).unwrap();
     let (free, _) = device::mem_info().unwrap();
     let b = fwd.scratch_bytes();
     println!(
         "\n== {lanes} lane(s) of {lane} rows: {passes} passes of {pass} rows (a {prompt}-token \
          prompt); weights {:.2} GB ({:.1} s); forward buffers {:.2} GiB; {:.1} GiB free; op \
-         profile {}; KDA through the {}",
+         profile {}; KDA through the {}; KDA projections {}; FP8 projections over 8 rows {}",
         weights as f64 / 1e9,
         t0.elapsed().as_secs_f64(),
         b as f64 / (1u64 << 30) as f64,
@@ -164,6 +191,18 @@ fn run(
             "chunked kernel"
         } else {
             "chain"
+        },
+        if wopts.kda_fp8 {
+            wopts.kda_scales.describe()
+        } else {
+            "BF16"
+        },
+        if fcfg.policy.w8a16(true) {
+            "W8A16"
+        } else if fcfg.policy.prefill_w8a16 {
+            "W8A16 (the KDA projections W8A8)"
+        } else {
+            "W8A8"
         }
     );
     fwd.set_lane_trace(true, false);

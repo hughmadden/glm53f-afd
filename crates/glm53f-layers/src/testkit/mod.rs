@@ -7,7 +7,7 @@ pub mod safetensors;
 pub mod sha256;
 
 use crate::bf16;
-use crate::fp8::{f32_to_e4m3, Fp8Matrix};
+use crate::fp8::{f32_to_e4m3, pow2_scale, Fp8Matrix, ScaleLayout, MX_BLOCK};
 
 /// SplitMix64: a small, seeded random source for test data.
 pub struct Rng(u64);
@@ -78,6 +78,27 @@ impl Rng {
             }
         }
         Fp8Matrix::new(rows, cols, data, scale)
+    }
+
+    /// A random MXFP8 weight `[rows][cols]`: `N(0, 1)` values, each 32-group of a row scaled to a
+    /// target over two decades and quantized with its power-of-two scale ([`pow2_scale`]), so
+    /// the E8M0 scales vary over about 7 binades.
+    pub fn fp8_matrix_mx(&mut self, rows: usize, cols: usize) -> Fp8Matrix {
+        assert_eq!(cols % MX_BLOCK, 0);
+        let groups = rows * cols / MX_BLOCK;
+        let mut data = vec![0u8; rows * cols];
+        let mut scale = vec![0f32; groups];
+        for g in 0..groups {
+            let t = 0.02 * 10f32.powf(self.uniform() * 2.0 - 1.0);
+            let v: Vec<f32> = (0..MX_BLOCK).map(|_| self.normal() * t).collect();
+            let amax = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+            let s = pow2_scale(amax);
+            scale[g] = s;
+            for (j, &x) in v.iter().enumerate() {
+                data[g * MX_BLOCK + j] = f32_to_e4m3(x / s);
+            }
+        }
+        Fp8Matrix::with_layout(rows, cols, data, scale, ScaleLayout::Mx32)
     }
 }
 

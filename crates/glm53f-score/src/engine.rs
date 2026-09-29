@@ -140,6 +140,7 @@ pub fn load(o: &Options, max_tokens: usize) -> Result<Engine, String> {
     let t0 = Instant::now();
     let wopts = WeightOptions {
         kda_fp8: o.numerics.kda_fp8,
+        kda_scales: o.numerics.kda_fp8_scales,
     };
     let model = s(DeviceModel::load_with(&ckpt, &shape, loaded, wopts))?;
     let embed = s(HostEmbedding::load(&ckpt))?;

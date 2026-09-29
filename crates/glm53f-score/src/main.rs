@@ -127,6 +127,14 @@ mod scorer {
                     ),
                     ("promote_k32", Json::Bool(o.promote_k32)),
                     ("kda_fp8", Json::Bool(o.numerics.kda_fp8)),
+                    (
+                        "kda_fp8_scales",
+                        str(match o.numerics.kda_fp8_scales {
+                            glm53f_serve::Fp8Scales::Block128 => "block128",
+                            glm53f_serve::Fp8Scales::Block128Pow2 => "block128-pow2",
+                            glm53f_serve::Fp8Scales::Mx32 => "mx32",
+                        }),
+                    ),
                     ("kda_state_bf16", Json::Bool(o.numerics.kda_state_bf16)),
                     ("prefill_w8a16", Json::Bool(o.numerics.prefill_w8a16)),
                     ("kda_prefill_w8a8", Json::Bool(o.numerics.kda_prefill_w8a8)),

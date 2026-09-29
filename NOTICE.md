@@ -100,3 +100,8 @@ authors under their own terms.
 
 - **Source:** "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision", arXiv:2407.08608v2, §3.1.
 - **What was taken:** nothing is copied. The prefill sparse-attention kernel (`attn_v3_kernel` in `crates/glm53f-dsa/kernels/dsa_mla.cu`) staggers two groups of warps so that one group's softmax overlaps the other's matrix products, the ping-pong scheduling the paper describes; the kernel, its arithmetic and its schedule are written here.
+
+## OCP Microscaling Formats (MX) Specification
+
+- **Source:** the Open Compute Project's *OCP Microscaling Formats (MX) Specification*, version 1.0.
+- **What was taken:** nothing is copied. The MXFP8 weight layout that `--kda-mxfp8` quantizes the KDA projections to (E4M3 values with one E8M0 power-of-two scale per 32 values of K) follows it (`crates/glm53f-layers/kernels/fp8_gemm.cu`, `src/fp8.rs`); the scale is rounded up rather than set by the specification's rule.
