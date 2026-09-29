@@ -167,10 +167,10 @@ mod daemon {
                     dir.display(),
                     d.weight_bytes() as f64 / GIB,
                     if d.is_fp8() {
-                        "FP8 block-128 with its own FP8 copy of the LM head for drafting: \
-                         --drafter-fp8"
+                        "FP8 block-128 with its own FP8 copy of the LM head for drafting; \
+                         --drafter-bf16 for BF16"
                     } else {
-                        "BF16; the LM head is the forward's"
+                        "BF16 (--drafter-bf16); the LM head is the forward's"
                     },
                     t0.elapsed().as_secs_f64()
                 );

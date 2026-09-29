@@ -77,8 +77,8 @@
 //! | `--decode-share S` | `GLM53F_DECODE_SHARE` | 0.2 | While prompts prefill, the share of the time the running requests keep, 0 to below 1: after each prefill round they step for S / (1 - S) of its time before the next; 0 gives them one step a round ([Decode during a long prefill](#decode-during-a-long-prefill)) |
 //! | `--drafter DIR` | `GLM53F_DFLASH_DIR` | off | The DFlash2 drafter (`incoai/GLM-5.3-Flash-DFlash2`: `config.json`, `model.safetensors`); needs decoder layers 0-43 |
 //! | `--copy-windows on\|off` | `GLM53F_COPY_WINDOWS` (`0` or `off`: off) | on | With the drafter: a greedy request whose last 24 tokens repeat an earlier span of its context verifies the tokens that followed it in place of drafts ([Copy windows](#copy-windows)) |
-//! | `--drafter-fp8` | `GLM53F_DRAFTER_FP8=1` | off | With the drafter: its weights in FP8 block-128 (quantized at load) and its own FP8 copy of the LM head for drafting ([The FP8 drafter](#the-fp8-drafter)); the target's head and every committed token unchanged |
-//! | `--l2-prefetch off\|auto\|MiB` | `GLM53F_L2_PREFETCH` | off | Decode and verify passes of one lane: while a MoE layer's routed experts are out, the next layer's first weights are prefetched into L2 (`auto`: three quarters of the GPU's L2) ([L2 prefetch](#l2-prefetch)); changes no bit |
+//! | `--drafter-fp8` / `--drafter-bf16` | `GLM53F_DRAFTER_FP8` (`0`: BF16) | on | With the drafter: its weights in FP8 block-128 (quantized at load) and its own FP8 copy of the LM head for drafting ([The FP8 drafter](#the-fp8-drafter)); the target's head and every committed token unchanged. `--drafter-bf16`: the checkpoint's BF16 drafter |
+//! | `--l2-prefetch off\|auto\|MiB` | `GLM53F_L2_PREFETCH` | auto | Decode and verify passes of one lane: while a MoE layer's routed experts are out, the next layer's first weights are prefetched into L2 (`auto`: three quarters of the GPU's L2) ([L2 prefetch](#l2-prefetch)); changes no bit |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
 //! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales: the same layout, kernels and bytes, and 82-89% of the q, k, v and o weights kept exactly (docs/SIZING.md §10) |
 //! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8: an E8M0 scale per row and 32 values of K (4.13 GiB of weights less), the MXFP8 GEMMs; the same error as `--kda-fp8-pow2` on these weights. The last of the three KDA flags given sets the scales |
@@ -282,9 +282,13 @@
 //! change: the verify pass accepts a draft only where it equals the target's own pick, so the
 //! output is the same. The drafter's device memory falls from 2.18 GiB to 1.76 GiB (1.17 GiB of
 //! FP8 weights, the head's copy 0.59 GiB); net of its larger working memory the KV pool gets
-//! 0.37 GiB more at 16 slots (`docs/SIZING.md` §11). The start-up log names it. It stays off
-//! until its acceptance is measured on the target hardware (the `[drafter]` lines: drafts kept
-//! and tokens a window, with and without it; and single-stream tok/s).
+//! 0.37 GiB more at 16 slots (`docs/SIZING.md` §11). The start-up log names it.
+//!
+//! On by default since 30 September 2026, after the target hardware: one stream decoded 2.3-4.2%
+//! faster (code 126.5 -> 129.5 tok/s, prose 71.0 -> 74.0, counting 184.7 -> 188.9), 4 and 16
+//! streams within 1.2%, every reply byte-identical, 76.2% of the drafts kept against 75.9% (3.72
+//! tokens a window against 3.75) and the KV pool 1,584,000 tokens against 1,519,424.
+//! `--drafter-bf16` (or `GLM53F_DRAFTER_FP8=0`) loads the checkpoint's BF16 drafter.
 //!
 //! # L2 prefetch
 //!
@@ -295,8 +299,13 @@
 //! GEMVs read those bytes from L2 instead of DRAM. It writes nothing, so every result is the same
 //! bit for bit, and it ends long before the exchange it overlaps. Passes of two lanes, where the
 //! other lane's attention fills the exchange, never prefetch. `auto` takes three quarters of the
-//! GPU's L2 (72 MiB of the RTX 5090's 96 MB); a number is MiB. Off by default until measured on the
-//! target hardware (single-stream tok/s and the `STEP` lines with `GLM53F_PROFILE=1`).
+//! GPU's L2 (72 MiB of the RTX 5090's 96 MB); a number is MiB.
+//!
+//! `auto` by default since 30 September 2026, after the target hardware: one stream decoded
+//! 2.7-5.5% faster (code 126.5 -> 130.3 tok/s, prose 71.0 -> 74.9, counting 184.7 -> 189.6) and 4
+//! and 16 streams 0.2-2.3% faster, every reply byte-identical. With the FP8 drafter (both
+//! defaults) one stream decoded 126.5 -> 133.4, 71.0 -> 78.1 and 184.7 -> 193.9 tok/s (+5.5%,
+//! +10.0%, +5.0%), and 4 and 16 streams moved -1.6% to +3.6%. `--l2-prefetch off` turns it off.
 //!
 //! # Development mode
 //!
@@ -326,8 +335,10 @@ options:
   --decode-share <s>  while prompts prefill, the running requests' share of the time (0.2)
   --drafter <dir>     the DFlash2 drafter: speculative decoding (needs decoder layers 0-43)
   --copy-windows on|off  with the drafter: greedy requests verify spans copied from their context (on)
-  --drafter-fp8       with the drafter: FP8 drafter weights and its own FP8 LM head copy (off)
-  --l2-prefetch off|auto|<MiB>  decode and verify: prefetch the next layer's weights into L2 (off)
+  --drafter-fp8       with the drafter: FP8 drafter weights and its own FP8 LM head copy (the
+                      default)
+  --drafter-bf16      with the drafter: the checkpoint's BF16 drafter weights and the target's head
+  --l2-prefetch off|auto|<MiB>  decode and verify: prefetch the next layer's weights into L2 (auto)
 numerics (each gated by KL; D8, W8A16 and the chunked KDA prefill on by default):
   --kda-fp8           KDA projections quantized to FP8 block-128 at load (D2)
   --kda-fp8-pow2      the same with power-of-two block scales
@@ -654,10 +665,10 @@ impl Options {
             Some(v) => on_off("GLM53F_COPY_WINDOWS", &v)?,
             None => true,
         };
-        let mut drafter_fp8 = env("GLM53F_DRAFTER_FP8").is_some_and(|v| v != "0");
+        let mut drafter_fp8 = env("GLM53F_DRAFTER_FP8").is_none_or(|v| v != "0");
         let mut l2_prefetch = match env("GLM53F_L2_PREFETCH") {
             Some(v) => parse_l2_prefetch(&v)?,
-            None => L2Prefetch::Off,
+            None => L2Prefetch::Auto,
         };
         let mut numerics = Numerics::from_env(env);
         let mut it = args.iter();
@@ -665,8 +676,8 @@ impl Options {
             if numerics.flag(k) {
                 continue;
             }
-            if k == "--drafter-fp8" {
-                drafter_fp8 = true;
+            if k == "--drafter-fp8" || k == "--drafter-bf16" {
+                drafter_fp8 = k == "--drafter-fp8";
                 continue;
             }
             let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
@@ -1166,33 +1177,48 @@ mod tests {
     }
 
     #[test]
-    fn the_fp8_drafter_and_the_l2_prefetch_are_off_unless_asked_for() {
+    fn the_fp8_drafter_and_the_l2_prefetch_are_on_unless_turned_off() {
         let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
         let o = Options::parse(&args("--checkpoint /c"), &env).unwrap();
-        assert!(!o.drafter_fp8);
-        assert_eq!(o.l2_prefetch, L2Prefetch::Off);
-        let o = Options::parse(
-            &args("--checkpoint /c --drafter-fp8 --l2-prefetch auto"),
-            &env,
-        )
-        .unwrap();
         assert!(o.drafter_fp8);
         assert_eq!(o.l2_prefetch, L2Prefetch::Auto);
         assert_eq!(o.l2_prefetch.bytes(96 << 20), 72 << 20);
+        let o = Options::parse(
+            &args("--checkpoint /c --drafter-bf16 --l2-prefetch off"),
+            &env,
+        )
+        .unwrap();
+        assert!(!o.drafter_fp8);
+        assert_eq!(o.l2_prefetch, L2Prefetch::Off);
+        // The last of the two drafter flags wins.
+        let o =
+            Options::parse(&args("--checkpoint /c --drafter-bf16 --drafter-fp8"), &env).unwrap();
+        assert!(o.drafter_fp8);
         let o = Options::parse(&args("--checkpoint /c --l2-prefetch 48"), &env).unwrap();
         assert_eq!(o.l2_prefetch, L2Prefetch::Mib(48));
         assert_eq!(o.l2_prefetch.bytes(96 << 20), 48 << 20);
         assert_eq!(L2Prefetch::Off.bytes(96 << 20), 0);
-        let on = |k: &str| match k {
-            "GLM53F_DRAFTER_FP8" => Some("1".to_string()),
+        let set = |k: &str| match k {
+            "GLM53F_DRAFTER_FP8" => Some("0".to_string()),
             "GLM53F_L2_PREFETCH" => Some("64".to_string()),
             other => env(other),
         };
-        let o = Options::parse(&args("--checkpoint /c"), &on).unwrap();
-        assert!(o.drafter_fp8);
+        let o = Options::parse(&args("--checkpoint /c"), &set).unwrap();
+        assert!(!o.drafter_fp8);
         assert_eq!(o.l2_prefetch, L2Prefetch::Mib(64));
-        // The flag wins over the environment.
-        let o = Options::parse(&args("--checkpoint /c --l2-prefetch off"), &on).unwrap();
+        // The flags win over the environment.
+        let o = Options::parse(
+            &args("--checkpoint /c --drafter-fp8 --l2-prefetch off"),
+            &set,
+        )
+        .unwrap();
+        assert!(o.drafter_fp8);
+        assert_eq!(o.l2_prefetch, L2Prefetch::Off);
+        let off = |k: &str| match k {
+            "GLM53F_L2_PREFETCH" => Some("off".to_string()),
+            other => env(other),
+        };
+        let o = Options::parse(&args("--checkpoint /c"), &off).unwrap();
         assert_eq!(o.l2_prefetch, L2Prefetch::Off);
         for bad in ["--l2-prefetch", "--l2-prefetch lots", "--l2-prefetch 5000"] {
             assert!(
