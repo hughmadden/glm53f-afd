@@ -95,8 +95,13 @@ Each binary runs only on the architecture it was built for; the rank checks this
    GLM53F_RDMA=1 GLM53F_WIRE_NOCRC=1 glm53f-serve \
      --checkpoint <coordinator-dir> \
      --ranks 192.0.2.10:8600,192.0.2.11:8600,192.0.2.12:8600,192.0.2.13:8600 \
-     --listen 0.0.0.0:8100
+     --drafter <dflash2-dir> --listen 0.0.0.0:8100
    ```
+
+   `--drafter` is optional, but the published decode figures use it. On one stream decode runs at
+   about 53 tok/s without it (52.7) and about 126 with it (125.6, code prompt, thinking off; prose
+   68.8, counting 180.3; 122.6 / 68.2 / 179.5 with the current defaults):
+   [PERFORMANCE.md](PERFORMANCE.md) §0, "Decode, one stream".
 
    Without `GLM53F_RDMA=1` the exchange runs over TCP on the same fabric addresses (with or
    without CRCs, as long as the ranks agree). It loads the weights (and with `--drafter` the
