@@ -274,8 +274,9 @@ routed experts as `glm53f-serve` does, and builds the forward as `glm53f-serve -
 ```text
 glm53f-score --checkpoint <dir> --ranks <a,b,c,d> --plan <plan.json> --out <dir>
              [--pass-rows <r>] [--windows <id,...>] [--prefill-lanes 1-4]
-             [--kda-chunked-prefill] [--fp8-act bf16|dynamic] [--no-promote-k32]
-             [--kda-fp8] [--kda-state-bf16] [--prefill-w8a16] [--kda-prefill-w8a8]
+             [--fp8-act bf16|dynamic] [--no-promote-k32] [--kda-fp8]
+             [--kda-state-bf16|--kda-state-f32] [--prefill-w8a16|--prefill-w8a8]
+             [--kda-chunked-prefill|--kda-chain-prefill] [--kda-prefill-w8a8]
 ```
 
 `--pass-rows` is 4096 by default (at most 4,096 per lane). `--experts local` runs the official
@@ -389,9 +390,10 @@ python3 harness/klgate.py compare decode.json prefill.json
 Each run prints its engine line and, per window, the tokens, passes, rows and times; `run.json`
 keeps them next to the windows' files. A numerics change is scored the same way into its own
 directory and compared with `compare <candidate>.json <baseline>.json --margin 0.002`
-(section 3). The numerics options under test (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
-`--kda-prefill-w8a8`; [SIZING.md](SIZING.md) §10) are flags of both binaries, named in the engine
-line.
+(section 3). The numerics options (`--kda-fp8`, `--kda-state-bf16`, `--prefill-w8a16`,
+`--kda-chunked-prefill`, `--kda-prefill-w8a8` and the flags that turn the defaults off;
+[SIZING.md](SIZING.md) §10) are flags of both binaries, with the same defaults
+([RUNNING.md](RUNNING.md), "Numerics defaults"), and the engine line names them.
 
 ## 5. Cost
 
@@ -750,6 +752,20 @@ The panel's window-level spread, for this pair:
 - **For planning** another comparison of this kind, the 125-window SD, 0.0090, is a better input than
   the 25-window 0.0115: 90% power (normal) needs 94 windows at δ = −0.001 and 210 at δ = 0.000
   (154 and 346 by the 25's SD), and 125 windows pass with probability 0.96 and 0.71.
+
+**29 September 2026: the pair became the default** after the speed comparison, run on the target
+hardware the same day with the same engine (`073b553`; [PERFORMANCE.md](PERFORMANCE.md) §0):
+- prefill 4,979–4,998 / 5,128–5,180 / 5,132–5,188 tok/s at 4K / 19K / 79K tokens against B's
+  4,099–4,129 / 4,103–4,104 / 4,051–4,053, 21–28% faster;
+- decode −2% to +5%, so neutral. Greedy replies change: all six single-stream replies differed,
+  within their first 340 characters, because a prompt's own prefill takes the new arithmetic;
+- at 16 slots the KV pool is 8.73 GiB against 9.33 (the chunked prefill's workspace and W8A16's
+  GEMM scratch), and a 1,048,576-token request still fits.
+
+`glm53f-serve` and `glm53f-score` now run the chunked KDA prefill with W8A16 unless told
+otherwise. B, the defaults this comparison was made against, is `--kda-chain-prefill
+--prefill-w8a8`; adding `--kda-state-f32` gives section 6a's configuration. The chunked kernel
+without W8A16 failed section 6b's gate (+0.0021), so the two are turned off together.
 
 ## 7. Open points
 

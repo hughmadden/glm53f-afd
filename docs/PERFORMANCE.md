@@ -17,20 +17,29 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
   - BF16 KDA states (D8, which passed the KL gate);
   - two decode lanes for passes of 2–16 rows;
   - copy windows for greedy requests;
-  - the rank's GB10 decode schedule.
+  - the rank's GB10 decode schedule;
+  - the chunked KDA prefill with W8A16 projections, which passed the KL gate in a second run that
+    day. That run's rows below name its engine, `073b553`, and say whether the pair was on.
 - Thinking on (the model's default) unless stated. Single runs; between runs, ±2–3% is typical.
+- `GLM53F_PROFILE=1` (the lane trace most of these runs used) costs nothing measurable: on
+  `073b553` traced and untraced boots decoded at the same speed within noise (for example 117.6 /
+  66.3 / 168.2 against 117.7 / 66.8 / 168.1 tok/s) with identical replies.
 
 **Decode, one stream** (tok/s; 1,024-token code and counting, a 903-token prose answer):
 
 | Case | Code | Prose | Counting |
 |---|---:|---:|---:|
 | No drafter (28 Sep) | 52.7 | 52.7 | 52.7 |
-| DFlash2 (chain τ 0.7), greedy, thinking off, 29 Sep (copy windows off) | **115.0** | 63.7 | **133.1** |
+| DFlash2 (chain τ 0.7), greedy, **thinking off (the template's Low effort)**, 29 Sep, `073b553` | **125.6** | **68.8** | **180.3** |
+| The same with the chunked KDA prefill and W8A16 (today's defaults) | 122.6 | 68.2 | 179.5 |
+| DFlash2 (chain τ 0.7), greedy, empty think block, 29 Sep (copy windows off) | 115.0 | 63.7 | 133.1 |
+| The same prompts, 29 Sep, `073b553` with its defaults (D8, decode lanes, copy windows on) | 117.7 | 66.8 | 168.1 (266 tokens) |
 | The same, 28 Sep | 111.3 | 62.4 | 128.4 |
 | DFlash2, greedy, thinking on (28 Sep) | 82.7 | 73.3 | 169.1 |
-| DFlash2, sampled (T 0.7), thinking off (28 Sep) | 113.5 | 67.0 | 123.1 |
+| DFlash2, sampled (T 0.7), empty think block (28 Sep) | 113.5 | 67.0 | 123.1 |
 
-- "Thinking off" in this table is the empty think block rendered until 29 September; since then thinking off is the template's Low effort (below, and `docs/DESIGN.md`).
+- The empty think block was "thinking off" until 29 September; since then thinking off is the template's Low effort, and the API no longer renders the empty block (`docs/DESIGN.md`). On `073b553` the empty block's counting answer stopped after 266 tokens instead of counting to 400. That failure is the mode's, not D8's: with F32 KDA states the empty block fails the count too, and Low counts to 400 with either.
+- The chunked KDA prefill with W8A16 changes the replies (all six differed within their first 340 characters: the prompt's own prefill takes the new arithmetic) and the speed by −2% to +5%.
 - Without a drafter, 52.7 tok/s is 19.0 ms per token.
 - With the drafter, 51–71% of verified drafts are kept (τ 0.3–0.7), 3.0–3.4 tokens per verify window.
 - The model below expected 36–43 tok/s without a drafter (§2) and 110–130 / 75–105 / 125–145 with it (§3).
@@ -42,15 +51,45 @@ Layout and format letters refer to [SIZING.md](SIZING.md).
 | Mode | Structured | Code | Prose | Drafts kept |
 |---|---:|---:|---:|---|
 | **This engine, `reasoning_effort: "low"`** (what its thinking off renders since 29 Sep) | **186.1** | **142.3** | **78.3** | 84.3%, 4.22 tokens a window |
+| The same, 29 Sep, `073b553` | 185.6 | 136.6 | 76.8 | 82.2%, 4.04 tokens a window |
 | This engine, empty `<think></think>` (its thinking off until 29 Sep, and `reasoning_effort: "none"` too; the API no longer renders it) | 167.2 | 124.1 | 71.4 | — |
+| The same, `073b553` | 169.8 | 129.0 | 75.1 | 82.0%, 3.85 |
 | This engine, thinking on (default effort) | 167.5 | 131.3 | 85.7 | 84.2% |
+| The same, `073b553` | 170.5 | 124.5 | 85.2 | 86.4%, 4.17 |
 | That recipe (commit `3e03894`, its message; its thinking off) | 167.2 | 118.7 | 64.4 | 88.5–97.2% on structured |
 
-In the matched mode this engine is 11% / 20% / 22% faster, with 4-bit experts that keep BF16 activations. That recipe's fastest build takes 4-bit activations in its prefill experts.
+In the matched mode this engine is 11% / 20% / 22% faster (11% / 15% / 19% on `073b553`), with 4-bit experts that keep BF16 activations. That recipe's fastest build takes 4-bit activations in its prefill experts. `073b553` runs BF16 KDA states, whose greedy replies differ from the F32 states' of the first run, so drafts kept and reply lengths move with them (an inference: with the same options the two builds score identical logits, [KL-GATE.md](KL-GATE.md) §6d).
 
-**Concurrency, aggregate** (tok/s; 400-token streams, DFlash2 τ 0.7):
+**RigMark** ([alexellis/rigmark](https://github.com/alexellis/rigmark) `c5a0db0`, MIT; 29 Sep, `073b553`):
+- Its agent workloads at reasoning effort Low, 4,096 tokens, 5 runs, `--skip-prefill`.
+- The comparison id `ringside-redhat-rowsplit-20260926` and seed 20260905 that mmastrac's gate uses (`gate/run.sh` at `203fc05`), so the prompts are byte-identical to that recipe's.
+- Its decode rate leaves out the time to the first token.
 
-**Caveat:** every stream here asks about the same topic. Streams that route alike share expert reads: 103 experts per exchange at 41 rows, against about 197 under independent routing. So these aggregates are optimistic for mixed traffic by an unmeasured margin (an estimate from routing diversity puts C48 20–31% high). The public recipes' concurrency figures use a prompt per stream; a like-for-like re-measurement is pending.
+| Workload | This engine (median; range) | Basic gates | mmastrac's recipe, as reported |
+|---|---:|---|---:|
+| Code | **123.9** (122.9–128.7) | 5/5 | 107.9 |
+| Prose | **65.8** (65.6–68.5) | 5/5 | 61.7 |
+| Structured | **174.9** (173.8–176.3) | 5/5 | 157.1 |
+
+- 15 of 15 gates passed; +15% / +7% / +11%. That recipe's figures are those of its `experimental/README.md` at `f88710f`.
+- RigMark's capped concurrent phase (short code, 256 tokens a stream) gave 97.7 / 137.2 / 189.2 tok/s aggregate at 1 / 2 / 4 streams.
+
+**Concurrency with a distinct prompt per stream** (aggregate tok/s; 29 Sep, `073b553`, before the chunked KDA prefill and W8A16 became the default; 512-token greedy streams at Low effort, DFlash2 τ 0.7, the median of three; 1–16 streams at 16 slots, 32 and 48 at 48 slots):
+
+| Prompts | C1 | C4 | C16 | C32 | C48 |
+|---|---:|---:|---:|---:|---:|
+| **Mixed** (code, prose and structured in turn) | 118.8 | **159.5** | **288.5** | **412.5** | **525.8** |
+| Code | 118.5 | 194.2 | 383.5 | 576.8 | 738.9 |
+| Structured | 131.5 | 186.7 | 353.6 | 447.8 | 583.9 |
+| Prose | 73.9 | 156.4 | 268.7 | 383.6 | 495.2 |
+| One topic on every stream, the same build (400-token streams, thinking on) | — | 168.5 | 321.3 | 485.7 | 605.0 |
+
+- **Mixed against one topic:** −5% at C4, −10% at C16, −15% at C32, −13% at C48. Prose is 7–21% below the one-topic figure; code is 15–22% above it (code drafts well).
+- **Why they differ:** streams that route alike share expert reads (103 experts per exchange at 41 rows, against about 197 under independent routing). The two probes also differ in tokens, effort and content, so read the gap as a range, not as the cost of routing alone.
+- **The chunked KDA prefill with W8A16** (today's defaults) measured decode-neutral: code 121.9 / 204.3 / 380.0 and mixed 121.8 / 156.8 / 286.4 tok/s at C1 / C4 / C16, against 118.5 / 194.2 / 383.5 and 118.8 / 159.5 / 288.5 without it.
+- **mmastrac's recipe** reports 317 and 451 tok/s for code at 16 and 32 streams with a prompt per stream, and 404 for 50 mixed streams (the message of its commit `e9839ea`). Its prompts are not these.
+
+**Concurrency with one topic on every stream** (aggregate tok/s; 400-token streams, DFlash2 τ 0.7; the earlier runs, optimistic for mixed traffic as above):
 
 | Streams | 16 slots, 29 Sep (copy windows off) | 16 slots, `--decode-lanes 2-16` (now the default) | 48 slots, D8, four prefill lanes, 29 Sep | 16 slots, 28 Sep | 48 slots, 28 Sep |
 |---|---:|---:|---:|---:|---:|
@@ -62,6 +101,8 @@ In the matched mode this engine is 11% / 20% / 22% faster, with 4-bit experts th
 | C48 | — | — | **600.8** | — | 573 (427 without drafting) |
 
 - **Context at 48 slots:** with D8 and four lanes the pool is 4.94 GiB (859,072 tokens) and the largest request 850,816 tokens (28 Sep: 470,592 and 462,336). At 16 slots a 1,048,576-token request fits.
+  - The chunked KDA prefill's workspace grows with the slots (34 MiB a slot: 544 MiB at 16, 1.59 GiB at 48), and W8A16 takes 64 MiB of GEMM scratch. At 16 slots the pool measured 8.73 GiB (1,519,424 tokens) with them, against 9.33 GiB (1,622,784) without: a 1,048,576-token request still fits.
+  - At 48 slots the two take about 1.66 GiB of the pool, which leaves about 3.28 GiB (about 570K tokens). This is computed from the workspace's size, not measured. `--kda-chain-prefill --prefill-w8a8` gives the 4.94 GiB back.
 - **Decode is bound by the ranks' weight reads.** At C16 the verify passes carry about 41 rows. Of each MoE layer's 2.24 ms (28 Sep), 1.73 ms was the exchange and 0.34 ms the coordinator's attention.
   - The rank's GB10 decode schedule (`crates/glm53f-rank/README.md`, "Measured on GB10") reads expert weights at 221–237 GB/s in its bench and 198–233 GB/s in service (28 Sep: 187–234). GB10's reads top out at about 225–241 GB/s in practice (273 on paper).
   - More rows per call share more of those reads: 48 streams reach 601 tok/s.
@@ -84,30 +125,43 @@ Copied windows averaged 7.8 tokens with 97.1% of copied tokens kept.
 
 | Prompt | 4K | 19K | 79K |
 |---|---:|---:|---:|
-| **Four lanes of 2,048 (default since 29 Sep)** | **4,145** | **4,138** | **4,089** |
+| **Four lanes of 2,048 with the chunked KDA prefill and W8A16 (the defaults since 29 Sep; `073b553`, two boots)** | **4,979–4,998** | **5,128–5,180** | **5,132–5,188** |
+| Four lanes of 2,048 without them (the default until then; `073b553`, two boots) | 4,099–4,129 | 4,103–4,104 | 4,051–4,053 |
+| Four lanes of 2,048, 29 Sep (the first run) | 4,145 | 4,138 | 4,089 |
 | Three lanes of 2,048 | 4,138 | 4,048 | 4,074 |
 | Two lanes of 4,096 | 3,771 | 4,041 | 4,013 |
 | Two lanes of 2,048, 29 Sep | 3,505 | 4,014 | 3,978 |
-| Four lanes with `--kda-chunked-prefill --prefill-w8a16` (opt-in; see below) | **4,956** | **5,180** | **5,190** |
+| Four lanes with the chunked KDA prefill and W8A16, the first run (on an unbalanced bond) | 4,956 | 5,180 | 5,190 |
 | Two lanes of 2,048, 28 Sep (rank kernel tuned for GB10) | 3,338 | 3,678 | 3,626 |
 | Two lanes of 2,048, 28 Sep (exchange fast paths, earlier rank kernel) | 3,033 | 3,369 | 3,350 |
 | Two lanes, host encode and pageable uploads | 2,717 | 2,964 | 2,899 |
 | One lane | 1,633 | 1,725 | 1,715 |
 
-- **With four lanes:**
+- **The chunked KDA prefill with W8A16 projections** is 21–28% faster than without them: +21–22% at 4K, +25–26% at 19K, +27–28% at 79K. Every `073b553` row comes from a boot whose RDMA bond was balanced (each port carrying 42–58% of the return traffic).
+  - A MoE layer of four 2,048-row lanes takes 28.2–29.6 ms against 42.8, and the GPU is 66–69% busy against 86%: the exchange sets the pace again.
+  - It passed the 125-window paired KL comparison ([KL-GATE.md](KL-GATE.md) §6d: mean −0.0014 nats, upper bound +0.0002 against the 0.002 margin), and is the default since 29 September.
+  - The first run's row came from an unbalanced bond (62.8% of the return traffic on one port) and matches the balanced boots: the bond did not limit it at these rates.
+- **With four lanes, without the pair:**
   - A 79K-token prompt takes 19.3 s; a 207K-token one 53.7 s (3.9K tok/s).
   - The GPU is 86% busy, attention is the bound again, and each lane's exchange hides behind the other lanes' attention.
-  - At 16 slots all forward buffers take 2.80 GiB and a 1M-token request fits (KV pool 8.26 GiB).
-- **The 5090's attention per 2,048-row lane** (`GLM53F_PROFILE_OPS=1`, §5a has the development GPU):
+  - At 16 slots all forward buffers take 2.80 GiB and a 1M-token request fits (KV pool 8.26 GiB with the first run's F32 KDA states; 9.33 GiB with BF16 states on `073b553`). With the pair the buffers take 3.40 GiB (its KDA workspace 544 MiB, W8A16's GEMM scratch 64 MiB) and the pool 8.73 GiB.
+- **The 5090's attention per 2,048-row lane** (`GLM53F_PROFILE_OPS=1`, the median; §5a has the development GPU):
 
-  | Layer | Attention | Main ops |
-  |---|---:|---|
-  | KDA | 8.52 ms | the serial chain 5.25 ms (59%); the `[q\|k\|v\|b]` projection 1.94 ms (22%) |
-  | DSA | 9.66 ms | the sparse attention 5.23 ms (52%) |
+  | Op | Without the pair (29 Sep, F32 KDA states) | With it (`073b553`) |
+  |---|---:|---:|
+  | KDA layer: attention | 8.515 ms | **4.259** |
+  | – the chain (`kda_core`), then the chunked kernel | 5.249 | **0.983** |
+  | – the `[q\|k\|v\|b]` projection (BF16) | 1.940 | 1.948 |
+  | Shared expert (FP8) | 0.405 | 0.610 |
+  | DSA layer: attention | 9.656 | 12.163 |
+  | – the indexer's selection | 0.180 | 1.875 |
+  | – `o_proj`, `q_b`, `q_a` (FP8) | 1.013, 0.313, 0.134 | 1.535, 0.530, 0.200 |
+  | – the sparse attention | 5.234 | 5.300 |
 
-  The shared expert takes 0.41 ms. The chunked KDA prefill replaces the chain. The sparse attention is the next lever.
-- **The opt-in pair** (the chunked KDA prefill with W8A16 projections) lowers the mean KL (0.0263 against 0.0282; [KL-GATE.md](KL-GATE.md) §6b). The 25-window gate cannot yet show it non-inferior, so it stays off until a larger panel decides.
-  - Its row was measured on an unbalanced RDMA bond (62.8% of the return traffic on one port), which slows the exchange it is bound by. It is probably an underestimate.
+  - The chunked kernel takes 4.3 ms off each KDA lane.
+  - W8A16 makes each FP8 GEMM about 1.5 times slower.
+  - The indexer's selection is ten times slower in this arm. An inference, not isolated: it is W8A16's doing, since the chunked kernel touches KDA layers only and the indexer's queries stay BF16.
+  - Faster W8A16 GEMMs and that selection are the next prefill lever: up to about 2.5 ms per DSA lane.
 - **The earlier story, in order:**
   - Without the exchange fast paths, the GPU was busy 66% of a 27.5 ms MoE layer. With them it was 72% of 25.1 ms.
   - With the GB10-tuned rank kernel a 2,048-row lane's exchange fell to 12 ms, longer than the other lane's attention (8.7 ms). That is why two lanes left the GPU idle and four do not.
@@ -123,20 +177,32 @@ Copied windows averaged 7.8 tokens with 97.1% of copied tokens kept.
 
 The restore itself took 21.4 ms. A 36K-token snapshot's store to RAM took 9.3 ms.
 
+**Snapshots go to RAM only on demand** (29 Sep, `073b553`, the same workload at 16 slots, every store and restore counted from the log):
+- Cold 53.22 s; again 0.01 s (the device snapshot); after the 30 other prompts, 0.04 s: the 207,436-token snapshot came back from RAM in 22.5 ms.
+- Nothing was stored to RAM while the pool and the slots had room. Once every slot held a finished conversation, each new prompt of about 36K tokens took the least recently used one's slot and sent that conversation to RAM (the 207K one at the 16th prompt: 3,241 pages in 38.7 ms).
+- 20 stores in all, every one such an eviction; one restore; no errors.
+- Not yet exercised on the target: the page-pressure path, where an incoming request needs pages the pool lacks. With 16 slots and 36K-token prompts the slots ran out long before the 1.62M-token pool.
+
+**Known limitation: a running stream nearly stops while a long prompt prefills** (29 Sep, `073b553`, before the prefill pair; the design of the prefill-blocking probe of mmastrac's recipe, `experimental/quality/prefill_block.py` at `0784b1b`, reimplemented):
+- A 64,596-token prompt, sent while another stream was generating, prefilled in 16.52 s (3,911 tok/s).
+- Meanwhile the running stream got 1.0 tok/s, with gaps of up to 3.96 s (75.5 tok/s before, 67.8 after).
+- Six short requests sent during the prefill got their first tokens in 1.1–3.1 s, all before the long prompt's: new requests are admitted between its passes.
+- The fix belongs to the scheduler and is not built: bounded prefill slices, or a decode step between prefill passes.
+
 **Against the public four-Spark recipes** (their reported figures; this engine as above). Both
 recipes run on four GB10 systems alone, with no RTX 5090, so the differences belong to the added
 GPU and this engine together:
 
 | Metric | [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark) (vLLM TP4, NVFP4) | mmastrac `perf-2026-09-27` (vLLM TP4, NVFP4) | This engine |
 |---|---|---|---|
-| Single stream | ~55 tok/s | 167.2 / 118.7 / 64.4 (structured / code / prose) | 186.1 / 142.3 / 78.3 in the same mode |
-| Aggregate | 530 tok/s at 48 streams | 253 tok/s at 16 streams | 316–326 at 16; **601 at 48** (48 slots) |
-| Prefill | 3.5–4.1K tok/s short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | 4.1K at 4K–79K; 5.2K with the opt-in pair |
-| Context | 1M | 512K | 1M (16 slots); 851K at 48 slots |
+| Single stream | ~55 tok/s | 167.2 / 118.7 / 64.4 (structured / code / prose); RigMark 107.9 / 61.7 / 157.1 (code / prose / structured) | 186.1 / 142.3 / 78.3 in the same mode; RigMark 123.9 / 65.8 / 174.9 |
+| Aggregate | 530 tok/s at 48 streams | 253 tok/s at 16 streams; code with a prompt per stream 317 / 451 at 16 / 32 | a prompt per stream, mixed: 288.5 at 16, **525.8 at 48** (48 slots); code alone 383.5 / 576.8 / 738.9 at 16 / 32 / 48 |
+| Prefill | 3.5–4.1K tok/s short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | **5.0–5.2K** at 4K–79K (4.1K without the default prefill pair) |
+| Context | 1M | 512K | 1M (16 slots); 851K at 48 slots without the default prefill pair, about 570K with it (computed) |
 
 - mmastrac's prefill takes 4-bit activations in its experts, which its own test puts 13–62% away from BF16 activations at the MoE output.
 - This engine's experts keep BF16 activations. Its KL against the BF16 teacher equals the published figure for its 4-bit expert checkpoint.
-- Sources, pinned: tonyd2wild's README at `2ac4e8d` (its 1M fp8 lane for the aggregate, the 114K prefill and the context). For mmastrac, the single-stream and 16-stream figures are those in the message of commit `3e03894` on `perf-2026-09-27`, and the prefill figures those of its `experimental/README.md` from `889a456`. That branch has moved on since: at `74faf89` the same file reports 170.3 / 120.8 / 65.8, 251.3 at 16 streams and 4,946 / 4,750 prefill.
+- Sources, pinned: tonyd2wild's README at `2ac4e8d` (its 1M fp8 lane for the aggregate, the 114K prefill and the context). For mmastrac, the single-stream and 16-stream figures are those in the message of commit `3e03894` on `perf-2026-09-27`, and the prefill figures those of its `experimental/README.md` from `889a456`. That branch has moved on since: at `74faf89` the same file reports 170.3 / 120.8 / 65.8, 251.3 at 16 streams and 4,946 / 4,750 prefill. Its RigMark figures are in the same file at `f88710f`, and the code figures with a prompt per stream in the message of `e9839ea`.
 
 **Start-up:** the coordinator is ready 7 s after launch (weights from the page cache). A rank is ready
 in 44–49 s (§6).
@@ -145,11 +211,13 @@ in 44–49 s (§6).
 - a number hidden at 37% depth is retrieved from 8.8K and 79K tokens of filler, with and without the drafter;
 - `harness/api_contract.py` passes all 12 rows on the real model.
 
-**KL gate** against the published BF16 teacher ([KL-GATE.md](KL-GATE.md) §6a, §6b):
+**KL gate** against the published BF16 teacher ([KL-GATE.md](KL-GATE.md) §6a, §6b, §6d):
 - decode path 0.0245 nats, top-1 95.1%, equal within its standard error to the published 0.0246
   for the same 4-bit experts; prefill path 0.0282 nats, top-1 94.7%; both pass;
 - every change merged by 29 September left the engine's output bit-identical;
-- D8 passed and is on; D2 (FP8 KDA projections at 128 × 128 scales) failed and stays off.
+- D8 passed and is on; D2 (FP8 KDA projections at 128 × 128 scales) failed and stays off;
+- the chunked KDA prefill with W8A16 passed a paired comparison on 125 windows (mean −0.0014
+  nats, upper bound +0.0002 against the 0.002 margin) and is on.
 
 ## 1. Anchors
 
@@ -394,7 +462,7 @@ above):
 
 | # | Lever | Per KDA layer | Per DSA layer | Per pass per lane (45 layers) | Bits | Cost |
 |---|---|---:|---:|---:|---|---|
-| 1 | **Chunked KDA prefill** (the kernel exists: `ForwardConfig::kda_chunked_prefill`). Measured here: chain 6.31 → 1.92–2.12 ms (12.3 → 4.0–4.1 at 4,096 rows), pass 1,206–1,228 → 980–1,045 ms | ≈ −3.5 | — | ≈ −120 | change (f32 rounding; KL gate) | a serve flag and a gate run |
+| 1 | **Chunked KDA prefill** (the kernel exists: `ForwardConfig::kda_chunked_prefill`). Measured here: chain 6.31 → 1.92–2.12 ms (12.3 → 4.0–4.1 at 4,096 rows), pass 1,206–1,228 → 980–1,045 ms | ≈ −3.5 | — | ≈ −120 | change (f32 rounding; KL gate) | **done**: with W8A16 it passed the gate and is on by default since 29 September; on the 5090 the chain's 5.25 ms became 0.98 (§0) |
 | 2 | **FP8 KDA projections (D2)** with E4M3 activations in prefill (`--kda-fp8 --kda-prefill-w8a8`). Measured on the 4090 per 2,048-row lane: projections 3.31–3.63 → 2.31 ms and `o_proj` 1.04–1.06 → 0.70–0.86 ms, about −1.3 to −1.5 ms (−30%); scaled by 1.27 | ≈ −1.0 to −1.2 | — | ≈ −35 to −40 | change (KL gate) | the flags exist; a gate run |
 | 3 | The KDA chain alongside the projections: row blocks of `[q\|k\|v\|b]` and `o_proj` on the 106 SMs the chain leaves idle | up to −3 | — | up to −100 | same, with a GEMM algorithm fixed per row block | moderate; moot after (1) |
 | 4 | Sparse MLA prefill: consecutive rows' selections shared (each latent tile decoded once for several rows), a causal kernel for the dense start | — | −1 to −2 | −11 to −22 | same, if each row keeps its tile order and products | a new kernel |
@@ -404,8 +472,8 @@ above):
 | 8 | Absorb with fused multiply-adds or on tensor cores | — | ≈ −0.6 | ≈ −7 | change (the absorb is bit-exact with the CPU by contract) | small, plus the gate |
 | 9 | mHC finish fused into the projection (the last CTA of a row finishes it, as the decode boundary does) | ≈ −0.05 | ≈ −0.05 | ≈ −2 | same | moderate |
 
-- (1), (2) and (3) change the KDA kernels or their dispatch: (1) and (2) are behind their own
-  switches and wait for the KL gate; (3) is a proposal.
+- (1), (2) and (3) change the KDA kernels or their dispatch: (1) passed the KL gate with W8A16
+  and is a default (§0), (2) failed it in this form (D2), and (3) is moot after (1).
 - D2 is chiefly a decode lever (half the KDA weight bytes). In prefill it saves about 12–14% of
   a KDA layer on the 5090, and about 20–23% once the chunked kernel has removed the chain.
   From the same measurements: `--prefill-w8a16` (BF16 activations for the FP8 projections over

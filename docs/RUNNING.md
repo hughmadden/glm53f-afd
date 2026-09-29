@@ -104,7 +104,7 @@ Each binary runs only on the architecture it was built for; the rank checks this
    prefill lane's scratch for `--prefill-rows`, the verify scratch, the attention workspaces,
    the expert exchange's buffers, the drafter's tap buffer and working memory), then sizes the
    KV page pool from what is left less `--reserve-gib` (1 by default), logs what it allocated
-   for what, and prints `serving the API on ...`.
+   for what, and prints `serving the API on ...`. The API listens only from then on.
 
 3. A request:
 
@@ -115,6 +115,42 @@ Each binary runs only on the architecture it was built for; the rank checks this
 
 `glm53f-serve --help` lists the options; the crate documentation (`crates/glm53f-serve/src/lib.rs`)
 describes each.
+
+### Health
+
+`GET /health` (`curl -s http://<api-host>:8100/health`) is for health checks:
+
+- **200** `{"status":"ok"}` while the engine can serve.
+- **503** `{"status":"unavailable","reason":"..."}` once it cannot:
+  - the expert wire failed: after any failed exchange the forward refuses every pass until the
+    coordinator restarts and reconnects to the ranks;
+  - or the scheduler's thread ended.
+
+  Restart the coordinator in either case.
+- It reads that state only, never the request queue or the GPU, so it answers at once under any
+  load. A 200 does not prove that the next pass succeeds; only a request does.
+- Before the engine is ready (loading, connecting the ranks, sizing the pool) nothing listens, so a
+  probe's connection is refused: there is no "starting" answer.
+
+### Numerics defaults
+
+Each option changes the engine's arithmetic and became a default only after the KL gate and speed
+runs on the target hardware ([KL-GATE.md](KL-GATE.md) §6). `glm53f-serve` and `glm53f-score` take the
+same flags and variables, with the same defaults; the start-up line `[coordinator] numerics: ...`
+names the options on.
+
+| Option | Default | Off with | KL gate |
+|---|---|---|---|
+| BF16 KDA states (D8) | on | `--kda-state-f32`, `GLM53F_KDA_STATE_BF16=0` | passed (§6b) |
+| Chunked KDA prefill | on | `--kda-chain-prefill`, `GLM53F_KDA_CHUNKED_PREFILL=0` | passed with W8A16 (§6d); failed without it (§6b) |
+| W8A16 prefill projections | on | `--prefill-w8a8`, `GLM53F_PREFILL_W8A16=0` | passed with the chunked prefill (§6d) |
+| FP8 KDA projections (D2) | off | (on with `--kda-fp8`) | failed (§6b) |
+| D2's KDA projections at W8A8 in prefill | off | (on with `--kda-prefill-w8a8`, with D2) | not gated alone; D2 failed (§6b) |
+
+- The chunked KDA prefill and W8A16 passed as a pair, so turn them off together:
+  `--kda-chain-prefill --prefill-w8a8`.
+- With `--kda-state-f32` as well, every option is off: the engine's reference arithmetic, which
+  section 6a of the KL gate scored.
 
 ### Prefill lanes and device memory
 
@@ -150,9 +186,10 @@ describes each.
   drafter and the default BF16 KDA states; 181 MiB with `--kda-state-f32`)
   and, with the drafter, the verify pass: every slot's window of 8 rows, capped by the step's row
   budget `GLM53F_SPEC_MAX_ROWS` (256 by default; the most likely drafts first), about 4.9 MiB a
-  row. Both come out of the KV pool. The start-up log states the largest request the pool admits
-  and says plainly when a request of `--max-context` tokens (1,048,576 by default) does not fit.
-  `crates/glm53f-serve/src/lib.rs` gives the plan at 16, 32 and 48 slots.
+  row. Both come out of the KV pool, and so does the chunked KDA prefill's workspace (on by
+  default: 34 MiB a slot, 544 MiB at 16 slots, 1.59 GiB at 48). The start-up log states the largest
+  request the pool admits and says plainly when a request of `--max-context` tokens (1,048,576 by
+  default) does not fit. `crates/glm53f-serve/src/lib.rs` gives the plan at 16, 32 and 48 slots.
 - **Tracing a pass.** With `GLM53F_PROFILE=1` each prefill pass prints a `PIPE` line: per MoE
   layer (median), the wall time, each lane's GPU time for its attention and its shared expert,
   the host's time waiting for the routes, in `submit` and in `finish` (blocked on the ranks,
@@ -264,10 +301,10 @@ The gate runs both pass sizes (the prefill path, and 8 rows or fewer: the decode
 [KL-GATE.md](KL-GATE.md) section 4.3 has the whole sequence, from `klgate.py plan` to `compare`.
 `glm53f-score` cuts a prefill pass into two lanes unless `--prefill-lanes` says otherwise (the
 coordinator's default is four). The numerics options (`--kda-fp8`, `--kda-state-bf16` or
-`--kda-state-f32`, `--prefill-w8a16`, `--kda-prefill-w8a8`, `--kda-chunked-prefill`, as
-`glm53f-serve` takes them; BF16 KDA states are the default in both binaries) are scored the same
-way into their own directories and compared with the baseline at `--margin 0.002`; the engine line
-in every output names them.
+`--kda-state-f32`, `--prefill-w8a16` or `--prefill-w8a8`, `--kda-chunked-prefill` or
+`--kda-chain-prefill`, `--kda-prefill-w8a8`, as `glm53f-serve` takes them, with its defaults:
+[Numerics defaults](#numerics-defaults)) are scored the same way into their own directories and
+compared with the baseline at `--margin 0.002`; the engine line in every output names them.
 `--experts local` runs the official FP8 experts on the coordinator's GPU instead of the ranks;
 `--dev-layers`, `--dev-load-layers` and `--experts zero` make a development run on one GPU, whose
 logits are meaningless.
@@ -322,8 +359,8 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_RANK_BIN=... GLM53F_RANK_DIRS=... \
   cargo test --release -p glm53f-serve --features cuda --test dev_mode -- --nocapture
 
 # Any model-path suite with a numerics option on (a comma-separated list of kda-fp8,
-# kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8), for example verify and commit with BF16
-# KDA states:
+# kda-state-bf16, prefill-w8a16 and kda-prefill-w8a8; the forward's tests otherwise run every
+# option off, whatever glm53f-serve's defaults), for example verify and commit with BF16 KDA states:
 GLM53F_TEST_NUMERICS=kda-state-bf16 GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... \
   cargo test --release -p glm53f-forward --features coordinator --test verify_commit -- --nocapture
 
@@ -354,9 +391,9 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
 | `GLM53F_KDA_STATE_BF16` | `--kda-state-bf16` / `--kda-state-f32` | D8, **on by default** (passed the KL gate, docs/KL-GATE.md §6b): the KDA recurrent states stored in BF16, computed in f32; `0` or `--kda-state-f32` for F32 |
-| `GLM53F_PREFILL_W8A16=1` | `--prefill-w8a16` | Numerics under test, off by default: FP8 projections over 8 rows with BF16 activations |
-| `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With the two above: the FP8 KDA projections keep E4M3 activations over 8 rows |
-| `GLM53F_KDA_CHUNKED_PREFILL=1` | `--kda-chunked-prefill` | Numerics under test, off by default: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain) |
+| `GLM53F_PREFILL_W8A16` | `--prefill-w8a16` / `--prefill-w8a8` | **On by default** with the chunked KDA prefill (the pair passed the KL gate, docs/KL-GATE.md §6d): FP8 projections over 8 rows with BF16 activations (W8A16); `0` or `--prefill-w8a8` for E4M3 activations (W8A8) |
+| `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows |
+| `GLM53F_KDA_CHUNKED_PREFILL` | `--kda-chunked-prefill` / `--kda-chain-prefill` | **On by default** with W8A16: the KDA of prefill passes through the chunked kernel instead of the serial chain (decode and verify keep the chain); `0` or `--kda-chain-prefill` for the chain. Without W8A16 the chunked kernel failed the KL gate, so turn the two off together |
 
 **Serving shell:** `GLM53F_QUEUE_DEPTH` and `GLM53F_QUEUE_WAIT_MS` (the request queue),
 `GLM53F_HOST_CACHE_GB` (the host RAM tier for KV snapshots; 0 turns it off; by default the

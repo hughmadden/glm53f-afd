@@ -10,8 +10,12 @@ and workspace figures are estimates, labelled as such.
 > built. Since then the engine has run on its target hardware ([PERFORMANCE.md](PERFORMANCE.md)
 > §0), and the KL gate has decided two of the decisions below ([KL-GATE.md](KL-GATE.md) §6b):
 > D8 (BF16 KDA states) passed and is on by default, halving the per-slot KDA state of §3 to
-> 68 MiB; D2 (FP8 KDA projections) failed and stays off. The measured pools and largest requests
-> are in PERFORMANCE.md §0, and the coordinator's start-up log prints its own plan.
+> 68 MiB; D2 (FP8 KDA projections) failed and stays off. Later that day the chunked KDA prefill
+> with W8A16 projections passed on 125 windows (KL-GATE.md §6d) and is on by default too: its
+> workspace takes 34 MiB a slot (544 MiB at 16 slots, 1.59 GiB at 48) and W8A16 64 MiB of GEMM
+> scratch, so at 16 slots the measured pool is 8.73 GiB (1.52 M tokens; a 1,048,576-token request
+> fits). The measured pools and largest requests are in PERFORMANCE.md §0, and the coordinator's
+> start-up log prints its own plan.
 
 Target: **GLM-5.3-Flash** (`zai-org/GLM-5.3-Flash`, architecture
 `glm5_next`) on **one RTX 5090 (32 GB)** coordinator and **four DGX Spark (GB10,
@@ -180,13 +184,16 @@ Each rank holds a quarter of every routed expert, split over the expert's
 
 ## 10. D2, D8 and the prefill activations as built (28 September 2026)
 
-Three numerics options (and a variant of the third), each **off by default** and each a flag of
+Three numerics options (and a variant of the third), each **off by default** when built and each a flag of
 `glm53f-serve` and `glm53f-score` (with an environment fallback). Each becomes a default only after the KL gate
 ([KL-GATE.md](KL-GATE.md) §6, `compare --margin 0.002` against the same engine without it) and
 speed runs on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
 *Outcome (29 September 2026, KL-GATE.md §6b): D8 passed and is now on by default; D2 failed;
 W8A16, alone or with the chunked KDA prefill, lowered the mean KL but could not yet be shown
-non-inferior on 25 windows, so it stays opt-in.*
+non-inferior on 25 windows, so it stays opt-in.* *Later on 29 September (KL-GATE.md §6d): W8A16
+with the chunked KDA prefill passed on 125 windows, and both are on by default since;
+`--prefill-w8a8 --kda-chain-prefill` turns them off. The chunked prefill's workspace takes 34 MiB
+a slot and W8A16's scratch 64 MiB.*
 
 **D2, FP8 KDA projections** (`--kda-fp8`, `GLM53F_KDA_FP8=1`).
 - At load, the fused q|k|v|b projection and `o_proj` of the 34 KDA layers are quantized on the
@@ -199,9 +206,10 @@ non-inferior on 25 windows, so it stays opt-in.*
 - Decode (layers 0–4, `decode_bench`): per KDA layer `kda_proj` 0.23 → 0.12 ms and `kda_o` 0.077
   → 0.041 ms at one row, **about −4.9 ms per step over 34 layers** on the 4090 (about −2.8 ms
   scaled by the 5090's bandwidth: an estimate, not a measurement).
-- Prefill: the KDA projections take the FP8 GEMMs, W8A8 (E4M3 activations) by default and
-  W8A16 with `--prefill-w8a16`. Per KDA layer and pass (`decode_bench`, one lane, the chunked KDA
-  kernel, three runs; the projections are q|k|v|b with the gate GEMMs, then `o_proj`):
+- Prefill: the KDA projections take the FP8 GEMMs, W8A8 (E4M3 activations; the default when this
+  was measured) or W8A16 with `--prefill-w8a16` (the default since 29 September). Per KDA layer
+  and pass (`decode_bench`, one lane, the chunked KDA kernel, three runs; the projections are
+  q|k|v|b with the gate GEMMs, then `o_proj`):
 
   | Rows per pass | BF16 (today) | D2, W8A8 | D2 with `--prefill-w8a16` |
   |---:|---:|---:|---:|
@@ -240,7 +248,8 @@ non-inferior on 25 windows, so it stays opt-in.*
   token windows decides. An FP16 state (same bytes, 3 more mantissa bits) measured 7.7× less drift
   on the CPU model (not built).
 
-**W8A16 prefill projections** (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`).
+**W8A16 prefill projections** (`--prefill-w8a16`, `GLM53F_PREFILL_W8A16=1`; on by default since 29
+September, with the chunked KDA prefill; `--prefill-w8a8` or `GLM53F_PREFILL_W8A16=0` turns it off).
 - FP8 projections over 8 rows take BF16 activations instead of E4M3 per 128-group (the likely
   source of the prefill path's +0.0038 nats, KL-GATE.md §6a): each weight is dequantized to BF16
   tiles of rows (`bf16(e4m3 × scale)`, one rounding) in 64 MiB of scratch and multiplied by cuBLAS.
