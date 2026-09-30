@@ -1,5 +1,8 @@
 //! L2 prefetch of the next layer's weights while a MoE layer's routed experts are out (feature
-//! `cuda`; [`crate::forward::ForwardConfig::l2_prefetch`], off by default).
+//! `cuda`; [`crate::forward::ForwardConfig::l2_prefetch`], 0 in the forward's default).
+//! `glm53f-serve` turns it on by default since v1.1.0 (30 September 2026; `--l2-prefetch auto`:
+//! three quarters of the GPU's L2, 72 MiB on the RTX 5090), after the target hardware, where it
+//! decoded one stream 2.7-5.5% faster on the v1.1 candidate.
 //!
 //! In a decode or verify pass the coordinator runs a MoE layer's attention and router, sends the
 //! rows to the expert ranks, runs the shared expert, and then waits for the ranks: in a pass of

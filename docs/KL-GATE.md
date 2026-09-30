@@ -5,8 +5,9 @@ pass** (section 6a). The decode path scores 0.0245 nats against the BF16 teacher
 standard error to the published figure for the same 4-bit experts. On 29 September the numerics
 options were gated (section 6b): BF16 KDA states (D8) passed and are now the default; FP8 KDA
 projections (D2) failed. A 125-window panel for paired comparisons (section 6c) had its first
-result the same day (section 6d). D2 with power-of-two or MXFP8 scales awaits the gate (section
-6e).
+result the same day (section 6d). On 30 September D2 with power-of-two scales passed and stays
+opt-in, D2 as MXFP8 failed, and v1.1.0 reproduced the defaults' 125-window run byte for byte
+(section 6e).
 
 The gate measures how far the engine's next-token distributions are from the BF16 model's, on the
 public panel that the published GLM-5.3-Flash quantization figures were measured on, with the
@@ -768,7 +769,7 @@ otherwise. B, the defaults this comparison was made against, is `--kda-chain-pre
 --prefill-w8a8`; adding `--kda-state-f32` gives section 6a's configuration. The chunked kernel
 without W8A16 failed section 6b's gate (+0.0021), so the two are turned off together.
 
-## 6e. D2 with power-of-two scales: the next arm (built 29 September 2026; not yet gated)
+## 6e. D2 with power-of-two scales (built 29 September 2026, gated 30 September)
 
 **Why.** D2's scales are the checkpoint's scheme for its FP8 tensors, `amax / 448` per 128 × 128
 block. But the KDA projections ship in BF16, and most of their weights already fit E4M3: 82–89% of
@@ -804,7 +805,8 @@ and 4: `crates/glm53f-layers/tests/real_weights.rs`, the same quantizer):
 
 The two give the same weights except one in 7,000–18,000 on layers 0 and 4 (the smallest, which a
 1 × 32 scale keeps in E4M3's normal range and a 128 × 128 one does not; `real_weights.rs`). So a
-result on one is expected to hold for the other (an inference, not a measurement).
+result on one is expected to hold for the other (an inference, not a measurement). On the target
+hardware it did not hold: a MISS (the result, below).
 
 **The runs**, as section 6c runs an arm (its panel and plan; `score` over the whole panel for
 `compare`, and over `--roles final` for the absolute gate), each compared with the defaults' own run
@@ -826,7 +828,101 @@ python3 harness/klgate.py compare mx-4096.json defaults-4096.json --margin 0.002
   1.3e-2 from the FP32 goldens in one W8A8 pass, against 2.3e-3 in 8-row passes (BF16 weights:
   2.2e-3 both ways; D2: 1.9e-2 and 1.4e-2).
 
-**Result: pending.** Nothing has been measured on the target hardware yet.
+**Result (target hardware, 30 September 2026): the powers of two pass; MXFP8 fails.** Engine
+`f812603`, the v1.1 candidate: v1.1.0's code before its last two changes (sparse MLA blocks of 510
+rows, which change no bit, and two serve defaults the scorer does not use). Each arm on top of the
+defaults, at 4,096 rows per pass on the 125-window plan of section 6c and at 8 rows on the first
+gate's 25-window plan; A is the arm, B the defaults' own run at the same pass size. The engine runs
+took 71–74 s at 4,096 rows and 240–257 s at 8 (a 4.5–4.8 s load included).
+
+`--kda-fp8-pow2` at 4,096 rows:
+
+```text
+paired over 23,625 rows in 125 windows: A 0.024688, B 0.024928
+  mean difference A - B       -0.000240  window bootstrap 95% [-0.001999, +0.001486]  clustered SE 0.000885
+  ratio A / B                 0.9904  95% [0.9224, 1.0598]
+  per-row correlation         0.8563
+  top-1 (rows): A agrees and B not 479, B agrees and A not 474; McNemar p 0.897
+  mean A - B per role         final 25 windows +0.001011; confirmation 64 windows -0.001208; selection 36 windows +0.000614
+gate: PASS: upper 95% bound of A - B +0.001486 < margin 0.002
+```
+
+`--kda-fp8-pow2` at 8 rows:
+
+```text
+paired over 4,725 rows in 25 windows: A 0.024288, B 0.023977
+  mean difference A - B       +0.000310  window bootstrap 95% [-0.001321, +0.001727]  clustered SE 0.000816
+  ratio A / B                 1.0129  95% [0.9521, 1.0827]
+  per-row correlation         0.8531
+  top-1 (rows): A agrees and B not 87, B agrees and A not 94; McNemar p 0.656
+gate: PASS: upper 95% bound of A - B +0.001727 < margin 0.002
+```
+
+`--kda-mxfp8` at 4,096 rows:
+
+```text
+paired over 23,625 rows in 125 windows: A 0.025412, B 0.024928
+  mean difference A - B       +0.000484  window bootstrap 95% [-0.001218, +0.002221]  clustered SE 0.000871
+  ratio A / B                 1.0194  95% [0.9526, 1.0890]
+  per-row correlation         0.8535
+  top-1 (rows): A agrees and B not 478, B agrees and A not 457; McNemar p 0.513
+  mean A - B per role         final 25 windows +0.001245; confirmation 64 windows +0.000651; selection 36 windows -0.000340
+gate: FAIL: upper 95% bound of A - B +0.002221 >= margin 0.002
+```
+
+`--kda-mxfp8` at 8 rows:
+
+```text
+paired over 4,725 rows in 25 windows: A 0.027048, B 0.023977
+  mean difference A - B       +0.003070  window bootstrap 95% [-0.000140, +0.007494]  clustered SE 0.001988
+  ratio A / B                 1.1280  95% [0.9933, 1.2742]
+  per-row correlation         0.7566
+  top-1 (rows): A agrees and B not 91, B agrees and A not 100; McNemar p 0.563
+gate: FAIL: upper 95% bound of A - B +0.007494 >= margin 0.002
+```
+
+The absolute gate on the 25 final windows (`--roles final --max-mean 0.040 --min-top1 0.93`)
+passes for every arm:
+
+| Arm | Rows per pass | Mean KL | + 1.96 SE | Top-1 agreement | Gate |
+|---|---:|---:|---:|---:|---|
+| Defaults | 4,096 | 0.02678 | 0.02933 | 0.9482 | PASS |
+| `--kda-fp8-pow2` | 4,096 | 0.02779 | 0.03026 | 0.9499 | PASS |
+| `--kda-mxfp8` | 4,096 | 0.02803 | 0.03060 | 0.9473 | PASS |
+| Defaults | 8 | 0.02398 | 0.02608 | 0.9513 | PASS |
+| `--kda-fp8-pow2` | 8 | 0.02429 | 0.02647 | 0.9517 | PASS |
+| `--kda-mxfp8` | 8 | 0.02705 | 0.02958 | 0.9521 | PASS |
+
+- **`--kda-fp8-pow2` passes at both pass sizes.** Over the 125 windows its mean KL is 0.00024
+  nats below the defaults', with the upper bound, +0.0015, inside the margin; on the decode path
+  it is 0.0003 above, bound +0.0017. Top-1 agreement moves on as many rows one way as the other
+  (McNemar p 0.90 and 0.66), and over the 125 windows the difference changes sign between the
+  roles. D2 with `amax / 448` scales had moved the decode path by +0.0039 (section 6b, against the
+  F32-state baseline of then).
+- **It stays opt-in: v1.1.0 keeps the checkpoint's BF16 KDA projections by default.** Quality
+  first: its speed gain is in decode only, one stream 6–15% faster (4 and 16 streams −0.7% to
+  +2.8%), while prefill runs 1–5% slower; it also grows the KV pool by 49% (12.98 GiB against 8.73
+  at 16 slots), and greedy replies change ([PERFORMANCE.md](PERFORMANCE.md) §0).
+  `--kda-fp8-pow2` turns it on.
+- **`--kda-mxfp8` fails at both.** At 4,096 rows the mean difference is +0.0005 and the bound,
+  +0.0022, misses the margin: by section 6c's reading an inconclusive result, the interval holding
+  both zero and the margin. At 8 rows the mean is +0.0031 (bound +0.0075), 13% above the defaults,
+  with top-1 not significantly different (McNemar p 0.56). It stays off.
+- **MISS: the expectation that a result on one arm holds for the other.** The two arms' weights
+  differ in one of 7,000–18,000, yet at 8 rows MXFP8 scored 0.02705 against the powers of two's
+  0.02429 (the defaults 0.02398), and at 4,096 rows 0.02541 against 0.02469. With weights that
+  close, the likely place to look is MXFP8's own GEMM paths (its decode GEMM at 8 rows, its W8A16
+  tiles at 4,096; for example which activations the decode GEMM took), not the weights. Not
+  investigated.
+- **Regression checks.** The defaults at 4,096 rows reproduced section 6d's arm A (`073b553` with
+  the chunked KDA prefill and W8A16) row for row: every one of the 23,625 rows' KL and top-1
+  equal, and the engine's output files byte-identical. At 8 rows they reproduced section 6b's D8
+  arm (`af0c565`) byte for byte: the positions and logits of all 25 windows. Nothing merged since
+  changed the defaults' output.
+- **v1.1.0.** The release's `glm53f-score` (built from `5a2eef7`), with the release's ranks, scored
+  the 125-window plan at 4,096 rows per pass byte for byte as the candidate's defaults: 125 of 125
+  window files identical (30 September). So the defaults' 4,096-row figures above are v1.1.0's; its
+  8-row run was not repeated.
 
 **On the development GPU** (not the gate): SIZING.md §10's development-model proxy, 7 windows ×
 189 rows, KL against the same engine without the option; these runs predate today's defaults (the

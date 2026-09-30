@@ -243,9 +243,12 @@ not a measurement: the 5090's 1.8 TB/s would bring the single-request block near
 
 `GpuDrafter::new_fp8` (its own stream; the head uploaded, quantized, freed) and
 `GpuDrafter::fp8_with_head_on` (the target forward's stream; the forward's head read once);
-`glm53f-serve --drafter-fp8`. Off by default until its acceptance is measured on the target
-hardware. The idea comes from two public four-Spark recipes (`NOTICE.md`): block-FP8 drafter
-weights with an FP8 draft head, reported with acceptance unchanged, and NVFP4 drafter weights.
+`glm53f-serve --drafter-fp8`. `glm53f-serve` loads it by default since v1.1.0 (30 September
+2026), after A/B runs on the target hardware with the v1.1 candidate: 76.2% of the drafts kept
+against the BF16 drafter's 75.9% (3.72 tokens a window against 3.75), one stream 2.3-4.2% faster,
+every reply byte-identical (`docs/PERFORMANCE.md` §0); `--drafter-bf16` loads the BF16 drafter.
+The idea comes from two public four-Spark recipes (`NOTICE.md`): block-FP8 drafter weights with
+an FP8 draft head, reported with acceptance unchanged, and NVFP4 drafter weights.
 
 - **What changes.** The GEMM weights (`fc`, and per layer the fused QKV, `o_proj`, the fused
   gate/up, `down` and the two convolutions' kernel projections) are quantized at load to FP8 E4M3
@@ -262,7 +265,9 @@ weights with an FP8 draft head, reported with acceptance unchanged, and NVFP4 dr
   `glm53f-forward`'s `tests/draft_lossless.rs` and `tests/copy_windows.rs` pass with
   `GLM53F_TEST_NUMERICS=drafter-fp8`.
 - **Memory.** 1.76 GiB (1.17 GiB of weights and scales, the head's copy 0.59 GiB) against the BF16
-  drafter's 2.18 GiB, which reads the target's head in place: 0.42 GiB less.
+  drafter's 2.18 GiB, which reads the target's head in place: 0.42 GiB less. Net of its larger
+  working memory, the target's KV pool at 16 slots measured 9.10 GiB against 8.73 (1,584,000
+  tokens against 1,519,424; v1.1.0's is the former).
 - **Tests** (`tests/gpu_fp8.rs`):
   - the GEMM, up to 8 rows, bit for bit `glm53f-layers`' CPU model in its split order; over 8 rows
     within 2^-10 of the magnitude of exact block products (worst measured 4.3e-4);

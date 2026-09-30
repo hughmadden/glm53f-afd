@@ -17,6 +17,10 @@ and workspace figures are estimates, labelled as such.
 > fits). The measured pools and largest requests are in PERFORMANCE.md §0, and the coordinator's
 > start-up log prints its own plan.
 
+> **Note (30 September 2026, v1.1.0).** The FP8 drafter and the L2 prefetch are on by default too
+> (§11): at 16 slots v1.1.0's measured pool is 9.10 GiB (1.58 M tokens). D2 with power-of-two
+> scales passed the KL gate and stays opt-in; as MXFP8 it failed (§10; KL-GATE.md §6e).
+
 Target: **GLM-5.3-Flash** (`zai-org/GLM-5.3-Flash`, architecture
 `glm5_next`) on **one RTX 5090 (32 GB)** coordinator and **four DGX Spark (GB10,
 128 GB unified memory)** expert ranks.
@@ -91,7 +95,7 @@ Byte counts are from the official checkpoint headers.
 | LM head | BF16, 1.27 GB | 1.27 GB |
 | Embedding | BF16, 1.27 GB | 1.27 GB, or 0 if kept in host RAM (row gather) |
 | **Total** | | **14.18 GiB** (13.00 GiB with the embedding in host RAM; 8.64 GiB with FP8 KDA as well) |
-| DFlash2 drafter | BF16, 2.34 GB | 2.18 GiB (shares the target's embedding and LM head); with `--drafter-fp8` 1.76 GiB, its own FP8 LM head included (§11) |
+| DFlash2 drafter | BF16, 2.34 GB | 2.18 GiB (shares the target's embedding and LM head); with `--drafter-fp8`, the default since v1.1.0, 1.76 GiB, its own FP8 LM head included (§11) |
 | MTP layer (optional second drafter) | 0.24 GB here | its experts sit on the Sparks |
 | Vision tower (optional) | BF16, 1.13 GB | paged in per image request |
 
@@ -263,6 +267,14 @@ a slot and W8A16's scratch 64 MiB.*
   - In one pass the E4M3 activations dominate: q|k|v|b 1.3e-2 (2.2e-3, 1.9e-2), head logits
     2.5e-2 (2.4e-2, 2.7e-2), argmax 8/9 (9/9, 7/9).
   - Powers of two per 128 × 128: the same per layer; head logits 1.02e-2 and 2.6e-2 in the chain.
+- **On the target hardware** (30 September 2026, the v1.1 candidate `f812603` against its
+  defaults, which kept the BF16 drafter; [KL-GATE.md](KL-GATE.md) §6e,
+  [PERFORMANCE.md](PERFORMANCE.md) §0): the powers of two passed the KL gate at 4,096 and 8 rows
+  per pass; MXFP8 failed at both. With `--kda-fp8-pow2` the weights took 8.74 GiB against 13.00
+  and the KV pool 12.98 GiB against 8.73 (2,258,944 tokens against 1,519,424, +49%); one stream
+  decoded 6–15% faster, 4 and 16 streams moved −0.7% to +2.8%, and prefill ran 1.0 / 3.4 / 4.6%
+  slower at 4K / 19K / 79K tokens. It stays off by default: v1.1.0 keeps the checkpoint's BF16 KDA
+  projections.
 
 **D8, BF16 KDA states** (`--kda-state-bf16`, `GLM53F_KDA_STATE_BF16=1`).
 - The state is stored in BF16 and every kernel computes in f32. The chain and the replay round
@@ -319,10 +331,11 @@ decides.
 
 ## 11. The FP8 drafter and the L2 prefetch (29 September 2026)
 
-Two speed options that change no committed token, each **off by default** and a flag of
-`glm53f-serve` with an environment fallback ([RUNNING.md](RUNNING.md), "The FP8 drafter and the
-L2 prefetch"). Neither needs the KL gate; both wait for speed (and the drafter for acceptance)
-measured on the target hardware. Development-GPU figures are an RTX 4090 shared with other work.
+Two speed options that change no committed token, each a flag of `glm53f-serve` with an
+environment fallback ([RUNNING.md](RUNNING.md), "The FP8 drafter and the L2 prefetch"). Neither
+needs the KL gate. Both are **on by default since v1.1.0** (30 September 2026), after their speed
+(and the drafter's acceptance) was measured on the target hardware (the end of this section).
+Development-GPU figures are an RTX 4090 shared with other work.
 
 **The FP8 drafter** (`--drafter-fp8`, `GLM53F_DRAFTER_FP8=1`; `crates/glm53f-dflash/README.md`,
 "The FP8 drafter").
@@ -365,3 +378,18 @@ measured on the target hardware. Development-GPU figures are an RTX 4090 shared 
   verify −4.5%. At 54 MiB (`auto` here): −8.1% and −5.2%; four requests in two lanes, which never
   prefetch, unchanged. The gain depends on how long the real exchange leaves the GPU idle, which
   only the target hardware shows.
+
+**On the target hardware** (30 September 2026; [PERFORMANCE.md](PERFORMANCE.md) §0). The A/B
+runs, on the v1.1 candidate `f812603` (v1.1.0 before these two defaults and its 510-row sparse MLA
+blocks), each arm its own boot:
+- The FP8 drafter: one stream (thinking off) 2.3–4.2% faster; 76.2% of the drafts kept against
+  75.9%, 3.72 tokens a window against 3.75; the KV pool at 16 slots 9.10 GiB (1,584,000 tokens)
+  against 8.73 GiB (1,519,424), the 0.37 GiB computed above.
+- The L2 prefetch at `auto` (72 MiB of the 96 MiB L2 the RTX 5090 reports): one stream 2.7–5.5%
+  faster.
+- Both: one stream 5.0–10.0% faster (code 126.5 → 133.4 tok/s, prose 71.0 → 78.1, counting
+  184.7 → 193.9); 4 and 16 streams −1.6% to +3.6%. In every arm the replies were byte-identical
+  to those without the options.
+
+v1.1.0, with both on by default: one stream 133.2 / 78.8 / 195.1 tok/s, 5.5–11.0% faster than
+v1.0.0 with byte-identical replies, and the pool at 16 slots 9.10 GiB (1,584,000 tokens).

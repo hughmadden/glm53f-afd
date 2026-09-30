@@ -21,7 +21,7 @@
 //! | `remote` | `RemoteExperts`: the routed experts on the four expert ranks over the shell's wire client (feature `coordinator`) |
 //! | `forward` | [`forward::GlmForward`]: the layer loop in one lane or up to four (a prefill's lanes overlap one lane's attention with the others' routed experts; decode and verify in two), the head, prefill / decode / verify / commit, taps, stage timing and the lane trace; `ForwardBuffers`, every buffer a pass uses, allocated up front |
 //! | `opprof` | The op profile of prefill passes (`GLM53F_PROFILE_OPS=1`): each operation's GPU time in each lane's attention and shared expert, per layer, and the `OPS` table |
-//! | `prefetch` | The L2 prefetch of the next layer's weights while a decode or verify pass waits for a MoE layer's routed experts (`ForwardConfig::l2_prefetch`, off by default) |
+//! | `prefetch` | The L2 prefetch of the next layer's weights while a decode or verify pass waits for a MoE layer's routed experts (`ForwardConfig::l2_prefetch`: 0, off, in this crate's default; `glm53f-serve` turns it on by default, `--l2-prefetch auto`) |
 //! | `draft` | The DFlash2 drafter in the forward (`glm53f-dflash`): its taps (the mean of the four streams after layers 5, 14, 24, 33 and 42), the committed rows appended to each slot's ring, the drafts |
 //! | `serve` | The serving shell's `KvSlot` and `ModelForward` (feature `coordinator`) |
 //! | `device`, `cuda`, `cublas`, `ffi` | Device memory, streams and events; the runtime, cuBLAS and kernel bindings |
@@ -76,9 +76,11 @@
 //! `kda_prefill_w8a8` keeping the FP8 KDA projections at E4M3). The model-path tests run with any
 //! of them on through `GLM53F_TEST_NUMERICS`.
 //!
-//! **Speed options that change no committed token**, each off by default: the L2 prefetch of
-//! decode and verify passes (`forward::ForwardConfig::l2_prefetch`, `prefetch`; bit for bit the
-//! same) and the FP8 drafter (`draft::Dflash::load_with`; other drafts, the same verified tokens).
+//! **Speed options that change no committed token**, each off in this crate's defaults and on in
+//! `glm53f-serve`'s since v1.1.0 (30 September 2026), after the target hardware (v1.1.0 decodes
+//! one stream 5.5-11.0% faster than v1.0.0 with both): the L2 prefetch of decode and verify passes
+//! (`forward::ForwardConfig::l2_prefetch`, `prefetch`; bit for bit the same) and the FP8 drafter
+//! (`draft::Dflash::load_with` with `fp8`; other drafts, the same verified tokens).
 //! `GLM53F_TEST_NUMERICS` takes them too (`l2-prefetch`, `drafter-fp8`).
 //!
 //! # The KV

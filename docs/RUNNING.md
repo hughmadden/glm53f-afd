@@ -16,10 +16,10 @@ weights, connects the same ranks and writes teacher-forced logits instead of ser
 The expert exchange runs over RoCE v2 RDMA, on a port of at least 100 Gb/s; both sides refuse
 other networks. The API can use any network.
 
-**Status (29 September 2026).** The whole engine runs on its target hardware: the coordinator on
-an RTX 5090 and four ranks on DGX Sparks, over RDMA at 200 Gb/s ([PERFORMANCE.md](PERFORMANCE.md)
-§0). The development setup below (one GPU, four rank daemons over TCP loopback) still runs every
-model-path test.
+**Status (30 September 2026: v1.1.0).** The whole engine runs on its target hardware: the
+coordinator on an RTX 5090 and four ranks on DGX Sparks, over RDMA at 200 Gb/s
+([PERFORMANCE.md](PERFORMANCE.md) §0). The development setup below (one GPU, four rank daemons over
+TCP loopback) still runs every model-path test.
 
 ## Build
 
@@ -133,9 +133,9 @@ The workspace manifest's `rust-version` is that Rust; no `rust-toolchain` file p
    ```
 
    `--drafter` is optional, but the published decode figures use it. On one stream decode runs at
-   about 53 tok/s without it (52.7) and about 126 with it (125.6, code prompt, thinking off; prose
-   68.8, counting 180.3; 122.6 / 68.2 / 179.5 with the current defaults):
-   [PERFORMANCE.md](PERFORMANCE.md) §0, "Decode, one stream".
+   about 53 tok/s without it (52.7) and about 133 with it on v1.1.0 (133.2, code prompt, thinking
+   off; prose 78.8, counting 195.1; v1.0.0 126.3 / 71.0 / 184.9): [PERFORMANCE.md](PERFORMANCE.md)
+   §0, "v1.1.0" and "Decode, one stream".
 
    Without `GLM53F_RDMA=1` the exchange runs over TCP on the same fabric addresses (with or
    without CRCs, as long as the ranks agree). It loads the weights (and with `--drafter` the
@@ -241,8 +241,8 @@ names the options on.
 | Chunked KDA prefill | on | `--kda-chain-prefill`, `GLM53F_KDA_CHUNKED_PREFILL=0` | passed with W8A16 (§6d); failed without it (§6b) |
 | W8A16 prefill projections | on | `--prefill-w8a8`, `GLM53F_PREFILL_W8A16=0` | passed with the chunked prefill (§6d) |
 | FP8 KDA projections (D2) | off | (on with `--kda-fp8`) | failed (§6b) |
-| D2 with power-of-two block scales | off | (on with `--kda-fp8-pow2`, `GLM53F_KDA_FP8_POW2=1`) | not yet gated (§6e) |
-| D2 as MXFP8 (an E8M0 scale per row and 32 values of K) | off | (on with `--kda-mxfp8`, `GLM53F_KDA_MXFP8=1`) | not yet gated (§6e) |
+| D2 with power-of-two block scales | off | (on with `--kda-fp8-pow2`, `GLM53F_KDA_FP8_POW2=1`) | passed (§6e); stays opt-in, the checkpoint's BF16 KDA projections kept by choice |
+| D2 as MXFP8 (an E8M0 scale per row and 32 values of K) | off | (on with `--kda-mxfp8`, `GLM53F_KDA_MXFP8=1`) | failed (§6e) |
 | D2's KDA projections at W8A8 in prefill | off | (on with `--kda-prefill-w8a8`, with D2) | not gated alone; D2 failed (§6b) |
 
 - The chunked KDA prefill and W8A16 passed as a pair, so turn them off together:
@@ -288,7 +288,11 @@ names the options on.
   before the next. A stream keeps
   about S of its rate while a long prompt prefills, and the prompt takes about 1 / (1 - S) times
   as long; `--decode-share 0` gives one step a round. It changes timing only: the prompt's passes
-  are cut where they were. `crates/glm53f-serve/src/lib.rs` gives the numbers behind the default.
+  are cut where they were. On v1.1.0 a stream kept 15.1 tok/s while a 64,596-token prompt
+  prefilled (1.0 on v1.0.0's scheduler); on the v1.1 candidate, 14.3 against 1.3 with a share of
+  0, and the prompt's first token came 23% later (15.08 s against 12.22 s;
+  [PERFORMANCE.md](PERFORMANCE.md) §0). `crates/glm53f-serve/src/lib.rs` gives the numbers behind
+  the default.
 - **Slots.** `--slots` (16 by default) sizes each slot's fixed state (about 113 MiB with the
   drafter and the default BF16 KDA states; 181 MiB with `--kda-state-f32`)
   and, with the drafter, the verify pass: every slot's window of 8 rows, capped by the step's row
@@ -392,27 +396,35 @@ v1.3.0 ported it). Greedy output is unchanged; sampled requests never copy.
 
 ### The FP8 drafter and the L2 prefetch
 
-Two options that change no committed token, both off until measured on the target hardware:
+Two options that change no committed token, both on by default in v1.1.0 (30 September 2026),
+after A/B runs on the target hardware with the v1.1 candidate `f812603` (v1.1.0 before these
+defaults and its 510-row sparse MLA blocks): one stream decoded 5.0–10.0% faster with both (code
+126.5 → 133.4 tok/s, prose 71.0 → 78.1, counting 184.7 → 193.9), 4 and 16 streams moved −1.6% to
++3.6%, and every reply was byte-identical. v1.1.0 decodes one stream 5.5–11.0% faster than v1.0.0
+(133.2 / 78.8 / 195.1 tok/s), with byte-identical replies ([PERFORMANCE.md](PERFORMANCE.md) §0).
 
-- **`--drafter-fp8`** (`GLM53F_DRAFTER_FP8=1`, with `--drafter`): the DFlash2 drafter's GEMM
-  weights in FP8 E4M3 with 128 x 128 block scales, quantized at load, and its own FP8 copy of the
-  LM head for drafting; the target's LM head is unchanged (`crates/glm53f-dflash/README.md`, "The
-  FP8 drafter"). It moves only which tokens are drafted: the verify pass keeps a draft only where
-  it equals the target's pick. The drafter takes 0.42 GiB less device memory, 0.37 GiB net of
-  its larger working memory at 16 slots, which the KV pool gets ([SIZING.md](SIZING.md) §11). The
-  start-up log names it; the `[drafter]` lines (drafts kept, tokens a window) measure its
-  acceptance.
-- **`--l2-prefetch off|auto|<MiB>`** (`GLM53F_L2_PREFETCH`): in decode and verify passes of one
-  lane (one request, or more rows than the decode lanes take), once a MoE layer's routed experts
-  are out and its shared expert is queued, the forward's stream reads the first bytes of the next
-  layer's weights through L2, in the order that layer reads them
+- **`--drafter-fp8`**, the default with `--drafter` (`--drafter-bf16` or `GLM53F_DRAFTER_FP8=0`
+  loads the checkpoint's BF16 drafter): the DFlash2 drafter's GEMM weights in FP8 E4M3 with
+  128 x 128 block scales, quantized at load, and its own FP8 copy of the LM head for drafting; the
+  target's LM head is unchanged (`crates/glm53f-dflash/README.md`, "The FP8 drafter"). It moves
+  only which tokens are drafted: the verify pass keeps a draft only where it equals the target's
+  pick. The drafter takes 0.42 GiB less device memory, 0.37 GiB net of its larger working memory
+  at 16 slots, which the KV pool gets ([SIZING.md](SIZING.md) §11). The start-up log names it;
+  the `[drafter]` lines (drafts kept, tokens a window) measure its acceptance. Alone, on the
+  candidate: one stream 2.3–4.2% faster, 76.2% of the drafts kept against the BF16 drafter's
+  75.9% (3.72 tokens a window against 3.75), and the pool 1,584,000 tokens against 1,519,424
+  (v1.1.0's pool is the same 1,584,000).
+- **`--l2-prefetch off|auto|<MiB>`** (`GLM53F_L2_PREFETCH`; `auto` by default): in decode and
+  verify passes of one lane (one request, or more rows than the decode lanes take), once a MoE
+  layer's routed experts are out and its shared expert is queued, the forward's stream reads the
+  first bytes of the next layer's weights through L2, in the order that layer reads them
   (`crates/glm53f-forward/src/prefetch.rs`). Every result is bit for bit the same, and the
   prefetch (77 us at 48 MiB on an RTX 4090) ends long before the exchange it overlaps. Passes
   of two lanes, where the other lane's attention fills the exchange, never prefetch. `auto` is
   three quarters of the GPU's L2 (72 MiB on the RTX 5090); the start-up log's `decode and verify
   passes` line states it. What it gains depends on how long the real exchange leaves the GPU
-  idle, which one GPU can only emulate: compare single-stream tok/s and the `STEP` lines
-  (`GLM53F_PROFILE=1`) with it off and on, on the target hardware.
+  idle, which one GPU can only emulate; on the candidate `auto` alone decoded one stream 2.7–5.5%
+  faster (4 and 16 streams +0.2% to +2.3%). `--l2-prefetch off` turns it off.
 
 On one GPU:
 
@@ -561,15 +573,15 @@ GLM53F_CHECKPOINT_DIR=... GLM53F_EXPERTS_DIR=... [GLM53F_KL_TEACHER=<teacher-dir
 | `GLM53F_MAX_SLOTS` | `--slots` | Requests with device state at once (default 16) |
 | `GLM53F_DFLASH_DIR` | `--drafter` | The DFlash2 drafter: speculative decoding, up to 7 drafts a step (needs decoder layers 0-43) |
 | `GLM53F_COPY_WINDOWS` | `--copy-windows` | With `--drafter`: copy windows for greedy requests, `on` (default) or `off` (`0` in the environment too) ([Copy windows](#copy-windows)) |
-| `GLM53F_DRAFTER_FP8=1` | `--drafter-fp8` | With `--drafter`: the FP8 drafter, off by default ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
-| `GLM53F_L2_PREFETCH` | `--l2-prefetch` | Decode and verify passes of one lane prefetch the next layer's weights into L2 while a MoE layer's experts are out: `off` (default), `auto` (three quarters of the L2) or MiB ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
+| `GLM53F_DRAFTER_FP8` | `--drafter-fp8` / `--drafter-bf16` | With `--drafter`: the FP8 drafter, **on by default** (after the target hardware); `0` or `--drafter-bf16` for the checkpoint's BF16 drafter ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
+| `GLM53F_L2_PREFETCH` | `--l2-prefetch` | Decode and verify passes of one lane prefetch the next layer's weights into L2 while a MoE layer's experts are out: `off`, `auto` (three quarters of the L2; **the default**, after the target hardware) or MiB ([The FP8 drafter and the L2 prefetch](#the-fp8-drafter-and-the-l2-prefetch)) |
 | `GLM53F_PREFILL_ROWS` | `--prefill-rows` | Rows of one prefill pass, every lane's together (default 8,192) |
 | `GLM53F_PREFILL_LANES` | `--prefill-lanes` | Lanes of a prefill pass, 1 to 4 (default 4); at most 4,096 rows per lane |
 | `GLM53F_DECODE_LANES` | `--decode-lanes` | Decode and verify passes of MIN to MAX rows in two lanes of whole requests: `off`, `MIN` or `MIN-MAX` (default `2-16`) (needs `--prefill-lanes` 2 or more) |
 | `GLM53F_DECODE_SHARE` | `--decode-share` | While prompts prefill, the share of the time the running requests keep, 0 to below 1 (default 0.2; 0: one step a prefill round) ([Decode during a long prefill](#prefill-lanes-and-device-memory)) |
 | `GLM53F_KDA_FP8=1` | `--kda-fp8` | Numerics under test, off by default (D2): the KDA projections quantized to FP8 block-128 at load ([SIZING.md](SIZING.md) §10) |
-| `GLM53F_KDA_FP8_POW2=1` | `--kda-fp8-pow2` | Numerics under test, off by default: D2 with power-of-two block scales (the same layout, kernels and bytes; 82-89% of the q, k, v and o weights kept exactly, [SIZING.md](SIZING.md) §10, [KL-GATE.md](KL-GATE.md) §6e) |
-| `GLM53F_KDA_MXFP8=1` | `--kda-mxfp8` | Numerics under test, off by default: D2 as MXFP8, an E8M0 scale per row and 32 values of K (the MXFP8 GEMMs; 4.13 GiB less rather than 4.26; the same error as `--kda-fp8-pow2` on these weights). Of the three KDA flags the last given sets the scales; in the environment `GLM53F_KDA_MXFP8` wins |
+| `GLM53F_KDA_FP8_POW2=1` | `--kda-fp8-pow2` | Numerics, off by default: D2 with power-of-two block scales (the same layout, kernels and bytes; 82-89% of the q, k, v and o weights kept exactly, [SIZING.md](SIZING.md) §10). It passed the KL gate and stays opt-in ([KL-GATE.md](KL-GATE.md) §6e) |
+| `GLM53F_KDA_MXFP8=1` | `--kda-mxfp8` | Numerics, off by default (failed the KL gate, [KL-GATE.md](KL-GATE.md) §6e): D2 as MXFP8, an E8M0 scale per row and 32 values of K (the MXFP8 GEMMs; 4.13 GiB less rather than 4.26; the same error as `--kda-fp8-pow2` on these weights). Of the three KDA flags the last given sets the scales; in the environment `GLM53F_KDA_MXFP8` wins |
 | `GLM53F_KDA_STATE_BF16` | `--kda-state-bf16` / `--kda-state-f32` | D8, **on by default** (passed the KL gate, docs/KL-GATE.md §6b): the KDA recurrent states stored in BF16, computed in f32; `0` or `--kda-state-f32` for F32 |
 | `GLM53F_PREFILL_W8A16` | `--prefill-w8a16` / `--prefill-w8a8` | **On by default** with the chunked KDA prefill (the pair passed the KL gate, docs/KL-GATE.md §6d): FP8 projections over 8 rows with BF16 activations (W8A16); `0` or `--prefill-w8a8` for E4M3 activations (W8A8) |
 | `GLM53F_KDA_PREFILL_W8A8=1` | `--kda-prefill-w8a8` | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows |

@@ -26,11 +26,13 @@
 //! - **Drafts.** A batch of requests, each at its committed length with its last verified token
 //!   as the anchor (the anchor's embedding row comes from the host table); the drafter reads the
 //!   forward's LM head in place.
-//! - **The FP8 drafter** ([`Dflash::load_with`] with `fp8`, `glm53f-serve --drafter-fp8`, off by
-//!   default). The drafter's GEMM weights in FP8 E4M3 with 128 x 128 block scales (quantized at
-//!   load) and its own FP8 copy of the LM head for drafting, quantized from the forward's once;
-//!   the forward's head is untouched (`glm53f-dflash`'s `gpu` module, "The FP8 drafter"). It
-//!   changes which drafts are proposed, never a committed token: the verify pass decides.
+//! - **The FP8 drafter** ([`Dflash::load_with`] with `fp8`; [`Dflash::load`] keeps the BF16
+//!   drafter). `glm53f-serve` loads it by default since v1.1.0 (30 September 2026), after the
+//!   target hardware (`--drafter-bf16` for BF16). The drafter's GEMM weights in FP8 E4M3 with
+//!   128 x 128 block scales (quantized at load) and its own FP8 copy of the LM head for drafting,
+//!   quantized from the forward's once; the forward's head is untouched (`glm53f-dflash`'s `gpu`
+//!   module, "The FP8 drafter"). It changes which drafts are proposed, never a committed token:
+//!   the verify pass decides.
 //!
 //! The rings live in the KV pool (`KvLayout::new(shape, Some(drafter config))`), one per slot,
 //! and follow the slot's rewinds, forks and restores (`crate::kv`). The forward must run decoder

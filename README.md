@@ -9,8 +9,8 @@ The RTX 5090, the *coordinator*, runs attention (Kimi delta attention and DeepSe
 attention), the KV cache, drafting, sampling and the API. The four Sparks, the *ranks*, run the
 routed experts. This split is attention–FFN disaggregation (AFD).
 
-**Status (29 September 2026).** The engine serves the whole model on its target hardware, and the
-figures below were measured there. It is young: most figures are single runs on one set of
+**Status (30 September 2026: v1.1.0).** The engine serves the whole model on its target hardware,
+and the figures below were measured there. It is young: most figures are single runs on one set of
 machines, and some parts are opt-in or not built yet
 ([Status and limitations](#status-and-limitations)).
 
@@ -44,50 +44,59 @@ Gen5 x8 slot. The prefill figures come from boots where both ports carried the r
 each 42–58% of it. A single 200 Gb/s port also works; prefill with one port is untested.
 [docs/RUNNING.md](docs/RUNNING.md#bonded-coordinator-nic) says how to check the balance.
 
-## Measured (28–29 September 2026)
+## Measured (28–30 September 2026)
 
 **Setup:**
 - One RTX 5090 and four DGX Sparks over RoCE v2 at 200 Gb/s.
-- EXL3 K4 experts, an FP8 MLA cache, the DFlash2 drafter, and the defaults of 29 September.
+- EXL3 K4 experts, an FP8 MLA cache, the DFlash2 drafter, and each build's defaults.
+- The figures marked v1.1.0 are the release's, measured on 30 September: one stream, concurrency
+  up to 16 streams, prefill and the KV pool. The others come from v1.0.0 (`4ad6477`) or earlier
+  builds (28–29 September) and say which.
 - Single runs; between runs ±2–3% is typical.
 
 Every table, method and earlier figure is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) §0.
 
-**Decode, one stream** (tok/s, greedy; 1,024-token code and counting answers, a 903-token prose
-answer):
+**Decode, one stream** (tok/s, greedy; the same code, prose and counting prompts in every row; on
+v1.0.0 and v1.1.0 the answers are 1,024, 804 and 968 tokens long):
 
 | Case | Code | Prose | Counting |
 |---|---:|---:|---:|
 | No drafter (28 Sep) | 52.7 | 52.7 | 52.7 |
-| DFlash2, thinking off (the template's Low effort; 29 Sep) | 125.6 | 68.8 | 180.3 |
+| **DFlash2, thinking off (the template's Low effort), v1.1.0** | **133.2** | **78.8** | **195.1** |
+| The same, v1.0.0 (29 Sep) | 126.3 | 71.0 | 184.9 |
 | DFlash2, no reasoning (an empty think block, no longer served; 29 Sep) | 115.0 | 63.7 | 133.1 |
 | DFlash2, thinking on (the model's default; 28 Sep) | 82.7 | 73.3 | 169.1 |
 
-The decode figures predate the chunked KDA prefill and W8A16 as defaults; with them, decode moved
-by −2% to +5% (122.6 / 68.2 / 179.5 in the thinking-off row).
+v1.1.0's FP8 drafter and L2 prefetch decode one stream 5.5% / 11.0% / 5.5% faster than v1.0.0, and
+the replies are byte-identical. The other rows predate v1.0.0's prefill defaults.
 
 **Concurrency** (aggregate tok/s; 512-token streams, each with its own prompt, code, prose and
-structured in turn): 159.5 / 288.5 at 4 / 16 streams with 16 slots; 412.5 / 525.8 at 32 / 48 streams
-with 48 slots. Code prompts alone reach 383.5 / 576.8 / 738.9 at 16 / 32 / 48 streams.
+structured in turn): v1.1.0 133.9 / 169.4 / 294.5 at 1 / 4 / 16 streams with 16 slots; code prompts
+alone 133.5 / 205.1 / 389.6. With 48 slots, measured before v1.0.0 (29 Sep, `073b553`, before the
+chunked KDA prefill and W8A16 were defaults) and not since: 412.5 / 525.8 at 32 / 48 streams, code
+alone 576.8 / 738.9.
 
 **Prefill** (one prompt at a time, the defaults: four lanes of 2,048 rows, the chunked KDA prefill
-and W8A16 projections): 4,979–4,998 / 5,128–5,180 / 5,132–5,188 tok/s at 4K / 19K / 79K tokens,
-21–28% above the 4,099–4,129 / 4,103–4,104 / 4,051–4,053 of the same build without the pair. A
-207K-token prompt took 53.7 s without it.
+and W8A16 projections): v1.1.0 4,996 / 5,376 / 5,523 tok/s at 4K / 19K / 79K tokens (v1.0.0
+4,990 / 5,221 / 5,257). The chunked KDA prefill with W8A16 made prefill 21–28% faster (29 Sep:
+4,099–4,129 / 4,103–4,104 / 4,051–4,053 without the pair). A 207K-token prompt took 53.7 s without
+it, and a 1,018,272-token prompt 259.1 s with it (v1.0.0).
 
 **Prompt cache:** a repeated 207,436-token prompt returns its first token in 0.01 s (53.67 s cold).
 After 30 other long prompts pushed its snapshot out of the GPU, it returns it in 0.04 s, restored
-from host RAM in 21–23 ms. Snapshots go to RAM only when an incoming request needs their room.
+from host RAM in 21–23 ms (29 Sep). On v1.0.0 a repeated 1,018,272-token prompt returned in
+0.066 s, and the same session came back from RAM in 145.9 ms. Snapshots go to RAM only when an
+incoming request needs their room.
 
 **Copy windows** (on by default for greedy requests with the drafter): rewriting a file decodes
 30–31% faster. Fresh code and prose are unchanged, and replies are byte-identical either way.
 
-**Context:** 16 slots admit a 1,048,576-token request (a pool of 1.52M tokens with the defaults). At
-48 slots the chunked KDA prefill's workspace (34 MiB a slot) leaves room for about 570K tokens
-(computed, not measured); without it 48 slots admitted up to 850,816.
+**Context:** 16 slots admit a 1,048,576-token request (v1.1.0's pool: 1.58M tokens). At 48 slots
+the chunked KDA prefill's workspace (34 MiB a slot) leaves room for about 570K tokens (computed for
+v1.0.0's defaults, not measured); without it 48 slots admitted up to 850,816.
 
-**Start-up:** the coordinator is ready 7 s after launch and a rank in 44–49 s (weights in the page
-cache).
+**Start-up:** the coordinator is ready 7 s after launch and a rank in 44–49 s (28 Sep, weights in
+the page cache). v1.1.0's ranks, reading their images from NVMe, were ready in 38.8–40.5 s.
 
 ### Against the public four-Spark recipes
 
@@ -98,13 +107,13 @@ alone. Their figures are as they report them; they were not re-run here.
 
 | | [tonyd2wild](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark) | [mmastrac](https://github.com/mmastrac/glm-5.3-flash-4x-gx10) (branch `perf-2026-09-27`) | This engine |
 |---|---|---|---|
-| Single stream (tok/s) | ~55 | 167.2 / 118.7 / 64.4 (structured / code / prose); RigMark 107.9 / 61.7 / 157.1 (code / prose / structured) | 186.1 / 142.3 / 78.3 in the same mode; RigMark 123.9 / 65.8 / 174.9 |
-| Aggregate (tok/s) | 530 at 48 streams | 253 at 16 streams | 288.5 at 16; 525.8 at 48 (48 slots); a prompt per stream (see below) |
-| Prefill (tok/s) | 3.5–4.1K short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | 5.0–5.2K at 4K–79K |
-| Context | 1M | 512K | 1M (16 slots); about 570K at 48 slots (851K without the default prefill pair) |
+| Single stream (tok/s) | ~55 | 167.2 / 118.7 / 64.4 (structured / code / prose); RigMark 107.9 / 61.7 / 157.1 (code / prose / structured) | 186.1 / 142.3 / 78.3 in the same mode; RigMark 123.9 / 65.8 / 174.9 (both before v1.0.0, not re-run; on its own prompts v1.1.0 decodes 5.5–11.0% faster than v1.0.0) |
+| Aggregate (tok/s) | 530 at 48 streams | 253 at 16 streams | v1.1.0 294.5 at 16; 525.8 at 48 (48 slots, before v1.0.0); a prompt per stream (see below) |
+| Prefill (tok/s) | 3.5–4.1K short; 1.9K at 114K | 4,956 / 4,808 at 32K / 128K, cold | v1.1.0 5.0–5.5K at 4K–79K |
+| Context | 1M | 512K | 1M (16 slots); about 570K at 48 slots (computed for v1.0.0's defaults; 851K without the default prefill pair) |
 
-- **The aggregate row gives each stream its own prompt**, as the other recipes' figures do (code, prose and structured prompts in turn; theirs are other prompts, so the row is close to like for like, not exact). These mixed aggregates are 5% / 10% / 15% / 13% below the same build's with one prompt topic on every stream, at 4 / 16 / 32 / 48 streams: streams that route alike read fewer expert weights. mmastrac's recipe reports 317 / 451 tok/s for code at 16 / 32 streams with a prompt per stream; code here gives 383.5 / 576.8.
-- **RigMark** ([alexellis/rigmark](https://github.com/alexellis/rigmark) `c5a0db0`) with the comparison id and seed mmastrac's gate uses (`ringside-redhat-rowsplit-20260926`, 20260905) sends both engines byte-identical prompts: reasoning effort Low, 4,096 tokens. This engine passed all 15 basic output gates and ran 15% / 7% / 11% faster than the figures that recipe reports (its `experimental/README.md` at `f88710f`).
+- **The aggregate row gives each stream its own prompt**, as the other recipes' figures do (code, prose and structured prompts in turn; theirs are other prompts, so the row is close to like for like, not exact). On one build before v1.0.0 (`073b553`) the mixed aggregates were 5% / 10% / 15% / 13% below its own with one prompt topic on every stream, at 4 / 16 / 32 / 48 streams: streams that route alike read fewer expert weights. mmastrac's recipe reports 317 / 451 tok/s for code at 16 / 32 streams with a prompt per stream; code here gives 389.6 at 16 (v1.1.0) and 576.8 at 32 (48 slots, `073b553`).
+- **RigMark** ([alexellis/rigmark](https://github.com/alexellis/rigmark) `c5a0db0`) with the comparison id and seed mmastrac's gate uses (`ringside-redhat-rowsplit-20260926`, 20260905) sends both engines byte-identical prompts: reasoning effort Low, 4,096 tokens. This engine (`073b553`, 29 Sep; not re-run since) passed all 15 basic output gates and ran 15% / 7% / 11% faster than the figures that recipe reports (its `experimental/README.md` at `f88710f`).
 - **The single-stream row is like for like.** This engine ran mmastrac's own `dev/repro/decode.py`
   prompts and method: 512 tokens, temperature 0, the median of three runs after a warm-up, tok/s
   including the time to the first token.
@@ -112,9 +121,10 @@ alone. Their figures are as they report them; they were not re-run here.
     since 29 September (`reasoning_effort: "low"` renders the same).
   - Its figures are the ones reported in its commit
     [`3e03894`](https://github.com/mmastrac/glm-5.3-flash-4x-gx10/commit/3e03894ef0) on that
-    branch. Against them this engine is 11% / 20% / 22% faster. The branch has moved on since:
-    at [`74faf89`](https://github.com/mmastrac/glm-5.3-flash-4x-gx10/tree/74faf894dd24) it
-    reports 170.3 / 120.8 / 65.8.
+    branch. Against them this engine was 11% / 20% / 22% faster (before v1.0.0; not re-run since).
+    The branch has moved on since: at
+    [`74faf89`](https://github.com/mmastrac/glm-5.3-flash-4x-gx10/tree/74faf894dd24) it reports
+    170.3 / 120.8 / 65.8.
 - **Activations.** mmastrac's prefill takes 4-bit activations in its experts. This engine's experts
   keep BF16 activations.
 
@@ -131,7 +141,14 @@ with 189 rows scored per window. A run passes when its mean KL plus 1.96 standar
 |---|---:|---:|---|
 | Decode kernels (passes of 8 rows or fewer), F32 KDA states, 28 Sep | 0.0245 | 95.1% | pass |
 | Prefill kernels (4,096-row passes), F32 KDA states, 28 Sep | 0.0282 | 94.7% | pass |
+| Decode kernels, v1.1.0's defaults (BF16 KDA states), 30 Sep | 0.0240 | 95.1% | pass |
+| Prefill kernels, v1.1.0's defaults (BF16 KDA states, the chunked KDA prefill, W8A16), 30 Sep | 0.0268 | 94.8% | pass |
 
+- **v1.1.0's rows** are the runs of the v1.1 candidate (`f812603`: v1.1.0 before its last two
+  changes, sparse MLA blocks of 510 rows and the FP8 drafter and the L2 prefetch as defaults;
+  [docs/KL-GATE.md](docs/KL-GATE.md) §6e). v1.1.0's own `glm53f-score` reproduced the prefill
+  path's run byte for byte, on all 125 windows of the paired panel; the decode path's was not
+  re-run.
 - **The published figure** for the same EXL3 K4 experts is 0.024555 nats, with top-1 agreement
   0.9526. It was measured offline, with no KV-cache quantization, on every position of the same 25
   windows.
@@ -142,9 +159,13 @@ with 189 rows scored per window. A run passes when its mean KL plus 1.96 standar
 - **The chunked KDA prefill with W8A16 projections** (the default since 29 September) passed a
   paired comparison on 125 windows against the defaults before it: mean −0.0014 nats, upper
   bound +0.0002 against the 0.002 margin ([docs/KL-GATE.md](docs/KL-GATE.md) §6d).
-- **FP8 KDA projections** (D2) failed and stay off.
+- **FP8 KDA projections** (D2) failed with the checkpoint's `amax / 448` scales and stay off. With
+  power-of-two scales (`--kda-fp8-pow2`) they passed a paired comparison on 125 windows (mean
+  −0.0002 nats, upper bound +0.0015 against the 0.002 margin) and on the decode path, and stay
+  opt-in (below); as MXFP8 (`--kda-mxfp8`) they failed ([docs/KL-GATE.md](docs/KL-GATE.md) §6e).
 - **Spot checks:** a number hidden at 37% depth is found in 8.8K and 79K tokens of filler, with and
-  without the drafter. `harness/api_contract.py` passes all 12 of its rows on the real model.
+  without the drafter, and in about 991K tokens (below). `harness/api_contract.py` passes all 12
+  of its rows on the real model.
 
 ## Build and run
 
@@ -251,6 +272,17 @@ gate):
   `--kda-chain-prefill --prefill-w8a8` restores the previous arithmetic);
 - decode and verify passes of 2–16 rows in two lanes;
 - copy windows for greedy requests, with the drafter;
+- the FP8 drafter (`--drafter-bf16` loads the checkpoint's BF16 one) and the L2 prefetch of the
+  next layer's weights in decode and verify passes of one lane (`--l2-prefetch off`), new in
+  v1.1.0: with both, one stream decodes 5.5–11.0% faster than on v1.0.0 with byte-identical
+  replies, 4 and 16 streams move by −0.3% to +3.4%, and the KV pool at 16 slots holds 1.58M tokens
+  instead of 1.52M. Their A/B runs on the v1.1 candidate gave 2.3–4.2% for the FP8 drafter alone
+  and 2.7–5.5% for the L2 prefetch alone;
+- while a long prompt prefills, the running requests keep 20% of the time (`--decode-share 0.2`,
+  new in v1.1.0): during a 64,596-token prefill a stream kept 15.1 tok/s on v1.1.0, against 1.0,
+  with gaps of up to 3.96 s, on v1.0.0's scheduler (measured on `073b553`). On the candidate a
+  share of 0 left it 1.3 tok/s, and 0.2 cost the prompt 23% more time to its first token (15.08 s
+  against 12.22 s);
 - the rank kernel's GB10 decode schedule;
 - an FP8 MLA cache and FP8 wire rows;
 - the embedding and a KV snapshot tier in host RAM;
@@ -258,26 +290,31 @@ gate):
 
 **Opt-in or under test:**
 - **`--kda-fp8` (D2):** failed the KL gate in this form.
+- **`--kda-fp8-pow2`** (D2 with power-of-two scales): passed the KL gate and stays opt-in. Its
+  speed gain is in decode only (one stream 6–15% faster, against the candidate's defaults), while
+  prefill runs 1–5% slower; it also grows the KV pool by 49%, and greedy replies change. v1.1.0
+  keeps the checkpoint's BF16 KDA projections by default: quality first.
+- **`--kda-mxfp8`** (D2 as MXFP8): failed the KL gate.
 - **The ranks' prefill reduce-scatter** (`GLM53F_ROW_SHARDED_MIN_ROWS`): slower than the
   four-plane return over the ranks' TCP mesh, so it is off. The RDMA mesh is built but untested.
 
 **Known limitations:**
-- **A running stream slows while a long prompt prefills.** On `073b553`, while a 64.6K-token
-  prompt prefilled (16.5 s), a stream already generating got 1.0 tok/s, with gaps of up to 3.96 s;
-  short requests sent meanwhile got their first tokens in 1.1–3.1 s. Since then a prefill round
-  holds one pass of a long prompt (about 1.6 s), and the running requests keep a share of the
-  time between rounds (`--decode-share`, 0.2 by default). Computed from that run's figures at
-  today's prefill rate: the stream keeps about 21% of its rate, and the prompt's first token comes
-  about 24% later. Not yet measured on the target hardware.
 - **At 48 slots the default prefill pair costs context:** its workspace grows with the slots, and
-  leaves room for about 570K tokens at 48 (computed; 851K without it).
+  leaves room for about 570K tokens at 48 (computed for v1.0.0's defaults; 851K without it).
 
 **Measured once, or not yet:**
 - Most figures are single runs, and the KL gate scores 189 of each window's 2,047 rows.
-- The longest prompt run end to end is 207,436 tokens. A 1,048,576-token request fits the memory
-  plan at 16 slots, but no prompt near 1M tokens, and no needle beyond 79K tokens, has run yet.
-- The host RAM tier has had two runs on the target hardware. Its page-pressure path (an incoming
-  request needing pool pages, not a slot) has not run there yet.
+- Prompts near 1M tokens have run once each. On v1.0.0 (`4ad6477`) a 1,018,272-token prompt
+  prefilled in 259.1 s, and repeated it returned its first token in 0.066 s from the GPU's
+  snapshot (217,924 and 676,784 tokens: 0.015 and 0.042 s). A number hidden at 37% depth was found
+  in 991,810 tokens on v1.0.0 (first token after 253.4 s) and in 991,506 on the v1.1 candidate
+  (245.8 s). A prompt of the full 1,048,576 tokens fits the memory plan at 16 slots but has not
+  run.
+- The host RAM tier, on v1.0.0: the 1,018,272-token session came back from RAM in 145.9 ms (its
+  first token 0.231 s after the request), and the 991,810-token needle session in 140.1 ms,
+  answered correctly again. The page-pressure path ran too: with the pool full of snapshot marks, a
+  676,786-token prompt's own snapshot sent an older one to RAM to make room, and the prompt's
+  repeat returned in 0.041 s.
 
 **Not built:**
 - image input (the API refuses media parts);

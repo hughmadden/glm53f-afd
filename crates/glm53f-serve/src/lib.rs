@@ -80,8 +80,8 @@
 //! | `--drafter-fp8` / `--drafter-bf16` | `GLM53F_DRAFTER_FP8` (`0`: BF16) | on | With the drafter: its weights in FP8 block-128 (quantized at load) and its own FP8 copy of the LM head for drafting ([The FP8 drafter](#the-fp8-drafter)); the target's head and every committed token unchanged. `--drafter-bf16`: the checkpoint's BF16 drafter |
 //! | `--l2-prefetch off\|auto\|MiB` | `GLM53F_L2_PREFETCH` | auto | Decode and verify passes of one lane: while a MoE layer's routed experts are out, the next layer's first weights are prefetched into L2 (`auto`: three quarters of the GPU's L2) ([L2 prefetch](#l2-prefetch)); changes no bit |
 //! | `--kda-fp8` | `GLM53F_KDA_FP8=1` | off | Numerics under test (D2): the KDA q\|k\|v\|b and o projections quantized at load to FP8 block-128 (4.26 GiB of weights less) |
-//! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales: the same layout, kernels and bytes, and 82-89% of the q, k, v and o weights kept exactly (docs/SIZING.md §10) |
-//! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8: an E8M0 scale per row and 32 values of K (4.13 GiB of weights less), the MXFP8 GEMMs; the same error as `--kda-fp8-pow2` on these weights. The last of the three KDA flags given sets the scales |
+//! | `--kda-fp8-pow2` | `GLM53F_KDA_FP8_POW2=1` | off | D2 with power-of-two block-128 scales: the same layout, kernels and bytes, and 82-89% of the q, k, v and o weights kept exactly (docs/SIZING.md §10); passed the KL gate on the target hardware and stays opt-in (docs/KL-GATE.md §6e) |
+//! | `--kda-mxfp8` | `GLM53F_KDA_MXFP8=1` | off | D2 as MXFP8: an E8M0 scale per row and 32 values of K (4.13 GiB of weights less), the MXFP8 GEMMs; the same error as `--kda-fp8-pow2` on these weights, but it failed the KL gate on the target hardware (docs/KL-GATE.md §6e). The last of the three KDA flags given sets the scales |
 //! | `--kda-state-bf16` / `--kda-state-f32` | `GLM53F_KDA_STATE_BF16` (`0`: F32) | on | D8: the KDA recurrent states stored in BF16, computed in f32 (68 MiB less per slot and per snapshot); passed the KL gate on the target hardware (docs/KL-GATE.md §6b) |
 //! | `--prefill-w8a16` / `--prefill-w8a8` | `GLM53F_PREFILL_W8A16` (`0`: W8A8) | on | FP8 projections over 8 rows take BF16 activations (W8A16) instead of E4M3 (W8A8; 64 MiB of GEMM scratch); with the chunked KDA prefill, passed the KL gate on the target hardware (docs/KL-GATE.md §6d) |
 //! | `--kda-prefill-w8a8` | `GLM53F_KDA_PREFILL_W8A8=1` | off | With `--kda-fp8` and W8A16: the FP8 KDA projections keep E4M3 activations over 8 rows (D2's prefill speed), the other projections W8A16 |
@@ -109,7 +109,10 @@
 //! states) passed and is on. The chunked KDA prefill with W8A16 projections passed as a pair (it
 //! prefilled 21-28% faster, decode unchanged) and is on; the chunked kernel without W8A16 failed
 //! the gate, so `--prefill-w8a8` goes with `--kda-chain-prefill`. D2, with any of its scales
-//! (`--kda-fp8`, `--kda-fp8-pow2`, `--kda-mxfp8`), and `--kda-prefill-w8a8` are off.
+//! (`--kda-fp8`, `--kda-fp8-pow2`, `--kda-mxfp8`), and `--kda-prefill-w8a8` are off: `--kda-fp8`
+//! and `--kda-mxfp8` failed the gate; `--kda-fp8-pow2` passed (docs/KL-GATE.md §6e) and stays
+//! opt-in, the checkpoint's BF16 KDA projections kept by choice (with it one stream decoded 6-15%
+//! faster and prefill ran 1-5% slower, against the defaults of the v1.1 candidate `f812603`).
 //! `glm53f-score` takes the same flags. The start-up log names the ones on.
 //!
 //! **The fabric.** Expert traffic runs only on the RDMA fabric: the wire client refuses a rank
@@ -135,7 +138,8 @@
 //! 86% busy and prefilled 4.1K tok/s at 4K-79K tokens, against 3.5-4.0K with two lanes of 2,048
 //! (docs/PERFORMANCE.md §0), and a 1,048,576-token request still fits at 16 slots. With the
 //! chunked KDA prefill and W8A16 (the defaults since 29 September 2026) the same lanes prefill
-//! 5.0-5.2K tok/s with the GPU 66-69% busy: the exchange sets the pace again. The sizing notes
+//! 5.0-5.2K tok/s with the GPU 66-69% busy: the exchange sets the pace again (v1.1.0: 5.0-5.5K
+//! tok/s at 4K-79K tokens). The sizing notes
 //! below predate the lanes: 4,096 rows keeps the lanes'
 //! scratch at about 1.1 GiB (8,192 rows take about 2.1 GiB; before the lanes shared their
 //! attention-kind buffers and the sparse MLA core ran in row blocks, 3.1 and 6.1 GiB; measured by
@@ -200,8 +204,9 @@
 //! predates the lanes' shared scratch (about 2 GiB more pool at 4,096 prefill rows) and the
 //! numerics options (`--kda-fp8` 4.26 GiB less, BF16 KDA states 68 MiB a slot less; the chunked
 //! KDA prefill's workspace 34 MiB a slot more, W8A16's GEMM scratch 64 MiB more); the start-up
-//! log gives the current plan. With today's defaults the target measured at 16 slots forward
-//! buffers of 3.40 GiB and a pool of 8.73 GiB (1.52 M tokens): a 1,048,576-token request fits.
+//! log gives the current plan. With v1.1.0's defaults the target measured at 16 slots forward
+//! buffers of 3.39 GiB and a pool of 9.10 GiB (1,584,000 tokens; v1.0.0, with the BF16 drafter,
+//! 3.40 GiB and 8.73 GiB, 1,519,424 tokens): a 1,048,576-token request fits.
 //! At 48 slots the chunked prefill's workspace is 1.59 GiB, about 1.1 GiB more than at 16.
 //!
 //! # Decode lanes
@@ -234,13 +239,23 @@
 //!   the prompt's pass cuts, so its bits. The share moves only when the steps run: the prompt's
 //!   passes are cut where they were (whole multiples of 8,192 rows), and a step computes what it
 //!   would at any other time (which requests share a step always depended on timing).
-//! - **The default, 0.2**, computed from the target's figures (a pass about 1.65 s; a step about
-//!   41 ms and 3.1 tokens, 75.5 tok/s alone; the 64,596-token prompt in 8 passes, about 13 s):
-//!   the stream keeps about 16 tok/s (21%), and the prompt's time to first token grows by about
-//!   24%. 0.15: 12.5 tok/s and +18%; 0.25: 19.5 tok/s and +31%; 0 (one step a round): 1.8 tok/s
-//!   and +2%. A short prompt that arrives meanwhile waits for the pass in hand and the steps
-//!   owed, about 2.2 s at most (3.07 s was measured with rounds of two passes). A prompt with
-//!   nothing decoding prefills as before.
+//! - **The default, 0.2, measured** on the target hardware (30 September 2026; the probe of
+//!   `073b553`'s run, docs/PERFORMANCE.md §0: a 64,596-token prompt sent while a stream generates,
+//!   six short prompts during its prefill). On v1.1.0 the stream kept 15.1 tok/s while the prompt
+//!   prefilled (17% of its 87.7), its gaps at most 1,553 ms (one pass); the prompt's first token
+//!   came after 14.54 s, the short prompts' in 0.40-0.91 s. The v1.1 candidate `f812603` (the same
+//!   scheduler) measured 0.2 against 0: the stream kept 14.3 tok/s (18% of its 79.8) against 1.3,
+//!   and the prompt's first token came after 15.08 s against 12.22 s: 11 times the stream's rate
+//!   for 23% more time to the long prompt's first token. Its gaps: median 0 ms and at most
+//!   1,641 ms, against a median of 1,470 ms with 0 (3.96 s at most on `073b553`); the short
+//!   prompts' first tokens in 0.73-0.92 s (0.10-1.37 s with 0; 1.07-3.07 s on `073b553`). The
+//!   long prompt's reply and the short ones were the same with 0.2 and 0; the stream's differed
+//!   from its 1,806th character (an inference: the short prompts shared its steps at other times).
+//! - **How 0.2 was chosen**, by computation from `073b553`'s run (a pass about 1.65 s; a step about
+//!   41 ms and 3.1 tokens, 75.5 tok/s alone; the prompt in 8 passes, about 13 s): about 16 tok/s
+//!   (21%) and +24% for 0.2; 0.15: 12.5 tok/s and +18%; 0.25: 19.5 tok/s and +31%; 0: 1.8 tok/s
+//!   and +2%; a short prompt that arrives meanwhile waits for the pass in hand and the steps owed,
+//!   about 2.2 s at most. A prompt with nothing decoding prefills as before.
 //! - **On the development GPU** (docs/PERFORMANCE.md §0's probe against `--dev-layers 0-4` and
 //!   four rank daemons on one RTX 4090: its 64,596-token prompt in 8 passes of about 0.6 s, and
 //!   `GLM53F_PREFILL_SEGMENT_MS=756`, so that a round held two passes before, as on the target):
@@ -284,10 +299,12 @@
 //! FP8 weights, the head's copy 0.59 GiB); net of its larger working memory the KV pool gets
 //! 0.37 GiB more at 16 slots (`docs/SIZING.md` §11). The start-up log names it.
 //!
-//! On by default since 30 September 2026, after the target hardware: one stream decoded 2.3-4.2%
-//! faster (code 126.5 -> 129.5 tok/s, prose 71.0 -> 74.0, counting 184.7 -> 188.9), 4 and 16
-//! streams within 1.2%, every reply byte-identical, 76.2% of the drafts kept against 75.9% (3.72
-//! tokens a window against 3.75) and the KV pool 1,584,000 tokens against 1,519,424.
+//! On by default since v1.1.0 (30 September 2026), after A/B runs on the target hardware with the
+//! v1.1 candidate `f812603` (v1.1.0 before its two new defaults and its 510-row sparse MLA blocks):
+//! one stream decoded 2.3-4.2% faster (code 126.5 -> 129.5 tok/s, prose 71.0 -> 74.0, counting
+//! 184.7 -> 188.9), 4 and 16 streams within 1.2%, every reply byte-identical, 76.2% of the drafts
+//! kept against 75.9% (3.72 tokens a window against 3.75) and the KV pool 1,584,000 tokens against
+//! 1,519,424 (v1.1.0's too).
 //! `--drafter-bf16` (or `GLM53F_DRAFTER_FP8=0`) loads the checkpoint's BF16 drafter.
 //!
 //! # L2 prefetch
@@ -301,11 +318,13 @@
 //! other lane's attention fills the exchange, never prefetch. `auto` takes three quarters of the
 //! GPU's L2 (72 MiB of the RTX 5090's 96 MB); a number is MiB.
 //!
-//! `auto` by default since 30 September 2026, after the target hardware: one stream decoded
-//! 2.7-5.5% faster (code 126.5 -> 130.3 tok/s, prose 71.0 -> 74.9, counting 184.7 -> 189.6) and 4
-//! and 16 streams 0.2-2.3% faster, every reply byte-identical. With the FP8 drafter (both
-//! defaults) one stream decoded 126.5 -> 133.4, 71.0 -> 78.1 and 184.7 -> 193.9 tok/s (+5.5%,
-//! +10.0%, +5.0%), and 4 and 16 streams moved -1.6% to +3.6%. `--l2-prefetch off` turns it off.
+//! `auto` by default since v1.1.0 (30 September 2026), after A/B runs on the target hardware with
+//! the v1.1 candidate: one stream decoded 2.7-5.5% faster (code 126.5 -> 130.3 tok/s, prose 71.0 ->
+//! 74.9, counting 184.7 -> 189.6) and 4 and 16 streams 0.2-2.3% faster, every reply byte-identical.
+//! With the FP8 drafter (both defaults) one stream decoded 126.5 -> 133.4, 71.0 -> 78.1 and 184.7
+//! -> 193.9 tok/s (+5.5%, +10.0%, +5.0%), and 4 and 16 streams moved -1.6% to +3.6%. v1.1.0 decodes
+//! one stream at 133.2 / 78.8 / 195.1 tok/s, 5.5-11.0% faster than v1.0.0, with byte-identical
+//! replies. `--l2-prefetch off` turns it off.
 //!
 //! # Development mode
 //!
