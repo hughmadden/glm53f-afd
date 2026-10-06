@@ -81,13 +81,16 @@ The workspace manifest's `rust-version` is that Rust; no `rust-toolchain` file p
   ```
 
   A rank directory holds about 38 GB (layers 3 to 44). All four ranks must be cut from the same
-  checkpoint. The EXL3 K4 checkpoint is `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (mirrored at
-  `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`).
+  checkpoint. The EXL3 K4 checkpoint is `brandonmusic/GLM-5.3-Flash-tr3-4bpw`. It was mirrored at
+  `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`, which is no longer public: since 6 October 2026 the Hub
+  answers 401 for it.
 
   **The images the published figures ran on** are listed by SHA-256 in
   [rank-images.sha256](rank-images.sha256): 168 files (four ranks, layers 3 to 44, 913,932,288
   bytes each). They were cut from `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` at `25a44fdb`, with
-  `--source "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw@25a44fdb"`.
+  `--source "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw@25a44fdb"`. The mirror can no longer be
+  downloaded; cut from `brandonmusic/GLM-5.3-Flash-tr3-4bpw` at `a5fee929` instead, which gives the
+  same images (next point).
 
   - **The pinned checkpoint cuts the same images.** `brandonmusic/GLM-5.3-Flash-tr3-4bpw` at
     `a5fee929` and the mirror at `25a44fdb` hold the same weights: each of the 123 files stored in

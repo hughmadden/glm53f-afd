@@ -8,8 +8,9 @@
 //!   the DSA projections (not `kv_b_proj`), the shared and dense MLPs and the
 //!   routed experts. KDA attention, the indexer, routers, norms, embedding and
 //!   LM head are BF16 (or F32 for a few small parameters).
-//! - [`CheckpointFormat::Exl3`] (`Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`, the
-//!   same weights as `brandonmusic/GLM-5.3-Flash-tr3-4bpw`): routed experts as
+//! - [`CheckpointFormat::Exl3`] (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`; its mirror
+//!   `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` is no longer public since 6 October
+//!   2026): routed experts as
 //!   ExLlamaV3 trellis tensors with the `mcg` codebook (`trellis`, `suh`,
 //!   `svh`, `mcg`); every other tensor BF16.
 //! - [`CheckpointFormat::Nvfp4`] (`LibertAIDAI/GLM-5.3-Flash-NVFP4`): routed

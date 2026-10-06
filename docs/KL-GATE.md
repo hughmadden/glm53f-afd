@@ -77,7 +77,7 @@ attention, no KV cache (`use_cache: false`), TF32 off, expert-parallel over four
 | GitHub `brandonmmusic-max/glm-5.3-flash-exl3-4bpw`, `kld quantization fidelity report.md` | commit `24784d71`, sha256 `692ff9e5…` (the digest `protocol.yaml` records) | the governing report |
 | `malaiwah/quant-fidelity-registry` (dataset): `data/measurements.jsonl`, `protocol/glm53-joint-kld-protocol.v1.json`, `protocol/per-window/*.json` | `394b64750b55c325899c5cd121a415cc6fc99c15`; `82c5ade5…`, `80df521e…` | FP8, K6 and floor figures; canaries; per-window means |
 | `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, `runtime-results-v44.json` | `a5fee929…`, sha256 `f47b8aad…` | the window-0 split: first 64 positions against the rest |
-| `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` model card | `9eaebb7c4e96d983dcd538e18624622ba5b820a8` | a byte-identical mirror of the K4 checkpoint (upstream revision `5ab363a8`); no figures of its own; its `runtime-results-v44.json` is the upstream file (same git blob) |
+| `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` model card | `9eaebb7c4e96d983dcd538e18624622ba5b820a8` | a byte-identical mirror of the K4 checkpoint (upstream revision `5ab363a8`), no longer public since 6 October 2026 (the Hub answers 401); no figures of its own; its `runtime-results-v44.json` is the upstream file (same git blob) |
 
 Full digests are in [`harness/PROVENANCE-klgate.md`](../harness/PROVENANCE-klgate.md).
 
